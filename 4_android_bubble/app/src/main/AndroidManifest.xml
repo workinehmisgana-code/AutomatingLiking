@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Draw the floating bubble on top of every app -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- Keep the bubble alive while you're in other apps -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Show the ongoing notification (Android 13+) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Optional: load the link list from a URL -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+
+        <!-- No UI: a translucent launcher that just starts the bubble and finishes. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Receives the nextbubble://auth?token=… deep link after Google sign-in -->
+        <activity
+            android:name=".AuthActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:launchMode="singleTask"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="nextbubble" android:host="auth" />
+            </intent-filter>
+        </activity>
+
+        <!-- Full-screen native dashboard opened from the bubble's expand icon -->
+        <activity
+            android:name=".DashboardActivity"
+            android:exported="false"
+            android:label="@string/app_name"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout"
+            android:theme="@style/AppTheme" />
+
+        <!-- Native task screens launched from the dashboard home -->
+        <activity
+            android:name=".VideoTaskActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout"
+            android:theme="@style/AppTheme" />
+        <activity
+            android:name=".PromoActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout"
+            android:theme="@style/AppTheme" />
+
+        <service
+            android:name=".BubbleService"
+            android:exported="false" />
+    </application>
+</manifest>

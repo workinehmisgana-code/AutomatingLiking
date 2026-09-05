@@ -1,0 +1,17 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- White speech (comment) bubble with a tail at the bottom-left -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M40,34 L69,34 Q80,34 80,45 L80,58 Q80,69 69,69 L52,69 L40,80 L42,69 L39,69 Q28,69 28,58 L28,45 Q28,34 40,34 Z" />
+    <!-- Emerald check mark, centred in the bubble -->
+    <path
+        android:strokeColor="#059669"
+        android:strokeWidth="7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M41,51 L49,59 L67,41" />
+</vector>

@@ -1,0 +1,74 @@
+# ── Never commit: credentials ────────────────────────────────────────────────
+# Every project reads its own .env. Between them these hold the Postgres URL,
+# the Vercel Blob read/write token, the links-export token, the captcha API key
+# and the auth secret — a push of any one of them is a credential leak that
+# survives in the history even after a delete.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+local.properties
+
+# ── Never commit: live logged-in browser sessions ────────────────────────────
+# These are not caches. A Chromium user data directory is a signed-in browser:
+# cookies, tokens and the device fingerprint TikTok/Instagram derive from it.
+# Anyone with the folder is logged in as those accounts.
+profile/
+profile-*/
+browser_profile/
+captcha-dump/
+
+# ── Never commit: the accounts file ──────────────────────────────────────────
+accounts.json
+
+# ── Build output and dependencies ────────────────────────────────────────────
+node_modules/
+.next/
+out/
+build/
+dist/
+.vercel/
+*.tsbuildinfo
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.gradle/
+app/build/
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# ── Scraped data ─────────────────────────────────────────────────────────────
+# Regenerable, and large: results/ alone runs to tens of megabytes, and one
+# channel_videos CSV is over 60 MB — past what GitHub accepts without LFS.
+# The scripts that produce it are what matter; the output is not source.
+1_tiktok_search_scraper/results/
+2_comment_automation/output/
+*.csv
+!sample*.csv
+!*example*.csv
+
+# The likers' ledgers: which comment each account has already liked. Per-machine
+# state, and it names accounts.
+done*.csv
+done*.csv.bak
+done*.csv.tmp
+
+# Scratch output from the probes
+inspect*.json
+inspect*.png
+capture.json
+captcha-fail-*.png
+*.log
+
+# ── OS / editor ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
