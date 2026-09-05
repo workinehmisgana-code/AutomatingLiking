@@ -1,0 +1,5 @@
+# Python deps for the dashboard's helper scripts (upload.py, stage_verify.py).
+#   pip install -r requirements.txt
+requests>=2.31
+python-dotenv>=1.0
+psycopg2-binary>=2.9        # stage_verify.py talks to Postgres directly

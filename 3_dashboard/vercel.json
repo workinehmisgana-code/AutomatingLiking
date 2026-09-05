@@ -1,0 +1,16 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/comments",
+      "schedule": "0 3 * * *"
+    },
+    {
+      "path": "/api/cron/comment-presence",
+      "schedule": "*/5 17-23 * * *"
+    },
+    {
+      "path": "/api/cron/pipeline",
+      "schedule": "* * * * *"
+    }
+  ]
+}
