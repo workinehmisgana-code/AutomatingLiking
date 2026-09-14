@@ -3,9 +3,17 @@
 import { useState, useRef, useMemo, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { signOut } from '@/lib/auth-client'
-import { PRODUCTS, DEACTIVATED_PRODUCTS, VIDEO_PAYMENT_BIRR, COMMENT_PAY_RATE, PROMO_PAY_BIRR } from '@/lib/config'
-import type { AdminData, AdminUserRow, PendingPayments, ApkInfo, UserClick } from '@/lib/db'
+import {
+  PRODUCTS,
+  DEACTIVATED_PRODUCTS,
+  VIDEO_PAYMENT_BIRR,
+  COMMENT_PAY_RATE,
+  PROMO_PAY_BIRR,
+  CLICK_PLATFORM_LABELS,
+} from '@/lib/config'
+import type { AdminData, AdminUserRow, PendingPayments, ApkInfo, UserClick, GuideVideo } from '@/lib/db'
 import ApkAdmin from '@/components/ApkAdmin'
+import GuideVideosAdmin from '@/components/GuideVideosAdmin'
 import PlatformLimits from '@/components/PlatformLimits'
 import ActiveProducts from '@/components/ActiveProducts'
 import { accountCreatedAt, accountAge } from '@/lib/tiktokId'
@@ -468,6 +476,7 @@ export default function AdminDashboard({
   adminEmail,
   pendingByUser,
   apk,
+  guideVideos,
   appVersions,
   videoTaskEnabled,
   promoTaskEnabled,
@@ -479,6 +488,7 @@ export default function AdminDashboard({
   adminEmail: string
   pendingByUser: Record<string, PendingPayments>
   apk: ApkInfo | null
+  guideVideos: GuideVideo[]
   appVersions: Record<string, { name: string | null; code: number | null }>
   videoTaskEnabled: boolean
   promoTaskEnabled: boolean
@@ -1387,6 +1397,7 @@ export default function AdminDashboard({
       <DailyClicksTable
         days={data.dailyClicks}
         byProduct={data.dailyClicksByProduct}
+        byPlatform={data.dailyClicksByPlatform}
         products={clickProducts}
       />
 
@@ -1433,6 +1444,7 @@ export default function AdminDashboard({
           <PlatformLimits />
           <ActiveProducts />
           <ApkAdmin apk={apk} />
+          <GuideVideosAdmin videos={guideVideos} />
         </div>
       </details>
 
@@ -2198,8 +2210,14 @@ export default function AdminDashboard({
                   </div>
                   <div className="text-[11px] text-zinc-600 mt-1">
                     Last active {verifyReport.day} · opened {verifyReport.opened} link(s)
+                    {/* The day is read IN FULL now, so a shortfall here means the
+                        pass has not finished — not that a sample was taken. It
+                        works to a deadline and resumes, so a heavy day needs
+                        more than one run. */}
                     {verifyReport.opened > verifyReport.links.length &&
-                      ` · ${verifyReport.links.length} sampled evenly across the day`}
+                      ` · ${verifyReport.links.length} read so far, ${(
+                        verifyReport.opened - verifyReport.links.length
+                      ).toLocaleString()} still to read`}
                     {verifyReport.skipped > 0 && ` · ${verifyReport.skipped} could not be judged`}
                   </div>
                 </div>
@@ -2545,17 +2563,6 @@ function UserCard({
               </span>
             )
           })()}
-          <button
-            onClick={onViewSnapshots}
-            title={
-              u.lastSnapshotDay
-                ? `View this user's saved past states — last saved ${u.lastSnapshotDay}`
-                : 'No past states saved yet (a state is saved each time you mark them paid)'
-            }
-            className="text-[11px] font-semibold rounded px-1.5 py-0.5 border border-zinc-600 bg-zinc-700/30 text-zinc-300 hover:bg-zinc-700/50 transition-colors"
-          >
-            🕓 past states{u.lastSnapshotDay ? ` · ${u.lastSnapshotDay}` : ''}
-          </button>
           <Chip label="clicked" value={u.totalClicks} />
           <Chip label="comments" value={u.totalCommented} />
           <Chip label="reposts" value={u.promoLinks.length} accent={unapprovedReposts ? 'amber' : undefined} />
@@ -2685,6 +2692,19 @@ function UserCard({
       {/* ── Expanded detail ───────────────────────────────────────────── */}
       {open && (
         <div className="px-3 pb-3 pt-3 space-y-4 border-t border-zinc-800">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={onViewSnapshots}
+              title={
+                u.lastSnapshotDay
+                  ? `View this user's saved past states — last saved ${u.lastSnapshotDay}`
+                  : 'No past states saved yet (a state is saved each time you mark them paid)'
+              }
+              className="text-[11px] font-semibold rounded px-1.5 py-0.5 border border-zinc-600 bg-zinc-700/30 text-zinc-300 hover:bg-zinc-700/50 transition-colors"
+            >
+              🕓 past states{u.lastSnapshotDay ? ` · ${u.lastSnapshotDay}` : ''}
+            </button>
+          </div>
           {/* Comment presence — the last 7 scored days behind the badge */}
           <div className="rounded-lg border border-zinc-800 p-2.5">
             <div className="flex items-baseline justify-between gap-2 mb-2">
@@ -3238,13 +3258,26 @@ function UserCard({
  * This is a ROLLING window and is deliberately not scoped to the data reset —
  * unlike the per-user tables, which count "since reset".
  */
+const PLATFORM_DOT: Record<string, string> = {
+  tiktok: 'bg-pink-500',
+  youtube_shorts: 'bg-orange-500',
+  youtube_videos: 'bg-red-500',
+  instagram: 'bg-fuchsia-500',
+}
+function platformDot(p: string): string {
+  return PLATFORM_DOT[p] ?? 'bg-zinc-600'
+}
+
 function DailyClicksTable({
   days,
   byProduct,
+  byPlatform,
   products,
 }: {
   days: { day: string; count: number }[]
   byProduct: Record<string, { day: string; count: number }[]>
+  /** The same days split by the platform stamped on each click. */
+  byPlatform: Record<string, { day: string; count: number }[]>
   products: string[]
 }) {
   if (days.length === 0) return null
@@ -3253,6 +3286,10 @@ function DailyClicksTable({
   // Only products that actually saw a click in the window get a row; '(none)'
   // (clicks by users with no product) is shown last when present.
   const rows = [...products, '(none)'].filter((p) => (byProduct[p] ?? []).some((d) => d.count > 0))
+  const platformRows = Object.entries(byPlatform)
+    .map(([key, series]) => ({ key, series, total: series.reduce((n, d) => n + d.count, 0) }))
+    .filter((r) => r.total > 0)
+    .sort((a, b) => b.total - a.total || a.key.localeCompare(b.key))
   const dayLabel = (iso: string) =>
     new Date(`${iso}T00:00:00`).toLocaleDateString(undefined, { weekday: 'short' })
 
@@ -3298,6 +3335,16 @@ function DailyClicksTable({
                 </td>
               ))}
             </tr>
+            {rows.length > 0 && (
+              <tr>
+                <td
+                  colSpan={days.length + 1}
+                  className="text-[10px] uppercase tracking-wide text-zinc-600 pr-3 pt-2 pb-0.5 border-t border-zinc-800"
+                >
+                  by product
+                </td>
+              </tr>
+            )}
             {rows.map((p) => {
               const series = byProduct[p] ?? []
               return (
@@ -3314,6 +3361,37 @@ function DailyClicksTable({
                 </tr>
               )
             })}
+            {platformRows.length > 0 && (
+              <tr>
+                <td
+                  colSpan={days.length + 1}
+                  className="text-[10px] uppercase tracking-wide text-zinc-600 pr-3 pt-2 pb-0.5 border-t border-zinc-800"
+                >
+                  by platform
+                </td>
+              </tr>
+            )}
+            {platformRows.map(({ key, series, total }) => (
+              <tr key={`plat-${key}`}>
+                <td
+                  className="text-zinc-400 pr-3 py-1 whitespace-nowrap"
+                  title={`${total.toLocaleString()} click(s) in this window`}
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className={`w-1.5 h-1.5 rounded-full ${platformDot(key)}`} />
+                    {CLICK_PLATFORM_LABELS[key] ?? key}
+                  </span>
+                </td>
+                {days.map((d, i) => (
+                  <td
+                    key={d.day}
+                    className="text-zinc-400 px-2 py-1 border-l border-t border-zinc-800 text-center tabular-nums"
+                  >
+                    {(series[i]?.count ?? 0).toLocaleString()}
+                  </td>
+                ))}
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>

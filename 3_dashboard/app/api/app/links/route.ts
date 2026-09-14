@@ -4,6 +4,7 @@ import {
   getClickedUrls,
   getClickCountsByUrl,
   getBlockedUrls,
+  getConfirmedBrokenUrls,
   getApk,
   getEffectivePlatformLimits,
   getUnrelatedUrls,
@@ -16,6 +17,7 @@ import {
 import { loadVideosJson, retiredUrlSet, type RawVideo } from '@/lib/videos'
 import { missingProducts } from '@/lib/commentScan'
 import { clusterAndOrder } from '@/lib/cluster'
+import { BROKEN_AFTER_MISSES } from '@/lib/linkStats'
 import { mixOrderings, seedFrom, DEFAULT_DATE_SHARE } from '@/lib/clusterMix'
 import {
   isAppOutdated,
@@ -77,14 +79,19 @@ export async function GET(req: NextRequest) {
   // Retirement counts every distinct user who opened the link, across all
   // products — users aren't assigned to a product, so there is no per-product
   // audience to scope it to.
-  const [clicked, clickCounts, videos, blocked, effective, unrelated] = await Promise.all([
-    getClickedUrls(userId).catch(() => [] as string[]),
-    getClickCountsByUrl().catch(() => ({}) as Record<string, number>),
-    loadVideosJson(),
-    getBlockedUrls().catch(() => [] as string[]),
-    getEffectivePlatformLimits(),
-    getUnrelatedUrls(userId).catch(() => [] as string[]),
-  ])
+  const [clicked, clickCounts, videos, blocked, effective, unrelated, broken] =
+    await Promise.all([
+      getClickedUrls(userId).catch(() => [] as string[]),
+      getClickCountsByUrl().catch(() => ({}) as Record<string, number>),
+      loadVideosJson(),
+      getBlockedUrls().catch(() => [] as string[]),
+      getEffectivePlatformLimits(),
+      getUnrelatedUrls(userId).catch(() => [] as string[]),
+      // Links the platform no longer serves. Confirmed ones only — a single
+      // dead reading is a suspicion, and withholding on it would let one bad
+      // minute on TikTok's side shrink everyone's list.
+      getConfirmedBrokenUrls(BROKEN_AFTER_MISSES).catch(() => [] as string[]),
+    ])
   // Withheld: clicked (already opened), retired (quota done), admin-blocked, and
   // links THIS user flagged as unrelated.
   //
@@ -99,6 +106,7 @@ export async function GET(req: NextRequest) {
   retired.forEach((u) => hidden.add(u))
   blocked.forEach((u) => hidden.add(u))
   unrelated.forEach((u) => hidden.add(u))
+  broken.forEach((u) => hidden.add(u))
   const platform = req.nextUrl.searchParams.get('platform')
 
   // How the two clusterings are mixed: a percentage set on the admin Links page

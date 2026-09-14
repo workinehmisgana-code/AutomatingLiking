@@ -32,6 +32,7 @@ import {
 } from './db'
 import { overlayStats } from './linkStats'
 import { parsePostedDate } from './cluster'
+import { isPhotoLink } from './dateScore'
 
 /** One row as the client renders it. Carries its own title and click count, so
  *  the browser never needs the 36k-entry title map or the whole click table. */
@@ -49,6 +50,11 @@ export interface AdminLinkRow {
   rankCluster: number
   dateCluster: number
   combinedCluster: number
+  /** 1-based place WITHIN the link's own cluster, in the order the feed serves
+   *  it — best search rank first, or highest date score first. Set by the same
+   *  sorted pass that assigns the cluster, so the two can never disagree. */
+  rankPos: number
+  datePos: number
   date_only: boolean
   /** Composite posted-date score (recency + video + hearts) written to the pool
    *  at upload / recluster. null for links scored before it existed. */
@@ -109,6 +115,18 @@ export interface LinkQuery {
   category?: string
   uploadDate?: string
   titleFilter?: '' | 'has' | 'none'
+  /**
+   * Whether the video carries any of OUR product comments.
+   *
+   *   none      extracted, and none of ours was found. Proof.
+   *   some      extracted, and at least one was found.
+   *   unscanned never extracted — no evidence either way.
+   *
+   * 'none' and 'unscanned' are deliberately separate. Merging them would report
+   * 125,070 links nobody has ever looked at as "proven to have none of ours",
+   * which is the difference between a gap you can act on and one you invented.
+   */
+  oursFilter?: '' | 'none' | 'some' | 'unscanned'
   /** photo = image carousels only, video = real videos only, unknown = not yet
    *  checked by the counts refresh. '' = any. */
   mediaFilter?: '' | 'photo' | 'video' | 'unknown'
@@ -117,7 +135,7 @@ export interface LinkQuery {
   minClicks?: number | null
   maxClicks?: number | null
   q?: string
-  sortCol?: 'cluster' | 'clicked_by' | null
+  sortCol?: 'cluster' | 'clicked_by' | 'unrelated' | null
   sortDir?: 'asc' | 'desc'
   offset?: number
   limit?: number
@@ -159,18 +177,26 @@ const uploadDayOf = (scrapedAt: string): string => {
   return m ? m[1] : ''
 }
 
-/** Split a sorted list into n contiguous, as-even-as-possible clusters. */
+/**
+ * Split a sorted list into n contiguous, as-even-as-possible clusters, and
+ * record each link's place inside its own cluster.
+ *
+ * The position comes from THIS pass rather than being computed later, because
+ * this is the sort that decides it: the list is already in the feed's serving
+ * order, so the j-th entry of a cluster is the j-th link that cluster serves.
+ * Deriving it separately would be a second sort that could drift from this one.
+ */
 function assignClusters<T>(
   list: T[],
   key: (x: T) => number,
-  set: (x: T, cluster: number) => void,
+  set: (x: T, cluster: number, posInCluster: number) => void,
   n: number
 ): void {
   const s = [...list].sort((a, b) => key(a) - key(b))
   let start = 0
   for (let i = 0; i < n; i++) {
     const size = Math.floor((s.length - start) / (n - i))
-    for (let j = start; j < start + size; j++) set(s[j], i + 1)
+    for (let j = start; j < start + size; j++) set(s[j], i + 1, j - start + 1)
     start += size
   }
 }
@@ -253,6 +279,8 @@ export async function buildAdminLinks(product: string): Promise<{
       retireAt: retireThreshold(platform, like),
       rankCluster: 0,
       dateCluster: 0,
+      rankPos: 0,
+      datePos: 0,
       combinedCluster: 0,
       date_only: Boolean((v as { date_only?: unknown }).date_only),
       category: categories[url] ?? '',
@@ -264,8 +292,10 @@ export async function buildAdminLinks(product: string): Promise<{
         const n = Number((v as { view_count?: unknown }).view_count)
         return Number.isFinite(n) && n > 0 ? n : null
       })(),
-      // A /photo/ URL is self-identifying; anything else needs the refreshed flag.
-      isPhoto: /\/photo\/\d/.test(url) ? true : (linkStats[url]?.isPhoto ?? null),
+      // One shared rule with the scoring (lib/dateScore) — these used to differ
+      // on whether the URL or the stored flag wins, so a link could read as a
+      // photo in this table and a video in its score.
+      isPhoto: isPhotoLink(url, linkStats[url]?.isPhoto ?? null),
       statsAt: linkStats[url]?.fetchedAt ?? null,
       title: titles[url] ?? '',
       clicks: clicksOf(url),
@@ -305,8 +335,13 @@ export async function buildAdminLinks(product: string): Promise<{
       : -(parsePostedDate(l.posted_date, l.scraped_at) ?? Number.NEGATIVE_INFINITY)
 
   byPlatform.forEach((list) => {
-    assignClusters(list.filter((l) => !l.date_only), rankKey, (l, c) => (l.rankCluster = c), RANK_CLUSTER_COUNT)
-    assignClusters(list, dateKey, (l, c) => (l.dateCluster = c), DATE_CLUSTER_COUNT)
+    assignClusters(
+      list.filter((l) => !l.date_only),
+      rankKey,
+      (l, c, pos) => { l.rankCluster = c; l.rankPos = pos },
+      RANK_CLUSTER_COUNT
+    )
+    assignClusters(list, dateKey, (l, c, pos) => { l.dateCluster = c; l.datePos = pos }, DATE_CLUSTER_COUNT)
   })
   for (const l of rows) {
     l.combinedCluster = l.date_only ? l.dateCluster : Math.min(l.rankCluster, l.dateCluster)
@@ -390,6 +425,14 @@ export function filterAdminLinks(
     if (qy.uploadDate && uploadDayOf(l.scraped_at) !== qy.uploadDate) return false
     if (qy.titleFilter === 'has' && !l.title) return false
     if (qy.titleFilter === 'none' && l.title) return false
+    if (qy.oursFilter) {
+      // null = never extracted; {} = extracted and clean; non-empty = carries ours.
+      const ours = l.ourComments
+      const has = !!ours && Object.keys(ours).length > 0
+      if (qy.oursFilter === 'unscanned' && ours !== null) return false
+      if (qy.oursFilter === 'none' && (ours === null || has)) return false
+      if (qy.oursFilter === 'some' && !has) return false
+    }
     if (qy.mediaFilter === 'photo' && l.isPhoto !== true) return false
     if (qy.mediaFilter === 'video' && l.isPhoto !== false) return false
     if (qy.mediaFilter === 'unknown' && l.isPhoto !== null) return false
@@ -417,7 +460,12 @@ export function sortAdminLinks(rows: AdminLinkRow[], qy: LinkQuery): AdminLinkRo
         : clusterBy === 'date'
           ? l.dateCluster
           : l.combinedCluster
-      : l.clicks
+      : qy.sortCol === 'unrelated'
+        // How many users reported the link as nothing to do with humanizers.
+        // Sorted DESC by default like the others, which puts the most-reported
+        // links first — the ones actually worth a decision.
+        ? l.unrelated
+        : l.clicks
   const dir = qy.sortDir === 'asc' ? 1 : -1
   return [...rows].sort((a, b) => (val(a) - val(b)) * dir)
 }

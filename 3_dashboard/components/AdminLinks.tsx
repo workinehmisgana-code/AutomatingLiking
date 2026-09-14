@@ -21,8 +21,15 @@ const CATEGORY_TONE: Record<string, string> = {
 }
 
 const DEFAULT_CW: Record<string, number> = {
-  platform: 112, cluster: 96, keyword: 144, title: 288, rank: 88, clicked: 112, ratio: 124,
-  parts: 132, ours: 120,
+  platform: 112, cluster: 96, pos: 64, keyword: 144, title: 288, rank: 88, clicked: 112,
+  ratio: 124, parts: 132, ours: 120,
+}
+
+/** "st" / "nd" / "rd" / "th" for a 1-based position. */
+function ordinalSuffix(n: number): string {
+  const tens = n % 100
+  if (tens >= 11 && tens <= 13) return 'th'
+  return { 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] ?? 'th'
 }
 
 // Short labels for the per-product breakdown. Six full product names do not fit
@@ -67,6 +74,9 @@ export interface LinkRow {
   rankCluster: number
   dateCluster: number
   combinedCluster: number
+  /** 1-based place inside the link's own cluster, in serving order. */
+  rankPos: number
+  datePos: number
   date_only?: boolean // no search rank; clusters by posted date only
   title?: string // cached video title, sent with the row
   clicks?: number // distinct-user clicks, already scoped to the selected product
@@ -81,7 +91,7 @@ export interface LinkRow {
   scanComplete?: boolean
 }
 
-type SortCol = 'cluster' | 'clicked_by'
+type SortCol = 'cluster' | 'clicked_by' | 'unrelated'
 type ClusterBy = 'rank' | 'date' | 'combined'
 
 const PLATFORMS: { key: string; label: string; dot: string }[] = [
@@ -91,9 +101,12 @@ const PLATFORMS: { key: string; label: string; dot: string }[] = [
   { key: 'instagram', label: 'Instagram', dot: 'bg-fuchsia-500' },
 ]
 
-const PAGE_SIZE = 100
+// Rows on screen at once. Divides WINDOW_SIZE exactly, which the paging relies
+// on: a page must never straddle two fetched windows, or the second half of it
+// would be blank until the next window arrived.
+const PAGE_SIZE = 500
 // Rows fetched per request. Paging inside this window costs nothing; the pool is
-// ~82k links, so shipping it whole to filter in the browser is what this avoids.
+// ~130k links, so shipping it whole to filter in the browser is what this avoids.
 const WINDOW_SIZE = 1000
 
 /** Posted-date cluster weights, held as PERCENTAGES while being edited — typing
@@ -305,6 +318,15 @@ export default function AdminLinks({
   // be scraped under says little. The keyword itself is still on the link's
   // tooltip, and still searchable in the box above.
   const [category, setCategory] = useState('') // '' = every audience
+  // The search keyword a link was scraped under. The server already filters on
+  // it exactly; the list of what exists comes back with every window, so the
+  // dropdown offers only keywords that actually match something.
+  const [keyword, setKeyword] = useState('') // '' = every keyword
+  // Whether the video carries any of our product comments. 'none' means the
+  // extraction READ it and found none — proof — while 'unscanned' means nobody
+  // has looked. Kept apart on purpose; see LinkQuery.oursFilter.
+  const [oursFilter, setOursFilter] = useState<'' | 'none' | 'some' | 'unscanned'>('')
+  const [keywords, setKeywords] = useState<string[]>([])
   const [uploadDate, setUploadDate] = useState('') // '' = all upload days (YYYY-MM-DD)
   const [titleFilter, setTitleFilter] = useState<'' | 'has' | 'none'>('')
   // TikTok serves photo-mode posts (image carousels) under /video/<id> and only
@@ -327,6 +349,253 @@ export default function AdminLinks({
   const [maxRatio, setMaxRatio] = useState('')
   const [reclustering, setReclustering] = useState(false)
   const [reclusterOpen, setReclusterOpen] = useState(false)
+  // ── Channels in the rank clusters but not the date ones ───────────────────
+  // Only meaningful once the cluster filter narrows it: every ranked link also
+  // gets a date cluster, so over the whole pool the answer is always zero. The
+  // modal says so rather than showing an empty list that looks like a fault.
+  interface RankOnlyChannel {
+    channel: string
+    platform: string
+    handle: string
+    profileUrl: string
+    links: number
+    bestCluster: number
+    bestRank: number
+    sample: string
+    /** The keywords that found it, best-ranked first. */
+    keywords: string[]
+    /** Its ranked links, best rank first, capped by the route. Each carries
+     *  everything a flat row needs, so the list can be per-video. */
+    videos: {
+      url: string
+      title: string
+      rank: number
+      cluster: number
+      keyword: string
+      blocked: boolean
+    }[]
+  }
+  const [rankOnlyOpen, setRankOnlyOpen] = useState(false)
+  const [rankOnly, setRankOnly] = useState<{
+    channels: RankOnlyChannel[]
+    rankLinks: number
+    dateLinks: number
+    rankChannels: number
+    dateChannels: number
+    both: number
+    dateOnlyChannels: number
+    clusters: number[]
+  } | null>(null)
+  const [rankOnlyBusy, setRankOnlyBusy] = useState(false)
+  // The modal filters by site itself rather than inheriting the page's platform:
+  // the comparison is worth seeing whole, then narrowed.
+  const [rankOnlyPlatform, setRankOnlyPlatform] = useState('')
+  const rankOnlySites = useMemo(() => {
+    const n: Record<string, number> = {}
+    for (const c of rankOnly?.channels ?? []) n[c.platform || 'other'] = (n[c.platform || 'other'] ?? 0) + 1
+    return Object.entries(n).sort((a, b) => b[1] - a[1])
+  }, [rankOnly])
+  const rankOnlyShown = useMemo(
+    () =>
+      (rankOnly?.channels ?? []).filter(
+        (c) => !rankOnlyPlatform || (c.platform || 'other') === rankOnlyPlatform
+      ),
+    [rankOnly, rankOnlyPlatform]
+  )
+
+  // ── The rows you actually act on ────────────────────────────────────────────
+  // One row per VIDEO, not per channel. Judging one of these is reading its
+  // title, so the title has to be a column you can scan down — and blocking is
+  // per URL, so the row you tick has to be the thing that gets blocked.
+  const [rankOnlySel, setRankOnlySel] = useState<Set<string>>(new Set())
+  // Blocked from in here. Recorded locally rather than reloading the whole
+  // comparison: recomputing it over 130k links takes seconds, and every row
+  // below the ones you just blocked would jump under the cursor.
+  const [rankOnlyBlocked, setRankOnlyBlocked] = useState<Set<string>>(new Set())
+  const [rankOnlyBlocking, setRankOnlyBlocking] = useState(false)
+  const [rankOnlyClassifying, setRankOnlyClassifying] = useState('')
+  const [rankOnlyNote, setRankOnlyNote] = useState('')
+  // Ticked rows float to the top after a classification run, so a list of 900
+  // doesn't need scrolling to find the 60 the model picked.
+  const [rankOnlyPin, setRankOnlyPin] = useState(false)
+  // Whether blocked links count at all. This has to be asked of the SERVER, not
+  // filtered here: leaving them out changes which channels qualify, because a
+  // blocked link carries no posted-date score and so can only ever put its
+  // channel on the rank side. Live links only is the default — with blocked
+  // links in, all 829 channels the comparison found were work already done.
+  const [rankOnlyWithBlocked, setRankOnlyWithBlocked] = useState(false)
+
+  const rankOnlyRows = useMemo(() => {
+    const out: {
+      url: string
+      title: string
+      rank: number
+      cluster: number
+      keyword: string
+      blocked: boolean
+      channel: string
+      platform: string
+      handle: string
+      profileUrl: string
+    }[] = []
+    for (const c of rankOnlyShown) {
+      for (const v of c.videos ?? []) {
+        const blocked = v.blocked || rankOnlyBlocked.has(v.url)
+        out.push({
+          url: v.url,
+          title: v.title,
+          rank: v.rank,
+          cluster: v.cluster,
+          keyword: v.keyword,
+          blocked,
+          channel: c.channel,
+          platform: c.platform,
+          handle: c.handle,
+          profileUrl: c.profileUrl,
+        })
+      }
+    }
+    if (!rankOnlyPin || rankOnlySel.size === 0) return out
+    const sel = out.filter((r) => rankOnlySel.has(r.url))
+    const rest = out.filter((r) => !rankOnlySel.has(r.url))
+    return [...sel, ...rest]
+  }, [rankOnlyShown, rankOnlyBlocked, rankOnlyPin, rankOnlySel])
+
+  /** The rows blocking can still do anything to. Everything acts on these. */
+  const rankOnlyOpenRows = useMemo(
+    () => rankOnlyRows.filter((r) => !r.blocked),
+    [rankOnlyRows]
+  )
+  const rankOnlyBlockedCount = rankOnlyRows.length - rankOnlyOpenRows.length
+
+  const rankOnlyAllSel =
+    rankOnlyOpenRows.length > 0 && rankOnlyOpenRows.every((r) => rankOnlySel.has(r.url))
+  const toggleRankOnly = (url: string) =>
+    setRankOnlySel((prev) => {
+      const n = new Set(prev)
+      if (n.has(url)) n.delete(url)
+      else n.add(url)
+      return n
+    })
+
+  /**
+   * Classify every listed title with Groq and tick the ones that are NOT about
+   * AI humanizers or AI detectors.
+   *
+   * The endpoint takes 120 titles at a time, and this list runs to hundreds, so
+   * it goes in batches with the progress on the button — a silent two-minute
+   * wait reads as a hang. A batch that fails is reported and the run stops
+   * rather than leaving a half-classified selection that looks complete.
+   */
+  async function classifyRankOnly() {
+    const items = rankOnlyOpenRows.filter((r) => r.title).map((r) => ({ url: r.url, title: r.title }))
+    if (items.length === 0) {
+      setRankOnlyNote(
+        rankOnlyBlockedCount > 0 && rankOnlyOpenRows.length === 0
+          ? 'Every link listed is already blocked — there is nothing left to classify.'
+          : 'None of these links has a cached title, so there is nothing to classify.'
+      )
+      return
+    }
+    const BATCH = 100
+    setRankOnlyNote('')
+    setRankOnlyClassifying(`0/${items.length}`)
+    try {
+      const related = new Set<string>()
+      for (let i = 0; i < items.length; i += BATCH) {
+        setRankOnlyClassifying(`${i}/${items.length}`)
+        const res = await fetch('/api/admin/links/classify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: items.slice(i, i + BATCH) }),
+        })
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok || !Array.isArray(d.related)) {
+          setRankOnlyNote(d?.error || 'Classification failed — nothing was selected.')
+          return
+        }
+        for (const u of d.related as string[]) related.add(u)
+      }
+      const unrelated = items.filter((it) => !related.has(it.url)).map((it) => it.url)
+      setRankOnlySel(new Set(unrelated))
+      setRankOnlyPin(true)
+      setRankOnlyNote(
+        `Selected ${unrelated.length} humanizer-unrelated link(s) of ${items.length} — ` +
+        'floated to the top. Review them, then Block selected.'
+      )
+    } catch {
+      setRankOnlyNote('Network error while classifying.')
+    } finally {
+      setRankOnlyClassifying('')
+    }
+  }
+
+  /** Block every ticked row. Same permanent block list as everywhere else. */
+  async function blockRankOnlySelected() {
+    const urls = Array.from(rankOnlySel)
+    if (urls.length === 0) return
+    if (!confirm(
+      `Block ${urls.length} selected link(s)?\n\n` +
+      'They are permanently blocked, so they stay hidden from every user even if ' +
+      'a future upload re-adds them. (Not a delete — you can unblock from the ' +
+      'Blocked panel on this page.)'
+    )) return
+    setRankOnlyBlocking(true)
+    setRankOnlyNote('')
+    try {
+      const res = await fetch('/api/admin/links/blocked', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'block', urls }),
+      })
+      const d = await res.json().catch(() => ({}))
+      if (!res.ok) { setRankOnlyNote(d?.error || 'Could not block those links.'); return }
+      setRankOnlyBlocked((prev) => {
+        const n = new Set(prev)
+        for (const u of urls) n.add(u)
+        return n
+      })
+      setRankOnlySel(new Set())
+      setRankOnlyPin(false)
+      setRankOnlyNote(`Blocked ${Number(d.changed ?? urls.length).toLocaleString()} link(s).`)
+      // The table behind the modal is now out of date by that many links.
+      loadWindow(winStart)
+    } catch {
+      setRankOnlyNote('Network error while blocking.')
+    } finally {
+      setRankOnlyBlocking(false)
+    }
+  }
+
+  async function loadRankOnly(withBlocked = false) {
+    setRankOnlyWithBlocked(withBlocked)
+    setRankOnlyOpen(true)
+    setRankOnlyBusy(true)
+    setRankOnly(null)
+    setRankOnlyPlatform('')
+    setRankOnlySel(new Set())
+    setRankOnlyBlocked(new Set())
+    setRankOnlyPin(false)
+    setRankOnlyNote('')
+    try {
+      const p = new URLSearchParams()
+      if (clusters.size) p.set('clusters', Array.from(clusters).sort((a, b) => a - b).join(','))
+      if (platform) p.set('platform', platform)
+      if (keyword) p.set('keyword', keyword)
+      if (oursFilter) p.set('ours', oursFilter)
+      if (productSel) p.set('product', productSel)
+      if (withBlocked) p.set('includeBlocked', '1')
+      const res = await fetch(`/api/admin/links/rank-only-channels?${p.toString()}`)
+      const d = await res.json()
+      if (!res.ok) { setLoadErr(d?.error || 'Could not compare the clusters.'); return }
+      setRankOnly(d)
+    } catch {
+      setLoadErr('Network error while comparing the clusters.')
+    } finally {
+      setRankOnlyBusy(false)
+    }
+  }
+
   const [weights, setWeights] = useState<Weights>(DEFAULT_WEIGHTS)
   const [weightsLoading, setWeightsLoading] = useState(false)
   // How the two clusterings are mixed when links are served: the percentage of
@@ -468,6 +737,19 @@ export default function AdminLinks({
   // The cluster number for the currently selected dimension.
   const clusterOf = (l: LinkRow) =>
     clusterBy === 'rank' ? l.rankCluster : clusterBy === 'date' ? l.dateCluster : l.combinedCluster
+
+  // Where the link sits INSIDE that cluster, 1 = served first.
+  //
+  // Under 'combined' the cluster is whichever dimension put the link earliest
+  // (min of the two), so the position has to come from that same dimension —
+  // reading the rank position beside a cluster the date dimension chose would
+  // be two different numbers pretending to be one.
+  const posOf = (l: LinkRow) => {
+    if (clusterBy === 'rank') return l.rankPos
+    if (clusterBy === 'date') return l.datePos
+    if (l.date_only) return l.datePos
+    return l.dateCluster < l.rankCluster ? l.datePos : l.rankPos
+  }
 
   // How many clusters the ACTIVE dimension actually has: rank 30, date 50, and
   // combined = min(rank, date) so it tops out at the rank count. The prop is the
@@ -834,6 +1116,154 @@ export default function AdminLinks({
   // Each POST works for ~40s and reports where to resume; this loop keeps going
   // until the server says done. Counts are written per batch, so stopping (or
   // closing the tab) keeps everything already fetched.
+
+  // ── Broken links ────────────────────────────────────────────────────────────
+  // Links the platform no longer serves — deleted, made private, taken down.
+  // They are withheld from users like blocked links, but reversibly: a post that
+  // comes back is restored by the next check rather than needing to be noticed.
+  interface BrokenRow {
+    url: string
+    reason: string
+    misses: number
+    firstSeen: string
+    lastChecked: string
+  }
+  const [brokenOpen, setBrokenOpen] = useState(false)
+  const [brokenRows, setBrokenRows] = useState<BrokenRow[]>([])
+  const [brokenTotal, setBrokenTotal] = useState(0)
+  const [brokenWithheld, setBrokenWithheld] = useState(0)
+  const [brokenThreshold, setBrokenThreshold] = useState(2)
+  const [brokenLoading, setBrokenLoading] = useState(false)
+  const [brokenNote, setBrokenNote] = useState('')
+  const [brokenSel, setBrokenSel] = useState<Set<string>>(new Set())
+  // The sweep, which runs in batches like the counts refresh.
+  const [sweeping, setSweeping] = useState(false)
+  const [sweepDone, setSweepDone] = useState(0)
+  const [sweepTotal, setSweepTotal] = useState(0)
+  const [sweepFound, setSweepFound] = useState(0)
+  const [sweepBack, setSweepBack] = useState(0)
+  const stopSweep = useRef(false)
+
+  async function loadBroken() {
+    setBrokenLoading(true)
+    try {
+      const res = await fetch('/api/admin/links/broken?limit=500')
+      const d = await res.json().catch(() => ({}))
+      if (!res.ok) { setBrokenNote(d?.error || 'Could not load the broken list.'); return }
+      setBrokenRows(Array.isArray(d.rows) ? d.rows : [])
+      setBrokenTotal(Number(d.total) || 0)
+      setBrokenWithheld(Number(d.withheld) || 0)
+      setBrokenThreshold(Number(d.threshold) || 2)
+    } catch {
+      setBrokenNote('Network error while loading the broken list.')
+    } finally {
+      setBrokenLoading(false)
+    }
+  }
+
+  /** Read every link in the pool, a batch at a time. Stoppable, resumable. */
+  async function sweepBroken() {
+    if (sweeping) { stopSweep.current = true; return }
+    if (!confirm(
+      'Check every link in the pool against its platform?\n\n' +
+      'This reads one page per link, so a full pass takes a while — progress is ' +
+      'saved continuously and you can stop any time.\n\n' +
+      `A link is only withheld after ${brokenThreshold} checks in a row find it gone, so ` +
+      'a rate limit cannot empty the pool. Anything that answers is put straight back.'
+    )) return
+    stopSweep.current = false
+    setSweeping(true)
+    setSweepFound(0)
+    setSweepBack(0)
+    setBrokenNote('Starting…')
+    let offset = 0
+    let found = 0
+    let back = 0
+    try {
+      for (;;) {
+        if (stopSweep.current) { setBrokenNote('Stopped — progress saved.'); break }
+        let res: Response
+        try {
+          res = await fetch('/api/admin/links/broken', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ offset }),
+          })
+        } catch {
+          setBrokenNote('Connection lost — progress saved.')
+          break
+        }
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok) { setBrokenNote(d?.error || 'The check failed.'); break }
+        offset = Number(d.nextOffset) || offset
+        found += Number(d.newlyBroken) || 0
+        back += Number(d.restored) || 0
+        setSweepDone(offset)
+        setSweepTotal(Number(d.total) || 0)
+        setSweepFound(found)
+        setSweepBack(back)
+        if (d.done) { setBrokenNote(`Done — ${found} broken, ${back} put back.`); break }
+        // Nothing answered at all: the platform is refusing us. Stopping beats
+        // walking the rest of the pool collecting readings that mean nothing.
+        if (!Number(d.checked)) { setBrokenNote('No responses — stopped. Try again later.'); break }
+      }
+      await loadBroken()
+      loadWindow(winStart)
+    } finally {
+      setSweeping(false)
+      stopSweep.current = false
+    }
+  }
+
+  /** Read the listed (or selected) broken links again; survivors come back. */
+  async function recheckBroken(urls: string[]) {
+    if (urls.length === 0 || brokenLoading) return
+    setBrokenLoading(true)
+    setBrokenNote(`Re-checking ${urls.length} link(s)…`)
+    try {
+      const res = await fetch('/api/admin/links/broken', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recheck: urls }),
+      })
+      const d = await res.json().catch(() => ({}))
+      if (!res.ok) { setBrokenNote(d?.error || 'Re-check failed.'); return }
+      setBrokenNote(
+        `${Number(d.restored) || 0} back in the live list, ` +
+        `${Number(d.stillBroken) || 0} still gone` +
+        (Number(d.unknown) ? `, ${d.unknown} could not be read` : '') + '.'
+      )
+      setBrokenSel(new Set())
+      await loadBroken()
+      loadWindow(winStart)
+    } catch {
+      setBrokenNote('Network error while re-checking.')
+    } finally {
+      setBrokenLoading(false)
+    }
+  }
+
+  /** Put links back without checking — for when you know better than the check. */
+  async function restoreBroken(urls: string[]) {
+    if (urls.length === 0) return
+    setBrokenLoading(true)
+    try {
+      const res = await fetch('/api/admin/links/broken', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ restore: urls }),
+      })
+      const d = await res.json().catch(() => ({}))
+      if (!res.ok) { setBrokenNote(d?.error || 'Could not restore.'); return }
+      setBrokenNote(`${Number(d.restored) || 0} link(s) put back in the live list.`)
+      setBrokenSel(new Set())
+      await loadBroken()
+      loadWindow(winStart)
+    } finally {
+      setBrokenLoading(false)
+    }
+  }
+
   async function refreshStats() {
     if (refreshing) { stopRefreshNow(); return }
     const scope = refreshDays > 0 ? `posted in the last ${refreshDays} days` : 'in the pool'
@@ -1141,6 +1571,8 @@ export default function AdminLinks({
     (winOffset: number) => {
       const p = new URLSearchParams()
       if (platform) p.set('platform', platform)
+      if (keyword) p.set('keyword', keyword)
+      if (oursFilter) p.set('ours', oursFilter)
       if (productSel) p.set('product', productSel)
       if (retiredOnly) p.set('retired', '1')
       if (unrelatedOnly) p.set('unrelated', '1')
@@ -1161,7 +1593,7 @@ export default function AdminLinks({
       p.set('limit', String(WINDOW_SIZE))
       return p.toString()
     },
-    [platform, productSel, retiredOnly, unrelatedOnly, blockedOnly, category, uploadDate,
+    [platform, productSel, retiredOnly, unrelatedOnly, blockedOnly, category, keyword, oursFilter, uploadDate,
      titleFilter, mediaFilter, clusters, clusterBy, minClicks, maxClicks, minRatio, maxRatio, q, sort]
   )
 
@@ -1178,6 +1610,10 @@ export default function AdminLinks({
         setMatched(Number(d.matched) || 0)
         setCounts(d.counts ?? counts)
         setUploadDays(d.uploadDays ?? [])
+        // Only replace it when the server sent one: a narrow filter returns the
+        // keywords of the WHOLE pool, but an error path returns none, and
+        // emptying the dropdown would strand whatever is selected.
+        if (Array.isArray(d.keywords) && d.keywords.length) setKeywords(d.keywords)
         setProducts(d.products ?? [])
         setRetirePlatforms(d.retirePlatforms ?? [])
         // Seed the title cache from what came back, so "Process" still only
@@ -1547,11 +1983,13 @@ export default function AdminLinks({
   const arrowFor = (col: SortCol) =>
     sort?.col !== col ? ' ↕' : sort.dir === 'desc' ? ' ↓' : ' ↑'
 
-  // Server export reflects the platform + retired filters (not the text search).
+  // Server export reflects the platform + keyword + retired filters (not the
+  // free-text search, which is a substring match the export does not implement).
   const exportUrl = (format: 'csv' | 'xls') =>
     `/api/admin/links/export?format=${format}` +
     (platform ? `&platform=${platform}` : '') +
     (productSel ? `&product=${encodeURIComponent(productSel)}` : '') +
+    (keyword ? `&keyword=${encodeURIComponent(keyword)}` : '') +
     (retiredOnly ? '&retired=1' : '')
 
   const reset = () => setOffset(0)
@@ -1684,7 +2122,14 @@ export default function AdminLinks({
           <input
             type="checkbox"
             checked={unrelatedOnly}
-            onChange={(e) => { setUnrelatedOnly(e.target.checked); reset() }}
+            onChange={(e) => {
+              setUnrelatedOnly(e.target.checked)
+              // Turning the filter off hides the sort control, so an active
+              // sort by it would carry on with nothing on screen to say why the
+              // order looks the way it does, or to undo it.
+              if (!e.target.checked) setSort((s) => (s?.col === 'unrelated' ? null : s))
+              reset()
+            }}
             className="accent-red-500"
           />
           Marked unrelated only
@@ -1812,6 +2257,37 @@ export default function AdminLinks({
             <option value="unknown">Not checked</option>
           </select>
         </label>
+        {/* Search keyword. An exact match on the keyword the link was scraped
+            under — the free-text box next to it does a substring match over the
+            URL and the keyword together, which is a different question. */}
+        <label
+          className="flex items-center gap-1.5 text-sm text-zinc-400"
+          title="Show only links found by one search keyword. The list is every keyword in the pool; the count beside it is how many links match everything else you have set."
+        >
+          keyword
+          <select
+            value={keyword}
+            onChange={(e) => { setKeyword(e.target.value); reset() }}
+            className={`max-w-[14rem] bg-zinc-900 border rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:border-emerald-500 ${
+              keyword ? 'border-teal-500 text-teal-200' : 'border-zinc-700 text-zinc-300'
+            }`}
+          >
+            <option value="">All keywords{keywords.length ? ` (${keywords.length})` : ''}</option>
+            {keywords.map((k) => (
+              <option key={k} value={k}>{k}</option>
+            ))}
+          </select>
+          {keyword && (
+            <button
+              type="button"
+              onClick={() => { setKeyword(''); reset() }}
+              title="Clear the keyword filter"
+              className="text-zinc-500 hover:text-white text-xs px-1"
+            >
+              ✕
+            </button>
+          )}
+        </label>
         <input
           value={q}
           onChange={(e) => { setQ(e.target.value); reset() }}
@@ -1889,6 +2365,14 @@ export default function AdminLinks({
           <div>
             <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Pipeline &amp; reports</div>
             <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void loadRankOnly()}
+                title="Channels with a search-ranked link but nothing carrying a posted-date score - they rank for a keyword and we are not ranking them. Compares the whole pool; a cluster selection narrows it."
+                className="text-sm rounded-lg px-3 py-1.5 border border-zinc-700 bg-zinc-800 text-white hover:bg-zinc-700 transition-colors"
+              >
+                Rank-only channels
+              </button>
         <a
                 href="/admin/pipeline"
                 title="What the automatic six-hourly cycle has done, turn by turn"
@@ -1982,6 +2466,14 @@ export default function AdminLinks({
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
+                onClick={() => { setBrokenOpen(true); void loadBroken() }}
+                title="Find links the platform no longer serves — deleted, private or taken down — and hold them out of everyone's list until they come back"
+                className="text-sm rounded-lg px-3 py-1.5 border transition-colors text-white bg-zinc-800 hover:bg-zinc-700 border-zinc-700"
+              >
+                🔗 Broken links
+              </button>
+              <button
+                type="button"
                 onClick={refreshStats}
                 title="Read each TikTok video's embed page for its current like and view count. Runs in batches; stop and resume any time."
                 className={`text-sm rounded-lg px-3 py-1.5 border transition-colors ${
@@ -2034,7 +2526,7 @@ export default function AdminLinks({
                 Export Excel
               </a>
               <span className="text-xs text-zinc-600">
-                (exports the platform / retired filter — not the text search)
+                (exports the platform / keyword / retired filters — not the text search)
               </span>
             </div>
           </div>
@@ -2143,8 +2635,19 @@ export default function AdminLinks({
         {/* Horizontal scroller. The columns are fixed-width and shrink-0, so on a
             narrow screen they overflow rather than squash — without this they
             spilled out of the card and took the whole page sideways with them.
-            Header and rows share ONE scroller so they cannot drift apart. */}
+            Header and rows share ONE scroller so they cannot drift apart.
+
+            The inner min-w-max is what makes the scroll a property of the
+            COLUMNS rather than of what happens to be listed. Without it the
+            header and every row are laid out at the scroller's own width while
+            their shrink-0 children hang off the right edge: measured, a row came
+            out 898px wide inside a 1182px scroll, so scrolling right left the
+            last columns sitting on bare card background with no row stripe,
+            border or selection highlight under them. At max-content the rows are
+            as wide as the scroll, and an empty result still scrolls because the
+            header alone sets the width. */}
         <div className="overflow-x-auto">
+        <div className="min-w-max">
         <div className="flex items-center gap-2 px-3 py-2 text-[11px] uppercase tracking-wide text-zinc-500 border-b border-zinc-800 bg-zinc-900/60">
           <span className="w-6 shrink-0 flex items-center justify-center">
             <input
@@ -2237,7 +2740,35 @@ export default function AdminLinks({
               <span onMouseDown={(e) => startResize('cluster', e)} title="Drag to resize" className="absolute top-0 -right-1 h-full w-2 cursor-col-resize hover:bg-teal-500/60 z-10" />
             </div>
           )}
-          <span className="flex-1 min-w-[10rem]">Link</span>
+          {!titleMode && (
+            <div className="shrink-0 relative text-right" style={{ width: cw.pos }}>
+              <span
+                className="text-[11px] uppercase tracking-wide"
+                title="Where the link sits inside its own cluster, in the order the feed serves it — 1 is served first. Follows the Cluster-by dimension above."
+              >
+                # in cl.
+              </span>
+              <span onMouseDown={(e) => startResize('pos', e)} title="Drag to resize" className="absolute top-0 -right-1 h-full w-2 cursor-col-resize hover:bg-teal-500/60 z-10" />
+            </div>
+          )}
+          <span className="flex-1 min-w-[10rem] flex items-center gap-2">
+            Link
+            {/* Only while the unrelated filter is on. The count is a badge beside
+                the URL rather than a column of its own, so there is nowhere else
+                to hang the sort — and outside that filter almost every row reads
+                0, which would make it a control that does nothing. */}
+            {unrelatedOnly && (
+              <button
+                onClick={() => cycleSort('unrelated')}
+                title="Sort by how many users reported this link as unrelated — most reported first."
+                className={`text-[11px] uppercase tracking-wide tabular-nums hover:text-zinc-200 transition-colors ${
+                  sort?.col === 'unrelated' ? 'text-red-300' : 'text-zinc-500'
+                }`}
+              >
+                🚫 reports{arrowFor('unrelated')}
+              </button>
+            )}
+          </span>
           {!titleMode && (
             <div className="shrink-0 relative" style={{ width: cw.keyword }}>
               <select
@@ -2349,7 +2880,7 @@ export default function AdminLinks({
             </div>
           )}
           {!titleMode && (
-            <div className="shrink-0 relative text-right" style={{ width: cw.ours }}>
+            <div className="shrink-0 relative text-right flex flex-col items-end gap-1" style={{ width: cw.ours }}>
               <span
                 className="text-[11px] uppercase tracking-wide"
                 title={
@@ -2360,6 +2891,27 @@ export default function AdminLinks({
               >
                 Ours
               </span>
+              <select
+                value={oursFilter}
+                onChange={(e) => {
+                  setOursFilter(e.target.value as '' | 'none' | 'some' | 'unscanned')
+                  reset()
+                }}
+                title={[
+                  'Filter by whether the video carries any of our product comments.',
+                  'None found — the extraction read it and found none of ours. Proof.',
+                  'Has ours — at least one of ours is on it.',
+                  'Never checked — nobody has extracted it, so there is no evidence either way. Most of the pool is in this state.',
+                ].join('\n')}
+                className={`w-full bg-zinc-900 border rounded px-1 py-0.5 text-[10px] normal-case tracking-normal focus:outline-none focus:border-emerald-500 ${
+                  oursFilter ? 'border-teal-500 text-teal-200' : 'border-zinc-700 text-zinc-300'
+                }`}
+              >
+                <option value="">Any</option>
+                <option value="none">None found</option>
+                <option value="some">Has ours</option>
+                <option value="unscanned">Never checked</option>
+              </select>
               <span onMouseDown={(e) => startResize('ours', e)} title="Drag to resize" className="absolute top-0 -right-1 h-full w-2 cursor-col-resize hover:bg-teal-500/60 z-10" />
             </div>
           )}
@@ -2390,7 +2942,16 @@ export default function AdminLinks({
           shownDisplay.map((l, idx) => {
             const retired = isRetired(l)
             return (
-              <div key={l.url} className={`flex items-center gap-2 px-3 py-2 border-b border-zinc-800/60 text-sm ${selected.has(l.url) ? 'bg-teal-500/25 border-l-4 border-l-teal-400 pl-2' : ''}`}>
+              // content-visibility:auto lets the browser skip layout and paint
+              // for rows scrolled out of view, which is most of them at 500 a
+              // page — each row is a flex box of ~15 cells, so a page is ~7,500
+              // elements. The intrinsic-size hint keeps the scrollbar honest;
+              // `auto` means the browser remembers a row's real height once it
+              // has been rendered, so a wrapped URL does not make the page jump.
+              <div
+                key={l.url}
+                className={`flex items-center gap-2 px-3 py-2 border-b border-zinc-800/60 text-sm [content-visibility:auto] [contain-intrinsic-size:auto_37px] ${selected.has(l.url) ? 'bg-teal-500/25 border-l-4 border-l-teal-400 pl-2' : ''}`}
+              >
                 <span className="w-6 shrink-0 flex items-center justify-center">
                   <input
                     type="checkbox"
@@ -2406,6 +2967,19 @@ export default function AdminLinks({
                 {!titleMode && (
                   <span className="shrink-0 text-xs text-zinc-400 tabular-nums" style={{ width: cw.cluster }}>
                     {clusterOf(l) > 0 ? `#${clusterOf(l)}` : '—'}
+                  </span>
+                )}
+                {!titleMode && (
+                  <span
+                    className="shrink-0 text-xs text-zinc-500 tabular-nums text-right"
+                    style={{ width: cw.pos }}
+                    title={
+                      posOf(l) > 0
+                        ? `Served ${posOf(l)}${ordinalSuffix(posOf(l))} out of this cluster`
+                        : 'Not in a cluster on this dimension'
+                    }
+                  >
+                    {posOf(l) > 0 ? posOf(l).toLocaleString() : '—'}
                   </span>
                 )}
                 <span className="flex-1 min-w-[10rem]">
@@ -2681,6 +3255,7 @@ export default function AdminLinks({
           })
         )}
         </div>
+        </div>
       </div>
 
       {/* Long-job progress, pinned so it stays visible while the table scrolls.
@@ -2878,8 +3453,15 @@ export default function AdminLinks({
               {blNote && <span className="text-xs text-zinc-400 ml-auto">{blNote}</span>}
             </div>
 
-            {/* Rows */}
-            <div className="max-h-[60vh] overflow-y-auto">
+            {/* Rows.
+                Scrolls both ways. The link column used to be flex-1 min-w-0,
+                which squashes instead of overflowing — so on a narrow window
+                the URLs were crushed to a few characters and there was nothing
+                to scroll sideways to. A min width gives it a floor: it still
+                stretches on a wide screen, and below that the row overflows and
+                the container scrolls, exactly like the main table. */}
+            <div className="max-h-[60vh] overflow-y-auto overflow-x-auto">
+              <div className="min-w-max">
               <div className="flex items-center gap-3 px-4 py-1.5 text-[11px] text-zinc-500 border-b border-zinc-800 sticky top-0 bg-zinc-900">
                 <span className="w-5 shrink-0" />
                 <span className="w-24 shrink-0">blocked</span>
@@ -2888,7 +3470,7 @@ export default function AdminLinks({
                 ) : (
                   <span className="w-16 shrink-0 text-center">in pool</span>
                 )}
-                <span className="flex-1 min-w-0">{blByChannel ? 'channel' : 'link / title'}</span>
+                <span className="flex-1 min-w-[28rem]">{blByChannel ? 'channel' : 'link / title'}</span>
                 <span className="w-10 shrink-0" />
               </div>
               {blLoading ? (
@@ -2926,7 +3508,7 @@ export default function AdminLinks({
                         >
                           {c.blocked.toLocaleString()}
                         </span>
-                        <span className="flex-1 min-w-0">
+                        <span className="flex-1 min-w-[28rem]">
                           <a
                             href={`https://www.tiktok.com/@${c.handle}`}
                             target="_blank"
@@ -2997,7 +3579,7 @@ export default function AdminLinks({
                           <span className="text-zinc-600">no</span>
                         )}
                       </span>
-                      <span className="flex-1 min-w-0">
+                      <span className="flex-1 min-w-[28rem]">
                         <a
                           href={r.url}
                           target="_blank"
@@ -3022,6 +3604,7 @@ export default function AdminLinks({
                   )
                 })
               )}
+            </div>
             </div>
 
             {/* Pagination */}
@@ -3202,6 +3785,454 @@ export default function AdminLinks({
           </div>
         </div>
       )}
+      {/* Channels in the rank clusters but not the date ones */}
+      {rankOnlyOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center p-4 overflow-y-auto"
+          onClick={() => setRankOnlyOpen(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-[92rem] mt-6 rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-4 px-4 py-3 border-b border-zinc-800">
+              <div>
+                <h2 className="text-sm font-semibold text-white">
+                  In the search-rank clusters, not in the posted-date ones
+                </h2>
+                <p className="text-[11px] text-zinc-500 mt-0.5">
+                  {clusters.size
+                    ? `Narrowed to cluster${clusters.size === 1 ? '' : 's'} ${Array.from(clusters).sort((a, b) => a - b).join(', ')}`
+                    : 'The whole pool'}
+                  {platform ? ` · ${labelFor(platform)}` : ''}
+                </p>
+              </div>
+              <button
+                onClick={() => setRankOnlyOpen(false)}
+                className="text-zinc-500 hover:text-white text-lg leading-none"
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-4">
+              {rankOnlyBusy && <p className="text-sm text-zinc-500 py-8 text-center">Comparing…</p>}
+
+              {!rankOnlyBusy && rankOnly && (
+                <>
+                  {/* The whole comparison, not only its result: three numbers
+                      that add up are far easier to trust than one that does
+                      not say what it was taken from. */}
+                  <div className="grid grid-cols-3 gap-2 mb-3">
+                    {([
+                      ['on the rank side only', rankOnlyShown.length, 'text-amber-300'],
+                      ['on both sides', rankOnly.both, 'text-zinc-300'],
+                      ['on the date side only', rankOnly.dateOnlyChannels, 'text-zinc-400'],
+                    ] as const).map(([label, n, tone]) => (
+                      <div key={label} className="rounded-lg border border-zinc-800 bg-zinc-900/50 px-3 py-2">
+                        <div className={`text-lg tabular-nums ${tone}`}>{n.toLocaleString()}</div>
+                        <div className="text-[11px] text-zinc-500">{label}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-zinc-500 mb-2">
+                    A channel is on the RANK side when any of its links has a search rank,
+                    and on the DATE side when any of its links carries a posted-date score —
+                    the number the date clusters are built from. Links with no score are
+                    left out: they sit in the last date bucket only because everything has
+                    to sit somewhere.{' '}
+                    {rankOnly.rankLinks.toLocaleString()} ranked link(s) ·{' '}
+                    {rankOnly.dateLinks.toLocaleString()} scored link(s).{' '}
+                    {rankOnlyWithBlocked ? (
+                      <span className="text-rose-300/80">
+                        Blocked links are being counted, so channels whose links you have
+                        already blocked appear here too.
+                      </span>
+                    ) : (
+                      <span className="text-emerald-300/70">
+                        Blocked links are left out of both sides, so every channel listed
+                        is one you can still act on.
+                      </span>
+                    )}
+                  </p>
+                    <div className="flex flex-wrap items-center gap-2 mb-2">
+                      <button
+                        type="button"
+                        onClick={classifyRankOnly}
+                        disabled={!!rankOnlyClassifying || rankOnlyOpenRows.length === 0}
+                        title="Read every title here with Groq and tick the ones that are not about AI humanizers or AI detectors"
+                        className="text-sm text-white bg-amber-600 hover:bg-amber-500 disabled:opacity-40 rounded-lg px-3 py-1.5 transition-colors"
+                      >
+                        {rankOnlyClassifying
+                          ? `Analyzing ${rankOnlyClassifying}…`
+                          : '🤖 Mark humanizer unrelated'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={blockRankOnlySelected}
+                        disabled={rankOnlyBlocking || rankOnlySel.size === 0}
+                        title="Permanently block the ticked links — they stay hidden from every user even if a future upload re-adds them"
+                        className="text-sm text-white bg-rose-600 hover:bg-rose-500 disabled:opacity-40 rounded-lg px-3 py-1.5 transition-colors"
+                      >
+                        {rankOnlyBlocking
+                          ? 'Blocking…'
+                          : `⛔ Block selected${rankOnlySel.size ? ` (${rankOnlySel.size})` : ''}`}
+                      </button>
+                      {rankOnlySel.size > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => { setRankOnlySel(new Set()); setRankOnlyPin(false) }}
+                          className="text-sm text-zinc-400 hover:text-zinc-200 rounded-lg px-2 py-1.5"
+                        >
+                          clear selection
+                        </button>
+                      )}
+                      <label
+                        className="flex items-center gap-1.5 text-xs text-zinc-400 cursor-pointer"
+                        title="Count blocked links too. They can only ever add channels to this list — a blocked link is never given a posted-date score."
+                      >
+                        <input
+                          type="checkbox"
+                          checked={rankOnlyWithBlocked}
+                          onChange={(e) => void loadRankOnly(e.target.checked)}
+                          className="accent-teal-500 cursor-pointer"
+                        />
+                        Include blocked links
+                      </label>
+                      <span className="text-xs text-zinc-500">
+                        {rankOnlyRows.length.toLocaleString()} link(s) across{' '}
+                        {rankOnlyShown.length.toLocaleString()} channel(s)
+                        {rankOnlyBlockedCount > 0 && (
+                          <span className="text-rose-400/80">
+                            {' '}· {rankOnlyBlockedCount.toLocaleString()} already blocked
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                    {rankOnlyNote && (
+                      <p className="text-xs text-amber-300/90 mb-2">{rankOnlyNote}</p>
+                    )}
+                    {rankOnlyOpenRows.length === 0 && rankOnlyBlockedCount > 0 && (
+                      <p className="text-xs text-rose-300/90 bg-rose-500/10 border border-rose-500/30 rounded-lg px-3 py-2 mb-2">
+                        Every link here is already blocked, so there is nothing to select.
+                        That is what puts these channels on the list: a blocked link is
+                        never given a posted-date score, so its channel has nothing on the
+                        date side. They have already been dealt with.
+                      </p>
+                    )}
+                  {rankOnlyShown.length === 0 ? (
+                    <p className="text-sm text-zinc-500 py-8 text-center">
+                      {rankOnly.channels.length === 0
+                        ? (rankOnlyWithBlocked
+                            ? 'Every search-ranked channel also has a link carrying a posted-date score. Nothing to chase.'
+                            : clusters.size
+                              ? 'No channel in this selection ranks without a scored live link. Nothing to chase.'
+                              : 'Across the whole pool every live ranked link also carries a posted-date score, so this is always empty. Select some clusters at the top of the page to compare within them — or tick “Include blocked links” to see the channels whose links you have already blocked.')
+                        : `No channel on ${rankOnlyPlatform} is on the rank side only — clear the site filter to see the other ${rankOnly.channels.length.toLocaleString()}.`}
+                    </p>
+                  ) : (
+                    <div className="overflow-x-auto max-h-[65vh] overflow-y-auto rounded-lg border border-zinc-800">
+                      <div className="min-w-max">
+                        <div className="flex items-center gap-3 px-3 py-1.5 text-[11px] uppercase tracking-wide text-zinc-500 border-b border-zinc-800 sticky top-0 bg-zinc-900">
+                          <span className="w-5 shrink-0">
+                            <input
+                              type="checkbox"
+                              checked={rankOnlyAllSel}
+                              onChange={() =>
+                                setRankOnlySel(
+                                  rankOnlyAllSel ? new Set() : new Set(rankOnlyOpenRows.map((r) => r.url))
+                                )
+                              }
+                              title="Select every link listed"
+                              className="accent-teal-500 cursor-pointer"
+                            />
+                          </span>
+                          <span className="w-24 shrink-0">
+                            {/* The platform filters here rather than being glued
+                                to the name: a channel is a name, and which site
+                                it is on is a property of it. */}
+                            <select
+                              value={rankOnlyPlatform}
+                              onChange={(e) => setRankOnlyPlatform(e.target.value)}
+                              title="Show only channels on one site"
+                              className={`w-full bg-zinc-900 border rounded px-1 py-0.5 text-[10px] normal-case tracking-normal focus:outline-none focus:border-emerald-500 ${
+                                rankOnlyPlatform ? 'border-teal-500 text-teal-200' : 'border-zinc-700 text-zinc-300'
+                              }`}
+                            >
+                              <option value="">All sites</option>
+                              {rankOnlySites.map(([p, n]) => (
+                                <option key={p} value={p}>
+                                  {p} ({n})
+                                </option>
+                              ))}
+                            </select>
+                          </span>
+                          <span className="w-56 shrink-0">channel</span>
+                          <span className="w-[44rem] shrink-0">title</span>
+                          <span className="w-16 shrink-0 text-right">rank</span>
+                          <span className="w-16 shrink-0 text-right">cluster</span>
+                          <span className="w-56 shrink-0">found by keyword</span>
+                        </div>
+                        {rankOnlyRows.map((r) => {
+                          const ticked = rankOnlySel.has(r.url)
+                          return (
+                            <div
+                              key={r.url}
+                              onClick={() => { if (!r.blocked) toggleRankOnly(r.url) }}
+                              className={`flex items-center gap-3 px-3 py-1.5 text-xs border-b border-zinc-800/60 ${
+                                r.blocked
+                                  ? 'opacity-50'
+                                  : ticked
+                                    ? 'bg-amber-500/15 border-l-4 border-l-amber-400 pl-2 cursor-pointer'
+                                    : 'hover:bg-zinc-900/60 cursor-pointer'
+                              }`}
+                            >
+                              <span className="w-5 shrink-0">
+                                {r.blocked ? (
+                                  <span
+                                    title="Already blocked — nothing left to do to it"
+                                    className="text-rose-400/70 text-[11px]"
+                                  >
+                                    ⛔
+                                  </span>
+                                ) : (
+                                  <input
+                                    type="checkbox"
+                                    checked={ticked}
+                                    onChange={() => toggleRankOnly(r.url)}
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="accent-teal-500 cursor-pointer"
+                                  />
+                                )}
+                              </span>
+                              <span className="w-24 shrink-0 text-[10px] text-zinc-500">
+                                {r.platform}
+                              </span>
+                              {/* The name IS the link — one click, new tab. */}
+                              <a
+                                href={r.profileUrl || r.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                title={`Open @${r.handle} on ${r.platform || 'the site'} in a new tab`}
+                                className="w-56 shrink-0 truncate text-zinc-200 hover:text-emerald-400 hover:underline"
+                              >
+                                @{r.handle}
+                              </a>
+                              {/* A fixed column, not flex-1: inside min-w-max a
+                                  flexible item still contributes its full
+                                  max-content width, and one long title would
+                                  stretch the table away from its header. */}
+                              <a
+                                href={r.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                title={r.title || r.url}
+                                className={`w-[44rem] shrink-0 truncate hover:text-emerald-400 ${
+                                  r.blocked ? 'text-zinc-500 line-through' : 'text-zinc-300'
+                                }`}
+                              >
+                                {r.title || <span className="text-zinc-600">{r.url}</span>}
+                              </a>
+                              <span className="w-16 shrink-0 text-right tabular-nums text-zinc-400">
+                                {r.rank > 0 ? `#${r.rank}` : '—'}
+                              </span>
+                              <span className="w-16 shrink-0 text-right tabular-nums text-zinc-400">
+                                #{r.cluster}
+                              </span>
+                              <span className="w-56 shrink-0 truncate text-zinc-400" title={r.keyword}>
+                                {r.keyword ? (
+                                  <span className="inline-block rounded bg-zinc-800 border border-zinc-700 px-1.5 py-0.5 text-[10px] text-zinc-300">
+                                    {r.keyword}
+                                  </span>
+                                ) : (
+                                  <span className="text-zinc-600">—</span>
+                                )}
+                              </span>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Links the platform no longer serves */}
+      {brokenOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center p-4 overflow-y-auto"
+          onClick={() => setBrokenOpen(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-5xl mt-6 rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-4 px-4 py-3 border-b border-zinc-800">
+              <div>
+                <h2 className="text-sm font-semibold text-white">Broken links</h2>
+                <p className="text-[11px] text-zinc-500 mt-0.5">
+                  Deleted, private or taken down. Held out of every user&apos;s list — but not
+                  blocked: re-check any of them and the ones that answer go straight back.
+                </p>
+              </div>
+              <button
+                onClick={() => setBrokenOpen(false)}
+                className="text-zinc-500 hover:text-white text-lg leading-none"
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-4">
+              <div className="flex flex-wrap items-center gap-2 mb-3">
+                <button
+                  type="button"
+                  onClick={sweepBroken}
+                  className={`text-sm text-white rounded-lg px-3 py-1.5 transition-colors ${
+                    sweeping ? 'bg-rose-700 hover:bg-rose-600' : 'bg-zinc-800 hover:bg-zinc-700 border border-zinc-700'
+                  }`}
+                >
+                  {sweeping
+                    ? `Stop (${sweepDone.toLocaleString()}/${sweepTotal.toLocaleString()})`
+                    : '🔎 Check every link'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void recheckBroken(
+                    brokenSel.size > 0 ? Array.from(brokenSel) : brokenRows.slice(0, 200).map((r) => r.url)
+                  )}
+                  disabled={brokenLoading || sweeping || brokenRows.length === 0}
+                  title="Read these again. Anything that answers is put back in the live list."
+                  className="text-sm text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 rounded-lg px-3 py-1.5 transition-colors"
+                >
+                  {brokenSel.size > 0 ? `↻ Re-check selected (${brokenSel.size})` : '↻ Re-check these'}
+                </button>
+                {brokenSel.size > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => void restoreBroken(Array.from(brokenSel))}
+                    disabled={brokenLoading}
+                    title="Put them back without checking"
+                    className="text-sm text-zinc-300 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 disabled:opacity-40 rounded-lg px-3 py-1.5"
+                  >
+                    put back ({brokenSel.size})
+                  </button>
+                )}
+                <span className="text-xs text-zinc-500">
+                  {brokenTotal.toLocaleString()} listed · {brokenWithheld.toLocaleString()} withheld
+                  {brokenTotal > brokenWithheld && (
+                    <span className="text-zinc-600">
+                      {' '}· {(brokenTotal - brokenWithheld).toLocaleString()} suspected, still served
+                    </span>
+                  )}
+                </span>
+              </div>
+              {sweeping && sweepTotal > 0 && (
+                <div className="mb-3">
+                  <div className="h-1.5 rounded-full bg-zinc-800 overflow-hidden">
+                    <div
+                      className="h-full bg-rose-500 transition-all"
+                      style={{ width: `${Math.min(100, (sweepDone / sweepTotal) * 100)}%` }}
+                    />
+                  </div>
+                  <p className="text-[11px] text-zinc-500 mt-1 tabular-nums">
+                    {sweepDone.toLocaleString()} of {sweepTotal.toLocaleString()} checked ·{' '}
+                    {sweepFound.toLocaleString()} broken · {sweepBack.toLocaleString()} put back
+                  </p>
+                </div>
+              )}
+              {brokenNote && <p className="text-xs text-amber-300/90 mb-2">{brokenNote}</p>}
+
+              {brokenRows.length === 0 ? (
+                <p className="text-sm text-zinc-500 py-10 text-center">
+                  {brokenLoading
+                    ? 'Loading…'
+                    : 'Nothing here — no link has been found broken yet. Run “Check every link”.'}
+                </p>
+              ) : (
+                <div className="max-h-[60vh] overflow-y-auto rounded-lg border border-zinc-800">
+                  <div className="flex items-center gap-3 px-3 py-1.5 text-[11px] uppercase tracking-wide text-zinc-500 border-b border-zinc-800 sticky top-0 bg-zinc-900">
+                    <span className="w-5 shrink-0">
+                      <input
+                        type="checkbox"
+                        checked={brokenRows.length > 0 && brokenRows.every((r) => brokenSel.has(r.url))}
+                        onChange={(e) =>
+                          setBrokenSel(e.target.checked ? new Set(brokenRows.map((r) => r.url)) : new Set())
+                        }
+                        className="accent-teal-500 cursor-pointer"
+                      />
+                    </span>
+                    <span className="flex-1">link</span>
+                    <span className="w-56 shrink-0">why</span>
+                    <span className="w-20 shrink-0 text-right">checks</span>
+                    <span className="w-28 shrink-0 text-right">first seen</span>
+                  </div>
+                  {brokenRows.map((r) => {
+                    const withheld = r.misses >= brokenThreshold
+                    return (
+                      <div
+                        key={r.url}
+                        className="flex items-center gap-3 px-3 py-1.5 text-xs border-b border-zinc-800/60 hover:bg-zinc-900/60"
+                      >
+                        <span className="w-5 shrink-0">
+                          <input
+                            type="checkbox"
+                            checked={brokenSel.has(r.url)}
+                            onChange={() =>
+                              setBrokenSel((prev) => {
+                                const n = new Set(prev)
+                                if (n.has(r.url)) n.delete(r.url)
+                                else n.add(r.url)
+                                return n
+                              })
+                            }
+                            className="accent-teal-500 cursor-pointer"
+                          />
+                        </span>
+                        <a
+                          href={r.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex-1 min-w-0 truncate text-zinc-300 hover:text-emerald-400"
+                        >
+                          {r.url}
+                        </a>
+                        <span className="w-56 shrink-0 truncate text-zinc-500" title={r.reason}>
+                          {r.reason || '—'}
+                        </span>
+                        <span
+                          className={`w-20 shrink-0 text-right tabular-nums ${
+                            withheld ? 'text-rose-400' : 'text-amber-400'
+                          }`}
+                          title={
+                            withheld
+                              ? 'Found gone this many times running — withheld from users'
+                              : `Found gone once. Still served until ${brokenThreshold} checks in a row agree.`
+                          }
+                        >
+                          {r.misses}× {withheld ? '' : '(suspected)'}
+                        </span>
+                        <span className="w-28 shrink-0 text-right text-zinc-600 tabular-nums">
+                          {r.firstSeen.slice(0, 10)}
+                        </span>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   )
 }

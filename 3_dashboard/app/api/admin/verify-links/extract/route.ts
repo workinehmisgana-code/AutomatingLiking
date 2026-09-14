@@ -75,6 +75,8 @@ export async function POST(req: NextRequest) {
     : []
 
   let channels: { handle: string }[]
+  /** Channels dropped because this route can only fetch from TikTok. */
+  let skippedOtherSites = 0
   let known: Set<string>
   /** Newest video id we already hold for each channel — the high-water mark. */
   let newestByHandle: Map<string, bigint>
@@ -93,6 +95,16 @@ export async function POST(req: NextRequest) {
     } else {
       channels = ranked
     }
+    // TikTok only: everything below reads a TikTok snowflake id out of the URL
+    // to decide what is new, and fetches listings from tiktok.com/embed/@handle.
+    // There is no Instagram or YouTube equivalent here. Those channels are
+    // dropped and COUNTED — silently contributing nothing makes a run of 2,000
+    // Instagram channels look broken rather than unsupported.
+    const before = channels.length
+    channels = channels.filter(
+      (c) => ((c as { platform?: string }).platform ?? 'tiktok') === 'tiktok'
+    )
+    skippedOtherSites = before - channels.length
     // Match on the numeric video id, not the URL: the same video appears with
     // and without query strings, and as /video/ or /photo/.
     known = new Set<string>()
@@ -130,7 +142,7 @@ export async function POST(req: NextRequest) {
   const total = channels.length
   if (offset >= total) {
     return NextResponse.json({
-      ok: true, total, nextOffset: total, done: true,
+      ok: true, total, nextOffset: total, done: true, skippedOtherSites,
       channelsChecked: 0, newLinks: 0, olderSkipped: 0, staged: 0, failed: 0,
     })
   }
@@ -223,6 +235,8 @@ export async function POST(req: NextRequest) {
     ok: true,
     total,
     nextOffset,
+    // Non-TikTok channels the client asked for and this route cannot fetch.
+    skippedOtherSites,
     channelsChecked: consumed,
     newLinks,
     // Listed videos passed over as older than our high-water mark for the

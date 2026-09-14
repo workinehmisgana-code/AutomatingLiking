@@ -14,6 +14,7 @@ import {
   type LinkCategory,
 } from './config'
 import { groqChat } from './groq'
+import { buildSystemPrompt, NAIVE_VOICE, voiceShapeRule } from './commentPrompt'
 import { COMMENTS } from './comments'
 import {
   getGeneratedComments,
@@ -22,6 +23,7 @@ import {
   releaseCommentLock,
   getProductCommentSettings,
   getCategoryComments,
+  getProductPrompt,
   saveCategoryComments,
   acquireCategoryLock,
   releaseCategoryLock,
@@ -147,6 +149,106 @@ const DANGLING = new RegExp(
   '(^|\\s)(' + 'a|an|and|as|at|but|by|for|from|in|into|is|its|just|like|my|of|on|or|our|really|so|than|the|their|then|to|very|was|were|when|while|with|without|your|about|after|before|every|even|have|has|had|do|does|did|will|would|can|could|get|gets|got|be|been|am|are' + ')[.,!?\\s]*$',
   'i'
 )
+// A question that takes the claim for granted, or one that argues against it.
+//
+// The prompt asks for the first; the model drifts to the second after a few
+// batches, and a doubting question is worse than a plain statement — "does
+// purify text actually work?" puts the case against us under our own video, in
+// our own comment. Rejected outright rather than posted.
+const DOUBTING = new RegExp(
+  [
+    // The subject is a bounded gap, not a fixed word: the product name sits
+    // where "it" would - "is purify text any good" is the same question.
+    String.raw`\b(is|are|was|were)\s+[\w .']{0,24}?\s*(any\s+good|legit|worth\s+it|real|safe|reliable|accurate)\b`,
+    String.raw`\bdoes\s+(it|this|that)\s+(actually\s+|really\s+|even\s+)?work\b`,
+    String.raw`\bhas\s+anyone\s+(tried|used|tested)\b`,
+    String.raw`\bshould\s+i\s+(use|try|get)\b`,
+    String.raw`\bwhich\s+(one|is)\s+(is\s+)?better\b`,
+    String.raw`\bis\s+it\s+better\s+than\b`,
+    String.raw`\bworth\s+(it|trying|using)\b`,
+    String.raw`\b(any|other)\s+alternatives?\b`,
+  ].join('|'),
+  'i'
+)
+
+// A line that endorses, compares, or speaks from personal experience.
+//
+// Only applied under the INFORMATIONAL voice, where the whole point is that the
+// comment says what the tool is and stops. The model drifts back to praise
+// within a batch or two — it is what almost every seed comment does — and a
+// "recommendation with the adjectives removed" is still a recommendation.
+const ENDORSING = new RegExp(
+  [
+    // First person about one's own results.
+    String.raw`\bi\s+(use|used|switched|tried|love|recommend|swear)\b`,
+    String.raw`\bmy\s+(essay|essays|paper|papers|work|writing|thesis|assignment)\b`,
+    String.raw`\bmine\s+(passes|passed|comes\s+back)\b`,
+    String.raw`\bworks\s+for\s+me\b`,
+    // Telling the reader what to do.
+    String.raw`\byou\s+(should|need\s+to|have\s+to|gotta|must)\b`,
+    String.raw`\b(try|use|get)\s+it\s+(now|today)\b`,
+    // Superlatives and rankings.
+    String.raw`\b(best|top|greatest|perfect|unbeatable|amazing|incredible|insane|goat)\b`,
+    String.raw`\b(the\s+only\s+one|nothing\s+else|no\s+other)\b`,
+    // Comparisons.
+    String.raw`\bbetter\s+than\b`,
+    String.raw`\bbeats?\s+(every|all|the)\b`,
+  ].join('|'),
+  'i'
+)
+
+// Is anyone actually being addressed? The curious voice asks a person something;
+// a line with no "you" in it is a rhetorical question wearing a friendly tone.
+const SECOND_PERSON = new RegExp(String.raw`\b(you|your|you're|youre|u|ur)\b`, 'i')
+
+// A comment written by the company rather than by a person.
+//
+// The writer is supposed to be an ordinary user who does not know the jargon.
+// The model knows it perfectly well and drifts back into it — "bypasses every
+// detector", "0% ai output", "this tool humanizes your content" — and a line
+// like that is the single clearest tell that a comment was planted, because no
+// classmate has ever described a website that way.
+//
+// Rejected, not rewritten: the vocabulary is the giveaway, and swapping words
+// out of a sentence built around them leaves the same sentence.
+//
+// Deliberately NOT banned: turnitin, gptzero and the other product names, and
+// "ai" on its own. Students say those every day — "turnitin didn't flag it" is
+// exactly the register we want, and banning it would leave nothing concrete to
+// say. What is banned is the register around them.
+// NARROW ON PURPOSE. The first version of this banned "detector", "tool" and any
+// percentage, and it rejected entire batches — a student saying "turnitin
+// flagged it" or "it came back 0%" is exactly the register we want, and the
+// ai_detector audience has almost nothing else to talk about. A filter that
+// leaves nothing for the model to say produces "No valid rewrites returned",
+// not better comments.
+//
+// So this catches only words no ordinary person reaches for. Shaping the rest
+// is the prompt's job; this is the backstop for when it drifts.
+const JARGON = new RegExp(
+  [
+    String.raw`\bhumaniz(e|es|ed|er|ers|ing|ation)\b`,
+    String.raw`\bai[\s-]?(content|text|writing|generated)\b`,
+    String.raw`\bbypass(es|ed|ing)?\b`,
+    String.raw`\bundetectable\b`,
+    String.raw`\balgorithm(s|ic)?\b`,
+    String.raw`\bparaphras(e|es|ed|ing|er)\b`,
+    String.raw`\b(nlp|api)\b`,
+    // The company's nouns for itself. "tool" is deliberately absent: people do
+    // say "this tool", and banning it cost more than it bought.
+    String.raw`\b(software|platform|solution|technology|engine)\b`,
+    String.raw`\b(output|input)s?\b`,
+    String.raw`\bgenerat(e|es|ed|ing|ion)\b`,
+    String.raw`\b(accuracy|efficiency|seamless(ly)?|effortless(ly)?|optimi[sz]e[ds]?)\b`,
+  ].join('|'),
+  'i'
+)
+
+/** Does the line read as a question at all? */
+function isQuestion(s: string): boolean {
+  return /\?\s*$/.test(stripEmoji(s).trim())
+}
+
 function sanitize(
   product: Product,
   lines: unknown,
@@ -173,11 +275,38 @@ function sanitize(
     s = named
     const n = wordCount(s)
     if (n < band.min || n > band.max) continue
+    // Question style is not decoration: the whole point is that the claim is
+    // presupposed rather than asserted. A line that is not a question, or one
+    // that questions the product instead of assuming it, is thrown away rather
+    // than posted — there is always another line in the batch.
+    //
+    // Only when the product is SET to question style. With it off, a comment
+    // ending in a question mark is just a comment, and DOUBTING would be
+    // reading statements for a rule they were never written under.
+    // Both question voices must actually be questions, and neither may argue
+    // against the product. They differ in what the question is ABOUT, which is
+    // the prompt's job; these two rules are the same for both.
+    if (style.voice === 'question' || style.voice === 'curious') {
+      if (!isQuestion(s)) continue
+      if (DOUBTING.test(s)) continue
+    }
+    // A curious comment is addressed to a PERSON. Without a second person in it
+    // the model has written a rhetorical question again, which is the other
+    // voice — and the whole difference between the two is who is being asked.
+    if (style.voice === 'curious' && !SECOND_PERSON.test(s)) continue
+    // Informational means informational: a line that endorses, compares or
+    // speaks in the first person is a recommendation wearing a flat tone.
+    if (style.voice === 'informational' && ENDORSING.test(s)) continue
     if (opts.banCliches && CLICHES.test(s)) continue
     // Rejected everywhere, not behind a flag. The audience sets banned
     // comparison words but the MAIN set banned nothing, which is how the
     // taglines above reached the app.
     if (SLOGANS.test(s)) continue
+    // Written by the company rather than by a person — see JARGON. Applies to
+    // every voice: the informational one is the plainest, not the most
+    // technical, and it drifts hardest because "state what it is" reads to the
+    // model as an invitation to describe the product.
+    if (JARGON.test(s)) continue
     if (DANGLING.test(stripEmoji(s))) continue
     // One or two upbeat emoji, appended when the model forgot and trimmed when
     // it got carried away. Doing it here rather than rejecting keeps a good
@@ -221,55 +350,13 @@ async function callGroq(
   product: Product,
   base: string[],
   band: WordBand,
-  style: CommentStyle
+  style: CommentStyle,
+  /** An admin-edited prompt, used verbatim in place of the built one. */
+  override?: string | null
 ): Promise<string[]> {
-  // The BARE form the model is asked for. Any quoting is applied by
-  // canonicaliseMention() after the JSON is parsed: asking the model to emit
-  // quotes inside a JSON string is a needless escaping hazard, and
-  // json_validate_failed is how that shows up.
-  const mention = productWords(product, style.splitBrand)
   // One target length per input line, spread across the band.
   const targets = targetLengths(base.length, band)
-  const system =
-    `"${product}" is an AI humanizer website — it rewrites AI-generated text so it reads ` +
-    `as human and bypasses every AI detector (Turnitin, GPTZero, Originality, Copyleaks, ` +
-    `ZeroGPT, etc.). ` +
-    // The voice is the whole job here. Asked to "hype it up", the model wrote
-    // mascot lines — "is my league forever", "takes the obvious #1 spot", "my
-    // secret bypass weapon" — which say nothing a reader can act on and read as
-    // paid promotion at a glance. A recommendation is a person telling you what
-    // they use and why it worked for them.
-    `You write comments from ONE point of view: a real person who has used it and ` +
-    `recommends it as the best humanizer — the one that gets their work past every ` +
-    `detector, at 0% AI, every time. ` +
-    `Write a RECOMMENDATION, never a slogan. It must sound like someone answering ` +
-    `"what do you use?" in a comment section — first person, from their own experience ` +
-    `("i use", "i switched to", "mine passes", "works for me"). ` +
-    `Banned outright: taglines, mascot lines, ad copy and anything that reads like a ` +
-    `brand caption — no "#1", no "secret weapon", no "holy grail", no "goat", no ` +
-    `"undefeated", no "king of", no "never fails" as a catchphrase, no crowning it, ` +
-    `no rhymes, no wordplay on the product name. ` +
-    `For each original comment, write ONE fresh comment that keeps the SAME core ` +
-    `recommendation as the original — that it is the best humanizer and that it passes ` +
-    `the detectors. Do not invent unrelated themes and do not drop the claim. ` +
-    // Diversity has to be in the REASON, not in the adjectives, or every comment
-    // becomes the same sentence with a different superlative in it.
-    `Make the batch genuinely varied by changing WHAT the recommendation rests on, ` +
-    `not by swapping in bigger words: what you tried before it, the score that came ` +
-    `back, the assignment you trusted it with, how long you have used it, that it still ` +
-    `sounds like your own writing, that you stopped double-checking, who you told about ` +
-    `it. Different comments should lean on different ones of those. ` +
-    `Every rewrite MUST: be between ${band.min} and ${band.max} words, ` +
-    `match the EXACT word count requested for its line (each input names one), ` +
-    `so the batch contains a real mix of short and long comments, ` +
-    `write the product as the two words ${mention} - exactly that spelling and ` +
-    `spacing, and do NOT put quotes around it - be lowercase and casual like a real ` +
-    `social-media reply, contain no hashtags and no quotes around the whole comment. ` +
-    (style.emoji
-      ? `End each comment with one upbeat emoji that fits what it says - vary them ` +
-        `across the batch. Emoji do not count towards the word total. `
-      : `Use no emoji at all. `) +
-    `Return strict JSON: {"comments": ["...", ...]} with one rewrite per input, in the same order.`
+  const system = override?.trim() ? override.trim() : buildSystemPrompt(product, band, style)
 
   // Each item carries its own word target, which is what produces varied
   // lengths: a single "between X and Y" instruction makes the model settle on
@@ -348,8 +435,25 @@ function batchSize(band: WordBand): number {
 
 // The cap sent to Groq: what this batch can actually need, plus room for the
 // model's own preamble. Never below the old fixed value, never absurd.
+/**
+ * Completion budget for one batch.
+ *
+ * The JSON is the SMALL part. gpt-oss is a reasoning model: measured on a real
+ * 38-item batch it spent 2,113-3,105 tokens thinking and about 560 on the
+ * answer, and the thinking grows with the prompt. The old cap was sized for the
+ * answer alone (600 + 104/item = 4,552 at full batch), which left roughly a
+ * thousand tokens of headroom — so a longer prompt tipped it over and Groq
+ * returned `json_validate_failed: max completion tokens reached before
+ * generating a valid document`, with the whole batch lost.
+ *
+ * The reserve is therefore explicit and generous. It costs nothing when unused:
+ * max_tokens is a ceiling, not a spend, and the measurements above show the
+ * model uses FEWER tokens when given more room, not more.
+ */
+const REASONING_RESERVE = 4500
+
 function tokenCap(count: number, band: WordBand): number {
-  return Math.min(8000, Math.max(1500, 600 + count * tokensPerItem(band)))
+  return Math.min(16000, Math.max(6000, REASONING_RESERVE + count * tokensPerItem(band)))
 }
 
 // Pick up to n items at random (Fisher–Yates on a copy). A fresh sample each
@@ -372,7 +476,8 @@ export async function regenerateProduct(product: Product): Promise<number> {
   const base = baseComments(product)
   if (base.length === 0) return 0
   const { band, style } = await settingsFor(product)
-  const fresh = await callGroq(product, sample(base, batchSize(band)), band, style)
+  const override = await getProductPrompt(product).catch(() => null)
+  const fresh = await callGroq(product, sample(base, batchSize(band)), band, style, override)
   await saveGeneratedComments(product, fresh)
   return fresh.length
 }
@@ -466,12 +571,12 @@ const AUDIENCE_ANGLE: Record<LinkCategory, string> = {
     'shopping for one.\n' +
     'WHO YOU ARE: someone who has genuinely been through several of these tools over months ' +
     `and settled on "{PRODUCT}" — not a fan, just someone who stopped looking.\n` +
-    'WHAT TO SAY: that it is the most reliable one, that it clears every detector, that it ' +
-    'is the one you trust when the submission actually matters. Earn the claim the way a ' +
-    'real person does, with a small concrete reason: you kept getting flagged until you ' +
-    'switched, you tried a few and this was the only clean one, you stopped re-checking ' +
-    'because it always comes back human, it does not mangle your meaning into odd ' +
-    'synonyms, you paid for others first and wish you had started here.\n' +
+    'WHAT TO SAY: that it is the one you ended up sticking with, and the one you trust ' +
+    'when it actually matters. Earn that the way a real person does, with a small ' +
+    'concrete reason: you kept getting flagged until you switched, you tried a few and ' +
+    'this was the only one that came back clean, you stopped re-checking, it still ' +
+    'sounds like you afterwards, you paid for others first and wish you had started ' +
+    'here. Plain words only — no jargon, and do not describe what it does.\n' +
     'NEVER name the rival, and NEVER use comparison-ad words (beats, wins, unbeatable, ' +
     'outperforms, rivals, the competition, number one, hands down, game changer). Let the ' +
     'comparison live in your own experience. Write a comment, not a verdict.',
@@ -480,11 +585,12 @@ const AUDIENCE_ANGLE: Record<LinkCategory, string> = {
     'ZeroGPT, being flagged, AI percentage scores. The viewer is worried about getting ' +
     'caught and may not know a fix exists.\n' +
     'WHO YOU ARE: someone who had exactly that problem and for whom it is simply over now.\n' +
-    `WHAT TO SAY: that "{PRODUCT}" gets you past the detector — told specifically, like a ` +
-    'person, not a slogan. Vary what you anchor on: the score that came back (0%, 2%, ' +
-    'fully human), the moment (pasting it in before submitting, re-running the check, the ' +
-    'professor never noticing), a detector by name, how many times it has held up, or that ' +
-    'it still reads like your own writing afterwards.\n' +
+    `WHAT TO SAY: that with "{PRODUCT}" it stopped being a problem — told specifically, ` +
+    'like a person, not a slogan. Vary what you anchor on: what the check said when it ' +
+    'came back, the moment (pasting it in before handing it in, running it through again, ' +
+    'the professor never saying anything), turnitin or gptzero by name, how many times it ' +
+    'has held up, or that it still reads like your own writing afterwards. Ordinary ' +
+    'words only.\n' +
     'Relief, not sales. Do not open every comment the same way, and do not simply say it ' +
     'saved you — say what actually happened.',
   generic:
@@ -522,8 +628,16 @@ async function callGroqForAudience(
     `"${product}" is an AI humanizer website — it rewrites AI-generated text so it reads ` +
     `as human and bypasses every AI detector (Turnitin, GPTZero, Originality, Copyleaks, ` +
     `ZeroGPT, etc.). It is the best humanizer available right now. ` +
-    `You write short recommendation comments left under a specific kind of video.\n\n` +
+    `That paragraph is background for you only — it is NOT how to write, and none of ` +
+    `those words may appear in a comment. ` +
+    `You write short comments left under a specific kind of video.\n\n` +
     `${angleFor(product, category)}\n\n` +
+    // Both were missing here. Without NAIVE_VOICE this path wrote as the
+    // company; without voiceShapeRule it never asked for a question under the
+    // 'curious' voice while sanitize() still required one, so every line was
+    // thrown away and all three audiences failed.
+    `${NAIVE_VOICE}\n\n` +
+    `${voiceShapeRule(style)}\n\n` +
     // The original is a STYLE reference only. An earlier version said "keep its
     // general intent", and the three audiences came back nearly identical —
     // "purifytext beats rivals" / "purifytext saved me" / "purifytext saved
@@ -532,7 +646,11 @@ async function callGroqForAudience(
     `whose MESSAGE comes from the audience above, not from the original. The original is a ` +
     `style reference, not content to preserve — say something that only makes sense to that ` +
     `audience. ` +
-    `Every rewrite MUST: be between ${band.min} and ${band.max} words, ` +
+    `Every rewrite MUST: ` +
+    (style.voice === 'question' || style.voice === 'curious'
+      ? 'end in a question mark, '
+      : '') +
+    `be between ${band.min} and ${band.max} words, ` +
     `match the EXACT word count requested for its line, ` +
     `write the product as the two words ${mention} - exactly that spelling and ` +
     `spacing, and do NOT put quotes around it - be lowercase and casual like a real ` +

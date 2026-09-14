@@ -22,7 +22,13 @@ export default async function FinishPage() {
   const block = await getBlockForEmail(session.user.email).catch(() => null)
   if (block) {
     if (block.reason === 'forever') return <Blocked email={session.user.email ?? ''} />
-    return <BlockedRemediation reason={block.reason} email={session.user.email ?? ''} />
+    return (
+      <BlockedRemediation
+        reason={block.reason}
+        email={session.user.email ?? ''}
+        auto={block.auto}
+      />
+    )
   }
   // Reporting work is an earning surface, so it needs a payable, verifiable
   // profile — this page is opened directly by the bubble and so never passes

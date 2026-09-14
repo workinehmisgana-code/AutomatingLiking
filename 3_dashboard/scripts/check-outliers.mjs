@@ -29,7 +29,7 @@ if (!blobs.length) {
   process.exit(1)
 }
 const res = await fetch(blobs[0].url, {
-  headers: { Authorization: `Bearer ${process.env.BLOB_READ_WRITE_TOKEN}` },
+  headers: { Authorization: `Bearer ${process.env.BLOB_READ_WRITE_TOKEN}` }, cache: 'no-store',
 })
 const videos = await res.json()
 console.log(`pool: ${videos.length.toLocaleString()} links\n`)

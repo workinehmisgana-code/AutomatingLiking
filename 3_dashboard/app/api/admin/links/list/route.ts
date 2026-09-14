@@ -33,6 +33,11 @@ function parseQuery(sp: URLSearchParams): LinkQuery {
     unrelatedOnly: sp.get('unrelated') === '1',
     blockedOnly: sp.get('blocked') === '1',
     keyword: sp.get('keyword') ?? '',
+    oursFilter: (['none', 'some', 'unscanned'] as const).includes(
+      sp.get('ours') as 'none' | 'some' | 'unscanned'
+    )
+      ? (sp.get('ours') as 'none' | 'some' | 'unscanned')
+      : '',
     category: sp.get('category') ?? '',
     uploadDate: sp.get('uploadDate') ?? '',
     titleFilter: tf === 'has' || tf === 'none' ? tf : '',
@@ -47,7 +52,10 @@ function parseQuery(sp: URLSearchParams): LinkQuery {
     minRatio: num(sp.get('minRatio')),
     maxRatio: num(sp.get('maxRatio')),
     q: sp.get('q') ?? '',
-    sortCol: sortCol === 'cluster' || sortCol === 'clicked_by' ? sortCol : null,
+    sortCol:
+      sortCol === 'cluster' || sortCol === 'clicked_by' || sortCol === 'unrelated'
+        ? sortCol
+        : null,
     sortDir: sp.get('sortDir') === 'asc' ? 'asc' : 'desc',
     offset: Math.max(0, Number(sp.get('offset')) || 0),
     limit: Math.min(MAX_ROWS, Math.max(1, Number(sp.get('limit')) || MAX_ROWS)),

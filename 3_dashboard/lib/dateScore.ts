@@ -99,13 +99,54 @@ export function channelOf(url: string): string | null {
  * Falling back to the URL: TikTok slideshows use /photo/, and an Instagram /p/
  * post is a photo where /reel/ is video. Anything else (YouTube) is video.
  */
+export function isPhotoLink(url: string, isPhoto?: boolean | null): boolean | null {
+  // A /photo/ URL is definitive and outranks the stored flag. TikTok only ever
+  // rewrites a URL TO /photo/, never away from it, so /photo/ cannot be wrong —
+  // whereas the flag can be a stale reading of a post whose embed came back
+  // empty. This ordering is also what makes one answer possible: the admin table
+  // used to let the URL win while the scoring let the flag win, so the same link
+  // could be a photo in the table and a video in the score.
+  if (/tiktok\.com\/@[^/]+\/photo\//i.test(url)) return true
+  if (isPhoto === true) return true
+  if (isPhoto === false) return false
+  // A /video/ URL proves nothing: photo posts are served under it and only
+  // rewritten in the browser. Measured on the pool, 9,536 of the 36,137 links we
+  // have actually checked — 26% — are photos wearing a /video/ URL.
+  if (/tiktok\.com\/@[^/]+\/video\//i.test(url)) return null
+  // INSTAGRAM'S PATH SAYS NOTHING AT ALL. /p/ is the generic permalink and
+  // serves single images, carousels and reels alike; only /reel/ is
+  // video-specific, and a reel is reachable at /p/<code>/ too. Reading /p/ as
+  // "photo" classified every Instagram link in this pool as one — all 5,712 of
+  // them — including 45-second reels. It takes a fetch to know: see
+  // fetchInstagramStat in lib/linkStats.
+  if (/instagram\.com\/(?:reel|tv)\//i.test(url)) return false
+  if (/instagram\.com\/(?:[^/]+\/)?p\//i.test(url)) return null
+  // YouTube has no photo posts.
+  if (/youtube\.com|youtu\.be/i.test(url)) return false
+  return null
+}
+
+/**
+ * Is this a video rather than a photo/slideshow post?
+ *
+ * Kept for callers that need a plain boolean. UNKNOWN COUNTS AS A VIDEO here,
+ * which is a guess — scoring must not use this; see photoScore below.
+ */
 export function isVideoPost(url: string, isPhoto?: boolean | null): boolean {
-  if (isPhoto === true) return false
-  if (isPhoto === false) return true
-  if (/tiktok\.com\/@[^/]+\/photo\//i.test(url)) return false
-  if (/instagram\.com\/[^/]+\/p\//i.test(url)) return false
-  if (/instagram\.com\/p\//i.test(url)) return false
-  return true
+  return isPhotoLink(url, isPhoto) !== true
+}
+
+/**
+ * The isVideo term of the date score: 1 video, 0 photo, 0.5 unknown.
+ *
+ * Unknown scores NEUTRAL, exactly as the hearts term already does, and for the
+ * same reason: 73% of the pool has never been checked, and calling all of it
+ * "video" both hands out full credit on no evidence and makes the term useless
+ * at telling links apart — 92% of scored links were carrying ds_v = 1.
+ */
+export function photoScore(url: string, isPhoto?: boolean | null): number {
+  const photo = isPhotoLink(url, isPhoto)
+  return photo === null ? 0.5 : photo ? 0 : 1
 }
 
 /**
@@ -157,6 +198,40 @@ export function computeDateScores(
   // Optional lookup into the refreshed link_stat flags. Returning null/undefined
   // for a URL means "not checked yet", which falls back to the URL heuristic —
   // so passing nothing behaves exactly as before.
+  photoOf?: (url: string) => boolean | null | undefined
+): number {
+  if (rows.length === 0) return 0
+  // ONE PLATFORM AT A TIME. Every component here is a PERCENTILE — a link's
+  // place in a distribution — so the set it is ranked against decides the score.
+  // Ranked across the whole pool, 130k TikTok links define that distribution and
+  // 4k Instagram links land wherever they fall inside it: their like counts sit
+  // in one narrow band of the TikTok scale, so the hearts term stops separating
+  // them from each other and only recency does any work. Clusters are already
+  // chunked per platform, so the mixing was invisible in the grouping and showed
+  // up only as a worse ORDER within each Instagram cluster.
+  //
+  // Scoring each platform against itself makes a score mean "how this link
+  // compares to others on its own site", which is the only comparison the
+  // ordering ever uses.
+  const groups = new Map<string, Scorable[]>()
+  for (const r of rows) {
+    const key = String(r.platform ?? '') || 'unknown'
+    const list = groups.get(key)
+    if (list) list.push(r)
+    else groups.set(key, [r])
+  }
+  if (groups.size > 1) {
+    let n = 0
+    for (const group of Array.from(groups.values())) n += scoreOnePlatform(group, weights, photoOf)
+    return n
+  }
+  return scoreOnePlatform(rows, weights, photoOf)
+}
+
+/** The scoring itself, over links that are all on the SAME platform. */
+function scoreOnePlatform(
+  rows: Scorable[],
+  weights: DateWeights,
   photoOf?: (url: string) => boolean | null | undefined
 ): number {
   if (rows.length === 0) return 0
@@ -237,7 +312,7 @@ export function computeDateScores(
   for (let i = 0; i < rows.length; i++) {
     const t = times[i]
     const recency = t === null ? 0 : timePct.get(t) ?? 0
-    const video = isVideoPost(urls[i], photoOf?.(urls[i]) ?? null) ? 1 : 0
+    const video = photoScore(urls[i], photoOf?.(urls[i]) ?? null)
     // A link with no heart data anywhere — not even from its channel — scores
     // NEUTRAL, not worst: that is a gap in our scraping, and 0 would sink every
     // such link to the bottom of the pool.
@@ -252,7 +327,7 @@ export function computeDateScores(
     // The parts, at 3 decimals — enough to explain a position, small enough that
     // storing them on every row costs little.
     rows[i].ds_r = Math.round(recency * 1000) / 1000
-    rows[i].ds_v = video
+    rows[i].ds_v = Math.round(video * 1000) / 1000
     rows[i].ds_h = Math.round(heartScore * 1000) / 1000
   }
   return rows.length

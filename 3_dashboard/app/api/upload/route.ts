@@ -135,6 +135,18 @@ export async function POST(req: NextRequest) {
   let added = 0
   let removed = 0
   let updated = 0
+  let protectedDateOnly = 0
+
+  // An upload is a search-rank scrape, and it may only touch search-rank links.
+  //
+  // A link with no search rank takes part ONLY in the posted-date clusters —
+  // it came from the verify list, not from a keyword search — and 121,110 of
+  // the 130,184 stored links are in that state. A platform-scoped replace used
+  // to drop every stored link of the incoming platforms that was not in the
+  // batch, which for a TikTok upload meant deleting 93% of the pool. Now they
+  // are neither dropped nor edited: an upload cannot reach them at all.
+  const dateClusteredOnly = (v: Video): boolean =>
+    v.date_only === true || !(Number(v.search_rank) > 0)
 
   if (mode === 'dedupe') {
     // Clean the stored data in place: keep one row per URL, drop duplicates.
@@ -158,6 +170,10 @@ export async function POST(req: NextRequest) {
       if (!stored) {
         byUrl.set(k, v)
         added++
+      } else if (dateClusteredOnly(stored)) {
+        // Already stored, and posted-date only. Leave it exactly as it is —
+        // refreshing it would rewrite a link this upload has no business in.
+        protectedDateOnly++
       } else if (refreshLink(stored, v)) {
         updated++
       }
@@ -176,17 +192,37 @@ export async function POST(req: NextRequest) {
     const existing = await loadExisting()
     const incomingPlatforms = new Set(incoming.map(platformOf))
     replacedPlatforms = Array.from(incomingPlatforms)
-    const kept = existing.filter((v) => !incomingPlatforms.has(platformOf(v)))
+    // Kept: every link of an untouched platform, AND every posted-date-only
+    // link regardless of platform. Only search-rank links of the incoming
+    // platforms are up for replacement.
+    const kept = existing.filter(
+      (v) => !incomingPlatforms.has(platformOf(v)) || dateClusteredOnly(v)
+    )
+    protectedDateOnly = existing.filter(
+      (v) => incomingPlatforms.has(platformOf(v)) && dateClusteredOnly(v)
+    ).length
     const storedForPlatforms = new Map<string, Video>()
     for (const v of existing) {
       const k = urlKey(v)
-      if (k && incomingPlatforms.has(platformOf(v))) storedForPlatforms.set(k, v)
+      if (k && incomingPlatforms.has(platformOf(v)) && !dateClusteredOnly(v)) {
+        storedForPlatforms.set(k, v)
+      }
+    }
+    // URLs that are already stored as posted-date-only. dedupeByUrl keeps the
+    // FIRST of a duplicate and `kept` goes in first, so the stored row would
+    // win anyway — but skipping them here keeps the counts honest instead of
+    // reporting links as "added" that are then silently dropped.
+    const protectedUrls = new Set<string>()
+    for (const v of existing) {
+      if (!dateClusteredOnly(v)) continue
+      const k = urlKey(v)
+      if (k) protectedUrls.add(k)
     }
     const byUrl = new Map<string, Video>()
     let reused = 0
     for (const v of incoming) {
       const k = urlKey(v)
-      if (!k || byUrl.has(k)) continue
+      if (!k || byUrl.has(k) || protectedUrls.has(k)) continue
       const stored = storedForPlatforms.get(k)
       if (stored) {
         if (refreshLink(stored, v)) updated++
@@ -249,6 +285,9 @@ export async function POST(req: NextRequest) {
       added,
       updated,
       removed,
+      // Posted-date-only links this upload deliberately did not touch. Worth
+      // reporting: it is usually far larger than everything else on this line.
+      protectedDateOnly,
       titlesSaved,
       scored,
       count: videos.length,

@@ -32,6 +32,9 @@ interface Payload {
   last: { stage: string; done: boolean; detail: Record<string, unknown>; at: string } | null
   timing: { startedAt: string | null; dueAt: string | null }
   everyHours: number
+  /** The hourly recluster, which runs on its own schedule rather than as part
+   *  of a lap — the cluster scores are relative, so they drift between laps. */
+  recluster: { lastAt: string | null; dueAt: string | null; everyHours: number } | null
 }
 
 const n = (v: unknown): number => (Number.isFinite(Number(v)) ? Number(v) : 0)
@@ -61,7 +64,8 @@ function summarise(stage: string, d: Record<string, unknown>): string {
   switch (stage) {
     case 'harvest':
       return (
-        `${fmt(d.checked)} channel(s) · ${fmt(d.found)} new video(s) · ` +
+        `${fmt(d.checked)} of ${fmt(d.eligible)} eligible channel(s) · ` +
+        `${fmt(d.found)} new video(s) · ` +
         `${fmt(d.merged)} merged · ${fmt(d.staged)} to verify` +
         (n(d.untitled) ? ` (${fmt(d.untitled)} untitled)` : '')
       )
@@ -228,6 +232,17 @@ export default function PipelineReport() {
           <div className="text-[11px] text-zinc-600 mt-2">
             last tick {when(data.last.at)} · {data.last.stage}
             {data.last.done ? ' · finished that step' : ''}
+          </div>
+        )}
+        {data.recluster && (
+          <div
+            className="text-[11px] text-zinc-500 mt-1"
+            title="The posted-date score is relative to the whole pool, so it drifts as links are added and blocked. This rescores every link on its own schedule, separately from the cycle."
+          >
+            🧮 recluster every {data.recluster.everyHours}h ·{' '}
+            {data.recluster.lastAt
+              ? <>last {when(data.recluster.lastAt)} · next {when(data.recluster.dueAt)}</>
+              : 'not run yet — the next scheduled hour does the first one'}
           </div>
         )}
       </div>

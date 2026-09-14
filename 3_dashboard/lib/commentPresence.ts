@@ -31,33 +31,19 @@ import {
  */
 const CONCURRENCY = 4
 
-/**
- * Most links judged for one user on one day.
- *
- * A heavy day runs to 160 links and every one costs a TikTok read, so the tail
- * of a big day buys precision nobody needs: 100 links already pins a percentage
- * to within a point or two.
- */
-export const MAX_LINKS_PER_DAY = 100
-
-/**
- * Cut a day down to MAX_LINKS_PER_DAY, spread EVENLY across the list.
- *
- * Not the first 100. The list is newest-first, so taking a prefix would score
- * everyone on their evening only — and someone who commented all morning and
- * then just clicked through would look perfect. An even stride covers the whole
- * day.
- *
- * Deterministic on purpose: the resume ledger only works if every pass picks
- * the same links, so this must never be random.
- */
-export function capDayLinks(all: string[]): string[] {
-  if (all.length <= MAX_LINKS_PER_DAY) return all
-  const stride = all.length / MAX_LINKS_PER_DAY
-  const out: string[] = []
-  for (let i = 0; i < MAX_LINKS_PER_DAY; i++) out.push(all[Math.floor(i * stride)])
-  return out
-}
+// A DAY IS CHECKED IN FULL. Every link the user opened that day is read.
+//
+// There used to be a cap of 100, taken on an even stride so the sample covered
+// the whole day rather than just the evening. It made a percentage cheap but it
+// also made it an estimate, and an estimate is a poor basis for blocking
+// someone: on the last 30 days, 61% of user-days ran past 100 links and the
+// biggest was 1,373, so most days were being judged on a fraction of themselves
+// and the missing part was never looked at.
+//
+// The cost is real — roughly twice the TikTok reads — but the sweep is
+// deadline-bounded and resumable: it judges what it can before the deadline,
+// writes what it judged, and the next pass picks up where it stopped. A bigger
+// day therefore takes more passes, not a longer request.
 
 /** Comment pages per link (50 each). Deep enough for a typical video. */
 const MAX_PAGES = 4
@@ -190,7 +176,8 @@ export async function scoreUserDay(
   if (!username) return null
   const opened = await getClickedOnDay(userId, day).catch(() => [] as string[])
   if (opened.length === 0) return null
-  const all = capDayLinks(opened)
+  // Every link opened that day, not a sample of them — see the note above.
+  const all = opened
 
   const done = await getJudgedLinks(userId, day, freshSince).catch(() => new Set<string>())
   const todo = all.filter((u) => !done.has(u))

@@ -46,6 +46,7 @@ import { buildAdminLinks } from './adminLinks'
 import { scanLink } from './commentScan'
 import { categorizeSome } from './categorise'
 import { reclusterPool } from './recluster'
+import { releaseLock, takeLock } from './poolLock'
 
 export const STAGES = ['idle', 'harvest', 'extract', 'categorise', 'recluster'] as const
 export type Stage = (typeof STAGES)[number]
@@ -59,7 +60,6 @@ const CYCLE_STARTED_KEY = 'pipeline_cycle_started'
 /** The pipeline_cycle row the current cycle is folding its totals into. */
 const CYCLE_ID_KEY = 'pipeline_cycle_id'
 /** Held while a tick is running, so two never work the same cursor at once. */
-const LOCK_KEY = 'pipeline_lock'
 const EXTRACT_CURSOR_KEY = 'pipeline_extract_cursor'
 const LAST_KEY = 'pipeline_last'
 
@@ -72,7 +72,6 @@ const LAST_KEY = 'pipeline_last'
  * it got to. The lease is generous enough to cover a slow tick and short enough
  * that a crashed one does not stall the cycle for long.
  */
-const LOCK_MS = 90_000
 
 /** Comment reads in flight. Matches the manual scan; TikTok throttles above it. */
 const SCAN_CONCURRENCY = 4
@@ -227,26 +226,6 @@ async function extractTick(
   }
 }
 
-/**
- * Take the lock, or report who has it.
- *
- * Not a real mutex — two calls landing in the same millisecond could both think
- * they won. That is tolerable here: the loser wastes a tick, which the next
- * minute replaces. Losing a cursor to two concurrent writers is not tolerable,
- * and this stops the common case of a slow tick still running when the next
- * fires.
- */
-async function takeLock(): Promise<boolean> {
-  const now = Date.now()
-  const held = Number(await getAppState(LOCK_KEY).catch(() => null))
-  if (Number.isFinite(held) && held > now) return false
-  await setAppState(LOCK_KEY, String(now + LOCK_MS)).catch(() => {})
-  return true
-}
-
-async function releaseLock(): Promise<void> {
-  await setAppState(LOCK_KEY, '0').catch(() => {})
-}
 
 /** Run one slice of whatever stage the cycle is on. */
 export async function tick(deadline: number): Promise<TickResult> {

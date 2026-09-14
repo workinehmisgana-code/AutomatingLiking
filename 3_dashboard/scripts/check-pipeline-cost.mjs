@@ -14,7 +14,7 @@ for (const l of env.split('\n')) {
 const { list } = await import('@vercel/blob')
 const { blobs } = await list({ prefix: 'videos.json' })
 const res = await fetch(blobs[0].url, {
-  headers: { Authorization: `Bearer ${process.env.BLOB_READ_WRITE_TOKEN}` },
+  headers: { Authorization: `Bearer ${process.env.BLOB_READ_WRITE_TOKEN}` }, cache: 'no-store',
 })
 const videos = await res.json()
 

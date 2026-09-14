@@ -34,6 +34,12 @@ export default function Login() {
           </svg>
           {loading ? 'Redirecting…' : 'Sign in with Google'}
         </button>
+        <a
+          href="/guide"
+          className="inline-block mt-4 text-sm text-zinc-400 hover:text-emerald-400 underline underline-offset-4 transition-colors"
+        >
+          📖 How it works — read before you sign in
+        </a>
       </div>
     </div>
   )

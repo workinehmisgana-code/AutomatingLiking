@@ -1,9 +1,10 @@
 'use client'
 
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
-import type { CommentStyle } from '@/lib/config'
+import { isCommentVoice, type CommentStyle, type CommentVoice, type Product } from '@/lib/config'
+import { buildSystemPrompt } from '@/lib/commentPrompt'
 
 function fmtWhen(iso: string | null): string {
   if (!iso) return ''
@@ -94,6 +95,8 @@ export default function AdminProductComments({
   const [emoji, setEmoji] = useState(style.emoji)
   const [splitBrand, setSplitBrand] = useState(style.splitBrand)
   const [quoteBrand, setQuoteBrand] = useState(style.quoteBrand)
+  // Which of the three pitches the comments make.
+  const [voice, setVoice] = useState<CommentVoice>(style.voice)
   // What the server currently holds, so an edited-but-unsaved box is visible.
   const [savedBand, setSavedBand] = useState({ min: wordMin, max: wordMax })
 
@@ -114,6 +117,7 @@ export default function AdminProductComments({
           emoji,
           splitBrand,
           quoteBrand,
+          voice,
         }),
       })
       const d = await res.json().catch(() => ({}))
@@ -124,6 +128,7 @@ export default function AdminProductComments({
       if (typeof d.emoji === 'boolean') setEmoji(d.emoji)
       if (typeof d.splitBrand === 'boolean') setSplitBrand(d.splitBrand)
       if (typeof d.quoteBrand === 'boolean') setQuoteBrand(d.quoteBrand)
+      if (isCommentVoice(d.voice)) setVoice(d.voice)
       return true
     } catch {
       setErr('Network error.')
@@ -140,10 +145,89 @@ export default function AdminProductComments({
     setSavingBand(false)
   }
 
+  // ── The prompt, editable before generating ────────────────────────────────
+  //
+  // The built prompt is computed HERE, from the switches as they stand, using
+  // the same function the server sends to Groq (lib/commentPrompt is pure and
+  // imports nothing but config). So changing the voice or the word range
+  // rewrites the box as you watch, with no round trip and no second copy of the
+  // wording to drift out of step.
+  //
+  // Only the SAVED override comes from the server, because only that is stored.
+  const [promptOpen, setPromptOpen] = useState(false)
+  const [promptSaved, setPromptSaved] = useState<string | null>(null)
+  const [promptBusy, setPromptBusy] = useState(false)
+  const [promptLoaded, setPromptLoaded] = useState(false)
+  // What is in the box. null means "following the built prompt" — the state
+  // that lets the settings drive it. Typing sets it, which stops the following.
+  const [promptEdit, setPromptEdit] = useState<string | null>(null)
+
+  const promptBuilt = useMemo(
+    () =>
+      buildSystemPrompt(
+        product as Product,
+        { min: Number(min) || wordMin, max: Number(max) || wordMax },
+        { emoji, splitBrand, quoteBrand, voice }
+      ),
+    [product, min, max, wordMin, wordMax, emoji, splitBrand, quoteBrand, voice]
+  )
+
+  // What the box shows: an unsaved edit, else the saved override, else live.
+  const promptText = promptEdit ?? promptSaved ?? promptBuilt
+  // A saved override does NOT follow the settings — it is the admin's own text.
+  // Say so rather than silently ignoring the switches they are moving.
+  const overrideStale = !promptEdit && !!promptSaved && promptSaved.trim() !== promptBuilt.trim()
+
+  async function loadPrompt() {
+    try {
+      const res = await fetch(`/api/admin/comments/prompt?product=${encodeURIComponent(product)}`)
+      const d = await res.json()
+      if (!res.ok) { setErr(d?.error || 'Could not load the prompt.'); return }
+      setPromptSaved(d.saved ?? null)
+      setPromptLoaded(true)
+    } catch {
+      setErr('Network error.')
+    }
+  }
+
+  async function savePrompt(text: string) {
+    setPromptBusy(true)
+    setMsg('')
+    setErr('')
+    try {
+      const res = await fetch('/api/admin/comments/prompt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ product, prompt: text }),
+      })
+      const d = await res.json()
+      if (!res.ok) { setErr(d?.error || 'Could not save the prompt.'); return }
+      setPromptSaved(d.saved ?? null)
+      setPromptEdit(null)
+      setMsg(d.saved ? 'Prompt saved. Regenerate to use it.' : 'Back to the built-in prompt.')
+    } catch {
+      setErr('Network error.')
+    } finally {
+      setPromptBusy(false)
+    }
+  }
+
   // What a mention will look like under the current switches, so the effect is
   // visible before spending a regeneration to find out.
   const words = splitBrand ? splitPreview(product) : product
-  const preview = (quoteBrand ? `“${words}”` : words) + (emoji ? ' 🙌' : '')
+  const brand = quoteBrand ? `“${words}”` : words
+  // Show the VOICE as well as the mention: the two switches together are what
+  // a comment will actually read like, and the mention alone hid the bigger of
+  // the two changes.
+  const preview =
+    (voice === 'question'
+      ? `why does nothing else come back 0% like ${brand} does?`
+      : voice === 'curious'
+        ? `what made you switch to ${brand}? the flow reads really clean`
+        : voice === 'recommendation'
+          ? `i switched to ${brand} and mine passes now`
+          : `${brand} rewrites ai text so detectors read it as human`) +
+    (emoji ? ' 🙌' : '')
 
   // Length spread of what is currently stored, so the effect is visible.
   const lengths = comments.map((c) => c.trim().split(/\s+/).filter(Boolean).length)
@@ -291,6 +375,82 @@ export default function AdminProductComments({
         )}
       </p>
 
+      {/* The prompt, at the top, editable before generating. Collapsed by
+          default: it is the thing you change least often and the longest thing
+          on the page. */}
+      <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 mb-4">
+        <button
+          type="button"
+          onClick={() => {
+            const next = !promptOpen
+            setPromptOpen(next)
+            if (next && !promptLoaded) void loadPrompt()
+          }}
+          className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left"
+        >
+          <span className="text-sm text-zinc-200">
+            ✎ Prompt
+            <span className="text-xs text-zinc-500 ml-2">
+              {promptSaved ? 'edited' : 'built from the settings below'}
+            </span>
+          </span>
+          <span className="text-zinc-500 text-xs">{promptOpen ? '▴' : '▾'}</span>
+        </button>
+        {promptOpen && (
+          <div className="px-3 pb-3 space-y-2 border-t border-zinc-800 pt-3">
+            <p className="text-[11px] text-zinc-500">
+              What the model is told before it writes. While it is unedited this box
+              follows the settings below — change the voice or the word range and the
+              wording here changes with it. Typing in it stops that: a saved prompt
+              REPLACES the built-in one entirely, and the settings then only shape the
+              checks applied to what comes back (word range, brand spelling, the voice
+              filters). Applies to the next Regenerate.
+            </p>
+            {overrideStale && (
+              <p className="text-[11px] text-amber-400/90">
+                The settings have moved on since this prompt was saved, and a saved prompt
+                does not follow them. Reset to built-in to take the new wording.
+              </p>
+            )}
+            <textarea
+              value={promptText}
+              onChange={(e) => setPromptEdit(e.target.value)}
+              spellCheck={false}
+              rows={14}
+              className="w-full text-xs font-mono leading-relaxed text-zinc-200 bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 focus:outline-none focus:border-emerald-500"
+            />
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void savePrompt(promptText)}
+                disabled={promptBusy || promptText.trim() === (promptSaved ?? '').trim()}
+                className="text-xs font-medium text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 rounded-lg px-3 py-1.5"
+              >
+                {promptBusy ? 'Saving…' : 'Save prompt'}
+              </button>
+              <button
+                type="button"
+                onClick={() => { setPromptEdit(null); void savePrompt('') }}
+                disabled={promptBusy || (!promptSaved && !promptEdit)}
+                title="Throw the edit away and follow the settings again."
+                className="text-xs text-zinc-300 border border-zinc-700 hover:bg-zinc-800 disabled:opacity-40 rounded-lg px-3 py-1.5"
+              >
+                Reset to built-in
+              </button>
+              <span className="text-[11px] text-zinc-600">
+                {promptText.length.toLocaleString()} characters ·{' '}
+                {promptEdit !== null
+                  ? 'unsaved changes'
+                  : promptSaved
+                    ? 'saved prompt — not following the settings'
+                    : 'following the settings'}
+              </span>
+            </div>
+          </div>
+        )}
+      </div>
+
+
       {/* Comment length band */}
       <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3 mb-4">
         <div className="flex flex-wrap items-end justify-between gap-3">
@@ -357,6 +517,28 @@ export default function AdminProductComments({
               {label}
             </label>
           ))}
+          {/* The voice is a choice of three, not a switch: they are three
+              different things for a comment to BE, and only one applies. */}
+          <label className="flex items-center gap-1.5 text-xs text-zinc-300">
+            voice
+            <select
+              value={voice}
+              onChange={(e) => setVoice(e.target.value as CommentVoice)}
+              title={[
+                'question — the claim is ASSUMED and the comment asks about something else, so the reader draws the conclusion.',
+                'curious — a question asked OF a person that wants a real answer, with the product folded in as a short aside.',
+                'recommendation — a person saying what they use and why it worked.',
+                'information — what the tool IS, stated flatly: no endorsement, no superlative, no first person.',
+                'Applies to the NEXT regeneration; stored comments are not rewritten.',
+              ].join('\n')}
+              className="bg-zinc-950 border border-zinc-700 rounded px-1.5 py-0.5 text-xs text-zinc-100 focus:outline-none focus:border-emerald-500"
+            >
+              <option value="question">question</option>
+              <option value="recommendation">recommendation</option>
+              <option value="curious">curious</option>
+              <option value="informational">information</option>
+            </select>
+          </label>
           <span className="text-[11px] text-zinc-600">
             example: {preview}
           </span>

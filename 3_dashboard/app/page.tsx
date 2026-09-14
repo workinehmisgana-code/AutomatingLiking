@@ -27,8 +27,11 @@ import {
   isUserVerified,
   getUserValidity,
   getClusterDateShare,
+  getConfirmedBrokenUrls,
 } from '@/lib/db'
 import { retiredUrlSet } from '@/lib/videos'
+import { buildUserFeed, FEED_PER_PLATFORM } from '@/lib/userFeed'
+import { BROKEN_AFTER_MISSES } from '@/lib/linkStats'
 import { DEFAULT_DATE_SHARE } from '@/lib/clusterMix'
 import {
   isAdminEmail,
@@ -89,7 +92,13 @@ export default async function Home() {
   const block = await getBlockForEmail(session.user.email).catch(() => null)
   if (block) {
     if (block.reason === 'forever') return <Blocked email={session.user.email ?? ''} />
-    return <BlockedRemediation reason={block.reason} email={session.user.email ?? ''} />
+    return (
+      <BlockedRemediation
+        reason={block.reason}
+        email={session.user.email ?? ''}
+        auto={block.auto}
+      />
+    )
   }
 
   // Is this the user's very first login? (Check before recording today's day.)
@@ -132,7 +141,7 @@ export default async function Home() {
     ...Object.values(platformLimits).map((l) => l.windowMs || 0)
   )
 
-  const [allVideos, clickedUrls, clickCounts, todayCounts, hourly, messages, pending, paidNotice, apk, blockedUrls] =
+  const [allVideos, clickedUrls, clickCounts, todayCounts, hourly, messages, pending, paidNotice, apk, blockedUrls, brokenUrls] =
     await Promise.all([
       getVideos(),
       getClickedUrls(session.user.id).catch(() => [] as string[]),
@@ -147,12 +156,17 @@ export default async function Home() {
       consumePayNotice(session.user.id).catch(() => null),
       getApk().catch(() => null),
       getBlockedUrls().catch(() => [] as string[]),
+      // Links the platform no longer serves, confirmed over two passes.
+      getConfirmedBrokenUrls(BROKEN_AFTER_MISSES).catch(() => [] as string[]),
     ])
   // What share of workers the admin has put on the posted-date clustering.
   const dateShare = await getClusterDateShare().catch(() => DEFAULT_DATE_SHARE)
   // Permanently-blocked links never appear, even if a new videos.json re-adds them.
-  const blockedSet = new Set(blockedUrls)
-  const videos = allVideos.filter((v) => !blockedSet.has(String((v as { url?: unknown }).url ?? '')))
+  // Blocked (a judgement we made) and broken (the platform no longer serves it)
+  // are different facts with the same effect here: neither is worth anyone's
+  // time to open.
+  const goneSet = new Set([...blockedUrls, ...brokenUrls])
+  const videos = allVideos.filter((v) => !goneSet.has(String((v as { url?: unknown }).url ?? '')))
   // Retire links per their engagement-based quota (TikTok likes/10, YT views/100,
   // Instagram = the cap) — hidden from every user once they hit it. Retirement only
   // applies while quota enforcement is ON; with it OFF no link is ever retired.
@@ -160,9 +174,22 @@ export default async function Home() {
   // retirement switch) — independent of the hourly quotas.
   const retiredUrls = Array.from(retiredUrlSet(videos, clickCounts, retirePlatforms))
 
+  // Only this user's slice crosses the wire. The whole pool used to: 129k links,
+  // tens of megabytes, re-sent on every load so a phone could render the first
+  // twenty. Each link keeps the cluster and position it earned against the FULL
+  // pool, so the queue means the same thing it always did — see lib/userFeed.
+  // Links already opened, and retired ones, are dropped before the cut, so the
+  // cap is a hundred links per platform that can actually be worked on.
+  const { served, remaining } = buildUserFeed(
+    videos,
+    new Set([...clickedUrls, ...retiredUrls]),
+    FEED_PER_PLATFORM
+  )
+
   return (
     <Dashboard
-      videos={videos}
+      videos={served}
+      remainingByPlatform={remaining}
       clickedUrls={clickedUrls}
       retiredUrls={retiredUrls}
       dateShare={dateShare}

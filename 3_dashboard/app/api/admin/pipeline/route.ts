@@ -4,6 +4,7 @@ import { auth } from '@/lib/auth'
 import { isAdminEmail } from '@/lib/config'
 import { getPipelineCycles, getCycleCoverage } from '@/lib/db'
 import { getStage, getLastTick, getCycleTiming, CYCLE_HOURS } from '@/lib/pipeline'
+import { getReclusterState } from '@/lib/recluster'
 
 export const dynamic = 'force-dynamic'
 
@@ -15,11 +16,13 @@ export async function GET() {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   try {
-    const [cycles, stage, last, timing] = await Promise.all([
+    const [cycles, stage, last, timing, recluster] = await Promise.all([
       getPipelineCycles(60),
       getStage(),
       getLastTick(),
       getCycleTiming(),
+      // The hourly recluster runs on its own schedule, not as part of a lap.
+      getReclusterState().catch(() => null),
     ])
     // The two most recent cycles that actually read something, newest first.
     // Coverage is a comparison, so it needs both; with only one cycle recorded
@@ -45,6 +48,7 @@ export async function GET() {
       last,
       timing,
       everyHours: CYCLE_HOURS,
+      recluster,
       coverage,
     })
   } catch (e) {

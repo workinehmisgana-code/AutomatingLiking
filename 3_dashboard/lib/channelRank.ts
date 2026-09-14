@@ -23,6 +23,8 @@ import { parsePostedDate } from './cluster'
 
 export interface ChannelRow {
   handle: string
+  /** Which site it is on — a handle alone does not say. */
+  platform: 'tiktok' | 'instagram' | 'youtube'
   /** Links of this channel still in the pool (blocked ones are removed from it). */
   links: number
   /** Pool links not on the blocked list. */
@@ -40,10 +42,34 @@ export interface ChannelRow {
   score: number
 }
 
-/** The TikTok handle in a URL, lowercased, or null. */
+/**
+ * The channel handle in a URL, lowercased, or null.
+ *
+ * TikTok and YouTube put the handle in the video URL. INSTAGRAM DOES NOT — a
+ * post is /p/<code>/ or /reel/<code>/ and names nobody — which is why every
+ * caller must pass the row's stored author as a fallback. Without it Instagram
+ * links group under no channel at all, and the whole channel table comes back
+ * empty however many links are in the pool.
+ */
 export function handleOf(url: string): string | null {
-  const m = url.match(/tiktok\.com\/@([A-Za-z0-9._]+)\/(?:video|photo)\/\d+/i)
-  return m ? m[1].toLowerCase() : null
+  const tt = url.match(/tiktok\.com\/@([A-Za-z0-9._]+)\/(?:video|photo)\/\d+/i)
+  if (tt) return tt[1].toLowerCase()
+  const yt = url.match(/youtube\.com\/@([A-Za-z0-9._-]+)/i)
+  if (yt) return yt[1].toLowerCase()
+  return null
+}
+
+/** The handle for a pool row: from its URL, else the author it was stored with. */
+export function channelOfRow(url: string, author: unknown): string | null {
+  return handleOf(url) ?? (String(author ?? '').trim().replace(/^@/, '').toLowerCase() || null)
+}
+
+/** Which site a channel is on, so its page can be opened. */
+export function siteOf(url: string): 'tiktok' | 'instagram' | 'youtube' {
+  const u = url.toLowerCase()
+  if (u.includes('instagram.com')) return 'instagram'
+  if (u.includes('youtube.com') || u.includes('youtu.be')) return 'youtube'
+  return 'tiktok'
 }
 
 /**
@@ -105,10 +131,12 @@ export async function rankChannels(): Promise<ChannelRow[]> {
   const blocked = new Set(blockedUrls)
 
   const acc = new Map<string, Acc>()
+  const site = new Map<string, 'tiktok' | 'instagram' | 'youtube'>()
   for (const v of videos) {
     const url = String(v.url ?? '')
-    const handle = handleOf(url)
+    const handle = channelOfRow(url, (v as { author?: unknown }).author)
     if (!handle) continue
+    site.set(handle, siteOf(url))
     const a = acc.get(handle) ?? { links: 0, active: 0, hearts: [], times: [] }
     a.links++
     if (!blocked.has(url)) a.active++
@@ -156,14 +184,16 @@ export async function rankChannels(): Promise<ChannelRow[]> {
     } else if (a.times.length === 1) {
       lastPostDays = Math.floor((now - a.times[0]) / 86_400_000)
     }
-    const blockedTotal = blockedByChannel.get(handle) ?? 0
+    const canAttributeBlocks = (site.get(handle) ?? 'tiktok') !== 'instagram'
+    const blockedTotal = canAttributeBlocks ? (blockedByChannel.get(handle) ?? 0) : 0
     const judged = a.active + blockedTotal
     rows.push({
       handle,
+      platform: site.get(handle) ?? 'tiktok',
       links: a.links,
       active: a.active,
       blocked: blockedTotal,
-      activePct: judged > 0 ? Math.round((a.active / judged) * 100) : null,
+      activePct: canAttributeBlocks && judged > 0 ? Math.round((a.active / judged) * 100) : null,
       avgHearts,
       perDay,
       lastPostDays,

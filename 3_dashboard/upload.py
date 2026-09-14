@@ -15,11 +15,17 @@ Usage:
     python upload.py                        # append the most recent CSV
     python upload.py --all                  # append every CSV in results/
 
-    --replace is the DESTRUCTIVE opt-in: it wipes every stored link for the
-    platforms present in the upload and keeps only what's in this batch (other
-    platforms are untouched). Use it only when you deliberately want to start a
-    platform over:
+    --replace is the DESTRUCTIVE opt-in: it wipes the stored SEARCH-RANK links
+    of the platforms present in the upload and keeps only what's in this batch
+    (other platforms are untouched). Use it only when you deliberately want to
+    start a platform over:
     python upload.py --replace              # replace this CSV's platforms
+
+    AN UPLOAD ONLY EVER TOUCHES SEARCH-RANK LINKS. A link with no search rank
+    belongs to the posted-date clusters alone — it came from the verify list,
+    not from a keyword search — and neither --append nor --replace will edit or
+    delete one. That is 121,110 of the 130,184 stored links: before this rule, a
+    single `--replace` of a TikTok CSV deleted 93% of the pool.
 
     --dedupe cleans the dashboard in place: removes any duplicate links (keeps one
     row per URL). No CSV needed:
@@ -185,6 +191,19 @@ def collect_csvs(args: list[str]) -> list[Path]:
     return [non_empty[-1]]
 
 
+def _report_protected(data: dict) -> None:
+    """Say how many posted-date links the upload deliberately left alone.
+
+    Usually the largest number on the page — 93% of the pool has no search rank
+    — and worth printing precisely because it is the thing an upload no longer
+    does. A silent "dropped 4,000 links" is what this replaced.
+    """
+    n = data.get("protectedDateOnly") or 0
+    if n:
+        print(f"    Posted-date links untouched: {n:,} "
+              "(no search rank — an upload never edits or drops these)")
+
+
 def upload(videos: list[dict], mode: str = "replace") -> None:
     if not DASHBOARD_URL:
         print("[!] DASHBOARD_URL not set in .env – cannot upload.")
@@ -212,6 +231,7 @@ def upload(videos: list[dict], mode: str = "replace") -> None:
                   f"(of {data.get('received', '?')} sent) → {data.get('count', '?')} videos stored in total.")
             print(f"    Titles cached: {data.get('titlesSaved', 0)}"
                   f" · posted-date clusters re-scored: {data.get('scored', 0)} link(s)")
+            _report_protected(data)
         else:
             replaced = data.get("replacedPlatforms") or []
             scope = ", ".join(replaced) if replaced else "all"
@@ -222,6 +242,7 @@ def upload(videos: list[dict], mode: str = "replace") -> None:
                   f"→ {data.get('count', '?')} videos stored in total.")
             print(f"    Titles cached: {data.get('titlesSaved', 0)}"
                   f" · posted-date clusters re-scored: {data.get('scored', 0)} link(s)")
+            _report_protected(data)
     else:
         print(f"[!] Upload failed: {r.status_code} {r.text}")
         sys.exit(1)
@@ -292,8 +313,10 @@ def main():
     breakdown = ", ".join(f"{p}: {n}" for p, n in sorted(by_platform.items()))
     print(f"[*] Total unique videos: {len(videos)}  ({breakdown})")
     if mode == "replace":
-        print(f"[!] REPLACE mode: every stored link for {sorted(by_platform)} will be "
-              f"DELETED and replaced by this batch. Other platforms stay unchanged.")
+        print(f"[!] REPLACE mode: stored SEARCH-RANK links for {sorted(by_platform)} will "
+              f"be DELETED and replaced by this batch.")
+        print("    Other platforms are untouched, and so is every posted-date link "
+              "(no search rank) — an upload never drops those.")
     else:
         print("[*] Append mode: new links are added, existing ones refreshed; nothing is deleted.")
 

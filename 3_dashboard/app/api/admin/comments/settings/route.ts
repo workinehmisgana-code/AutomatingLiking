@@ -7,6 +7,7 @@ import {
   COMMENT_WORD_MIN,
   COMMENT_WORD_MAX,
   DEFAULT_COMMENT_STYLE,
+  isCommentVoice,
   type CommentStyle,
 } from '@/lib/config'
 import {
@@ -64,6 +65,7 @@ export async function POST(req: NextRequest) {
     emoji: flag(body?.emoji, current.style.emoji),
     splitBrand: flag(body?.splitBrand, current.style.splitBrand),
     quoteBrand: flag(body?.quoteBrand, current.style.quoteBrand),
+    voice: isCommentVoice(body?.voice) ? body.voice : current.style.voice,
   }
   try {
     await setProductWordBand(product, band)

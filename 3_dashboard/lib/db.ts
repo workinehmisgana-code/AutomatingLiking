@@ -11,15 +11,16 @@ import {
   DEFAULT_PLATFORM_LIMIT,
   type PlatformLimit,
   PRODUCTS,
-  FIRST_ON_EMPTY_PRODUCT,
   DEACTIVATED_PRODUCTS,
   isProduct,
+  platformFromUrl,
   type DateWeights,
   DEFAULT_DATE_WEIGHTS,
   normalizeDateWeights,
   COMMENT_WORD_MIN,
   COMMENT_WORD_MAX,
   type CommentStyle,
+  isCommentVoice,
   DEFAULT_COMMENT_STYLE,
 } from './config'
 import { isGenericTitle } from './titleFilter'
@@ -123,6 +124,25 @@ export function ensureClickedTable(): Promise<void> {
           url        TEXT PRIMARY KEY,
           blocked_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+
+        -- Links the platform no longer serves: deleted, made private, or taken
+        -- down. Held apart from blocked_link because they are a different fact
+        -- and have a different fate — a block is a judgement we made and keep,
+        -- while a broken link is a state of the world that can reverse itself
+        -- when a post is unhidden or a region block lifts.
+        --
+        -- misses counts CONSECUTIVE dead readings. One is never enough: the
+        -- same empty response comes back from a rate limit or a bad minute on
+        -- TikTok's side, and condemning a live link on one reading would quietly
+        -- shrink the pool.
+        CREATE TABLE IF NOT EXISTS broken_link (
+          url          TEXT PRIMARY KEY,
+          reason       TEXT NOT NULL DEFAULT '',
+          misses       INT  NOT NULL DEFAULT 1,
+          first_seen   TIMESTAMPTZ NOT NULL DEFAULT now(),
+          last_checked TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS broken_link_seen_idx ON broken_link (first_seen DESC);
 
         -- Cached video titles (fetched once from the platform, reused forever).
         CREATE TABLE IF NOT EXISTS link_title (
@@ -623,10 +643,11 @@ export async function saveVerifyLinks(rows: RawVerifyRow[]): Promise<number> {
   if (clean.length === 0) return 0
   await ensureVerifyLinkTable()
   const { rowCount } = await pool.query(
-    `INSERT INTO verify_link (url, account, view_count, heart_count, comment_count, share_count, posted_date, title, bio)
-     SELECT * FROM unnest($1::text[], $2::text[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[], $7::text[], $8::text[], $9::text[])
+    `INSERT INTO verify_link (url, account, platform, view_count, heart_count, comment_count, share_count, posted_date, title, bio)
+     SELECT * FROM unnest($1::text[], $2::text[], $10::text[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[], $7::text[], $8::text[], $9::text[])
      ON CONFLICT (url) DO UPDATE SET
        account       = COALESCE(NULLIF(EXCLUDED.account, ''), verify_link.account),
+       platform      = EXCLUDED.platform,
        view_count    = CASE WHEN EXCLUDED.view_count    > 0 THEN EXCLUDED.view_count    ELSE verify_link.view_count    END,
        heart_count   = CASE WHEN EXCLUDED.heart_count   > 0 THEN EXCLUDED.heart_count   ELSE verify_link.heart_count   END,
        comment_count = CASE WHEN EXCLUDED.comment_count > 0 THEN EXCLUDED.comment_count ELSE verify_link.comment_count END,
@@ -640,6 +661,7 @@ export async function saveVerifyLinks(rows: RawVerifyRow[]): Promise<number> {
       clean.map((r) => r.comment_count), clean.map((r) => r.share_count),
       clean.map((r) => r.posted_date), clean.map((r) => r.title),
       clean.map((r) => r.bio),
+      clean.map((r) => platformFromUrl(r.url)),
     ]
   )
   return rowCount ?? 0
@@ -704,9 +726,22 @@ export async function getVerifyLinks(
   const { predicate, params } = verifyWhere(filter, accounts)
   const [pageRes, cntRes] = await Promise.all([
     pool.query(
+      // GROUPED BY CHANNEL. A channel is judged as a whole — from its bio and
+      // what it posts — so its links have to arrive together instead of being
+      // interleaved with everyone else's by upload time.
+      //
+      // Channels are ordered by when their FIRST link was staged, not
+      // alphabetically: that keeps the list in the order the uploads arrived,
+      // which is the order the admin is working through, while still putting
+      // each channel's links in one run. A channel wider than a page continues
+      // onto the next one under the same heading.
       `SELECT url, account, platform, view_count, heart_count, comment_count, share_count, posted_date, title, bio
-         FROM verify_link WHERE ${predicate}
-        ORDER BY added_at, url LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+         FROM (
+           SELECT *, min(added_at) OVER (PARTITION BY lower(coalesce(account, ''))) AS chan_first
+             FROM verify_link WHERE ${predicate}
+         ) t
+        ORDER BY chan_first, lower(coalesce(account, '')), added_at, url
+        LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
       [...params, limit, offset]
     ),
     // One row per filter state: the filtered count drives the pager, the
@@ -2027,12 +2062,15 @@ export async function saveJudgedLinks(
   // stays correct however many times a pass is interrupted and resumed.
   //
   // `freshSince` narrows that to the verdicts THIS pass made. It matters more
-  // than it looks: a day is capped at MAX_LINKS_PER_DAY links, but the ledger
-  // accumulates a row for every link any pass ever judged, and as a day grows
-  // the cap selects a different 100 each time. One real user has 431 rows for a
-  // single day. Totalling all of them would mix a hundred readings taken just
-  // now with three hundred taken hours ago, and report the average as today's
-  // score — which is precisely what a fresh check is supposed to stop.
+  // than it looks: the ledger accumulates a row for every link any pass ever
+  // judged, and a day keeps growing while it is being swept, so an early pass
+  // and a later one judge overlapping but different sets. One real user has 431
+  // rows for a single day. Totalling all of them would mix a hundred readings
+  // taken just now with three hundred taken hours ago and report the average as
+  // today's score — precisely what a fresh check is supposed to stop.
+  //
+  // (This used to say the day was capped at 100 links. It no longer is: every
+  // link opened that day is read — see lib/commentPresence.)
   await pool.query(
     freshSince
       ? `INSERT INTO comment_presence (user_id, day, checked, found, skipped)
@@ -2488,6 +2526,111 @@ export async function getBlockedUrls(): Promise<string[]> {
   return rows.map((r) => r.url)
 }
 
+// ── Broken links ─────────────────────────────────────────────────────────────
+// Links the platform no longer serves. Kept out of every user's list the same
+// way blocked links are, but reversible on its own: a post that comes back is
+// restored by the next check rather than needing an admin to notice.
+
+export interface BrokenLinkRow {
+  url: string
+  reason: string
+  misses: number
+  firstSeen: string
+  lastChecked: string
+}
+
+/** Every broken URL, for filtering. */
+export async function getBrokenUrls(): Promise<string[]> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ url: string }>('SELECT url FROM broken_link')
+  return rows.map((r) => r.url)
+}
+
+/** A page of broken links, newest first, for the modal. */
+export async function getBrokenLinks(
+  limit = 200,
+  offset = 0
+): Promise<{ rows: BrokenLinkRow[]; total: number }> {
+  await ensureClickedTable()
+  const [page, count] = await Promise.all([
+    pool.query<{
+      url: string
+      reason: string
+      misses: number
+      first_seen: string
+      last_checked: string
+    }>(
+      `SELECT url, reason, misses, first_seen, last_checked
+         FROM broken_link ORDER BY first_seen DESC, url LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    ),
+    pool.query<{ n: number }>('SELECT COUNT(*)::int AS n FROM broken_link'),
+  ])
+  return {
+    rows: page.rows.map((r) => ({
+      url: r.url,
+      reason: r.reason,
+      misses: r.misses,
+      firstSeen: String(r.first_seen),
+      lastChecked: String(r.last_checked),
+    })),
+    total: count.rows[0]?.n ?? 0,
+  }
+}
+
+/**
+ * Record a dead reading.
+ *
+ * A link only BECOMES broken once it has read dead `threshold` times running —
+ * the same empty response comes back from a rate limit, so one reading is a
+ * suspicion, not a verdict. Returns how many links crossed the threshold on
+ * this call.
+ */
+export async function recordBrokenReadings(
+  urls: string[],
+  reason: string,
+  threshold: number
+): Promise<number> {
+  if (urls.length === 0) return 0
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ url: string; misses: number }>(
+    `INSERT INTO broken_link (url, reason, misses)
+     SELECT u, $2, 1 FROM unnest($1::text[]) AS u
+     ON CONFLICT (url) DO UPDATE
+       SET misses = broken_link.misses + 1, reason = $2, last_checked = now()
+     RETURNING url, misses`,
+    [urls, reason.slice(0, 120)]
+  )
+  return rows.filter((r) => r.misses >= threshold).length
+}
+
+/**
+ * Clear a link's dead readings — it answered.
+ *
+ * Called for every link that reads ALIVE, not only for ones already listed:
+ * that is what makes a run of near-misses reset instead of accumulating across
+ * unrelated passes until an intermittent link is condemned.
+ */
+export async function clearBrokenReadings(urls: string[]): Promise<number> {
+  if (urls.length === 0) return 0
+  await ensureClickedTable()
+  const { rowCount } = await pool.query(
+    'DELETE FROM broken_link WHERE url = ANY($1::text[])',
+    [urls]
+  )
+  return rowCount ?? 0
+}
+
+/** URLs whose dead readings have reached the threshold — the ones withheld. */
+export async function getConfirmedBrokenUrls(threshold: number): Promise<string[]> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ url: string }>(
+    'SELECT url FROM broken_link WHERE misses >= $1',
+    [threshold]
+  )
+  return rows.map((r) => r.url)
+}
+
 // ── Cached video titles ──────────────────────────────────────────────────────
 // All saved titles, keyed by URL (seeds the admin Links page so titles never
 // need re-fetching once extracted).
@@ -2739,55 +2882,55 @@ export async function getPlatformLimit(platform: string): Promise<PlatformLimit>
   return all[platform] ?? { ...DEFAULT_PLATFORM_LIMIT }
 }
 
-// ── Fair per-link comment rotation ──────────────────────────────────────────
-// Which product a link advertises next.
+// ── Which product a link advertises next ────────────────────────────
 //
-// A video we have READ and found none of ours on opens with one nominated
-// product (config.FIRST_ON_EMPTY_PRODUCT). That is the OPENING comment only.
+// ONE PRODUCT PER VIDEO. Whichever of our products already leads a video's
+// comment section gets every further comment on that video, so a reader sees one
+// product recommended repeatedly rather than four arguing.
 //
-// Everything after that, and every link we have not read, is picked at RANDOM
-// from the active products.
+// A video with none of ours yet is assigned a product FROM THE URL, not at
+// random: the same video hands every user the same product from the very first
+// click, before any count exists to read. A random draw would give the first few
+// concurrent clicks different products and start the video off split — exactly
+// what this is meant to prevent. Across the pool the hash spreads products
+// evenly, so each product ends up owning its share of videos.
 //
-// It used to be least-served-wins with ties broken at random, which sounds
-// fairer and behaves worse: it fixes a link's next comment to whichever product
-// is behind on it, so every user who opens that link gets the same answer until
-// the count moves. A draw gives concurrent users different products on the same
-// video, and evens out across a link anyway over enough clicks.
+// This REPLACES two earlier rules. It replaces the purifytext-first rule
+// (config.FIRST_ON_EMPTY_PRODUCT): serving purifytext to every empty link would
+// make purifytext the leader on every video and no other product would ever hold
+// one. And it replaces the random draw that followed, which was chosen so that
+// concurrent users got different products on the same video — the opposite of
+// what is wanted now.
 
 /**
- * Has the extraction READ this video and found none of our comments on it?
+ * Does this link already carry a given product's comment?
  *
- * read_count > 0 is the whole point of the check. A scan row that read nothing
- * saw no more than never looking did, and treating it as proof of an empty video
- * would hand the opening comment to links that may already be full.
- */
-export async function isLinkProvenEmpty(url: string): Promise<boolean> {
-  await ensureClickedTable()
-  const { rows } = await pool.query<{ empty: boolean }>(
-    `SELECT (read_count > 0 AND our_count = 0) AS empty
-       FROM link_comment_scan WHERE url = $1`,
-    [url]
-  )
-  return rows[0]?.empty === true
-}
-
-/**
- * Has ANY product's comment been served for this URL yet?
+ * TWO sources, because either alone gets it wrong:
  *
- * Only whether, not how many: nothing weighs the per-product counts any more,
- * and this is the one question left — whether the link has had its opening
- * comment. EXISTS stops at the first row instead of grouping the lot.
+ *   • link_product_comment — what the extraction actually FOUND on the video.
+ *     Proof, but only for links that have been scanned, which most have not.
+ *   • clicked_link.product — what we have SERVED for the video. Not proof that
+ *     anyone posted it, but it is the only signal that exists between serving a
+ *     comment and the next scan finding it, which can be days.
+ *
+ * Without the served half, every user opening the same fresh link would be
+ * handed the same product until a scan caught up: five people, five identical
+ * comments on one video.
+ *
+ * One round trip: both EXISTS run in a single statement, and each stops at its
+ * first matching row.
  */
-export async function hasServedProductForUrl(url: string): Promise<boolean> {
+export async function linkHasProduct(url: string, product: string): Promise<boolean> {
   await ensureClickedTable()
-  const { rows } = await pool.query<{ any: boolean }>(
-    `SELECT EXISTS (
-       SELECT 1 FROM clicked_link
-        WHERE url = $1 AND product IS NOT NULL AND product <> ''
-     ) AS any`,
-    [url]
+  const { rows } = await pool.query<{ has: boolean }>(
+    `SELECT (
+       EXISTS (SELECT 1 FROM link_product_comment WHERE url = $1 AND product = $2)
+       OR
+       EXISTS (SELECT 1 FROM clicked_link WHERE url = $1 AND product = $2)
+     ) AS has`,
+    [url, product]
   )
-  return rows[0]?.any === true
+  return rows[0]?.has === true
 }
 
 /**
@@ -2814,12 +2957,56 @@ export async function getProductCommentCountsByUrl(): Promise<Record<string, Rec
 }
 
 /**
- * Pick the product whose comment should be served next for `url`, fairly.
+ * How many comments each of our products has on one link.
  *
- * Least-served wins; ties are broken uniformly at random so the very first
- * clicks on a fresh link don't all land on whichever product happens to sort
- * first. Products never served for this link count as 0, so they are picked
- * before any product that already has one.
+ * TWO sources added together, for the same reason linkHasProduct reads both:
+ *
+ *   • link_product_comment — what a scan actually FOUND on the video. Proof,
+ *     but only for links that have been scanned, and 94% never have been.
+ *   • clicked_link.product — what we have SERVED for the video. Not proof that
+ *     anyone posted it, but between serving a comment and the next scan finding
+ *     it there is nothing else, and that gap runs to days.
+ *
+ * Found-only would leave almost every link at all-zero, so no product could ever
+ * lead and the rule would never fire. Summing does double-count a served comment
+ * that a later scan then finds — which inflates the leader, and the leader is
+ * what we are trying to identify, so it pushes the right way.
+ */
+export async function getProductCountsForUrl(url: string): Promise<Record<string, number>> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ product: string; n: number }>(
+    `SELECT product, COUNT(*)::int AS n FROM (
+       SELECT product FROM link_product_comment WHERE url = $1 AND product IS NOT NULL
+       UNION ALL
+       SELECT product FROM clicked_link WHERE url = $1 AND product IS NOT NULL
+     ) t
+     GROUP BY product`,
+    [url]
+  )
+  const out: Record<string, number> = {}
+  for (const r of rows) out[r.product] = r.n
+  return out
+}
+
+/** Stable 32-bit hash of a string — same URL, same number, every process. */
+function hashUrl(url: string): number {
+  let h = 2166136261
+  for (let i = 0; i < url.length; i++) {
+    h ^= url.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return h >>> 0
+}
+
+/**
+ * Pick the product whose comment should be served next for `url`.
+ *
+ * The product already leading this video's comment section, so one product
+ * dominates it. With nothing on the video yet, the URL itself decides — see the
+ * note above this section for why that is a hash and not a draw.
+ *
+ * A product that is no longer active is ignored even if it leads, or an admin
+ * turning a product off would leave every video it owns stuck on it.
  *
  * Returns null only when there are no products to choose from.
  */
@@ -2829,29 +3016,29 @@ export async function pickFairProductForUrl(
 ): Promise<string | null> {
   if (products.length === 0) return null
 
-  // A video we have READ and found none of ours on opens with one nominated
-  // product. Only the opening comment: after that the draw below decides, and
-  // every product is equal again.
-  //
-  // Gated on nothing having been served yet rather than on the scan alone,
-  // because the scan is only true as of when it ran — a link scanned empty last
-  // week that has had three comments served since is not empty now, and would
-  // otherwise keep being handed the same opener over and over.
-  if (products.includes(FIRST_ON_EMPTY_PRODUCT)) {
-    const opened = await hasServedProductForUrl(url).catch(() => true)
-    if (!opened && (await isLinkProvenEmpty(url).catch(() => false))) {
-      return FIRST_ON_EMPTY_PRODUCT
+  // Ordered, so the hash maps a URL to the same product on every call. The
+  // active list arrives in whatever order the query returned it.
+  const active = [...products].sort()
+
+  // A read failure must not silently reshuffle a video that already has a
+  // leader, so it falls through to the hash — which at least keeps every user
+  // of that video on one product, the same one, until the database is back.
+  const counts = await getProductCountsForUrl(url).catch(() => ({}) as Record<string, number>)
+
+  let best: string | null = null
+  let bestN = 0
+  for (const p of active) {
+    const n = counts[p] ?? 0
+    // Strictly greater: on a tie the earlier product in the sorted list holds
+    // the lead rather than the two swapping back and forth.
+    if (n > bestN) {
+      best = p
+      bestN = n
     }
   }
+  if (best) return best
 
-  // Otherwise: picked at RANDOM from the active products, fresh on every call.
-  // Nothing is remembered and no counts are consulted, so two users opening the
-  // same link a second apart can get different products.
-  //
-  // Not least-served, which is what this used to do: that fixed a link's next
-  // comment to whichever product was behind on it, so everyone hitting that link
-  // got the same answer until the count moved.
-  return products[Math.floor(Math.random() * products.length)] ?? null
+  return active[hashUrl(url) % active.length] ?? null
 }
 
 // ── Effective enforcement ────────────────────────────────────────────────────
@@ -3159,6 +3346,10 @@ export interface BlockInfo {
   reason: BlockReason
   bankNorm: string | null
   tiktokNorm: string | null
+  /** Decided by the nightly presence check rather than by a person. The screen
+   *  a user sees says something different in that case — a machine's reading of
+   *  their account is a thing they can answer. */
+  auto: boolean
 }
 
 // Canonicalise a bank account number for matching: strip whitespace, lowercase.
@@ -3303,8 +3494,9 @@ export async function getBlockForEmail(email: string | null | undefined): Promis
     reason: string
     bank_norm: string | null
     tiktok_norm: string | null
+    auto: boolean
   }>(
-    `SELECT user_id, reason, bank_norm, tiktok_norm
+    `SELECT user_id, reason, bank_norm, tiktok_norm, auto
      FROM blocked_user WHERE email = $1
      ORDER BY blocked_at DESC LIMIT 1`,
     [e]
@@ -3316,6 +3508,7 @@ export async function getBlockForEmail(email: string | null | undefined): Promis
     reason: isBlockReason(r.reason) ? r.reason : 'forever',
     bankNorm: r.bank_norm,
     tiktokNorm: r.tiktok_norm,
+    auto: r.auto === true,
   }
 }
 
@@ -3398,6 +3591,20 @@ export function ensureAdminTables(): Promise<void> {
         ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS emoji BOOLEAN NOT NULL DEFAULT true;
         ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS split_brand BOOLEAN NOT NULL DEFAULT true;
         ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS quote_brand BOOLEAN NOT NULL DEFAULT true;
+        -- Question style vs plain statements. Defaults TRUE because that is what
+        -- the generator was switched to; a row written before this column existed
+        -- picks it up as well, which is intended - the two styles are a choice to
+        -- try, not a migration to preserve.
+        ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS question BOOLEAN NOT NULL DEFAULT true;
+        -- Which of the three pitches a comment makes. Replaces the question
+        -- boolean above, which is left in place so a rollback still reads a
+        -- sane value; the backfill below carries whatever it was set to.
+        ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS voice TEXT NOT NULL DEFAULT 'question';
+        UPDATE product_comment_setting SET voice = CASE WHEN question THEN 'question' ELSE 'recommendation' END
+         WHERE voice IS NULL OR voice NOT IN ('question','recommendation','informational','curious');
+        -- The system prompt, when an admin has edited it on the comments page.
+        -- NULL means "build it from the settings", which is the normal case.
+        ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS prompt TEXT;
         -- JSON array of products whose comments feed the app's comment pool (admin
         -- controlled). NULL = default to all non-deactivated products.
         ALTER TABLE app_state ADD COLUMN IF NOT EXISTS active_comment_products TEXT;
@@ -3544,6 +3751,22 @@ export function ensureAdminTables(): Promise<void> {
           last_used_at TIMESTAMPTZ
         );
         CREATE INDEX IF NOT EXISTS app_token_user_idx ON app_token (user_id);
+        -- Video guides shown on the (public) /guide page. A list rather than a
+        -- single asset: the guide covers several tasks, and each gets its own
+        -- clip. The position column orders them; lang is a hint shown on the
+        -- card, not a filter, so a clip is never hidden from someone who needs it.
+        CREATE TABLE IF NOT EXISTS guide_video (
+          id         SERIAL PRIMARY KEY,
+          url        TEXT NOT NULL,
+          filename   TEXT,
+          size       BIGINT,
+          title      TEXT NOT NULL DEFAULT '',
+          note       TEXT NOT NULL DEFAULT '',
+          lang       TEXT NOT NULL DEFAULT '',
+          position   INT  NOT NULL DEFAULT 0,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS guide_video_pos_idx ON guide_video (position, id);
       `)
       .then(() => undefined)
       .catch((e) => {
@@ -3642,8 +3865,9 @@ export async function getProductCommentSettings(
     emoji: boolean
     split_brand: boolean
     quote_brand: boolean
+    voice: string
   }>(
-    `SELECT word_min, word_max, emoji, split_brand, quote_brand
+    `SELECT word_min, word_max, emoji, split_brand, quote_brand, voice
        FROM product_comment_setting WHERE product = $1`,
     [product]
   )
@@ -3651,8 +3875,36 @@ export async function getProductCommentSettings(
   if (!r) return { band: dflt, style: DEFAULT_COMMENT_STYLE }
   return {
     band: { min: r.word_min, max: r.word_max },
-    style: { emoji: r.emoji, splitBrand: r.split_brand, quoteBrand: r.quote_brand },
+    style: {
+      emoji: r.emoji,
+      splitBrand: r.split_brand,
+      quoteBrand: r.quote_brand,
+      voice: isCommentVoice(r.voice) ? r.voice : DEFAULT_COMMENT_STYLE.voice,
+    },
   }
+}
+
+/** The admin's edited system prompt for this product, or null to use the built one. */
+export async function getProductPrompt(product: string): Promise<string | null> {
+  await ensureAdminTables()
+  const { rows } = await pool.query<{ prompt: string | null }>(
+    'SELECT prompt FROM product_comment_setting WHERE product = $1',
+    [product]
+  )
+  const p = rows[0]?.prompt
+  return p && p.trim() ? p : null
+}
+
+/** Save an edited prompt, or clear it (null / blank) to go back to the built one. */
+export async function setProductPrompt(product: string, prompt: string | null): Promise<void> {
+  await ensureAdminTables()
+  const value = prompt && prompt.trim() ? prompt.trim() : null
+  await pool.query(
+    `INSERT INTO product_comment_setting (product, word_min, word_max, prompt, updated_at)
+     VALUES ($1, $2, $3, $4, now())
+     ON CONFLICT (product) DO UPDATE SET prompt = EXCLUDED.prompt, updated_at = now()`,
+    [product, COMMENT_WORD_MIN, COMMENT_WORD_MAX, value]
+  )
 }
 
 export async function setProductCommentStyle(product: string, style: CommentStyle): Promise<void> {
@@ -3660,14 +3912,16 @@ export async function setProductCommentStyle(product: string, style: CommentStyl
   // The row may not exist yet — a product whose band was never touched still
   // needs somewhere to put the style, so this inserts the defaults alongside it.
   await pool.query(
-    `INSERT INTO product_comment_setting (product, word_min, word_max, emoji, split_brand, quote_brand, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, now())
+    `INSERT INTO product_comment_setting (product, word_min, word_max, emoji, split_brand, quote_brand, voice, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, now())
      ON CONFLICT (product) DO UPDATE SET
        emoji = EXCLUDED.emoji,
        split_brand = EXCLUDED.split_brand,
        quote_brand = EXCLUDED.quote_brand,
+       voice = EXCLUDED.voice,
        updated_at = now()`,
-    [product, COMMENT_WORD_MIN, COMMENT_WORD_MAX, style.emoji, style.splitBrand, style.quoteBrand]
+    [product, COMMENT_WORD_MIN, COMMENT_WORD_MAX, style.emoji, style.splitBrand, style.quoteBrand,
+     style.voice]
   )
 }
 
@@ -3824,6 +4078,106 @@ export async function setApk(meta: {
   )
   const prevUrl = prev.rows[0]?.url ?? null
   return { prevUrl: prevUrl && prevUrl !== meta.url ? prevUrl : null }
+}
+
+export interface GuideVideo {
+  id: number
+  url: string
+  filename: string | null
+  size: number | null
+  title: string
+  note: string
+  lang: string
+  position: number
+}
+
+/** Every guide clip, in the order the guide page shows them. */
+export async function getGuideVideos(): Promise<GuideVideo[]> {
+  await ensureAdminTables()
+  const { rows } = await pool.query<GuideVideo>(
+    `SELECT id, url, filename, size::int AS size, title, note, lang, position
+       FROM guide_video ORDER BY position, id`
+  )
+  return rows
+}
+
+/** Append a clip. New clips go last, so adding one never reorders the guide. */
+export async function addGuideVideo(v: {
+  url: string
+  filename?: string | null
+  size?: number | null
+  title?: string
+  note?: string
+  lang?: string
+}): Promise<GuideVideo> {
+  await ensureAdminTables()
+  const { rows } = await pool.query<GuideVideo>(
+    `INSERT INTO guide_video (url, filename, size, title, note, lang, position)
+     VALUES ($1, $2, $3, $4, $5, $6,
+             COALESCE((SELECT max(position) + 1 FROM guide_video), 0))
+     RETURNING id, url, filename, size::int AS size, title, note, lang, position`,
+    [
+      v.url,
+      v.filename ?? null,
+      v.size ?? null,
+      (v.title ?? '').slice(0, 200),
+      (v.note ?? '').slice(0, 500),
+      (v.lang ?? '').slice(0, 20),
+    ]
+  )
+  return rows[0]
+}
+
+/** Edit a clip's text. Only the fields given are touched. */
+export async function updateGuideVideo(
+  id: number,
+  patch: { title?: string; note?: string; lang?: string }
+): Promise<void> {
+  await ensureAdminTables()
+  await pool.query(
+    `UPDATE guide_video
+        SET title = COALESCE($2, title), note = COALESCE($3, note), lang = COALESCE($4, lang)
+      WHERE id = $1`,
+    [
+      id,
+      patch.title === undefined ? null : patch.title.slice(0, 200),
+      patch.note === undefined ? null : patch.note.slice(0, 500),
+      patch.lang === undefined ? null : patch.lang.slice(0, 20),
+    ]
+  )
+}
+
+/** Remove a clip. Returns its blob URL so the caller can delete the file too. */
+export async function deleteGuideVideo(id: number): Promise<string | null> {
+  await ensureAdminTables()
+  const { rows } = await pool.query<{ url: string }>(
+    'DELETE FROM guide_video WHERE id = $1 RETURNING url',
+    [id]
+  )
+  return rows[0]?.url ?? null
+}
+
+/**
+ * Move a clip one place up or down.
+ *
+ * Positions are rewritten from the resulting order rather than swapped, so a
+ * list that arrived with duplicate or gapped positions (an interrupted write,
+ * an old row) comes out clean instead of getting stuck.
+ */
+export async function moveGuideVideo(id: number, dir: -1 | 1): Promise<void> {
+  await ensureAdminTables()
+  const all = await getGuideVideos()
+  const i = all.findIndex((v) => v.id === id)
+  const j = i + dir
+  if (i < 0 || j < 0 || j >= all.length) return
+  const order = all.map((v) => v.id)
+  ;[order[i], order[j]] = [order[j], order[i]]
+  await pool.query(
+    `UPDATE guide_video AS g SET position = x.pos
+       FROM unnest($1::int[]) WITH ORDINALITY AS x(id, pos)
+      WHERE g.id = x.id`,
+    [order]
+  )
 }
 
 // Record which app version a user is running (called from the app status ping).
@@ -5160,6 +5514,10 @@ export interface AdminData {
    *  window). `byProduct` holds the same days split by the click's product. */
   dailyClicks: { day: string; count: number }[]
   dailyClicksByProduct: Record<string, { day: string; count: number }[]>
+  /** The same days split by the PLATFORM stamped on each click. Separate
+   *  from the product split: one says which product is advertised, the
+   *  other which site the work happened on. */
+  dailyClicksByPlatform: Record<string, { day: string; count: number }[]>
 }
 
 // Clicks per product since `resetAt`, plus the last N days of clicks (total and
@@ -5169,6 +5527,7 @@ async function getClickAggregates(resetAt: Date): Promise<{
   clicksByProduct: Record<string, number>
   dailyClicks: { day: string; count: number }[]
   dailyClicksByProduct: Record<string, { day: string; count: number }[]>
+  dailyClicksByPlatform: Record<string, { day: string; count: number }[]>
 }> {
   const days = ADMIN_DAILY_CLICK_DAYS
   const [totals, daily] = await Promise.all([
@@ -5181,13 +5540,14 @@ async function getClickAggregates(resetAt: Date): Promise<{
     ),
     // generate_series zero-fills days with no clicks, so the table always shows
     // the full window instead of silently skipping quiet days.
-    pool.query<{ day: string; product: string | null; n: number }>(
+    pool.query<{ day: string; product: string | null; platform: string | null; n: number }>(
       `SELECT d::date::text AS day,
               COALESCE(NULLIF(cl.product, ''), '(none)') AS product,
+              COALESCE(NULLIF(cl.platform, ''), '(none)') AS platform,
               COUNT(cl.id)::int AS n
          FROM generate_series(CURRENT_DATE - ($1::int - 1), CURRENT_DATE, '1 day') d
          LEFT JOIN clicked_link cl ON cl.clicked_at::date = d::date
-        GROUP BY 1, 2 ORDER BY 1`,
+        GROUP BY 1, 2, 3 ORDER BY 1`,
       [days]
     ),
   ])
@@ -5200,16 +5560,24 @@ async function getClickAggregates(resetAt: Date): Promise<{
   const zero = () => allDays.map((day) => ({ day, count: 0 }))
   const dailyTotals = zero()
   const byProduct: Record<string, { day: string; count: number }[]> = {}
+  const byPlatform: Record<string, { day: string; count: number }[]> = {}
   const idx = new Map(allDays.map((d, i) => [d, i]))
   for (const r of daily.rows) {
     if (!r.n) continue // the LEFT JOIN's empty days come back as 0
     const i = idx.get(r.day)
     if (i === undefined) continue
+    // One row per (day, product, platform) now, so a day's total is the sum of
+    // its rows rather than a single row's count.
     dailyTotals[i].count += r.n
-    const key = r.product ?? '(none)'
-    ;(byProduct[key] ??= zero())[i].count += r.n
+    ;(byProduct[r.product ?? '(none)'] ??= zero())[i].count += r.n
+    ;(byPlatform[r.platform ?? '(none)'] ??= zero())[i].count += r.n
   }
-  return { clicksByProduct, dailyClicks: dailyTotals, dailyClicksByProduct: byProduct }
+  return {
+    clicksByProduct,
+    dailyClicks: dailyTotals,
+    dailyClicksByProduct: byProduct,
+    dailyClicksByPlatform: byPlatform,
+  }
 }
 
 // Everything the admin dashboard needs, all scoped to "since the last reset".
@@ -5496,6 +5864,7 @@ export async function getAdminData(): Promise<AdminData> {
     clicksByProduct: {} as Record<string, number>,
     dailyClicks: [] as { day: string; count: number }[],
     dailyClicksByProduct: {} as Record<string, { day: string; count: number }[]>,
+    dailyClicksByPlatform: {} as Record<string, { day: string; count: number }[]>,
   }))
 
   return { resetAt: resetAt.toISOString(), users: Array.from(byId.values()), ...aggregates }

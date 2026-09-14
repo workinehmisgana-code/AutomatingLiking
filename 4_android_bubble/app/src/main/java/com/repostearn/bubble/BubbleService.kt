@@ -236,15 +236,36 @@ class BubbleService : Service() {
     private val cooldownMinMs = 12_000L
     private val cooldownMaxMs = 22_000L
 
-    private fun setActionsEnabled(enabled: Boolean) {
-        nextButton?.isEnabled = enabled
-        unrelatedButton?.isEnabled = enabled
-        nextButton?.alpha = if (enabled) 1f else 0.5f
-        unrelatedButton?.alpha = if (enabled) 1f else 0.5f
+    /**
+     * Put the two buttons in the state the current guards call for.
+     *
+     * They are NOT the same state, and that is the point:
+     *
+     *   NEXT is held by both guards - an operation in flight AND the cooldown.
+     *   UNRELATED is held only while an operation is in flight.
+     *
+     * Unrelated has to stay live through the cooldown because the cooldown is
+     * time to read the video and write a comment, and the whole reason to press
+     * Unrelated is that this video is not one you can comment on. Making people
+     * sit out twenty seconds before they can say so wasted exactly the time the
+     * pause exists to give them.
+     *
+     * It is still shut while an operation is in flight, which is a different
+     * guard: that one stops a double tap flagging the same link twice or racing
+     * the advance.
+     */
+    private fun refreshActionButtons() {
+        val cooling = cooldownTicker != null
+        val nextOn = !busy && !cooling
+        val unrelatedOn = !busy
+        nextButton?.isEnabled = nextOn
+        nextButton?.alpha = if (nextOn) 1f else 0.5f
+        unrelatedButton?.isEnabled = unrelatedOn
+        unrelatedButton?.alpha = if (unrelatedOn) 1f else 0.5f
     }
 
-    private fun lock() { busy = true; setActionsEnabled(false) }
-    private fun unlock() { cancelCooldown(); busy = false; setActionsEnabled(true) }
+    private fun lock() { busy = true; refreshActionButtons() }
+    private fun unlock() { cancelCooldown(); busy = false; refreshActionButtons() }
 
     /**
      * Hold the actions closed for a random 12-22 seconds, counting down on the
@@ -254,8 +275,10 @@ class BubbleService : Service() {
      * seconds reads as a broken app, and people force-close it and reopen it.
      * Showing the seconds turns the same wait into an obvious rule.
      *
-     * Unrelated is held too - it calls openNextLink() itself, so leaving it live
-     * would just be a second Next with no pause.
+     * Unrelated stays live throughout. It does call openNextLink() itself, so it
+     * can be used to move on early - but only by first declaring the current
+     * link unrelated, which drops that click server-side. It is a way out of a
+     * link you cannot comment on, not a way to skip the pause.
      */
     private fun startCooldown() {
         cancelCooldown()
@@ -274,18 +297,28 @@ class BubbleService : Service() {
             }
         }
         cooldownTicker = tick
+        // The OPERATION is over - the link is open and the click is recorded.
+        // What remains is the pause, and the pause is Next's alone. Leaving
+        // `busy` set here is what used to hold Unrelated shut for the whole
+        // countdown: it was standing in for two different things at once.
+        busy = false
         ui.post(tick)
+        refreshActionButtons()
     }
 
     private fun cancelCooldown() {
         cooldownTicker?.let { ui.removeCallbacks(it) }
         cooldownTicker = null
         nextButton?.text = nextLabel
+        refreshActionButtons()
     }
 
     // ── Next → record click, then open the link ──────────────────────────────
     private fun onNext() {
-        if (busy) return
+        // Both guards apply here. The button is disabled in either state, so this
+        // is belt and braces - but a stray tap that arrives in the same frame as
+        // the disable must not open a link.
+        if (busy || cooldownTicker != null) return
         openNextLink()
     }
 
@@ -363,6 +396,8 @@ class BubbleService : Service() {
     // it from this user from now on — then move straight on to the next link, so
     // one tap replaces "Unrelated, then Next".
     private fun onMarkUnrelated() {
+        // `busy`, not the cooldown: an operation in flight blocks this, a running
+        // countdown does not. Pressing Unrelated mid-cooldown is the normal case.
         if (busy) return
         val token = AuthStore.token(this) ?: run { promptSignIn(); return }
         val current = LinkStore.current(this)

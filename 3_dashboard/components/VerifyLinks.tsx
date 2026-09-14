@@ -60,6 +60,8 @@ function parseCsv(text: string): string[][] {
 
 interface ChannelRank {
   handle: string
+  /** Which site the channel is on — a handle alone does not say. */
+  platform: 'tiktok' | 'instagram' | 'youtube'
   links: number
   active: number
   blocked: number
@@ -284,6 +286,41 @@ export default function VerifyLinks() {
 
   const mergeChannel = () => mergeChannels(Array.from(mergeAccounts))
 
+  // ── Review every staged channel, one at a time ──────────────────────────────
+  // Open the channel, look at it, merge it or set it aside. The whole staging
+  // list is 2,000+ channels, so the modal has to hold your place: a merged
+  // channel leaves the list by itself, and one you decide against is hidden for
+  // the session rather than sitting at the top of every later pass.
+  const [channelsOpen, setChannelsOpen] = useState(false)
+  const [chanQuery, setChanQuery] = useState('')
+  const [chanSort, setChanSort] = useState<'links' | 'name'>('links')
+  const [chanSeen, setChanSeen] = useState<Set<string>>(new Set())
+  const [chanHidden, setChanHidden] = useState<Set<string>>(new Set())
+  const [chanBusy, setChanBusy] = useState('')
+
+  const chanShown = useMemo(() => {
+    const q = chanQuery.trim().toLowerCase()
+    const out = accounts.filter(
+      (a) => !chanHidden.has(a.account) && (q === '' || a.account.toLowerCase().includes(q))
+    )
+    return chanSort === 'name'
+      ? [...out].sort((a, b) => a.account.localeCompare(b.account))
+      : [...out].sort((a, b) => b.n - a.n || a.account.localeCompare(b.account))
+  }, [accounts, chanQuery, chanSort, chanHidden, chanSeen])
+
+  const chanLinksShown = chanShown.reduce((n, a) => n + a.n, 0)
+
+  /** Merge one channel from the modal, without the list jumping under you. */
+  async function mergeOneChannel(account: string) {
+    if (chanBusy) return
+    setChanBusy(account)
+    try {
+      await mergeChannels([account])
+    } finally {
+      setChanBusy('')
+    }
+  }
+
   // Switching the filter changes what lands on every page, so jump back to page 0.
   // No explicit re-fetch: changing titleFilter gives fetchPage a new identity, and
   // the effect above re-runs on it — so this always costs exactly one request.
@@ -302,6 +339,29 @@ export default function VerifyLinks() {
     for (const r of rows) (selected.has(r.url) ? sel : rest).push(r)
     return [...sel, ...rest]
   }, [rows, pinSelected, selected])
+
+  // Consecutive rows of the same channel, so the table can print one heading per
+  // channel instead of repeating the account on every line. The query already
+  // returns each channel's links in one run (see getVerifyLinks); this only has
+  // to notice where a run starts and ends.
+  //
+  // Built from displayRows, not rows: with "Mark unrelated" pinning selections
+  // to the top the display order is what the reader sees, and a heading that
+  // disagreed with it would be worse than none.
+  const rowGroups = useMemo(() => {
+    const out: { account: string | null; platform: string | null; bio: string | null; rows: VRow[] }[] = []
+    for (const r of displayRows) {
+      const key = (r.account || '').toLowerCase()
+      const last = out[out.length - 1]
+      if (last && (last.account || '').toLowerCase() === key) last.rows.push(r)
+      else out.push({ account: r.account, platform: r.platform, bio: r.bio, rows: [r] })
+    }
+    return out
+  }, [displayRows])
+
+  /** How many links this channel has staged in TOTAL, not just on this page. */
+  const stagedFor = (account: string | null) =>
+    accounts.find((a) => a.account.toLowerCase() === (account || '').toLowerCase())?.n ?? null
 
   const toggle = (url: string) =>
     setSelected((prev) => {
@@ -572,11 +632,17 @@ export default function VerifyLinks() {
           (older ? ` — ${older.toLocaleString()} older one(s) passed over.` : '.')
         )
         if (d.done) {
+          const skipped = Number(d.skippedOtherSites) || 0
           setExNote(
             `Done — ${found.toLocaleString()} new link(s) added to this list` +
             (older
               ? `, and ${older.toLocaleString()} older than what we already had were skipped.`
-              : '.')
+              : '.') +
+            (skipped
+              ? ` ${skipped.toLocaleString()} channel(s) were not checked: fetching new videos ` +
+                'works for TikTok only — scrape Instagram and YouTube channels with ' +
+                '1_tiktok_search_scraper and upload the CSV here.'
+              : '')
           )
           break
         }
@@ -682,6 +748,14 @@ export default function VerifyLinks() {
           className="text-sm text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 rounded-lg px-3 py-1.5 transition-colors"
         >
           {merging ? 'Merging…' : `🔀 Merge this page into main links${rows.length ? ` (${rows.length})` : ''}`}
+        </button>
+        <button
+          type="button"
+          onClick={() => setChannelsOpen(true)}
+          title="List every staged channel so you can open each one, check it, and merge all of its videos"
+          className="text-sm text-white bg-teal-700 hover:bg-teal-600 border border-teal-600 rounded-lg px-3 py-1.5 transition-colors"
+        >
+          📋 Review channels{accounts.length ? ` (${accounts.length})` : ''}
         </button>
         <button
           type="button"
@@ -806,6 +880,18 @@ export default function VerifyLinks() {
                       <span className="flex-1 min-w-0 truncate text-[11px] text-zinc-300">
                         @{a.account}
                       </span>
+                      {channelUrl(a.account, a.platform) && (
+                        <a
+                          href={channelUrl(a.account, a.platform) as string}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          onClick={(e) => e.stopPropagation()}
+                          title={`Open @${a.account} on ${a.platform || 'tiktok'}`}
+                          className="shrink-0 text-[10px] text-zinc-500 hover:text-emerald-400"
+                        >
+                          ↗
+                        </a>
+                      )}
                       <span className="shrink-0 text-[10px] text-zinc-600 tabular-nums">
                         {a.n.toLocaleString()}
                       </span>
@@ -900,9 +986,10 @@ export default function VerifyLinks() {
                 >
                   <span className="w-12 shrink-0 text-right text-zinc-600 tabular-nums">{c.rank}</span>
                   <a
-                    href={`https://www.tiktok.com/@${c.handle}`}
+                    href={channelUrl(c.handle, c.platform) as string}
                     target="_blank"
                     rel="noopener noreferrer"
+                    title={`Open @${c.handle} on ${c.platform}`}
                     className="flex-1 min-w-0 truncate text-zinc-300 hover:text-emerald-400"
                   >
                     @{c.handle}
@@ -979,7 +1066,70 @@ export default function VerifyLinks() {
         ) : displayRows.length === 0 ? (
           <p className="text-sm text-zinc-500 text-center py-12">No links. Upload a channel CSV to begin.</p>
         ) : (
-          displayRows.map((r) => (
+          rowGroups.map((g) => {
+            const staged = stagedFor(g.account)
+            const href = channelUrl(g.account, g.platform)
+            const groupUrls = g.rows.map((r) => r.url)
+            const allPicked = groupUrls.every((u) => selected.has(u))
+            return (
+            <div key={`${g.account ?? 'none'}-${g.rows[0].url}`}>
+            {/* One heading per channel. A channel is judged as a whole, so its
+                name, bio and controls belong once above its links rather than
+                repeated on every row. */}
+            <div className="flex items-center gap-2 px-3 py-1.5 bg-zinc-900/70 border-y border-zinc-800 sticky top-0 z-10">
+              <span className="w-6 shrink-0 flex justify-center">
+                <input
+                  type="checkbox"
+                  checked={allPicked}
+                  onChange={() =>
+                    setSelected((prev) => {
+                      const n = new Set(prev)
+                      for (const u of groupUrls) allPicked ? n.delete(u) : n.add(u)
+                      return n
+                    })
+                  }
+                  title={allPicked ? "Unselect this channel's links on this page" : "Select this channel's links on this page"}
+                  className="accent-teal-500 cursor-pointer"
+                />
+              </span>
+              <span className="min-w-0 flex items-center gap-1.5">
+                <span className="text-sm text-zinc-100 truncate">@{g.account || 'no channel'}</span>
+                {href && (
+                  <a
+                    href={href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title={`Open @${g.account} on ${g.platform || 'tiktok'} in a new tab`}
+                    className="shrink-0 text-xs text-emerald-400 hover:text-emerald-300"
+                  >
+                    ↗
+                  </a>
+                )}
+              </span>
+              <span className="shrink-0 text-[11px] text-zinc-500 tabular-nums">
+                {g.rows.length.toLocaleString()} here
+                {staged !== null && staged !== g.rows.length && (
+                  <span className="text-zinc-600"> · {staged.toLocaleString()} staged</span>
+                )}
+              </span>
+              {g.bio && (
+                <span className="flex-1 min-w-0 truncate text-[11px] text-zinc-600" title={g.bio}>
+                  {g.bio}
+                </span>
+              )}
+              {g.account && (
+                <button
+                  type="button"
+                  disabled={merging}
+                  onClick={() => mergeChannels([g.account as string])}
+                  title={`Merge every link from @${g.account} into the main list — the whole channel, across all pages`}
+                  className="ml-auto shrink-0 text-[11px] text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 rounded px-2 py-0.5 transition-colors"
+                >
+                  🔀 merge channel
+                </button>
+              )}
+            </div>
+            {g.rows.map((r) => (
             <div key={r.url} className={`flex items-center gap-2 px-3 py-2 border-b border-zinc-800/60 text-sm ${selected.has(r.url) ? 'bg-amber-500/15 border-l-4 border-l-amber-400 pl-2' : ''}`}>
               <span className="w-6 shrink-0 flex justify-center">
                 <input type="checkbox" checked={selected.has(r.url)} onChange={() => toggle(r.url)} className="accent-teal-500 cursor-pointer" />
@@ -1063,9 +1213,140 @@ export default function VerifyLinks() {
                 )
               })()}
             </div>
-          ))
+            ))}
+            </div>
+          )})
         )}
       </div>
+      {/* Every staged channel, to be reviewed one at a time */}
+      {channelsOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center p-4 overflow-y-auto"
+          onClick={() => setChannelsOpen(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-3xl mt-6 rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-4 px-4 py-3 border-b border-zinc-800">
+              <div>
+                <h2 className="text-sm font-semibold text-white">Channels staged for review</h2>
+                <p className="text-[11px] text-zinc-500 mt-0.5">
+                  Open a channel, decide, then merge all of its videos or set it aside.
+                  Merging takes the channel in full, across every page.
+                </p>
+              </div>
+              <button
+                onClick={() => setChannelsOpen(false)}
+                className="text-zinc-500 hover:text-white text-lg leading-none"
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-4">
+              <div className="flex flex-wrap items-center gap-2 mb-3">
+                <input
+                  value={chanQuery}
+                  onChange={(e) => setChanQuery(e.target.value)}
+                  placeholder="Find a channel…"
+                  className="flex-1 min-w-[10rem] bg-zinc-900 border border-zinc-700 rounded-lg px-2.5 py-1.5 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-emerald-500"
+                />
+                <select
+                  value={chanSort}
+                  onChange={(e) => setChanSort(e.target.value as 'links' | 'name')}
+                  className="bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-sm text-zinc-300 focus:outline-none focus:border-emerald-500"
+                >
+                  <option value="links">Most links first</option>
+                  <option value="name">By name</option>
+                </select>
+                {chanHidden.size > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setChanHidden(new Set())}
+                    title="Bring back the channels you set aside this session"
+                    className="text-xs text-zinc-400 hover:text-zinc-200 border border-zinc-700 rounded-lg px-2 py-1.5"
+                  >
+                    show {chanHidden.size} set aside
+                  </button>
+                )}
+              </div>
+              <p className="text-[11px] text-zinc-500 mb-2">
+                {chanShown.length.toLocaleString()} channel(s) · {chanLinksShown.toLocaleString()} link(s)
+                {chanSeen.size > 0 && <> · {chanSeen.size.toLocaleString()} opened</>}
+              </p>
+
+              {chanShown.length === 0 ? (
+                <p className="text-sm text-zinc-500 py-10 text-center">
+                  {accounts.length === 0
+                    ? 'No channels staged. Upload a channel CSV first.'
+                    : 'Nothing matches — clear the search, or bring back the ones you set aside.'}
+                </p>
+              ) : (
+                <div className="max-h-[60vh] overflow-y-auto rounded-lg border border-zinc-800 divide-y divide-zinc-800/60">
+                  {chanShown.map((a) => {
+                    const href = channelUrl(a.account, a.platform)
+                    const seen = chanSeen.has(a.account)
+                    return (
+                      <div
+                        key={a.account}
+                        className={`flex items-center gap-2 px-3 py-2 text-sm hover:bg-zinc-900/60 ${
+                          seen ? 'bg-zinc-900/40' : ''
+                        }`}
+                      >
+                        <span className="w-16 shrink-0 text-right text-xs text-zinc-500 tabular-nums">
+                          {a.n.toLocaleString()}
+                        </span>
+                        <span className="w-20 shrink-0 text-[10px] text-zinc-600">{a.platform}</span>
+                        <span className="flex-1 min-w-0 truncate text-zinc-200">
+                          @{a.account}
+                          {seen && <span className="ml-1.5 text-[10px] text-zinc-600">opened</span>}
+                        </span>
+                        {href && (
+                          <a
+                            href={href}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            // Opening IS the review step, so it marks the row —
+                            // 2,000 channels is far too many to hold in your head.
+                            onClick={() =>
+                              setChanSeen((prev) => new Set(prev).add(a.account))
+                            }
+                            title={`Open @${a.account} on ${a.platform || 'tiktok'} in a new tab`}
+                            className="shrink-0 text-xs text-emerald-400 hover:text-emerald-300 border border-emerald-500/30 rounded-lg px-2 py-1"
+                          >
+                            ↗ view
+                          </a>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => void mergeOneChannel(a.account)}
+                          disabled={merging || chanBusy !== ''}
+                          title={`Merge all ${a.n.toLocaleString()} of @${a.account}'s staged links into the main list`}
+                          className="shrink-0 text-xs text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 rounded-lg px-2 py-1 transition-colors"
+                        >
+                          {chanBusy === a.account ? 'Merging…' : '🔀 merge all'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setChanHidden((prev) => new Set(prev).add(a.account))
+                          }
+                          title="Set aside for now — hidden until you reopen this page. Nothing is deleted or blocked."
+                          className="shrink-0 text-xs text-zinc-500 hover:text-zinc-200 border border-zinc-700 rounded-lg px-2 py-1"
+                        >
+                          skip
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

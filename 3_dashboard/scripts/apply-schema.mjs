@@ -18,25 +18,42 @@ for (const l of env.split('\n')) {
 
 const src = readFileSync(new URL('../lib/db.ts', import.meta.url), 'utf8')
 
-// The template literal passed to pool.query inside ensureClickedTable.
-const start = src.indexOf('export function ensureClickedTable')
-if (start < 0) throw new Error('ensureClickedTable not found')
-const open = src.indexOf('`', start)
-const close = src.indexOf('`', open + 1)
-const ddl = src.slice(open + 1, close)
-if (!ddl.includes('link_scan_run')) {
-  throw new Error('the extracted block is not the schema — lib/db.ts has moved')
+// Both lazy-DDL functions, not just the first. product_comment_setting lives in
+// ensureAdminTables, so a run that only executed ensureClickedTable reported a
+// clean schema while a column added there did not exist — which is exactly the
+// failure this script is for.
+function ddlOf(fnName, mustContain) {
+  const start = src.indexOf(fnName)
+  if (start < 0) throw new Error(`${fnName} not found`)
+  const open = src.indexOf('`', start)
+  const close = src.indexOf('`', open + 1)
+  const block = src.slice(open + 1, close)
+  if (!block.includes(mustContain)) {
+    throw new Error(`the block extracted for ${fnName} is not the schema — lib/db.ts has moved`)
+  }
+  return block
 }
+
+const blocks = [
+  ['ensureClickedTable', ddlOf('export function ensureClickedTable', 'link_scan_run')],
+  // 'export function', not the bare name: the first bare match is a CALL SITE
+  // 2,400 lines earlier, and the backtick after it belongs to someone else's
+  // query entirely.
+  ['ensureAdminTables', ddlOf('export function ensureAdminTables', 'product_comment_setting')],
+]
 
 const pool = new pg.Pool({
   connectionString: process.env.POSTGRES_URL || process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 })
 try {
-  await pool.query(ddl)
-  console.log(`schema applied — ${ddl.split('CREATE TABLE').length - 1} table statement(s) parsed and run`)
+  for (const [name, ddl] of blocks) {
+    await pool.query(ddl)
+    console.log(`${name}: ${ddl.split('CREATE TABLE').length - 1} table statement(s) parsed and run`)
+  }
+  console.log('schema applied')
 } catch (e) {
-  console.error('SCHEMA FAILED — ensureClickedTable would throw for every caller:')
+  console.error('SCHEMA FAILED — the app would throw for every caller of that block:')
   console.error('  ' + String(e.message || e))
   await pool.end()
   process.exit(1)

@@ -6,6 +6,7 @@
 // contains.
 
 import { list, put } from '@vercel/blob'
+import { platformFromUrl } from './config'
 import {
   getVerifyLinksByUrls,
   getVerifyLinksByAccounts,
@@ -78,7 +79,8 @@ export async function mergeVerifyLinks(opts: {
   const now = new Date().toISOString()
   const incoming: Video[] = verifyRows.map((r) => ({
     url: r.url,
-    platform: 'tiktok',
+    platform: platformFromUrl(r.url),
+    author: (r.account ?? '').replace(/^@/, ''),
     search_query: '',
     search_rank: 0, // no rank — clusters by posted date only
     like_count: r.heart_count,

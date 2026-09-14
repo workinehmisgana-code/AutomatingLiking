@@ -530,7 +530,20 @@ UA = (
 
 # Fallback only. The live set arrives from the dashboard alongside the links, so
 # a product switched off there stops being liked here without an edit.
-PRODUCTS = ["purifytext", "acoustictext", "prohumanly", "humlexic", "kinprose", "tintfolio"]
+#
+# cohumanly is in this list but NOT in the dashboard's, so --all-products picks
+# it up from here (the two are unioned) while --products alone would not see it
+# on a run that reaches the dashboard. Add it there too if its comments are
+# meant to be served as well as liked.
+PRODUCTS = [
+    "purifytext",
+    "acoustictext",
+    "prohumanly",
+    "humlexic",
+    "kinprose",
+    "tintfolio",
+    "cohumanly",
+]
 
 VIDEO_ID_RE = re.compile(r"tiktok\.com/@[^/]+/(?:video|photo)/(\d+)", re.I)
 
@@ -611,6 +624,124 @@ def from_dashboard(cluster_by: str, clusters: str, extra: dict) -> tuple[list[st
     if products:
         print(f"active products: {', '.join(products)}")
     return links, products
+
+
+def comment_from_dashboard(url: str, product: str = "") -> tuple[str, str]:
+    """One comment to post on this link, and the product it belongs to.
+
+    The same set the Android app hands its workers, from the same store — asking
+    the dashboard rather than keeping a copy here is what stops the two drifting
+    apart, and it means a product switched off or regenerated there takes effect
+    without an edit.
+
+    Returns ("", "") when the dashboard has nothing to offer, which is a reason
+    to skip the video rather than to stop the run.
+    """
+    env = load_env()
+    base = (env.get("DASHBOARD_URL") or "").rstrip("/")
+    token = env.get("LINKS_EXPORT_TOKEN") or ""
+    if not base or not token:
+        return "", ""
+    params = {"token": token, "url": url}
+    if product:
+        params["product"] = product
+    req = urllib.request.Request(
+        base + "/api/links/comment?" + urlencode(params), headers={"User-Agent": UA}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:120]
+        print(f"     dashboard would not give a comment: HTTP {e.code} {detail}")
+        return "", ""
+    except Exception as e:  # noqa: BLE001
+        print(f"     could not reach the dashboard for a comment: {e}")
+        return "", ""
+    return str(data.get("comment") or ""), str(data.get("product") or "")
+
+
+# Where the comment goes, and what sends it.
+#
+# TikTok's box is a contenteditable div, not an input, so its value cannot be
+# set: React listens for real key events and a programmatic .textContent leaves
+# the Post button disabled. Playwright's type() produces real events, which is
+# why this is done from Python rather than in one evaluate().
+COMMENT_BOX = (
+    '[data-e2e="comment-input"] [contenteditable="true"], '
+    '[data-e2e="comment-input"], '
+    'div[role="textbox"][contenteditable="true"], '
+    '[contenteditable="true"][data-e2e*="comment"]'
+)
+COMMENT_POST = '[data-e2e="comment-post"], [data-e2e="comment-post-btn"]'
+
+
+def post_comment(page, text: str, timeout_ms: int = 15000) -> tuple[bool, str]:
+    """Type a comment into the open panel and send it. Returns (posted, note).
+
+    VERIFIED, not assumed. A click on a disabled Post button does nothing and
+    looks identical to success from here, so the comment list is read back
+    afterwards and the comment is only reported as posted once it is actually
+    on the page. An unverified selector therefore fails loudly instead of
+    silently recording comments that were never made.
+    """
+    box = None
+    for sel in COMMENT_BOX.split(", "):
+        box = page.query_selector(sel.strip())
+        if box:
+            break
+    if not box:
+        return False, "no comment box on the page"
+
+    try:
+        box.click()
+        page.wait_for_timeout(250)
+        # Typed, not pasted: the Post button stays disabled until React has seen
+        # input events, and a paste does not always produce them.
+        page.keyboard.type(text, delay=random.uniform(18, 45))
+        page.wait_for_timeout(400)
+    except Exception as e:  # noqa: BLE001
+        return False, f"could not type: {str(e)[:60]}"
+
+    sent = False
+    for sel in COMMENT_POST.split(", "):
+        el = page.query_selector(sel.strip())
+        if el:
+            try:
+                el.click()
+                sent = True
+                break
+            except Exception:  # noqa: BLE001
+                pass
+    if not sent:
+        # Enter posts when the button cannot be found or clicked.
+        try:
+            page.keyboard.press("Enter")
+            sent = True
+        except Exception as e:  # noqa: BLE001
+            return False, f"could not send: {str(e)[:60]}"
+
+    # Read it back. Our own comment appears at the top of the list once accepted.
+    needle = norm(text)[:40]
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        page.wait_for_timeout(700)
+        try:
+            found = page.evaluate(
+                """(needle) => {
+                  const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+                  for (const el of document.querySelectorAll('[data-e2e="comment-level-1"]')) {
+                    if (norm(el.innerText).includes(needle)) return true
+                  }
+                  return false
+                }""",
+                needle,
+            )
+        except Exception:  # noqa: BLE001
+            found = False
+        if found:
+            return True, "verified on the page"
+    return False, "sent but the comment did not appear"
 
 
 def video_id(url: str) -> str | None:
@@ -1164,6 +1295,13 @@ def main() -> int:
                     help="let the page load video/images — slower, only for debugging")
     ap.add_argument("--unlike", action="store_true", help="remove the like instead of adding it")
     ap.add_argument("--dry-run", action="store_true", help="find targets, like nothing")
+    ap.add_argument("--comment-empty", action="store_true",
+                    help="on a video carrying NONE of our product comments, post one "
+                         "from the dashboard. OFF by default: it is the only thing here "
+                         "that writes something public")
+    ap.add_argument("--comment-product", default="purifytext",
+                    help="which product's comment to post with --comment-empty "
+                         "(default purifytext; blank = let the dashboard choose)")
     ap.add_argument("--keep-failures", action="store_true",
                     help="leave failed rows in done.csv, so failed comments are "
                          "never retried (by default they are dropped and tried again)")
@@ -1252,17 +1390,33 @@ def main() -> int:
     # link. Doing every read first meant a 500-link run spent eight minutes
     # building a list before it liked anything, and a run stopped early had
     # nothing to show for that time. Now the first like lands within seconds.
-    def targets_for(aweme: str) -> tuple[list[dict], int, int]:
-        """Comments on this video worth liking: (todo, matched, already)."""
+    def targets_for(aweme: str) -> tuple[list[dict], int, int, int]:
+        """Comments on this video worth liking.
+
+        Returns (todo, matched, already, product_hits). The last one counts ONLY
+        comments naming a product, which is what "this video carries none of
+        ours" means — `matched` also includes --users and --all matches, and a
+        video full of a watched handle's comments is not an empty one.
+        """
         comments = fetch_comments(aweme, args.pages)
         picks = [c for c in comments if wanted(c, products, users, args.all)]
         fresh = [c for c in picks if c["cid"] not in done and not c["already"]]
-        return fresh, len(picks), len(picks) - len(fresh)
+        hits = sum(1 for c in comments if products and wanted(c, products, set(), False))
+        return fresh, len(picks), len(picks) - len(fresh), hits
 
     if args.dry_run:
         found = 0
+        would_post = 0
         for url, aweme in targets_videos:
-            todo, matched, already = targets_for(aweme)
+            todo, matched, already, hits = targets_for(aweme)
+            # The same test the real run makes, so a dry run shows exactly which
+            # videos would be written on before any of them are.
+            if args.comment_empty and not todo and hits == 0:
+                text, prod = comment_from_dashboard(url, args.comment_product)
+                if text:
+                    would_post += 1
+                    print(f"  {url}")
+                    print(f"      WOULD COMMENT ({prod}): {text[:70]}")
             if not todo:
                 continue
             print(f"  {url}")
@@ -1283,7 +1437,7 @@ def main() -> int:
         return 1
 
     f, w = open_done()
-    ok = failed = 0
+    ok = failed = commented = 0
     try:
         with sync_playwright() as p:
             ctx = launch_liker(
@@ -1337,6 +1491,19 @@ def main() -> int:
 
             digg_type = 0 if args.unlike else 1
             started = time.time()
+
+            def record_post(url, aweme, key, prod, text, status, note):
+                """A POSTED comment, in the same ledger as the likes.
+
+                Keyed "post:<aweme>" rather than a comment id: TikTok gives the
+                new comment one only after it appears, and the key is needed
+                before that to stop a re-run commenting twice on the same video.
+                """
+                w.writerow([
+                    time.strftime("%Y-%m-%dT%H:%M:%S"), url, aweme, key,
+                    prod or args.comment_product, text[:200], status, note[:120],
+                ])
+                f.flush()
 
             def record(url, aweme, c, status, note):
                 w.writerow(
@@ -1439,7 +1606,55 @@ def main() -> int:
                 total_videos = len(targets_videos)
                 for vn, (url, aweme) in enumerate(targets_videos, 1):
                     # Read THIS link's comments now, not all of them up front.
-                    wants, matched, already_liked = targets_for(aweme)
+                    wants, matched, already_liked, product_hits = targets_for(aweme)
+                    # A video carrying NONE of our comments is the one worth
+                    # writing on, and with --comment-empty that is what happens:
+                    # the dashboard hands over one of its stored comments (the
+                    # same set the Android app gives its workers) and it is
+                    # posted here. Off by default — it is the only thing in this
+                    # script that writes something public.
+                    if not wants and args.comment_empty and product_hits == 0:
+                        key = f"post:{aweme}"
+                        if key in done:
+                            print(f"  [{vn}/{total_videos}] {aweme}: already commented on")
+                            continue
+                        text, prod = comment_from_dashboard(url, args.comment_product)
+                        if not text:
+                            print(f"  [{vn}/{total_videos}] {aweme}: no comment to post")
+                            continue
+                        print(
+                            f"  [{vn}/{total_videos}] {aweme}: none of ours — "
+                            f"commenting as {prod or args.comment_product}"
+                        )
+                        print(f"       {text[:70]}")
+                        if not open_video(page, url):
+                            print("     page did not render, skipping")
+                            time.sleep(random.uniform(lo, hi))
+                            continue
+                        if page_is_logged_out(page):
+                            print("     logged out — skipping the comment")
+                            continue
+                        if captcha_present(page):
+                            if not wait_out_captcha(page, args.profile, args.headed,
+                                                    tried_api=args.solve_captcha):
+                                break
+                        if not open_comments(page):
+                            record_post(url, aweme, key, prod, text,
+                                        "fail:dom", "comment panel did not open")
+                            print("     comment panel did not open")
+                            time.sleep(random.uniform(lo, hi))
+                            continue
+                        posted, note = post_comment(page, text)
+                        record_post(url, aweme, key, prod, text,
+                                    "ok" if posted else "fail:post", note)
+                        done.add(key)
+                        commented += 1 if posted else 0
+                        print(f"     {'commented' if posted else 'NOT posted'} - {note}")
+                        # A comment is a much bigger action than a like, so the
+                        # pause after one is longer than the like delay.
+                        time.sleep(random.uniform(lo * 2, hi * 2))
+                        continue
+
                     if not wants:
                         # Nothing to do here, so the page is never even loaded —
                         # which is most of the list and costs nothing.

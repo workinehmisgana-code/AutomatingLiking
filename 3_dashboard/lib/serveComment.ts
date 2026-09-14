@@ -4,15 +4,14 @@ import { getFreshComments } from './commentGen'
 /**
  * Choose the comment to serve for one link.
  *
- * Fairness is PER LINK, not global: we look at how many times each product's
- * comment has already been served for this exact URL and pick the least-served
- * one (random among ties). A link that has been advertising one product over and
- * over therefore keeps handing the next turns to the others until they catch up.
+ * The PRODUCT is decided first and is a property of the video, not of this
+ * click: whichever of our products already leads that video's comment section
+ * gets every further comment on it, so one product dominates rather than four
+ * arguing. pickFairProductForUrl holds that rule and the reasoning behind it.
  *
- * Picking the product before the comment also removes a second, subtler bias:
- * drawing uniformly from one flattened pool favours whichever product simply has
- * the most comments written for it. Here every product gets an equal shot, then a
- * random comment is taken from within it.
+ * Only the COMMENT is random, drawn from within the chosen product. Drawing from
+ * one flattened pool instead would also have let whichever product simply has
+ * the most comments written for it win the video.
  *
  * Returns nulls when no product is active or the chosen product has no comments,
  * in which case the caller should record the click with no product.

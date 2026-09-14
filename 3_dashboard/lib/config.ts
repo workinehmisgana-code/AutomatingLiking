@@ -299,6 +299,17 @@ export const APP_LINK_BATCH = Math.max(1, Number(process.env.APP_LINK_BATCH || 1
 // ── Comment verification gate ────────────────────────────────────────────────
 // Before anyone can work, they must prove they can actually post a comment from
 // the TikTok account they registered. Everyone comments something harmless on
+// Where the work actually happens.
+//
+// The guide page is public and meant to be SHARED — a link in a group chat, a
+// message to someone who has not joined yet. So it has to send the reader
+// somewhere absolute: a relative "/" is wrong the moment the page is read from
+// a preview deployment, and useless the moment the text is copied anywhere
+// else. Overridable so a domain change needs no code edit.
+export const SITE_URL = (
+  process.env.NEXT_PUBLIC_SITE_URL || 'https://comments-delta-sand.vercel.app'
+).replace(/\/+$/, '')
+
 // ONE designated video; a checker reads that video's commenters and marks the
 // matching users valid (see 5_comment_verifier). Until then they are held.
 //
@@ -330,15 +341,15 @@ export const PRODUCTS = [
 export type Product = (typeof PRODUCTS)[number]
 
 /**
- * The product that opens a link we KNOW carries none of ours.
+ * NO LONGER USED to choose a product — kept only so nothing importing it breaks.
  *
- * Only the first comment. Once a link has one, every product is back in the
- * draw on equal terms — this decides who goes first on a clean video, not who
- * owns it.
+ * A video is now owned by ONE product: whichever already leads its comment
+ * section, or one derived from the URL when it has none. Opening every clean
+ * video with purifytext would have made purifytext the leader on all of them,
+ * and no other product would ever have held a video. See the "Which product a
+ * link advertises next" note in lib/db.ts.
  *
- * "Know" is meant strictly: the extraction must have read the video and found
- * none of ours. A link nobody has looked at does not count, because unexamined
- * and empty are not the same thing and most of the pool is the former.
+ * @deprecated
  */
 export const FIRST_ON_EMPTY_PRODUCT: Product = 'purifytext'
 
@@ -379,12 +390,49 @@ export interface CommentStyle {
   splitBrand: boolean
   /** Wrap the name in double quotes. */
   quoteBrand: boolean
+  /**
+   * Which of three pitches the comment makes. Not three wordings — three
+   * different things to be, and which one lands is a thing to try rather than
+   * reason about, so it is a setting.
+   *
+   *   question       the claim is PRESUPPOSED and the comment asks about
+   *                  something else — "why does nothing else come back 0% like
+   *                  purify text does?". The reader draws the conclusion.
+   *   recommendation a person saying what they use and why it worked —
+   *                  "i switched to purify text and mine passes now".
+   *   informational  a neutral fact, no endorsement and no superlative —
+   *                  "purify text rewrites ai text so detectors read it as
+   *                  human". Says what the thing IS, and lets that stand.
+   *   curious        a question asked of a PERSON, that genuinely wants an
+   *                  answer — "what made you switch to purify text? the flow
+   *                  reads really clean". The product is an aside inside a
+   *                  question about them, not the subject of it.
+   *
+   * question and curious are both questions and are not the same thing. The
+   * first is rhetorical and expects no reply: it presupposes the claim and asks
+   * around it. The second is addressed to someone, wants a reply, and mentions
+   * the product in passing — which is what makes the endorsement incidental
+   * rather than the point.
+   */
+  voice: CommentVoice
+}
+
+export type CommentVoice = 'question' | 'recommendation' | 'informational' | 'curious'
+export const COMMENT_VOICES: readonly CommentVoice[] = [
+  'question',
+  'recommendation',
+  'informational',
+  'curious',
+] as const
+export function isCommentVoice(v: unknown): v is CommentVoice {
+  return typeof v === 'string' && (COMMENT_VOICES as readonly string[]).includes(v)
 }
 
 export const DEFAULT_COMMENT_STYLE: CommentStyle = {
   emoji: true,
   splitBrand: true,
   quoteBrand: true,
+  voice: 'question',
 }
 
 /** The brand exactly as it should appear in a comment, under these settings. */
@@ -473,6 +521,28 @@ export const HOURLY_WINDOW_MS = 60 * 60 * 1000 // 1 hour
 // The link platforms whose quota + wait window are individually configurable.
 export const CLICK_PLATFORMS = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram'] as const
 export type ClickPlatform = (typeof CLICK_PLATFORMS)[number]
+
+/**
+ * Which platform a link belongs to, read from the URL itself.
+ *
+ * The URL is the only trustworthy source. Rows arrive from CSV uploads, channel
+ * scrapes and the verify list, and each of those had its own idea of what to put
+ * in a platform field — the verify list defaulted every row to 'tiktok' and
+ * never wrote anything else, so 68k Instagram links were all labelled TikTok.
+ * Mislabelling is not cosmetic: platform decides which tab a link appears under,
+ * which hourly quota it counts against, and which retirement threshold applies.
+ *
+ * Falls back to 'tiktok' for an unrecognised host, which is what every caller
+ * assumed before this existed.
+ */
+export function platformFromUrl(url: string): ClickPlatform {
+  const u = String(url ?? '').toLowerCase()
+  if (u.includes('instagram.com')) return 'instagram'
+  if (u.includes('youtube.com') || u.includes('youtu.be')) {
+    return u.includes('/shorts/') ? 'youtube_shorts' : 'youtube_videos'
+  }
+  return 'tiktok'
+}
 
 export const CLICK_PLATFORM_LABELS: Record<string, string> = {
   tiktok: 'TikTok',

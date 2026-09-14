@@ -2,9 +2,20 @@
 // them without asking anyone.
 //
 // WHICH CHANNELS
-// The ones ranking in the top half — score >= HARVEST_MIN_SCORE (0.5) in
-// lib/channelRank. That score is four percentiles blended, so "top half" means
-// half of the channels we know about, not half of some absolute scale.
+// The ones whose links mostly SURVIVE: at least HARVEST_MIN_ACTIVE_PCT (50) per
+// cent of everything we have ever held for that channel is still active rather
+// than blocked. Channels below that line are left alone for a person to extract
+// and filter by hand.
+//
+// An absolute bar, not a relative one. It used to be "the top half by rank
+// score" — four percentiles blended — which always admits half the channels
+// however bad they all are, and would keep harvesting from a channel whose
+// every link had been blocked simply because the others were worse. Measured on
+// the live pool: 1,138 of 5,448 channels clear 50%, and 3,993 sit at 0-9% —
+// channels whose work has been thrown out almost in its entirety.
+//
+// rankChannels still decides the ORDER — it returns best-first — so the most
+// promising of the eligible channels are visited first on each pass.
 //
 // WHAT HAPPENS TO WHAT IT FINDS
 // Everything new is staged in verify_link first, exactly as the manual Extract
@@ -35,8 +46,16 @@ import {
   setAppState,
 } from './db'
 
-/** A channel is worth harvesting from once it ranks in the top half. */
-export const HARVEST_MIN_SCORE = 0.5
+/**
+ * The share of a channel's links that must still be active for the automatic
+ * harvest to take it. Below this, the channel is a person's job.
+ *
+ * "Active" is measured against every link we have ever held for the channel,
+ * blocked ones included, even those long gone from the pool — a channel is not
+ * rehabilitated by its bad links being deleted.
+ */
+export const HARVEST_MIN_ACTIVE_PCT = 50
+
 
 /** Where the last run stopped, so the next one carries on. */
 const CURSOR_KEY = 'channel_harvest_cursor'
@@ -92,7 +111,14 @@ export async function getLastHarvest(): Promise<LastRun | null> {
  */
 export async function harvestOnce(deadline: number): Promise<HarvestResult> {
   const ranked = await rankChannels()
-  const eligible = ranked.filter((c) => c.score >= HARVEST_MIN_SCORE)
+  // rankChannels returns best-first, so filtering keeps that order: the most
+  // promising eligible channel is visited first on each pass.
+  //
+  // A null ratio means the channel has neither an active nor a blocked link —
+  // nothing to judge it on — and it is excluded rather than assumed good.
+  const eligible = ranked.filter(
+    (c) => c.activePct !== null && c.activePct >= HARVEST_MIN_ACTIVE_PCT
+  )
 
   const empty: HarvestResult = {
     eligible: eligible.length,

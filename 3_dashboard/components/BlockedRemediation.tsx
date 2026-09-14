@@ -11,9 +11,12 @@ import { ADMIN_TELEGRAM } from '@/lib/config'
 export default function BlockedRemediation({
   reason,
   email,
+  auto = false,
 }: {
   reason: 'bank' | 'tiktok'
   email?: string
+  /** Blocked by the nightly presence check rather than by a person. */
+  auto?: boolean
 }) {
   const router = useRouter()
   const [value, setValue] = useState('')
@@ -24,7 +27,9 @@ export default function BlockedRemediation({
   const title = isBank ? 'Your bank account needs updating' : 'Your TikTok account needs updating'
   const explain = isBank
     ? 'Your account was blocked because the bank account number you gave appears to be incorrect. Enter a new, correct bank account number to continue.'
-    : 'Your account was blocked because your TikTok account’s visibility is restricted. Enter a different TikTok profile link (a public account) to continue.'
+    : auto
+      ? 'We checked the videos you opened and could not find your comments on them. That usually means the account you registered is restricted, so nobody can see what you post. Enter a different TikTok account below and you are back in straight away — or sign in again with another account.'
+      : 'Your account was blocked because your TikTok account’s visibility is restricted. Enter a different TikTok profile link (a public account) to continue.'
   const label = isBank ? 'New bank account number' : 'New TikTok profile link'
   const placeholder = isBank ? 'Correct account number' : 'https://www.tiktok.com/@you'
 
@@ -86,6 +91,20 @@ export default function BlockedRemediation({
           className="mt-6 w-full bg-emerald-600 text-white font-medium rounded-lg px-4 py-2.5 hover:bg-emerald-500 transition-colors disabled:opacity-50"
         >
           {saving ? 'Saving…' : 'Save and continue'}
+        </button>
+
+        {/* A second way out, for someone whose whole sign-in is the wrong one.
+            Signing out lands on the login page, where Google offers the account
+            picker — so "use a different account" is one screen away. */}
+        <button
+          type="button"
+          onClick={async () => {
+            await signOut()
+            window.location.href = '/'
+          }}
+          className="mt-3 w-full text-sm text-zinc-200 border border-zinc-700 bg-zinc-800/60 hover:bg-zinc-800 rounded-lg px-4 py-2.5 transition-colors"
+        >
+          Sign in again with a different account
         </button>
 
         <div className="mt-6 flex items-center justify-between text-xs">

@@ -1,7 +1,6 @@
 'use client'
 
 import { useState } from 'react'
-import Link from 'next/link'
 import { en, am, type GuideProps } from '@/components/GuideContent'
 
 type Props = GuideProps
@@ -14,11 +13,13 @@ type Lang = 'en' | 'am'
  * Both languages live in this one file so they can't drift apart, and a toggle
  * swaps between them rather than stacking both — stacked bilingual text doubles
  * the scroll length and makes the steps hard to follow. Every number comes from
- * props (config + live DB) so the guide can't go stale when a quota changes.
+ * props (config + live DB) so the guide can't go stale when a rate changes.
  */
-export default function Guide(props: Props) {
+export default function Guide(props: Props & { signedIn?: boolean }) {
   const [lang, setLang] = useState<Lang>('en')
   const t = lang === 'am' ? am(props) : en(props)
+  // Absolute, because this page gets shared off-site — see SITE_URL in config.
+  const start = props.startUrl || '/'
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-6 sm:py-8">
@@ -41,12 +42,16 @@ export default function Guide(props: Props) {
               </button>
             ))}
           </div>
-          <Link
-            href="/"
-            className="text-xs text-zinc-400 hover:text-white border border-zinc-700 rounded-lg px-2.5 py-1.5 hover:bg-zinc-800 transition-colors"
+          <a
+            href={start}
+            className={`text-xs rounded-lg px-2.5 py-1.5 border transition-colors ${
+              props.signedIn === false
+                ? 'text-white bg-emerald-600 hover:bg-emerald-500 border-emerald-500'
+                : 'text-zinc-400 hover:text-white border-zinc-700 hover:bg-zinc-800'
+            }`}
           >
-            {t.back}
-          </Link>
+            {props.signedIn === false ? t.signIn : t.back}
+          </a>
         </div>
       </div>
 
@@ -60,6 +65,23 @@ export default function Guide(props: Props) {
           </div>
         ))}
       </div>
+
+      <a
+        href={start}
+        className="block rounded-xl border border-emerald-500/40 bg-emerald-600/10 px-4 py-3 mb-6 hover:bg-emerald-600/20 transition-colors group"
+      >
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-emerald-300 group-hover:text-emerald-200">
+              {t.startCta}
+            </div>
+            <div className="text-xs text-zinc-400 mt-0.5 leading-relaxed">{t.startHint}</div>
+          </div>
+          <span className="text-xs text-zinc-500 truncate hidden sm:block">
+            {start.replace(/^https?:\/\//, '')}
+          </span>
+        </div>
+      </a>
 
       {t.sections.map((sec) => (
         <section key={sec.heading} className="mb-7">
@@ -95,30 +117,52 @@ export default function Guide(props: Props) {
         </section>
       ))}
 
-      {/* Hourly quota table — live values */}
-      <section className="mb-7">
-        <h2 className="text-base font-semibold text-white border-b border-zinc-800 pb-1.5 mb-3">
-          {t.quotaHeading}
-        </h2>
-        <p className="text-sm text-zinc-400 mb-3 leading-relaxed">{t.quotaIntro}</p>
-        <div className="rounded-lg border border-zinc-800 overflow-hidden">
-          <div className="flex px-3 py-2 bg-zinc-900 border-b border-zinc-800 text-[11px] uppercase tracking-wide text-zinc-500">
-            <span className="flex-1">{t.quotaCols[0]}</span>
-            <span className="w-40 text-right">{t.quotaCols[1]}</span>
+      {/* Video walkthroughs — whatever the admin has uploaded, in their order */}
+      {props.videos && props.videos.length > 0 && (
+        <section className="mb-7">
+          <h2 className="text-base font-semibold text-white border-b border-zinc-800 pb-1.5 mb-3">
+            {t.videoHeading}
+          </h2>
+          <p className="text-sm text-zinc-400 mb-3 leading-relaxed">{t.videoIntro}</p>
+          <div className="space-y-4">
+            {props.videos.map((v) => (
+              <figure key={v.id} className="rounded-lg border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+                {/* preload="none" — several clips on one page would otherwise
+                    each start pulling data on a phone before anyone pressed
+                    play. The poster frame appears once playback starts. */}
+                <video
+                  src={v.url}
+                  controls
+                  preload="none"
+                  playsInline
+                  className="w-full bg-black aspect-video"
+                />
+                <figcaption className="px-3 py-2">
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-sm font-medium text-zinc-200">{v.title}</span>
+                    {v.lang && (
+                      <span className="text-[10px] uppercase tracking-wide text-zinc-500 border border-zinc-700 rounded px-1.5 py-0.5">
+                        {v.lang === 'am' ? 'አማርኛ' : v.lang}
+                      </span>
+                    )}
+                  </div>
+                  {v.note && <p className="text-xs text-zinc-500 mt-0.5 leading-relaxed">{v.note}</p>}
+                </figcaption>
+              </figure>
+            ))}
           </div>
-          {props.quotas.map((q) => (
-            <div key={q.platform} className="flex px-3 py-2 text-sm border-b border-zinc-800/60 last:border-0">
-              <span className="flex-1 text-zinc-300">{q.platform}</span>
-              <span className="w-40 text-right text-zinc-400 tabular-nums">
-                {q.limit > 0 ? t.quotaValue(q.limit, q.hours) : t.quotaUnlimited}
-              </span>
-            </div>
-          ))}
-        </div>
-        <p className="text-xs text-zinc-500 mt-3 leading-relaxed">{t.quotaFoot}</p>
-      </section>
+        </section>
+      )}
 
-      <p className="text-xs text-zinc-600 border-t border-zinc-800 pt-4">{t.footer}</p>
+      <div className="border-t border-zinc-800 pt-4">
+        <a
+          href={start}
+          className="inline-flex items-center gap-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg px-4 py-2 transition-colors"
+        >
+          {t.startCta}
+        </a>
+        <p className="text-xs text-zinc-600 mt-4">{t.footer}</p>
+      </div>
     </div>
   )
 }

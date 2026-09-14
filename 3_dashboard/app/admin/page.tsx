@@ -5,6 +5,7 @@ import {
   getAdminData,
   getAllPendingPay,
   getApk,
+  getGuideVideos,
   getUserAppVersions,
   getVideoTaskEnabled,
   getPromoTaskEnabled,
@@ -30,7 +31,7 @@ export default async function AdminPage() {
 
   const [
     data, pendingByUser, apk, appVersions, videoTaskEnabled, promoTaskEnabled,
-    presence, presenceHistory, tiktokAccounts,
+    presence, presenceHistory, tiktokAccounts, guideVideos,
   ] = await Promise.all([
     getAdminData(),
     getAllPendingPay().catch(() => ({})),
@@ -45,6 +46,7 @@ export default async function AdminPage() {
     // The numeric TikTok id behind each handle, which dates the account. Picked
     // up for free by presence checks; one small table.
     getTiktokAccounts().catch(() => ({})),
+    getGuideVideos().catch(() => []),
   ])
 
   return (
@@ -59,6 +61,7 @@ export default async function AdminPage() {
       presence={presence}
       presenceHistory={presenceHistory}
       tiktokAccounts={tiktokAccounts}
+      guideVideos={guideVideos}
     />
   )
 }

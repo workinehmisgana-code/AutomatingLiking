@@ -5,8 +5,23 @@
 // Every number comes from Props (config + live DB), never written into the text,
 // so an admin changing a quota or a pay rate can't leave the guide lying.
 
+export interface GuideVideoItem {
+  id: number
+  url: string
+  title: string
+  note: string
+  lang: string
+}
+
 export interface GuideProps {
-  quotas: { platform: string; limit: number; hours: number }[]
+  /** Links shown per page in the dashboard list. */
+  linksPerPage: number
+  /** Absolute URL of the live site — the guide is shared off-site, so its
+   *  "start working" link cannot be relative. */
+  startUrl?: string
+  /** Clips the admin uploaded, in the order they were arranged. Empty is the
+   *  normal state — the guide reads perfectly well without them. */
+  videos?: GuideVideoItem[]
   commentRate: number
   videoBirr: number
   promoBirr: number
@@ -28,12 +43,14 @@ export interface GuideCopy {
   subtitle: string
   back: string
   rates: { label: string; value: string; hint: string }[]
-  quotaHeading: string
-  quotaIntro: string
-  quotaCols: [string, string]
-  quotaValue: (n: number, h: number) => string
-  quotaUnlimited: string
-  quotaFoot: string
+  /** Shown instead of `back` to a visitor who is not signed in. */
+  signIn: string
+  /** The call to action that sends a reader to the site to begin. */
+  startCta: string
+  startHint: string
+  /** Heading for the uploaded video walkthroughs. */
+  videoHeading: string
+  videoIntro: string
   footer: string
   sections: Section[]
 }
@@ -43,19 +60,17 @@ export function en(p: GuideProps): GuideCopy {
     title: 'How it works',
     subtitle: 'Everything you need: the app, the dashboard, and how you get paid.',
     back: '← Links',
+    signIn: 'Sign in to start →',
+    startCta: 'Start working →',
+    startHint: 'Sign in with Google, finish the short setup, and your first links are there.',
     rates: [
       { label: 'Per comment', value: `${p.commentRate} birr`, hint: 'on your reported count' },
       { label: 'Per video you make', value: `${p.videoBirr} birr`, hint: '30s–1min, once approved' },
       { label: 'Per repost link', value: `${p.promoBirr} birr`, hint: 'one per platform per day' },
     ],
-    quotaHeading: 'Hourly limits',
-    quotaIntro:
-      'Each platform lets you open a limited number of links per hour. When you reach the limit that platform locks and the app moves you to another one. The lock lifts by itself as your older clicks age out, and the app shows a countdown.',
-    quotaCols: ['Platform', 'Links you may open'],
-    quotaValue: (n, h) => `${n} per ${h === 1 ? 'hour' : `${h} hours`}`,
-    quotaUnlimited: 'No limit',
-    quotaFoot:
-      'These are set by the admin and can change. This table always shows what is active right now.',
+    videoHeading: 'Video walkthroughs',
+    videoIntro:
+      'Watch these if the steps above are easier to follow on screen. They open here — nothing to download.',
     footer: 'Questions? Message the admin from the dashboard and the reply appears there.',
     sections: [
       {
@@ -123,7 +138,6 @@ export function en(p: GuideProps): GuideCopy {
         steps: [
           'Tap Finish in the app, or open the Finish page on the website.',
           'For each platform, enter how many videos you commented on.',
-          'Paste one sample link of a video you actually commented on.',
           'Upload screenshots of your comment history showing the comments you posted.',
           'Submit. Your pending pay updates on the dashboard right away.',
           'Payment is sent once a week, straight to the bank account number you entered when you set up your account. What you see under pending pay is what is owed to you so far.',
@@ -149,10 +163,11 @@ export function en(p: GuideProps): GuideCopy {
         intro: 'The website is for setup, reporting and payment. Day-to-day commenting happens in the app.',
         rows: [
           { k: 'Links', v: 'Your remaining links, grouped, plus your totals for today.' },
+          { k: 'Pages', v: `Links come a page at a time, best group first — ${p.linksPerPage} on a page, which is about an hour's work. Use Next at the bottom for the following page.` },
           { k: 'Comments', v: 'The comment pool. Tap any comment to copy it manually if you need to.' },
           { k: 'Video task', v: 'Upload your own video and see whether it was approved.' },
           { k: 'Repost & earn', v: 'Download promo videos and captions, and submit your reposted links.' },
-          { k: 'Finish', v: 'Report your counts, sample links and screenshots.' },
+          { k: 'Finish', v: 'Report your counts and screenshots.' },
           { k: 'Messages', v: 'Messages from the admin appear at the top of the dashboard, and you can reply there.' },
         ],
       },
@@ -176,19 +191,17 @@ export function am(p: GuideProps): GuideCopy {
     title: 'እንዴት እንደሚሠራ',
     subtitle: 'የሚያስፈልግዎት ሁሉ፦ አፑ፣ ዳሽቦርዱ እና ክፍያ የሚያገኙበት መንገድ።',
     back: '← ወደ ሊንኮች',
+    signIn: 'ለመጀመር ይግቡ →',
+    startCta: 'ሥራ ይጀምሩ →',
+    startHint: 'በGoogle ይግቡ፣ አጭሩን ዝግጅት ይጨርሱ፤ የመጀመሪያዎቹ ሊንኮችዎ እዚያው ይጠብቁዎታል።',
     rates: [
       { label: 'ለአንድ አስተያየት', value: `${p.commentRate} ብር`, hint: 'ሪፖርት ባደረጉት ብዛት መሠረት' },
       { label: 'ለሠሩት አንድ ቪዲዮ', value: `${p.videoBirr} ብር`, hint: '30 ሰከንድ–1 ደቂቃ፣ ከጸደቀ በኋላ' },
       { label: 'ለአንድ ሪፖስት ሊንክ', value: `${p.promoBirr} ብር`, hint: 'በቀን በአንድ መድረክ አንድ' },
     ],
-    quotaHeading: 'የሰዓት ገደቦች',
-    quotaIntro:
-      'እያንዳንዱ መድረክ በሰዓት የተወሰነ ቁጥር ያላቸውን ሊንኮች ብቻ እንዲከፍቱ ይፈቅዳል። ገደቡ ሲደርስ ያ መድረክ ይቆለፋል፤ አፑም ወደ ሌላ መድረክ ያዛውርዎታል። ቀደም ብለው የከፈቷቸው ሊንኮች ጊዜያቸው ሲያልፍ ቁልፉ በራሱ ይከፈታል፤ አፑም ቆጠራውን ያሳያል።',
-    quotaCols: ['መድረክ', 'መክፈት የሚችሉት ሊንክ'],
-    quotaValue: (n, h) => `${n} በ${h === 1 ? 'አንድ ሰዓት' : `${h} ሰዓት`}`,
-    quotaUnlimited: 'ገደብ የለም',
-    quotaFoot:
-      'እነዚህ ቁጥሮች በአስተዳዳሪው የሚወሰኑ ሲሆኑ ሊለወጡ ይችላሉ። ይህ ሰንጠረዥ ሁልጊዜ አሁን በሥራ ላይ ያለውን ያሳያል።',
+    videoHeading: 'የቪዲዮ ማብራሪያዎች',
+    videoIntro:
+      'ከላይ ያሉት ደረጃዎች በምስል ማየት ከቀለለዎት እነዚህን ይመልከቱ። እዚሁ ላይ ይከፈታሉ፤ ማውረድ አያስፈልግም።',
     footer: 'ጥያቄ አለዎት? ከዳሽቦርዱ ላይ ለአስተዳዳሪው መልእክት ይላኩ፤ መልሱም እዚያው ይታያል።',
     sections: [
       {
@@ -256,7 +269,6 @@ export function am(p: GuideProps): GuideCopy {
         steps: [
           'በአፑ ላይ Finish ን ይንኩ፣ ወይም በድረ-ገጹ ላይ የFinish ገጹን ይክፈቱ።',
           'ለእያንዳንዱ መድረክ በስንት ቪዲዮዎች ላይ አስተያየት እንደሰጡ ያስገቡ።',
-          'በእውነት አስተያየት የሰጡበትን አንድ ናሙና ሊንክ ይለጥፉ።',
           'የለጠፏቸውን አስተያየቶች የሚያሳዩ የአስተያየት ታሪክዎን ስክሪንሾቶች ይላኩ።',
           'ይላኩ። በዳሽቦርዱ ላይ ያለው ገና ያልተከፈለ ክፍያዎ ወዲያውኑ ይዘመናል።',
           'ክፍያ በሳምንት አንድ ጊዜ ይላካል፤ አካውንትዎን ሲያዘጋጁ ባስገቡት የባንክ ሒሳብ ቁጥር በቀጥታ ይከፈላል። በዳሽቦርዱ ላይ በ"ገና ያልተከፈለ ክፍያ" ሥር የሚያዩት እስካሁን የሚገባዎትን ገንዘብ ያሳያል።',
@@ -282,10 +294,11 @@ export function am(p: GuideProps): GuideCopy {
         intro: 'ድረ-ገጹ ለዝግጅት፣ ለሪፖርት እና ለክፍያ ነው። የዕለት ተዕለት አስተያየት መስጠት የሚከናወነው በአፑ ላይ ነው።',
         rows: [
           { k: 'ሊንኮች', v: 'የቀሩት ሊንኮችዎ በቡድን ተከፋፍለው፣ እንዲሁም የዛሬው ጠቅላላ ውጤትዎ።' },
+          { k: 'ገጾች', v: `ሊንኮች በገጽ በገጽ ይቀርባሉ፤ ምርጡ ቡድን መጀመሪያ። በአንድ ገጽ ${p.linksPerPage} ሊንኮች ሲሆኑ ይህም የአንድ ሰዓት ያህል ሥራ ነው። ቀጣዩን ገጽ ለማየት ከታች ያለውን Next ይጠቀሙ።` },
           { k: 'አስተያየቶች', v: 'የአስተያየት ስብስቡ። ካስፈለገዎት ማንኛውንም አስተያየት ነክተው በእጅ ኮፒ ማድረግ ይችላሉ።' },
           { k: 'የቪዲዮ ሥራ', v: 'የራስዎን ቪዲዮ ይላኩ እና መጽደቁን ይከታተሉ።' },
           { k: 'ሪፖስት አድርገው ያግኙ', v: 'የማስተዋወቂያ ቪዲዮዎችንና ጽሑፎችን ያውርዱ፣ የለጠፏቸውንም ሊንኮች ይላኩ።' },
-          { k: 'Finish', v: 'ብዛቱን፣ የናሙና ሊንኮችንና ስክሪንሾቶችን ሪፖርት ያድርጉ።' },
+          { k: 'Finish', v: 'ብዛቱንና ስክሪንሾቶችን ሪፖርት ያድርጉ።' },
           { k: 'መልእክቶች', v: 'ከአስተዳዳሪው የሚላኩ መልእክቶች በዳሽቦርዱ ላይኛው ክፍል ይታያሉ፤ እዚያው መመለስ ይችላሉ።' },
         ],
       },

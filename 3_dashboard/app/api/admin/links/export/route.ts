@@ -163,6 +163,10 @@ export async function GET(req: NextRequest) {
   const platform = req.nextUrl.searchParams.get('platform') || '' // '' = all platforms
   const product = req.nextUrl.searchParams.get('product') || '' // '' = all products (max)
   const retiredOnly = req.nextUrl.searchParams.get('retired') === '1'
+  // Exact match on the keyword a link was scraped under, mirroring the list's
+  // dropdown. Without this the export ignored the filter on screen and quietly
+  // wrote the whole pool.
+  const keyword = req.nextUrl.searchParams.get('keyword') || ''
 
   const [all, clicksByProduct, blockedUrls, effective] = await Promise.all([
     loadVideosJson().then((v) => v as unknown as Row[]),
@@ -203,6 +207,7 @@ export async function GET(req: NextRequest) {
   const rows: Row[] = httpAll.filter(
     (v) =>
       (!platform || String(v.platform ?? '') === platform) &&
+      (!keyword || String(v.search_query ?? '') === keyword) &&
       (!retiredOnly || rowIsRetired(v))
   )
 
@@ -210,6 +215,7 @@ export async function GET(req: NextRequest) {
   const scope =
     (retiredOnly ? 'retired_' : '') +
     (product ? `${product.replace(/[^a-z0-9]/gi, '')}_` : '') +
+    (keyword ? `${keyword.replace(/[^a-z0-9]+/gi, '-')}_` : '') +
     (platform || 'all')
 
   if (format === 'xls') {

@@ -37,6 +37,14 @@ export interface Video {
   source_file: string
   /** Composite posted-date score set at upload (lib/dateScore.ts). */
   date_score?: number
+  // Where this link sits in the FULL pool, stamped by lib/userFeed before the
+  // page cut the pool down. The browser is only sent a slice now, so it cannot
+  // work these out for itself — clustering the slice would spread a hundred
+  // links across thirty clusters and call the best of them "cluster 1".
+  rankCluster?: number
+  rankPos?: number
+  dateCluster?: number
+  datePos?: number
 }
 
 interface UserInfo {
@@ -319,35 +327,129 @@ const LinkRow = memo(function LinkRow({ v, onOpen }: { v: Video; onOpen: (v: Vid
   )
 })
 
+/** Links per page. One page is one hour's work: the hourly quota is
+ *  HOURLY_LINK_LIMIT links per platform, so a full page is exactly what a user
+ *  can open before the platform locks. */
+const LINKS_PER_PAGE = HOURLY_LINK_LIMIT
+
 /**
- * The whole cluster list. Memoized so the once-a-second clock tick in Dashboard
- * doesn't even diff the thousands of rows below it — this subtree only re-renders
- * when `clusters` actually changes (a click, a filter, a shuffle). `onOpen` must
- * be referentially stable for that to hold; Dashboard passes a ref-backed one.
+ * The whole cluster list, a page at a time. Memoized so the once-a-second clock
+ * tick in Dashboard doesn't even diff the rows below it — this subtree only
+ * re-renders when `clusters` actually changes (a click, a filter, a switch).
+ * `onOpen` must be referentially stable for that to hold; Dashboard passes a
+ * ref-backed one.
+ *
+ * Paging runs over the clusters FLATTENED IN ORDER, not over the clusters
+ * themselves: cluster 1 is the best work in the list and has to be the first
+ * thing on the first page, whether it holds three links or three hundred. A
+ * cluster wider than a page simply continues onto the next one, under the same
+ * heading.
  */
 const ClusterList = memo(function ClusterList({
   clusters,
   onOpen,
+  resetKey,
 }: {
   clusters: Cluster[]
   onOpen: (v: Video) => void
+  /** Changes when the list means something different — a new platform or a new
+   *  clustering. Paging starts over; a link merely being opened does not. */
+  resetKey: string
 }) {
+  const [page, setPage] = useState(0)
+  useEffect(() => {
+    setPage(0)
+  }, [resetKey])
+
+  // Every link in serving order, each remembering the cluster it came from so
+  // a page can label the ones it actually contains.
+  const flat = useMemo(() => {
+    const rows: { v: Video; ci: number }[] = []
+    clusters.forEach((c, ci) => {
+      for (const v of c.items) rows.push({ v, ci })
+    })
+    return rows
+  }, [clusters])
+
+  const pageCount = Math.max(1, Math.ceil(flat.length / LINKS_PER_PAGE))
+  // Opening links shortens the list, so the page you are on can fall off the
+  // end. Clamp rather than showing a blank page.
+  const cur = Math.min(page, pageCount - 1)
+  const start = cur * LINKS_PER_PAGE
+  const slice = flat.slice(start, start + LINKS_PER_PAGE)
+
+  // Runs of the same cluster, so a heading is printed once per run rather than
+  // once per link. `from` is the run's offset inside its own cluster, which is
+  // what lets a cluster split across pages say "21-40 of 300".
+  const runs: { ci: number; from: number; items: Video[] }[] = []
+  slice.forEach((r, i) => {
+    const last = runs[runs.length - 1]
+    if (last && last.ci === r.ci) last.items.push(r.v)
+    else {
+      let clusterStart = start + i
+      while (clusterStart > 0 && flat[clusterStart - 1].ci === r.ci) clusterStart--
+      runs.push({ ci: r.ci, from: start + i - clusterStart, items: [r.v] })
+    }
+  })
+
+  const go = (n: number) => {
+    setPage(Math.max(0, Math.min(pageCount - 1, n)))
+    if (typeof window !== 'undefined') window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
   return (
     <div className="space-y-6">
-      {clusters.map((c, ci) => (
-        <div key={ci}>
-          <div className="flex items-baseline gap-2 mb-2 pb-1 border-b border-zinc-800">
-            <h2 className="text-sm font-semibold text-emerald-400">{c.label}</h2>
-            <span className="text-xs text-zinc-500">{c.range}</span>
-            <span className="text-xs text-zinc-600 ml-auto">{c.items.length.toLocaleString()} links</span>
+      {runs.map((run, i) => {
+        const c = clusters[run.ci]
+        const from = run.from
+        return (
+          <div key={`${run.ci}-${i}`}>
+            <div className="flex items-baseline gap-2 mb-2 pb-1 border-b border-zinc-800">
+              <h2 className="text-sm font-semibold text-emerald-400">{c.label}</h2>
+              <span className="text-xs text-zinc-500">{c.range}</span>
+              <span className="text-xs text-zinc-600 ml-auto tabular-nums">
+                {c.items.length > run.items.length
+                  ? `${(from + 1).toLocaleString()}–${(from + run.items.length).toLocaleString()} of ${c.items.length.toLocaleString()}`
+                  : `${c.items.length.toLocaleString()} links`}
+              </span>
+            </div>
+            <div className="space-y-1">
+              {run.items.map((v) => (
+                <LinkRow key={v.url} v={v} onOpen={onOpen} />
+              ))}
+            </div>
           </div>
-          <div className="space-y-1">
-            {c.items.map((v) => (
-              <LinkRow key={v.url} v={v} onOpen={onOpen} />
-            ))}
-          </div>
+        )
+      })}
+
+      {pageCount > 1 && (
+        <div className="flex items-center justify-between gap-2 pt-2 border-t border-zinc-800">
+          <button
+            type="button"
+            onClick={() => go(cur - 1)}
+            disabled={cur === 0}
+            className="text-sm text-zinc-300 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 disabled:hover:bg-zinc-800 rounded-lg px-3 py-1.5 transition-colors"
+          >
+            ← Previous
+          </button>
+          <span className="text-xs text-zinc-500 tabular-nums text-center">
+            Page {cur + 1} of {pageCount}
+            <span className="hidden sm:inline">
+              {' '}
+              · {(start + 1).toLocaleString()}–{(start + slice.length).toLocaleString()} of{' '}
+              {flat.length.toLocaleString()}
+            </span>
+          </span>
+          <button
+            type="button"
+            onClick={() => go(cur + 1)}
+            disabled={cur >= pageCount - 1}
+            className="text-sm text-zinc-300 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 disabled:hover:bg-zinc-800 rounded-lg px-3 py-1.5 transition-colors"
+          >
+            Next →
+          </button>
         </div>
-      ))}
+      )}
     </div>
   )
 })
@@ -358,6 +460,7 @@ export default function Dashboard({
   videos,
   clickedUrls,
   retiredUrls,
+  remainingByPlatform,
   dateShare,
   todayCounts,
   hourly,
@@ -375,6 +478,10 @@ export default function Dashboard({
   videos: Video[]
   clickedUrls: string[]
   retiredUrls: string[]
+  /** How many links each platform really has left for this user, counted over
+   *  the WHOLE pool. `videos` is only the served slice, so it cannot answer
+   *  this. Absent on an older payload, and then the slice is counted instead. */
+  remainingByPlatform?: Record<string, number>
   /** Percent of workers put on the posted-date clustering; set on the admin
    *  Links page. The rest work from search rank. */
   dateShare: number
@@ -425,6 +532,10 @@ export default function Dashboard({
 
   // URLs this user has opened — hidden from them from now on.
   const [clicked, setClicked] = useState<Set<string>>(() => new Set(clickedUrls))
+  // What was already clicked when the page loaded. The server's remaining
+  // counts have these subtracted already, so only clicks made SINCE then may
+  // come off the number again.
+  const clickedAtLoad = useMemo(() => new Set(clickedUrls), [clickedUrls])
   // Today's click counts per platform (seeded from the server, bumped live).
   const [today, setToday] = useState<Record<string, number>>(() => ({ ...todayCounts }))
   // Rolling hourly quota: click timestamps (ms) per platform in the last hour.
@@ -583,9 +694,23 @@ export default function Dashboard({
 
   const availableByPlatform = useMemo(() => {
     const m: Record<string, number> = { tiktok: 0, youtube_shorts: 0, youtube_videos: 0, instagram: 0 }
+    if (remainingByPlatform) {
+      for (const [k, n] of Object.entries(remainingByPlatform)) m[k] = n
+      for (const v of videos) {
+        if (clicked.has(v.url) && !clickedAtLoad.has(v.url)) m[v.platform] = Math.max(0, (m[v.platform] ?? 0) - 1)
+      }
+      return m
+    }
     for (const v of available) m[v.platform] = (m[v.platform] ?? 0) + 1
     return m
-  }, [available])
+  }, [available, videos, clicked, clickedAtLoad, remainingByPlatform])
+  const totalRemaining = useMemo(
+    () =>
+      remainingByPlatform
+        ? Object.values(availableByPlatform).reduce((a, b) => a + b, 0)
+        : available.length,
+    [availableByPlatform, available, remainingByPlatform]
+  )
 
   // A platform is "workable" if it isn't at its hourly cap and still has links.
   const isWorkable = (p: string) => !isLocked(p) && (availableByPlatform[p] ?? 0) > 0
@@ -628,6 +753,22 @@ export default function Dashboard({
   const clusterAssignment = useMemo(() => {
     const n = Math.max(1, effGroupBy === 'rank' ? RANK_CLUSTER_COUNT : DATE_CLUSTER_COUNT)
     const map = new Map<string, number>()
+    // Stamped by the server against the whole pool — use it and stop. Only a
+    // payload from before this existed falls through to computing it here, and
+    // that computation is over whatever slice arrived, which is why it is the
+    // fallback rather than the rule.
+    const stamped = videos.some((v) => typeof v.rankCluster === 'number')
+    if (stamped) {
+      const posMap = new Map<string, number>()
+      for (const v of videos) {
+        if (v.platform !== platform) continue
+        const ci = effGroupBy === 'rank' ? v.rankCluster : v.dateCluster
+        const pi = effGroupBy === 'rank' ? v.rankPos : v.datePos
+        map.set(v.url, typeof ci === 'number' ? ci : -1)
+        if (typeof pi === 'number' && pi >= 0) posMap.set(v.url, pi)
+      }
+      return { map, pos: posMap }
+    }
     // Where each link sits in the clustering score's own order. Kept because the
     // cluster index alone does not say that: two links in cluster 3 still have
     // a better and a worse score, and that is the order they are served in.
@@ -829,7 +970,7 @@ export default function Dashboard({
               📖 How it works
             </Link>
           </div>
-          <p className="text-sm text-zinc-500 mt-0.5">{available.length.toLocaleString()} remaining</p>
+          <p className="text-sm text-zinc-500 mt-0.5">{totalRemaining.toLocaleString()} remaining</p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           {user.image && (
@@ -1102,7 +1243,11 @@ export default function Dashboard({
           </p>
         </div>
       ) : (
-        <ClusterList clusters={clusters} onOpen={onOpen} />
+        <ClusterList
+          clusters={clusters}
+          onOpen={onOpen}
+          resetKey={`${platform}:${effGroupBy}:${search}`}
+        />
       )}
 
       {/* First-clicks reminder dialog */}

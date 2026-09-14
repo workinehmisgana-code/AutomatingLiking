@@ -14,9 +14,15 @@ const PLATFORMS: { key: string; label: string; dot: string }[] = [
 
 // Standalone version of the Finish flow, used by the /finish page (which the
 // Android bubble opens in the browser so screenshot uploads work).
+//
+// A report is a COUNT and SCREENSHOTS, nothing else. There used to be a "sample
+// video URL" box per platform. Verification reads the links a user actually
+// opened rather than one they nominate, so the box asked for work while proving
+// nothing — and the dashboard's own Finish modal had already dropped it, which
+// left the two surfaces disagreeing. The server still accepts the field from
+// older Android builds, and old submissions keep displaying theirs.
 export default function FinishForm() {
   const [counts, setCounts] = useState<Record<string, string>>({})
-  const [sampleUrls, setSampleUrls] = useState<Record<string, string>>({})
   const [files, setFiles] = useState<Record<string, FileList | null>>({})
   const [saving, setSaving] = useState(false)
   const [progress, setProgress] = useState('')
@@ -105,7 +111,6 @@ export default function FinishForm() {
       const platforms = PLATFORMS.map((p) => ({
         platform: p.key,
         count: counts[p.key] || '0',
-        sampleUrl: sampleUrls[p.key] || '',
         screenshots: urlsByPlatform[p.key],
       }))
 
@@ -175,16 +180,6 @@ export default function FinishForm() {
                   onChange={(e) => setCounts((c) => ({ ...c, [p.key]: e.target.value }))}
                   placeholder="0"
                   className="mt-1 w-28 bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-emerald-500"
-                />
-              </label>
-              <label className="text-xs text-zinc-400">
-                Sample video URL you commented on
-                <input
-                  type="url"
-                  value={sampleUrls[p.key] ?? ''}
-                  onChange={(e) => setSampleUrls((s) => ({ ...s, [p.key]: e.target.value }))}
-                  placeholder="https://…"
-                  className="mt-1 block w-full bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-emerald-500"
                 />
               </label>
               <label className="text-xs text-zinc-400">
