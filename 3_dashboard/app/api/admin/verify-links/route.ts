@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { isAdminEmail } from '@/lib/config'
+import { isAdminEmail, CLICK_PLATFORMS } from '@/lib/config'
 import {
   getVerifyLinks,
+  getVerifyPlatformCounts,
   deleteVerifyLinks,
   getAllVerifyLinkUrls,
   clearVerifyLinks,
@@ -51,7 +52,10 @@ async function purgeDecidedLinks(): Promise<void> {
   if (decided.length) await deleteVerifyLinks(decided).catch(() => {})
 }
 
-// GET ?page=N&limit=500&title=all|has|none&accounts=a,b,c
+// GET ?page=N&limit=500&title=all|has|none&accounts=a,b,c&platform=tiktok|…
+//
+// `platform` is read from each link's URL, not from its stored platform
+// column — see VERIFY_PLATFORM_SQL for why.
 //
 // One page of the verify-links list plus its counts. `title=has` filters OUT
 // every link with no title yet; `title=none` shows only those. `accounts` limits
@@ -75,8 +79,17 @@ export async function GET(req: NextRequest) {
     // on page 0 (the initial load and every post-upload/merge reload) to avoid a
     // videos.json fetch on every pagination click.
     if (page === 0) await purgeDecidedLinks().catch(() => {})
-    const { rows, total, totalAll } = await getVerifyLinks(limit, page * limit, title, accounts)
-    return NextResponse.json({ rows, total, totalAll, page, limit, title, accounts })
+    const platformParam = String(req.nextUrl.searchParams.get('platform') ?? '').trim()
+    const platform = CLICK_PLATFORMS.includes(platformParam as (typeof CLICK_PLATFORMS)[number])
+      ? platformParam
+      : ''
+    const [{ rows, total, totalAll }, platformCounts] = await Promise.all([
+      getVerifyLinks(limit, page * limit, title, accounts, platform),
+      getVerifyPlatformCounts().catch(() => ({}) as Record<string, number>),
+    ])
+    return NextResponse.json({
+      rows, total, totalAll, page, limit, title, accounts, platform, platformCounts,
+    })
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 })
   }

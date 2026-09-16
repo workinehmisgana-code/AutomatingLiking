@@ -106,11 +106,31 @@ function percentiles(values: number[]): Map<number, number> {
 }
 
 interface Acc {
+  handle: string
+  site: 'tiktok' | 'instagram' | 'youtube'
   links: number
   active: number
   hearts: number[]
   times: number[]
 }
+
+/**
+ * The key a channel is accumulated under: SITE AND HANDLE, not handle alone.
+ *
+ * The same name is routinely taken on two sites by the same person — measured
+ * on the live pool, 98 of our handles exist on more than one. Keyed by handle
+ * alone they were folded into ONE row whose platform was whichever URL happened
+ * to be seen last, so @betweenstudybreaks (58 Instagram links + 205 TikTok)
+ * appeared once, as TikTok, and its Instagram side could not be found at all.
+ *
+ * Worse than a missing row: every number on the merged one — links, median
+ * hearts, posting rate, active share — was computed across two platforms at
+ * once, so the score that ordered it described neither.
+ *
+ * scrape_channels.py has always namespaced its accounts this way
+ * (account_key); this brings the ranking in line with it.
+ */
+const channelKey = (site: string, handle: string) => `${site}:${handle}`
 
 /**
  * Every channel in the pool, best first.
@@ -119,6 +139,33 @@ interface Acc {
  * the pool, and there is no reason to spend a request re-checking a channel we
  * have rejected outright.
  */
+/**
+ * Links we hold that cannot be attributed to ANY channel, by platform.
+ *
+ * Not a failure of the ranking — a fact about the links. A YouTube Shorts URL
+ * is /shorts/<id> and names nobody, and an Instagram post is /p/<code>/ which
+ * names nobody either, so an Instagram link is only attributable when the
+ * scrape stored an author beside it. Reported so "the channel list is missing
+ * channels" has a number attached instead of being a suspicion.
+ */
+/**
+ * What the last rankChannels() call could not attribute.
+ *
+ * Module state rather than a second return value: every caller of rankChannels
+ * already destructures an array, and the count is only ever wanted by the one
+ * route that displays it.
+ */
+let lastUnattributed: UnattributedCount = { total: 0, byPlatform: {} }
+
+export function unattributedLinks(): UnattributedCount {
+  return lastUnattributed
+}
+
+export interface UnattributedCount {
+  total: number
+  byPlatform: Record<string, number>
+}
+
 export async function rankChannels(): Promise<ChannelRow[]> {
   const [videos, blockedUrls, stats] = await Promise.all([
     loadVideosJson().catch(() => []),
@@ -131,13 +178,22 @@ export async function rankChannels(): Promise<ChannelRow[]> {
   const blocked = new Set(blockedUrls)
 
   const acc = new Map<string, Acc>()
-  const site = new Map<string, 'tiktok' | 'instagram' | 'youtube'>()
+  lastUnattributed = { total: 0, byPlatform: {} }
   for (const v of videos) {
     const url = String(v.url ?? '')
     const handle = channelOfRow(url, (v as { author?: unknown }).author)
-    if (!handle) continue
-    site.set(handle, siteOf(url))
-    const a = acc.get(handle) ?? { links: 0, active: 0, hearts: [], times: [] }
+    if (!handle) {
+      // Counted rather than skipped in silence: these are links whose channel
+      // we simply cannot name, and their absence from the list is the honest
+      // answer to "why is this channel not here".
+      const p = String((v as { platform?: unknown }).platform ?? '') || 'unknown'
+      lastUnattributed.total++
+      lastUnattributed.byPlatform[p] = (lastUnattributed.byPlatform[p] ?? 0) + 1
+      continue
+    }
+    const s = siteOf(url)
+    const key = channelKey(s, handle)
+    const a = acc.get(key) ?? { handle, site: s, links: 0, active: 0, hearts: [], times: [] }
     a.links++
     if (!blocked.has(url)) a.active++
     const h = Number((v as { heart_count?: unknown }).heart_count ?? v.like_count)
@@ -147,23 +203,27 @@ export async function rankChannels(): Promise<ChannelRow[]> {
       v.scraped_at == null ? undefined : String(v.scraped_at)
     )
     if (t !== null) a.times.push(t)
-    acc.set(handle, a)
+    acc.set(key, a)
   }
 
   // Blocked counts come from the WHOLE blocked list, not from the pool: blocking
   // a link removes it from videos.json, so 98% of blocked links are no longer
   // there. Counting only the ones still in the pool made almost every channel
   // look 100% active. This mirrors what the admin Links page already does.
+  // Keyed the same way as the pool, or a TikTok channel's blocks would be
+  // charged against a same-named Instagram one.
   const blockedByChannel = new Map<string, number>()
   for (const url of blockedUrls) {
     const handle = handleOf(url)
     if (!handle) continue
-    blockedByChannel.set(handle, (blockedByChannel.get(handle) ?? 0) + 1)
+    const key = channelKey(siteOf(url), handle)
+    blockedByChannel.set(key, (blockedByChannel.get(key) ?? 0) + 1)
   }
 
   const now = Date.now()
   const rows: ChannelRow[] = []
-  acc.forEach((a, handle) => {
+  acc.forEach((a, key) => {
+    const handle = a.handle
     // MEDIAN, not mean — the same reason as lib/dateScore.ts. A channel whose
     // typical video gets 7 likes and whose best got 4.2 million has a mean of
     // 377,726, and ranking it on that would send us back to mine a channel that
@@ -184,12 +244,15 @@ export async function rankChannels(): Promise<ChannelRow[]> {
     } else if (a.times.length === 1) {
       lastPostDays = Math.floor((now - a.times[0]) / 86_400_000)
     }
-    const canAttributeBlocks = (site.get(handle) ?? 'tiktok') !== 'instagram'
-    const blockedTotal = canAttributeBlocks ? (blockedByChannel.get(handle) ?? 0) : 0
+    // An Instagram post URL carries no handle, so a blocked Instagram link
+    // cannot be attributed to anyone — its channel would always read 100%
+    // active, which is worse than reading unknown.
+    const canAttributeBlocks = a.site !== 'instagram'
+    const blockedTotal = canAttributeBlocks ? (blockedByChannel.get(key) ?? 0) : 0
     const judged = a.active + blockedTotal
     rows.push({
       handle,
-      platform: site.get(handle) ?? 'tiktok',
+      platform: a.site,
       links: a.links,
       active: a.active,
       blocked: blockedTotal,

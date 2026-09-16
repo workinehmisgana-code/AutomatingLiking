@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { userIdFromApp } from '@/lib/appAuth'
-import { getActiveCommentProducts } from '@/lib/db'
-import { getFreshComments, getFreshCategoryComments } from '@/lib/commentGen'
-import { LINK_CATEGORIES, type LinkCategory } from '@/lib/config'
+import { getActiveCommentProducts, getProductPlatforms } from '@/lib/db'
+import { getFreshCategoryComments } from '@/lib/commentGen'
+import { LINK_CATEGORIES, FALLBACK_COMMENT_CATEGORY, type LinkCategory } from '@/lib/config'
 
 export const dynamic = 'force-dynamic'
 
@@ -13,15 +13,29 @@ export const dynamic = 'force-dynamic'
 // matching set, so a comment written for someone worried about Turnitin never
 // lands under a video that has nothing to do with detection.
 //
-// The response stays BACKWARDS COMPATIBLE. `comments` and `commentProducts` keep
-// their exact old shape — the flat, every-audience pool — so an app build that
-// predates categories behaves exactly as before. `byCategory` is additive and
-// simply ignored by those builds.
+// The response stays BACKWARDS COMPATIBLE in SHAPE: `comments` and
+// `commentProducts` are still a flat, index-aligned pair, so a build that
+// predates categories keeps working. What they CONTAIN has changed — they are
+// now the fallback audience's pool rather than every audience merged together.
+// A flat pool is used by a caller that cannot tell one link from another, and
+// handing that caller a mix of three audiences guarantees two thirds of it is
+// aimed at the wrong video. FALLBACK_COMMENT_CATEGORY is the same guess the
+// server makes for an uncategorised link; see the constant for why.
+//
+// `byCategory` is what a current build reads, picking the set that matches each
+// link's own `category`.
 export async function GET(req: NextRequest) {
   const userId = await userIdFromApp(req)
   if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
   const products = await getActiveCommentProducts().catch(() => [] as string[])
+  // Informational for the app: it pastes the comment the SERVER chose on each
+  // click (/api/app/click), and that choice is already scoped to the link's
+  // platform. This is here so a build that falls back to its cached pool can
+  // apply the same rule instead of ignoring it.
+  const productPlatforms = await getProductPlatforms().catch(
+    () => ({}) as Record<string, string[]>
+  )
 
   // One flat pool per audience, plus the product each comment belongs to. The
   // product mapping is what per-product click attribution counts, so it has to
@@ -56,21 +70,18 @@ export async function GET(req: NextRequest) {
     })
   )
 
-  // The legacy flat pool: every audience merged, de-duped. An older build reads
-  // only this and keeps working; a category-aware build ignores it.
-  const seen = new Set<string>()
-  const comments: string[] = []
-  const commentProducts: string[] = []
-  for (const category of LINK_CATEGORIES) {
-    const list = byCategory[category] ?? []
-    const owners = productsByCategory[category] ?? []
-    list.forEach((c, i) => {
-      if (!seen.has(c)) {
-        seen.add(c)
-        comments.push(c)
-        commentProducts.push(owners[i])
-      }
-    })
+  // The flat pool: the fallback audience, which is the one to use when the
+  // link's audience is unknown — and to a caller reading this field, every
+  // link's audience is unknown. Falls back to whatever IS populated rather than
+  // handing back an empty list.
+  let comments = byCategory[FALLBACK_COMMENT_CATEGORY] ?? []
+  let commentProducts = productsByCategory[FALLBACK_COMMENT_CATEGORY] ?? []
+  if (comments.length === 0) {
+    const stocked = LINK_CATEGORIES.find((c) => (byCategory[c] ?? []).length > 0)
+    if (stocked) {
+      comments = byCategory[stocked] ?? []
+      commentProducts = productsByCategory[stocked] ?? []
+    }
   }
   // A build that knows about categories but finds one empty should fall back to
   // the flat pool rather than copy nothing.
@@ -83,6 +94,10 @@ export async function GET(req: NextRequest) {
     comments,
     commentProducts,
     categories: LINK_CATEGORIES,
+    // Which set `comments` above was filled from, and what a link with no
+    // category of its own should use.
+    fallbackCategory: FALLBACK_COMMENT_CATEGORY,
+    productPlatforms,
     byCategory,
     productsByCategory,
     emptyCategories: empty,

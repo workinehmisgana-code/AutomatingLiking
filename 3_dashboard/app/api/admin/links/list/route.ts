@@ -5,9 +5,9 @@ import { isAdminEmail } from '@/lib/config'
 import {
   buildAdminLinks,
   filterAdminLinks,
+  parseLinkQuery,
   sortAdminLinks,
   type LinkQuery,
-  type ClusterBy,
 } from '@/lib/adminLinks'
 
 export const dynamic = 'force-dynamic'
@@ -17,46 +17,12 @@ export const maxDuration = 60
 // and the filtering are computed over the whole pool regardless.
 const MAX_ROWS = 1000
 
+// The page's filters, parsed by the one shared parser, plus the paging this
+// endpoint alone needs. Every other endpoint that scopes work to "the links
+// currently filtered" reads the same query the same way.
 function parseQuery(sp: URLSearchParams): LinkQuery {
-  const num = (v: string | null) => {
-    if (v == null || v.trim() === '') return null
-    const n = Number(v)
-    return Number.isFinite(n) ? n : null
-  }
-  const tf = sp.get('title')
-  const mf = sp.get('media')
-  const sortCol = sp.get('sortCol')
   return {
-    platform: sp.get('platform') ?? '',
-    product: sp.get('product') ?? '',
-    retiredOnly: sp.get('retired') === '1',
-    unrelatedOnly: sp.get('unrelated') === '1',
-    blockedOnly: sp.get('blocked') === '1',
-    keyword: sp.get('keyword') ?? '',
-    oursFilter: (['none', 'some', 'unscanned'] as const).includes(
-      sp.get('ours') as 'none' | 'some' | 'unscanned'
-    )
-      ? (sp.get('ours') as 'none' | 'some' | 'unscanned')
-      : '',
-    category: sp.get('category') ?? '',
-    uploadDate: sp.get('uploadDate') ?? '',
-    titleFilter: tf === 'has' || tf === 'none' ? tf : '',
-    mediaFilter: mf === 'photo' || mf === 'video' || mf === 'unknown' ? mf : '',
-    clusters: (sp.get('clusters') ?? '')
-      .split(',')
-      .map((x) => Number(x))
-      .filter((n) => Number.isFinite(n) && n > 0),
-    clusterBy: ((sp.get('clusterBy') as ClusterBy) || 'rank') as ClusterBy,
-    minClicks: num(sp.get('minClicks')),
-    maxClicks: num(sp.get('maxClicks')),
-    minRatio: num(sp.get('minRatio')),
-    maxRatio: num(sp.get('maxRatio')),
-    q: sp.get('q') ?? '',
-    sortCol:
-      sortCol === 'cluster' || sortCol === 'clicked_by' || sortCol === 'unrelated'
-        ? sortCol
-        : null,
-    sortDir: sp.get('sortDir') === 'asc' ? 'asc' : 'desc',
+    ...parseLinkQuery(sp),
     offset: Math.max(0, Number(sp.get('offset')) || 0),
     limit: Math.min(MAX_ROWS, Math.max(1, Number(sp.get('limit')) || MAX_ROWS)),
   }

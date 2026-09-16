@@ -1,7 +1,12 @@
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import Guide from '@/components/Guide'
-import { getGuideVideos } from '@/lib/db'
+import {
+  getGuideVideos,
+  getAccountTaskDomain,
+  getAccountTaskOpen,
+  getAccountTaskPassword,
+} from '@/lib/db'
 import {
   COMMENT_PAY_RATE,
   VIDEO_PAYMENT_BIRR,
@@ -10,6 +15,7 @@ import {
   PROMO_DOWNLOAD_DAILY_LIMIT,
   REMINDER_CLICKS,
   HOURLY_LINK_LIMIT,
+  ACCOUNT_PAY_BIRR,
   SITE_URL,
 } from '@/lib/config'
 
@@ -30,7 +36,15 @@ export default async function GuidePage() {
     .getSession({ headers: await headers() })
     .catch(() => null)
 
-  const guideVideos = await getGuideVideos().catch(() => [])
+  // The guide describes the email task only while it is actually being
+  // offered. A guide that explains a task nobody can do is worse than one that
+  // does not mention it.
+  const [guideVideos, accountDomain, accountOpen, accountPassword] = await Promise.all([
+    getGuideVideos().catch(() => []),
+    getAccountTaskDomain().catch(() => ''),
+    getAccountTaskOpen().catch(() => false),
+    getAccountTaskPassword().catch(() => ''),
+  ])
 
   return (
     <Guide
@@ -41,6 +55,10 @@ export default async function GuidePage() {
       promoPerPlatform={PROMO_DAILY_LIMIT_PER_PLATFORM}
       promoDownloads={PROMO_DOWNLOAD_DAILY_LIMIT}
       reminderClicks={REMINDER_CLICKS}
+      accountBirr={ACCOUNT_PAY_BIRR}
+      accountDomain={accountDomain}
+      accountPassword={accountPassword}
+      accountOpen={accountOpen && !!accountDomain}
       videos={guideVideos}
       signedIn={!!session}
       startUrl={SITE_URL}

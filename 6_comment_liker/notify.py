@@ -159,6 +159,76 @@ class nagging:
         return False
 
 
+# ── Bringing the window forward ──────────────────────────────────────────────
+# A toast and a sound say SOMETHING needs you. With nine accounts running, they
+# do not say WHICH window, and the one that needs you may be minimised behind
+# eight others.
+#
+# Playwright's page.bring_to_front() raises the TAB within its browser and is not
+# enough on its own: it does not restore a minimised window. So on Windows the
+# real window is found and restored through user32.
+#
+# The window is matched by TITLE, which the caller makes unique by setting
+# document.title first — nine accounts on the same video otherwise all carry the
+# same title and the wrong one comes forward.
+
+
+def focus_window(title_contains: str) -> bool:
+    """Restore and raise the first visible window whose title contains this.
+
+    Returns whether a window was actually found and raised. Fails quietly like
+    everything else here: a run that is otherwise fine must not end because a
+    window could not be focused.
+    """
+    if not WINDOWS or not title_contains:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        SW_RESTORE = 9
+        found: list[int] = []
+        needle = title_contains.lower()
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def each(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            n = user32.GetWindowTextLengthW(hwnd)
+            if n <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            if needle in buf.value.lower():
+                found.append(hwnd)
+                return False  # stop at the first match
+            return True
+
+        user32.EnumWindows(each, 0)
+        if not found:
+            return False
+        hwnd = found[0]
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, SW_RESTORE)
+        # Windows refuses SetForegroundWindow from a process that does not own
+        # the foreground. Attaching to the foreground window's input thread for
+        # the call is the documented way round it.
+        fg = user32.GetForegroundWindow()
+        cur = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        mine = user32.GetWindowThreadProcessId(hwnd, None)
+        if cur and mine and cur != mine:
+            user32.AttachThreadInput(cur, mine, True)
+            user32.SetForegroundWindow(hwnd)
+            user32.AttachThreadInput(cur, mine, False)
+        else:
+            user32.SetForegroundWindow(hwnd)
+        user32.BringWindowToTop(hwnd)
+        return True
+    except Exception:  # noqa: BLE001 - never worth ending a run over
+        return False
+
+
 def main() -> int:
     print("sending a test notification and playing the alert sound…")
     ok = toast("Captcha waiting", "Test alert from the comment liker.")

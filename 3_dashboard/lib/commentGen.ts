@@ -12,18 +12,17 @@ import {
   type CommentStyle,
   DEFAULT_COMMENT_STYLE,
   type LinkCategory,
+  LINK_CATEGORIES,
+  isCommentVoice,
+  type CommentVoice,
 } from './config'
 import { groqChat } from './groq'
-import { buildSystemPrompt, NAIVE_VOICE, voiceShapeRule } from './commentPrompt'
+import { buildAudiencePrompt } from './commentPrompt'
 import { COMMENTS } from './comments'
 import {
-  getGeneratedComments,
-  saveGeneratedComments,
-  acquireCommentLock,
-  releaseCommentLock,
   getProductCommentSettings,
+  addCategoryVoice,
   getCategoryComments,
-  getProductPrompt,
   saveCategoryComments,
   acquireCategoryLock,
   releaseCategoryLock,
@@ -127,6 +126,9 @@ function targetLengths(count: number, band: WordBand): number[] {
 const CLICHES =
   /\b(beats?|beating|unbeatable|outperform\w*|outclass\w*|outrun\w*|wins?|winning|winner|rivals?|competitors?|competition|the\s+other\s+one|no\s+other\s+tool|number\s*one|hands\s+down|game\s*changer|superior)\b/i
 
+/** Blank line between the prompt's sections, so they read as separate rules. */
+const SEP = '\n\n'
+
 // Ad copy, as opposed to a recommendation.
 //
 // These are what the model produced when the prompt asked it to "hype it up":
@@ -149,23 +151,37 @@ const DANGLING = new RegExp(
   '(^|\\s)(' + 'a|an|and|as|at|but|by|for|from|in|into|is|its|just|like|my|of|on|or|our|really|so|than|the|their|then|to|very|was|were|when|while|with|without|your|about|after|before|every|even|have|has|had|do|does|did|will|would|can|could|get|gets|got|be|been|am|are' + ')[.,!?\\s]*$',
   'i'
 )
-// A question that takes the claim for granted, or one that argues against it.
+// A question that puts OUR OWN product in doubt.
 //
-// The prompt asks for the first; the model drifts to the second after a few
-// batches, and a doubting question is worse than a plain statement — "does
-// purify text actually work?" puts the case against us under our own video, in
-// our own comment. Rejected outright rather than posted.
-const DOUBTING = new RegExp(
+// Always rejected, under every voice. "does purify text actually work?" argues
+// the case against us, under our own comment, in our own words — worse than
+// saying nothing. The subject is a bounded gap rather than a fixed word, because
+// the product name sits where "it" would: "is purify text any good" is the same
+// question as "is it any good".
+const SELF_DOUBT = new RegExp(
   [
-    // The subject is a bounded gap, not a fixed word: the product name sits
-    // where "it" would - "is purify text any good" is the same question.
     String.raw`\b(is|are|was|were)\s+[\w .']{0,24}?\s*(any\s+good|legit|worth\s+it|real|safe|reliable|accurate)\b`,
     String.raw`\bdoes\s+(it|this|that)\s+(actually\s+|really\s+|even\s+)?work\b`,
     String.raw`\bhas\s+anyone\s+(tried|used|tested)\b`,
     String.raw`\bshould\s+i\s+(use|try|get)\b`,
+    String.raw`\bworth\s+(it|trying|using)\b`,
+  ].join('|'),
+  'i'
+)
+
+// A question that invites a comparison.
+//
+// WANTED under the question voice and banned under the curious one, which is
+// why it is separate from SELF_DOUBT. Asking the creator to measure what they
+// are showing against our product is the whole point of that voice — "how does
+// this compare to purify text?" treats it as the benchmark without claiming
+// anything, and nobody argues with a question. The curious voice is the
+// opposite shape (the person is the subject, the product a passing aside), so a
+// comparison there turns it back into an advert.
+const COMPARISON = new RegExp(
+  [
     String.raw`\bwhich\s+(one|is)\s+(is\s+)?better\b`,
     String.raw`\bis\s+it\s+better\s+than\b`,
-    String.raw`\bworth\s+(it|trying|using)\b`,
     String.raw`\b(any|other)\s+alternatives?\b`,
   ].join('|'),
   'i'
@@ -288,7 +304,11 @@ function sanitize(
     // the prompt's job; these two rules are the same for both.
     if (style.voice === 'question' || style.voice === 'curious') {
       if (!isQuestion(s)) continue
-      if (DOUBTING.test(s)) continue
+      // Never allowed either way: our own product questioned.
+      if (SELF_DOUBT.test(s)) continue
+      // Comparisons are the POINT of the question voice and the ruin of the
+      // curious one — see COMPARISON.
+      if (style.voice === 'curious' && COMPARISON.test(s)) continue
     }
     // A curious comment is addressed to a PERSON. Without a second person in it
     // the model has written a rhetorical question again, which is the other
@@ -343,62 +363,6 @@ function sanitize(
   return out
 }
 
-// Ask Groq's OpenAI-compatible endpoint to rewrite this product's theme bank
-// into fresh, very short comments. Throws on any failure so callers can fall
-// back to whatever is already stored.
-async function callGroq(
-  product: Product,
-  base: string[],
-  band: WordBand,
-  style: CommentStyle,
-  /** An admin-edited prompt, used verbatim in place of the built one. */
-  override?: string | null
-): Promise<string[]> {
-  // One target length per input line, spread across the band.
-  const targets = targetLengths(base.length, band)
-  const system = override?.trim() ? override.trim() : buildSystemPrompt(product, band, style)
-
-  // Each item carries its own word target, which is what produces varied
-  // lengths: a single "between X and Y" instruction makes the model settle on
-  // one comfortable length and repeat it for the whole batch.
-  const items = base.map((text, i) => ({ text, words: targets[i] }))
-  const user =
-    `Rewrite these ${base.length} comments. Each item gives the original text and ` +
-    `the exact number of words its rewrite must have:\n${JSON.stringify(items, null, 0)}`
-
-  // groqChat tries each model in GROQ_MODELS, falling back on a quota/429 error.
-  // Free tier counts (input + output) tokens/minute, so keep the cap modest.
-  const { content } = await groqChat({
-    temperature: 0.9,
-    jsonObject: true,
-    maxTokens: tokenCap(base.length, band),
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user', content: user },
-    ],
-  })
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(content)
-  } catch {
-    throw new Error('Groq returned non-JSON content')
-  }
-  const arr = (parsed as { comments?: unknown })?.comments
-  // banCliches applies here as well now. It used to be set only for the
-  // audience sets, so "takes the obvious #1 spot" was filtered out of one
-  // path and waved through the other — and the other is where most comments
-  // come from.
-  const clean = sanitize(product, arr, band, { style, banCliches: true })
-  if (clean.length === 0) throw new Error('No valid rewrites returned')
-  return clean
-}
-
-/**
- * This product's band and writing style, with the compiled defaults as backup.
- *
- * One helper because every generation path needs both, and reading them apart
- * is how a regeneration ends up honouring the length but not the style.
- */
 async function settingsFor(product: Product): Promise<{ band: WordBand; style: CommentStyle }> {
   const dflt = { min: COMMENT_WORD_MIN, max: COMMENT_WORD_MAX }
   return getProductCommentSettings(product, dflt).catch(() => ({
@@ -469,146 +433,77 @@ function sample<T>(arr: T[], n: number): T[] {
   return a.slice(0, n)
 }
 
-// Generate + persist a fresh set for one product in a single, budget-sized LLM
-// call. Used by the manual per-product trigger and the daily cron. Returns the
-// number of comments stored.
-export async function regenerateProduct(product: Product): Promise<number> {
-  const base = baseComments(product)
-  if (base.length === 0) return 0
-  const { band, style } = await settingsFor(product)
-  const override = await getProductPrompt(product).catch(() => null)
-  const fresh = await callGroq(product, sample(base, batchSize(band)), band, style, override)
-  await saveGeneratedComments(product, fresh)
-  return fresh.length
-}
-
-// Regenerate several products one at a time, swallowing per-product errors so
-// one failure doesn't abort the batch. Sequential (not parallel) so we don't
-// fire several requests into the free-tier tokens-per-minute limit at once; a
-// product that still gets rate-limited is left for the next cron / lazy refresh.
-export async function regenerateProducts(
-  products: readonly Product[] = PRODUCTS.filter((p) => !DEACTIVATED_PRODUCTS.includes(p))
+/**
+ * Generate + persist one product's comments for ONE AUDIENCE, replacing what is
+ * stored. Every comment served is an audience comment — there is no
+ * audience-neutral set any more — so this and appendToCategory are the only two
+ * ways comments come into existence.
+ */
+export async function regenerateCategoryProducts(
+  products: readonly Product[],
+  categories: readonly LinkCategory[] = LINK_CATEGORIES
 ): Promise<Record<string, { ok: boolean; count?: number; error?: string }>> {
   const out: Record<string, { ok: boolean; count?: number; error?: string }> = {}
+  // Sequential, not parallel: concurrent rewrites of the same product hit the
+  // Groq tokens-per-minute limit and the later ones simply fail. One that gets
+  // rate-limited anyway is left for the next run or the lazy 24h refresh.
   for (const p of products) {
-    try {
-      out[p] = { ok: true, count: await regenerateProduct(p) }
-    } catch (e) {
-      out[p] = { ok: false, error: String(e) }
+    for (const c of categories) {
+      const key = `${p}/${c}`
+      try {
+        out[key] = { ok: true, count: await regenerateCategory(p, c) }
+      } catch (e) {
+        out[key] = { ok: false, error: String(e) }
+      }
     }
   }
   return out
 }
 
 /**
- * Return the comments a user should see for their product, regenerating first
- * if the stored set is missing or older than the 24h refresh window. Only one
- * request regenerates at a time (via the DB lease); everyone else is served the
- * current cache. Falls back to the static theme bank if generation fails and
- * nothing is stored yet.
+ * Generate another batch for one audience and ADD it to what is stored.
+ *
+ * Regenerating replaces the set, which is right when a voice is being tuned and
+ * wrong when the aim is a MIX: a comment section where every line is the same
+ * shape reads as one person with several accounts. This generates with whatever
+ * voice is set right now and appends, so a set can be built up from two or three
+ * voices by switching the voice and pressing Add again.
+ *
+ * Deduped against the stored set on the same key sanitize() uses within a batch —
+ * text without emoji, lowercased — so running it twice on one voice does not
+ * double the set, and a line the model happens to repeat is dropped rather than
+ * stored twice.
+ *
+ * Returns how many were actually added, which is the number worth reporting: a
+ * batch of 30 that adds 4 has told you the voice is exhausted.
  */
-export async function getFreshComments(
-  product: string
-): Promise<{ comments: string[]; generatedAt: string | null }> {
-  if (!isProduct(product)) return { comments: [], generatedAt: null }
+export async function appendToCategory(
+  product: Product,
+  category: LinkCategory
+): Promise<{ added: number; total: number }> {
+  const base = baseComments(product)
+  if (base.length === 0) return { added: 0, total: 0 }
+  const { band, style } = await settingsFor(product)
+  const fresh = await callGroqForAudience(product, category, sample(base, batchSize(band)), band, style)
 
-  const current = await getGeneratedComments(product)
-  const age = current?.generated_at ? Date.now() - new Date(current.generated_at).getTime() : Infinity
-  const stale = !current || current.comments.length === 0 || age > COMMENT_REFRESH_MS
-
-  if (stale) {
-    const won = await acquireCommentLock(product, LOCK_LEASE_MS)
-    if (won) {
-      try {
-        const fresh = await regenerateProduct(product)
-        if (fresh > 0) {
-          const saved = await getGeneratedComments(product)
-          return {
-            comments: saved?.comments ?? [],
-            generatedAt: saved?.generated_at ? new Date(saved.generated_at).toISOString() : null,
-          }
-        }
-      } catch {
-        // fall through to whatever we have / the static bank
-      } finally {
-        await releaseCommentLock(product).catch(() => {})
-      }
-    }
+  const stored = (await getCategoryComments(product, category).catch(() => null))?.comments ?? []
+  const key = (t: string) => stripEmoji(t).toLowerCase()
+  const seen = new Set(stored.map(key))
+  const added: string[] = []
+  for (const c of fresh) {
+    const k = key(c)
+    if (seen.has(k)) continue
+    seen.add(k)
+    added.push(c)
   }
-
-  if (current && current.comments.length > 0) {
-    return {
-      comments: current.comments,
-      generatedAt: current.generated_at ? new Date(current.generated_at).toISOString() : null,
-    }
-  }
-  // Nothing generated yet (or generation failed). The static bank spells the
-  // product as one word and carries no emoji, so it goes through the same
-  // normaliser the generated sets do - otherwise the fallback would post a
-  // differently-shaped comment than everything else.
-  const { band, style } = await settingsFor(product as Product)
-  const fallback = sanitize(
-    product as Product,
-    baseComments(product as Product),
-    { min: 1, max: Math.max(band.max, 60) },
-    { style }
-  )
-  return { comments: fallback, generatedAt: null }
-}
-
-// ── Audience-tailored comments ───────────────────────────────────────────────
-// The same product, pitched three ways. A link's category (lib/linkCategory.ts)
-// decides which set the app serves under it, so the comment answers what that
-// video's viewers are actually thinking about.
-//
-// Each audience adds an ANGLE to the normal prompt; the hard rules (word count,
-// must name the product, lowercase, no emojis) are unchanged, so sanitize() is
-// the same safety net for all three.
-
-const AUDIENCE_ANGLE: Record<LinkCategory, string> = {
-  competitors:
-    'AUDIENCE: the video promotes or reviews a RIVAL humanizer, and the viewer is already ' +
-    'shopping for one.\n' +
-    'WHO YOU ARE: someone who has genuinely been through several of these tools over months ' +
-    `and settled on "{PRODUCT}" — not a fan, just someone who stopped looking.\n` +
-    'WHAT TO SAY: that it is the one you ended up sticking with, and the one you trust ' +
-    'when it actually matters. Earn that the way a real person does, with a small ' +
-    'concrete reason: you kept getting flagged until you switched, you tried a few and ' +
-    'this was the only one that came back clean, you stopped re-checking, it still ' +
-    'sounds like you afterwards, you paid for others first and wish you had started ' +
-    'here. Plain words only — no jargon, and do not describe what it does.\n' +
-    'NEVER name the rival, and NEVER use comparison-ad words (beats, wins, unbeatable, ' +
-    'outperforms, rivals, the competition, number one, hands down, game changer). Let the ' +
-    'comparison live in your own experience. Write a comment, not a verdict.',
-  ai_detector:
-    'AUDIENCE: the video is about AI DETECTORS — Turnitin, GPTZero, Originality, Copyleaks, ' +
-    'ZeroGPT, being flagged, AI percentage scores. The viewer is worried about getting ' +
-    'caught and may not know a fix exists.\n' +
-    'WHO YOU ARE: someone who had exactly that problem and for whom it is simply over now.\n' +
-    `WHAT TO SAY: that with "{PRODUCT}" it stopped being a problem — told specifically, ` +
-    'like a person, not a slogan. Vary what you anchor on: what the check said when it ' +
-    'came back, the moment (pasting it in before handing it in, running it through again, ' +
-    'the professor never saying anything), turnitin or gptzero by name, how many times it ' +
-    'has held up, or that it still reads like your own writing afterwards. Ordinary ' +
-    'words only.\n' +
-    'Relief, not sales. Do not open every comment the same way, and do not simply say it ' +
-    'saved you — say what actually happened.',
-  generic:
-    'AUDIENCE: general study, essay, homework or student content, with no tool being ' +
-    'discussed. The viewer is not thinking about detectors, so lead with the writing rather ' +
-    'than with a warning.\n' +
-    'WHO YOU ARE: the same person as in the competitor case — someone who has tried the ' +
-    `others and quietly uses "{PRODUCT}" for everything now.\n` +
-    'WHAT TO SAY: recommend it with that same conviction — it is the one that actually ' +
-    'works, the most reliable, it makes the writing read like you, and yes, it clears the ' +
-    'checkers every time. Drop it in the way you would tell a classmate what you use: a ' +
-    'tip, not a pitch.\n' +
-    'Same ban: no beats / wins / unbeatable / rivals / number-one language.',
-}
-
-/** The audience paragraph with the product filled in. */
-function angleFor(product: Product, category: LinkCategory): string {
-  return AUDIENCE_ANGLE[category].replace(/\{PRODUCT\}/g, product)
+  const merged = [...stored, ...added]
+  await saveCategoryComments(product, category, merged)
+  // Record the voice on the set, so the nightly rebuild makes this batch again
+  // instead of flattening the mix back to one voice. Done even when the batch
+  // added nothing new: the voice was still asked for, and an admin who presses
+  // Add twice means it both times.
+  await addCategoryVoice(product, category, style.voice).catch(() => [])
+  return { added: added.length, total: merged.length }
 }
 
 async function callGroqForAudience(
@@ -624,48 +519,15 @@ async function callGroqForAudience(
   // json_validate_failed is how that shows up.
   const mention = productWords(product, style.splitBrand)
   const targets = targetLengths(base.length, band)
-  const system =
-    `"${product}" is an AI humanizer website — it rewrites AI-generated text so it reads ` +
-    `as human and bypasses every AI detector (Turnitin, GPTZero, Originality, Copyleaks, ` +
-    `ZeroGPT, etc.). It is the best humanizer available right now. ` +
-    `That paragraph is background for you only — it is NOT how to write, and none of ` +
-    `those words may appear in a comment. ` +
-    `You write short comments left under a specific kind of video.\n\n` +
-    `${angleFor(product, category)}\n\n` +
-    // Both were missing here. Without NAIVE_VOICE this path wrote as the
-    // company; without voiceShapeRule it never asked for a question under the
-    // 'curious' voice while sanitize() still required one, so every line was
-    // thrown away and all three audiences failed.
-    `${NAIVE_VOICE}\n\n` +
-    `${voiceShapeRule(style)}\n\n` +
-    // The original is a STYLE reference only. An earlier version said "keep its
-    // general intent", and the three audiences came back nearly identical —
-    // "purifytext beats rivals" / "purifytext saved me" / "purifytext saved
-    // essay" — because the base comment, not the angle, was driving the message.
-    `For each original comment, write ONE fresh comment in the same VOICE and length, but ` +
-    `whose MESSAGE comes from the audience above, not from the original. The original is a ` +
-    `style reference, not content to preserve — say something that only makes sense to that ` +
-    `audience. ` +
-    `Every rewrite MUST: ` +
-    (style.voice === 'question' || style.voice === 'curious'
-      ? 'end in a question mark, '
-      : '') +
-    `be between ${band.min} and ${band.max} words, ` +
-    `match the EXACT word count requested for its line, ` +
-    `write the product as the two words ${mention} - exactly that spelling and ` +
-    `spacing, and do NOT put quotes around it - be lowercase and casual like a real ` +
-    `social-media reply, contain no hashtags and no quotes around the whole comment. ` +
-    (style.emoji
-      ? `End each comment with one upbeat emoji that fits what it says - vary them ` +
-        `across the batch. Emoji do not count towards the word total. `
-      : `Use no emoji at all. `) +
-    `Return strict JSON: {"comments": ["...", ...]} with one rewrite per input, in the same order.`
+  const system = buildAudiencePrompt(product, category, band, style)
 
   const items = base.map((text, i) => ({ text, words: targets[i] }))
   const user =
-    `Rewrite these ${base.length} comments for that audience. Each item gives the original ` +
-    `text and the exact number of words its rewrite must have:\n${JSON.stringify(items, null, 0)}`
+    `Rewrite these ${base.length} comments. Each item gives the original text and ` +
+    `the exact number of words its rewrite must have:\n${JSON.stringify(items, null, 0)}`
 
+  // groqChat tries each model in GROQ_MODELS, falling back on a quota/429 error.
+  // Free tier counts (input + output) tokens/minute, so keep the cap modest.
   const { content } = await groqChat({
     temperature: 0.9,
     jsonObject: true,
@@ -681,15 +543,68 @@ async function callGroqForAudience(
   } catch {
     throw new Error('Groq returned non-JSON content')
   }
-  const clean = sanitize(product, (parsed as { comments?: unknown })?.comments, band, {
-    banCliches: true,
-    style,
-  })
+  const arr = (parsed as { comments?: unknown })?.comments
+  // banCliches applies here as well now. It used to be set only for the
+  // audience sets, so "takes the obvious #1 spot" was filtered out of one
+  // path and waved through the other — and the other is where most comments
+  // come from.
+  const clean = sanitize(product, arr, band, { style, banCliches: true })
   if (clean.length === 0) throw new Error('No valid rewrites returned')
   return clean
 }
 
-/** Generate + persist one product's comments for one audience. */
+/**
+ * One batch for one audience in one voice, retried once.
+ *
+ * Two attempts, each on a fresh sample. The cliche filter can reject most of a
+ * batch when the model falls back into ad language, and a silent failure here
+ * would leave the audience showing yesterday's comments with no sign anything
+ * went wrong.
+ */
+async function batchForVoice(
+  product: Product,
+  category: LinkCategory,
+  base: string[],
+  band: WordBand,
+  style: CommentStyle,
+  voice: CommentVoice
+): Promise<string[]> {
+  const styled: CommentStyle = { ...style, voice }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const out = await callGroqForAudience(
+        product,
+        category,
+        sample(base, batchSize(band)),
+        band,
+        styled
+      )
+      if (out.length > 0) return out
+    } catch (e) {
+      if (attempt === 1) throw e
+    }
+  }
+  return []
+}
+
+/**
+ * Generate + persist one product's comments for one audience, REBUILDING THE
+ * WHOLE MIX.
+ *
+ * A set is a deliberate blend: generate on one voice, switch the voice, add
+ * another batch. That is the only way a comment section stops reading as one
+ * person with several accounts. Regeneration used to throw it away — it made a
+ * single batch in whatever voice happened to be selected, so the nightly cron
+ * flattened every mix an admin had built, overnight, silently.
+ *
+ * Now the voices a set was built from are recorded on the set itself, and a
+ * regeneration makes one batch per recorded voice and merges them. A set with
+ * no recorded mix uses the product's current voice, which is exactly what every
+ * set did before, and records it so the next rebuild matches this one.
+ *
+ * Deduped across voices on the same key appendToCategory uses, so two voices
+ * that happen to produce the same line store it once.
+ */
 export async function regenerateCategory(
   product: Product,
   category: LinkCategory
@@ -697,29 +612,57 @@ export async function regenerateCategory(
   const base = baseComments(product)
   if (base.length === 0) return 0
   const { band, style } = await settingsFor(product)
-  // Two attempts, each on a fresh sample. The cliche filter can reject most of
-  // a batch when the model falls back into ad language, and a silent failure
-  // here would leave the audience showing yesterday's comments with no sign
-  // anything went wrong.
-  let fresh: string[] = []
-  for (let attempt = 0; attempt < 2 && fresh.length === 0; attempt++) {
+
+  const stored = await getCategoryComments(product, category).catch(() => null)
+  const recorded = (stored?.voices ?? []).filter(isCommentVoice)
+  const voices: CommentVoice[] = recorded.length ? recorded : [style.voice]
+
+  const key = (t: string) => stripEmoji(t).toLowerCase()
+  const seen = new Set<string>()
+  const out: string[] = []
+  const usedVoices: CommentVoice[] = []
+  let lastError: unknown = null
+
+  // Sequential, not parallel: several batches for one product at once exhaust
+  // the Groq tokens-per-minute budget and the later ones simply fail.
+  for (const voice of voices) {
+    let batch: string[] = []
     try {
-      fresh = await callGroqForAudience(product, category, sample(base, batchSize(band)), band, style)
+      batch = await batchForVoice(product, category, base, band, style, voice)
     } catch (e) {
-      if (attempt === 1) throw e
+      // One voice failing must not lose the others. Remembered so a total
+      // failure still throws rather than quietly writing an empty set.
+      lastError = e
+      continue
+    }
+    if (batch.length === 0) continue
+    usedVoices.push(voice)
+    for (const c of batch) {
+      const k = key(c)
+      if (seen.has(k)) continue
+      seen.add(k)
+      out.push(c)
     }
   }
-  if (fresh.length === 0) return 0
-  await saveCategoryComments(product, category, fresh)
-  return fresh.length
+
+  if (out.length === 0) {
+    if (lastError) throw lastError
+    return 0
+  }
+  // Record the voices that ACTUALLY produced something. A voice that failed
+  // tonight stays in the recipe only if it worked — otherwise a permanently
+  // broken voice would be retried forever and its absence never noticed.
+  await saveCategoryComments(product, category, out, usedVoices)
+  return out.length
 }
 
 /**
  * One product's comments for one audience, regenerating when stale.
  *
- * Falls back to the product's ordinary (audience-neutral) comments when nothing
- * has been generated for this pair yet, so switching the app over to categories
- * never leaves a link with an empty comment pool.
+ * There is no audience-neutral set to fall back to any more. If this pair has
+ * never been generated and generating it here fails, the answer is an empty
+ * list, and the caller looks to another product for the same audience rather
+ * than serving a comment written for nobody in particular.
  */
 export async function getFreshCategoryComments(
   product: string,
@@ -745,7 +688,7 @@ export async function getFreshCategoryComments(
           }
         }
       } catch {
-        // fall through to whatever exists / the neutral set
+        // fall through to whatever is already stored, even if it is stale
       } finally {
         await releaseCategoryLock(product, category).catch(() => {})
       }
@@ -758,6 +701,6 @@ export async function getFreshCategoryComments(
       generatedAt: current.generated_at ? new Date(current.generated_at).toISOString() : null,
     }
   }
-  // Nothing audience-specific yet — the ordinary set is still on-message.
-  return getFreshComments(product)
+  // Never generated, and generating it just now did not work either.
+  return { comments: [], generatedAt: null }
 }

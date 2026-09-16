@@ -5,15 +5,22 @@ import {
   COMMENT_PAY_RATE,
   VIDEO_PAYMENT_BIRR,
   PROMO_PAY_BIRR,
+  ACCOUNT_PAY_BIRR,
+  ACCOUNT_TASK_DEFAULT_DOMAIN,
+  ACCOUNT_TASK_DEFAULT_PASSWORD,
   PROMO_DOWNLOAD_DAILY_LIMIT,
   CLICK_EXCLUDED_EMAILS,
   CLICK_PLATFORMS,
+  type ClickPlatform,
   DEFAULT_PLATFORM_LIMIT,
   type PlatformLimit,
   PRODUCTS,
   DEACTIVATED_PRODUCTS,
   isProduct,
   platformFromUrl,
+  isLlmModel,
+  DEFAULT_LLM_MODEL,
+  type LlmModel,
   type DateWeights,
   DEFAULT_DATE_WEIGHTS,
   normalizeDateWeights,
@@ -135,6 +142,22 @@ export function ensureClickedTable(): Promise<void> {
         -- same empty response comes back from a rate limit or a bad minute on
         -- TikTok's side, and condemning a live link on one reading would quietly
         -- shrink the pool.
+        -- Clicks made while "serve only links with none of ours" is ON.
+        --
+        -- Held apart from clicked_link because it answers a different question
+        -- and has a different lifetime. clicked_link is the permanent record of
+        -- what a user has ever opened, and while that setting is on it is
+        -- deliberately IGNORED so a link with none of ours comes back round.
+        -- Without a second record a user would then be handed the same link on
+        -- every fetch of the session. This is that record, and it is wiped every
+        -- time the setting is switched, so each ON session starts empty.
+        CREATE TABLE IF NOT EXISTS clean_session_click (
+          user_id    TEXT NOT NULL,
+          url        TEXT NOT NULL,
+          clicked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (user_id, url)
+        );
+
         CREATE TABLE IF NOT EXISTS broken_link (
           url          TEXT PRIMARY KEY,
           reason       TEXT NOT NULL DEFAULT '',
@@ -697,14 +720,42 @@ export type TitleFilter = 'all' | 'has' | 'none'
 //
 // Returned as a bare predicate (not "WHERE …") because the count query embeds it
 // inside COUNT(*) FILTER (WHERE …).
+/**
+ * The platform of a verify row, IN SQL, read from its URL.
+ *
+ * Deliberately not the stored `platform` column. That column is whatever the
+ * uploader or scraper put there, and it has been wrong before — 504 pool rows
+ * were Instagram links labelled tiktok, which is how Instagram links ended up
+ * in the rank clusters. The URL is the only thing that cannot be mislabelled.
+ *
+ * Mirrors platformFromUrl() in lib/config.ts, rule for rule, including
+ * "anything unrecognised is tiktok" — so the filter buckets a row exactly where
+ * the rest of the app does.
+ */
+const VERIFY_PLATFORM_SQL = `
+  CASE
+    WHEN lower(url) LIKE '%instagram.com%' THEN 'instagram'
+    WHEN lower(url) LIKE '%youtube.com%' OR lower(url) LIKE '%youtu.be%'
+      THEN CASE WHEN lower(url) LIKE '%/shorts/%' THEN 'youtube_shorts'
+                ELSE 'youtube_videos' END
+    ELSE 'tiktok'
+  END`
+
 function verifyWhere(
   filter: TitleFilter,
-  accounts: string[]
+  accounts: string[],
+  platform = ''
 ): { predicate: string; params: unknown[] } {
   const conds: string[] = []
   const params: unknown[] = []
   if (filter === 'has') conds.push("title IS NOT NULL AND btrim(title) <> ''")
   else if (filter === 'none') conds.push("(title IS NULL OR btrim(title) = '')")
+
+  const plat = String(platform ?? '').trim()
+  if (plat) {
+    params.push(plat)
+    conds.push(`${VERIFY_PLATFORM_SQL} = $${params.length}`)
+  }
 
   const accs = Array.from(
     new Set(accounts.map((a) => String(a ?? '').trim().toLowerCase()).filter(Boolean))
@@ -720,10 +771,11 @@ export async function getVerifyLinks(
   limit: number,
   offset: number,
   filter: TitleFilter = 'all',
-  accounts: string[] = []
+  accounts: string[] = [],
+  platform = ''
 ): Promise<{ rows: VerifyLinkRow[]; total: number; totalAll: number }> {
   await ensureVerifyLinkTable()
-  const { predicate, params } = verifyWhere(filter, accounts)
+  const { predicate, params } = verifyWhere(filter, accounts, platform)
   const [pageRes, cntRes] = await Promise.all([
     pool.query(
       // GROUPED BY CHANNEL. A channel is judged as a whole — from its bio and
@@ -766,6 +818,23 @@ export async function getVerifyLinksByUrls(urls: string[]): Promise<VerifyLinkRo
     [urls]
   )
   return rows.map(mapVerifyRow)
+}
+
+/**
+ * How many verify links each platform holds, by URL.
+ *
+ * Counted rather than assumed so the filter can show the numbers: a dropdown
+ * offering Instagram when there are no Instagram links is a filter that
+ * silently empties the page.
+ */
+export async function getVerifyPlatformCounts(): Promise<Record<string, number>> {
+  await ensureVerifyLinkTable()
+  const { rows } = await pool.query<{ p: string; n: number }>(
+    `SELECT ${VERIFY_PLATFORM_SQL} AS p, COUNT(*)::int AS n FROM verify_link GROUP BY 1`
+  )
+  const out: Record<string, number> = {}
+  for (const r of rows) out[r.p] = r.n
+  return out
 }
 
 /** Distinct channels in the verify list, with how many links each still has. */
@@ -1783,6 +1852,25 @@ export async function getAppState(key: string): Promise<string | null> {
   return rows[0]?.value ?? null
 }
 
+// ── Which LLM every generation uses ──────────────────────────────────────────
+// One setting for the whole app: comments, replies, title classification and
+// audience analysis all run through groqChat, so choosing here changes all of
+// them. Stored rather than compiled in so it can be switched without a deploy —
+// which is the point when one model starts refusing or drifting.
+
+/** The chosen model, or the default when nothing has been chosen. */
+export async function getLlmModel(): Promise<LlmModel> {
+  const v = await getAppState('llm_model').catch(() => null)
+  return isLlmModel(v) ? v : DEFAULT_LLM_MODEL
+}
+
+/** Choose the model. Anything not on the list is refused rather than stored. */
+export async function setLlmModel(model: string): Promise<LlmModel> {
+  if (!isLlmModel(model)) throw new Error(`Unknown model: ${model}`)
+  await setAppState('llm_model', model)
+  return model
+}
+
 /** Set one named value. */
 export async function setAppState(key: string, value: string): Promise<void> {
   await ensureClickedTable()
@@ -1809,6 +1897,43 @@ export async function setClusterDateShare(pct: number): Promise<number> {
   const v = clampShare(pct)
   await setAppState(CLUSTER_DATE_SHARE_KEY, String(v))
   return v
+}
+
+// ── Serve only links that carry none of our comments ────────────────────────
+// Off by default. On, the app and the web dashboard withhold every link already
+// known to carry one of our product comments, so a session is spent on videos
+// nobody has commented on yet.
+//
+// "Known to carry one" is the only thing that can be excluded. A link nobody has
+// extracted might have ten of ours on it or none — that is what UNEXTRACTED
+// means — and withholding those too would cut the pool from ~148k to the 13k
+// that have actually been read, which is not what "no product comments" is
+// asking for.
+
+const SERVE_ONLY_CLEAN_KEY = "serve_only_clean"
+
+export async function getServeOnlyClean(): Promise<boolean> {
+  const raw = await getAppState(SERVE_ONLY_CLEAN_KEY).catch(() => null)
+  return raw === "1"
+}
+
+export async function setServeOnlyClean(on: boolean): Promise<boolean> {
+  await setAppState(SERVE_ONLY_CLEAN_KEY, on ? "1" : "0")
+  return on
+}
+
+/**
+ * Every URL an extraction has found one of our comments on.
+ *
+ * Just the URLs — the serving paths only need to know WHETHER, and the full
+ * per-product counts are a much larger read for a set membership test.
+ */
+export async function getUrlsWithProductComments(): Promise<string[]> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ url: string }>(
+    "SELECT DISTINCT url FROM link_product_comment WHERE product IS NOT NULL"
+  )
+  return rows.map((r) => r.url)
 }
 
 /** The database's own clock, as an ISO string.
@@ -2263,6 +2388,35 @@ export async function getPresenceAverages(): Promise<Record<string, { pct: numbe
 }
 
 // ── Link audience categories ─────────────────────────────────────────────────
+
+/**
+ * The category of ONE link, or null when it has never been categorised.
+ *
+ * Serving a comment needs this one row, not the 150k-row map getLinkCategories
+ * returns — that is a page-load's worth of data to answer a question about a
+ * single URL, on the hottest path there is (every click).
+ */
+export async function getLinkCategory(url: string): Promise<string | null> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ category: string }>(
+    'SELECT category FROM link_category WHERE url = $1',
+    [url]
+  )
+  return rows[0]?.category ?? null
+}
+
+/** The categories of a specific set of links, as { url: category }. */
+export async function getLinkCategoriesFor(urls: string[]): Promise<Record<string, string>> {
+  if (urls.length === 0) return {}
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ url: string; category: string }>(
+    'SELECT url, category FROM link_category WHERE url = ANY($1::text[])',
+    [urls]
+  )
+  const out: Record<string, string> = {}
+  for (const r of rows) out[r.url] = r.category
+  return out
+}
 
 /** Every categorised URL -> its category. */
 export async function getLinkCategories(): Promise<Record<string, string>> {
@@ -2820,6 +2974,44 @@ export async function recordClick(
   )
 }
 
+// ── Clicks inside an "only links with none of ours" session ─────────────────
+// See the clean_session_click table. Only written while that setting is on, and
+// wiped whenever it is switched, so it never outlives the session it belongs to.
+
+/** Note that this user opened this link during the current ON session. */
+export async function recordCleanSessionClick(userId: string, url: string): Promise<void> {
+  await ensureClickedTable()
+  await pool.query(
+    `INSERT INTO clean_session_click (user_id, url) VALUES ($1, $2)
+     ON CONFLICT (user_id, url) DO NOTHING`,
+    [userId, url]
+  )
+}
+
+/** What this user has opened during the current ON session. */
+export async function getCleanSessionClicks(userId: string): Promise<string[]> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ url: string }>(
+    "SELECT url FROM clean_session_click WHERE user_id = $1",
+    [userId]
+  )
+  return rows.map((r) => r.url)
+}
+
+/**
+ * Start a new session: forget everything the last one recorded.
+ *
+ * Called on BOTH transitions. Off is the one the ask names, but clearing on the
+ * way in is what actually guarantees "after the last time the button was turned
+ * on" — if the setting were ever switched on twice without an off in between,
+ * the old session's clicks would otherwise still be suppressing links.
+ */
+export async function clearCleanSessionClicks(): Promise<number> {
+  await ensureClickedTable()
+  const { rowCount } = await pool.query("DELETE FROM clean_session_click")
+  return rowCount ?? 0
+}
+
 // ── Per-platform link limits (admin-configurable quota + wait window) ─────────
 
 let ensuredPlatformLimit: Promise<void> | null = null
@@ -2834,12 +3026,14 @@ function ensurePlatformLimitTable(): Promise<void> {
           window_ms    BIGINT NOT NULL,   -- rolling window / wait time
           enabled        BOOLEAN NOT NULL DEFAULT true, -- hourly quota switch
           retire_enabled BOOLEAN NOT NULL DEFAULT true, -- link-retirement switch
+          harvest_enabled BOOLEAN NOT NULL DEFAULT true, -- automatic channel extraction
           updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
         );
-        -- Existing installs: both default to true so nothing changes until the
+        -- Existing installs: all default to true so nothing changes until the
         -- admin switches a platform off explicitly.
         ALTER TABLE platform_limit ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true;
         ALTER TABLE platform_limit ADD COLUMN IF NOT EXISTS retire_enabled BOOLEAN NOT NULL DEFAULT true;
+        ALTER TABLE platform_limit ADD COLUMN IF NOT EXISTS harvest_enabled BOOLEAN NOT NULL DEFAULT true;
       `)
       .then(() => undefined)
       .catch((e) => {
@@ -2859,7 +3053,11 @@ export async function getPlatformLimits(): Promise<Record<string, PlatformLimit>
     window_ms: string
     enabled: boolean
     retire_enabled: boolean
-  }>('SELECT platform, hourly_limit, window_ms, enabled, retire_enabled FROM platform_limit')
+    harvest_enabled: boolean
+  }>(
+    `SELECT platform, hourly_limit, window_ms, enabled, retire_enabled, harvest_enabled
+       FROM platform_limit`
+  )
   const saved = new Map(
     rows.map((r) => [
       r.platform,
@@ -2868,6 +3066,7 @@ export async function getPlatformLimits(): Promise<Record<string, PlatformLimit>
         windowMs: Number(r.window_ms),
         enabled: r.enabled !== false,
         retireEnabled: r.retire_enabled !== false,
+        harvestEnabled: r.harvest_enabled !== false,
       },
     ])
   )
@@ -3096,8 +3295,9 @@ export async function setPlatformLimit(platform: string, limit: number, windowMs
   const lim = Math.trunc(Number(limit))
   const win = Math.max(1000, Math.trunc(Number(windowMs)))
   await pool.query(
-    `INSERT INTO platform_limit (platform, hourly_limit, window_ms, enabled, retire_enabled, updated_at)
-     VALUES ($1, $2, $3, $4, $5, now())
+    `INSERT INTO platform_limit
+       (platform, hourly_limit, window_ms, enabled, retire_enabled, harvest_enabled, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, now())
      ON CONFLICT (platform) DO UPDATE SET
        hourly_limit = EXCLUDED.hourly_limit,
        window_ms    = EXCLUDED.window_ms,
@@ -3108,6 +3308,7 @@ export async function setPlatformLimit(platform: string, limit: number, windowMs
       win,
       DEFAULT_PLATFORM_LIMIT.enabled,
       DEFAULT_PLATFORM_LIMIT.retireEnabled,
+      DEFAULT_PLATFORM_LIMIT.harvestEnabled,
     ]
   )
 }
@@ -3117,14 +3318,15 @@ export async function setPlatformLimit(platform: string, limit: number, windowMs
 // saved, so a flag can be flipped before any limit is chosen.
 async function setPlatformFlag(
   platform: string,
-  column: 'enabled' | 'retire_enabled',
+  column: 'enabled' | 'retire_enabled' | 'harvest_enabled',
   value: boolean
 ): Promise<void> {
   await ensurePlatformLimitTable()
   // `column` is a literal from the union above, never caller input.
   await pool.query(
-    `INSERT INTO platform_limit (platform, hourly_limit, window_ms, enabled, retire_enabled, updated_at)
-     VALUES ($1, $2, $3, $4, $5, now())
+    `INSERT INTO platform_limit
+       (platform, hourly_limit, window_ms, enabled, retire_enabled, harvest_enabled, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, now())
      ON CONFLICT (platform) DO UPDATE SET
        ${column}  = EXCLUDED.${column},
        updated_at = now()`,
@@ -3134,6 +3336,7 @@ async function setPlatformFlag(
       DEFAULT_PLATFORM_LIMIT.windowMs,
       column === 'enabled' ? value : DEFAULT_PLATFORM_LIMIT.enabled,
       column === 'retire_enabled' ? value : DEFAULT_PLATFORM_LIMIT.retireEnabled,
+      column === 'harvest_enabled' ? value : DEFAULT_PLATFORM_LIMIT.harvestEnabled,
     ]
   )
 }
@@ -3146,6 +3349,27 @@ export async function setPlatformEnabled(platform: string, enabled: boolean): Pr
 /** Turn one platform's LINK RETIREMENT on/off (still gated by the master switch). */
 export async function setPlatformRetireEnabled(platform: string, enabled: boolean): Promise<void> {
   await setPlatformFlag(platform, 'retire_enabled', enabled)
+}
+
+/** Turn one platform's AUTOMATIC CHANNEL EXTRACTION on/off. */
+export async function setPlatformHarvestEnabled(
+  platform: string,
+  enabled: boolean
+): Promise<void> {
+  await setPlatformFlag(platform, 'harvest_enabled', enabled)
+}
+
+/**
+ * The click platforms whose channels the automatic harvest may visit.
+ *
+ * Read on every harvest slice rather than cached: the switch has to take effect
+ * on the next tick, not the next deploy.
+ */
+export async function getHarvestPlatforms(): Promise<Set<string>> {
+  const all = await getPlatformLimits().catch(() => ({}) as Record<string, PlatformLimit>)
+  const out = new Set<string>()
+  for (const [p, rule] of Object.entries(all)) if (rule.harvestEnabled !== false) out.add(p)
+  return out
 }
 
 // ── User profile / onboarding ────────────────────────────────────────────────
@@ -3681,6 +3905,28 @@ export function ensureAdminTables(): Promise<void> {
         ALTER TABLE video_submission ADD COLUMN IF NOT EXISTS reject_reason TEXT;
         -- Backfill: anything already paid was implicitly accepted.
         UPDATE video_submission SET status = 'approved' WHERE paid = true AND status = 'pending';
+
+        -- Mailbox task: an address a worker created on the company's own
+        -- domain. Reviewed per submission, exactly like video_submission:
+        -- pending (awaiting an admin checking it exists) | approved | rejected.
+        CREATE TABLE IF NOT EXISTS account_submission (
+          id            BIGSERIAL PRIMARY KEY,
+          user_id       TEXT NOT NULL,
+          email         TEXT NOT NULL,
+          status        TEXT NOT NULL DEFAULT 'pending',
+          reject_reason TEXT,
+          paid          BOOLEAN NOT NULL DEFAULT false,
+          submitted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+          reviewed_at   TIMESTAMPTZ,
+          reviewed_by   TEXT
+        );
+        -- One address, one payment. Without this two workers can submit the
+        -- same address and both be paid for it, and the second submission is
+        -- not work — it is a copy of someone else's.
+        CREATE UNIQUE INDEX IF NOT EXISTS account_submission_email_key
+          ON account_submission (lower(email));
+        CREATE INDEX IF NOT EXISTS account_submission_user_idx
+          ON account_submission (user_id, submitted_at DESC);
 
         CREATE TABLE IF NOT EXISTS admin_message (
           id             BIGSERIAL PRIMARY KEY,
@@ -4266,6 +4512,16 @@ export function ensureCommentsTable(): Promise<void> {
           locked_at    TIMESTAMPTZ,
           PRIMARY KEY (product, category)
         );
+        -- The VOICES this set is built from, in the order they were added.
+        --
+        -- A set is a deliberate mix: generate on one voice, switch, add another.
+        -- Without recording it, the nightly regeneration rebuilt the set from
+        -- whatever single voice happened to be selected at the time, so every
+        -- mix an admin built was flattened overnight and the work was lost.
+        -- Empty means "whatever the product's current voice is", which is what
+        -- every set did before this existed.
+        ALTER TABLE category_comments
+          ADD COLUMN IF NOT EXISTS voices JSONB NOT NULL DEFAULT '[]'::jsonb;
         CREATE TABLE IF NOT EXISTS generated_comments (
           product      TEXT PRIMARY KEY,
           comments     JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -4285,30 +4541,90 @@ export function ensureCommentsTable(): Promise<void> {
 export async function getCategoryComments(
   product: string,
   category: string
-): Promise<{ comments: string[]; generated_at: Date | null } | null> {
+): Promise<{ comments: string[]; generated_at: Date | null; voices: string[] } | null> {
   await ensureCommentsTable()
-  const { rows } = await pool.query<{ comments: string[]; generated_at: Date | null }>(
-    'SELECT comments, generated_at FROM category_comments WHERE product = $1 AND category = $2',
+  const { rows } = await pool.query<{
+    comments: string[]
+    generated_at: Date | null
+    voices: string[]
+  }>(
+    'SELECT comments, generated_at, voices FROM category_comments WHERE product = $1 AND category = $2',
     [product, category]
   )
   const r = rows[0]
   if (!r) return null
-  return { comments: Array.isArray(r.comments) ? r.comments : [], generated_at: r.generated_at }
+  return {
+    comments: Array.isArray(r.comments) ? r.comments : [],
+    generated_at: r.generated_at,
+    // Only voices we still recognise: a voice removed from the product would
+    // otherwise sit in the recipe forever and fail every regeneration.
+    voices: (Array.isArray(r.voices) ? r.voices : []).map(String).filter(isCommentVoice),
+  }
 }
 
 export async function saveCategoryComments(
   product: string,
   category: string,
-  comments: string[]
+  comments: string[],
+  // The voices the set is now built from. Omitted leaves the recorded mix
+  // alone, so a caller that only edits the text cannot erase the recipe.
+  voices?: string[]
 ): Promise<void> {
   await ensureCommentsTable()
+  const clean = voices === undefined ? null : voices.filter(isCommentVoice)
   await pool.query(
-    `INSERT INTO category_comments (product, category, comments, generated_at)
-     VALUES ($1, $2, $3::jsonb, now())
+    `INSERT INTO category_comments (product, category, comments, voices, generated_at)
+     VALUES ($1, $2, $3::jsonb, COALESCE($4::jsonb, '[]'::jsonb), now())
      ON CONFLICT (product, category) DO UPDATE SET
-       comments = EXCLUDED.comments, generated_at = now(), locked_at = NULL`,
-    [product, category, JSON.stringify(comments)]
+       comments = EXCLUDED.comments,
+       voices = COALESCE($4::jsonb, category_comments.voices),
+       generated_at = now(), locked_at = NULL`,
+    [product, category, JSON.stringify(comments), clean === null ? null : JSON.stringify(clean)]
   )
+}
+
+/**
+ * Add a voice to a set's recorded mix, keeping the order it was added in.
+ *
+ * Separate from saving the comments because appending a batch does both and
+ * they fail independently: a batch that generated but whose voice was not
+ * recorded would be rebuilt without that voice the next night.
+ */
+export async function addCategoryVoice(
+  product: string,
+  category: string,
+  voice: string
+): Promise<string[]> {
+  if (!isCommentVoice(voice)) return []
+  await ensureCommentsTable()
+  const { rows } = await pool.query<{ voices: string[] }>(
+    `UPDATE category_comments
+        SET voices = CASE
+              WHEN voices @> $3::jsonb THEN voices
+              ELSE voices || $3::jsonb
+            END
+      WHERE product = $1 AND category = $2
+      RETURNING voices`,
+    [product, category, JSON.stringify([voice])]
+  )
+  return (rows[0]?.voices ?? []).map(String).filter(isCommentVoice)
+}
+
+/** Replace a set's recorded mix outright (the admin editing the recipe). */
+export async function setCategoryVoices(
+  product: string,
+  category: string,
+  voices: string[]
+): Promise<string[]> {
+  await ensureCommentsTable()
+  const clean = Array.from(new Set(voices.filter(isCommentVoice)))
+  await pool.query(
+    `INSERT INTO category_comments (product, category, voices)
+     VALUES ($1, $2, $3::jsonb)
+     ON CONFLICT (product, category) DO UPDATE SET voices = EXCLUDED.voices`,
+    [product, category, JSON.stringify(clean)]
+  )
+  return clean
 }
 
 /** Lease-based lock, so two requests can't regenerate the same pair at once. */
@@ -4353,6 +4669,74 @@ export async function getGeneratedComments(product: string): Promise<GeneratedCo
   const r = rows[0]
   if (!r) return null
   return { comments: Array.isArray(r.comments) ? r.comments : [], generated_at: r.generated_at }
+}
+
+/**
+ * How many comments each product holds, summed across its three audiences.
+ *
+ * The audience sets are the only comments there are, so this is the product's
+ * whole stock. One query for the whole switcher rather than one per product:
+ * the picker shows every product, and a count beside each is what makes it
+ * obvious which ones have never been generated.
+ */
+export async function getCommentSetSizes(): Promise<Record<string, number>> {
+  await ensureCommentsTable()
+  const { rows } = await pool.query<{ product: string; n: number }>(
+    `SELECT product, COALESCE(SUM(jsonb_array_length(comments)), 0)::int AS n
+       FROM category_comments
+      GROUP BY product`
+  )
+  const out: Record<string, number> = {}
+  for (const r of rows) out[r.product] = r.n
+  return out
+}
+
+// ── Dropping one comment an admin does not want ──────────────────────────────
+// BY TEXT, not by position. The list on screen can be a regeneration behind the
+// stored one, and deleting index 7 would then remove whatever happens to be
+// seventh now — silently, and with nothing to point at afterwards. An exact
+// string either matches the line that was on screen or matches nothing.
+//
+// generated_at is deliberately left alone. It drives the refresh schedule, and
+// saveGeneratedComments resets it — so routing a delete through that would make
+// removing one line look like a full regeneration and push the next one back.
+
+/** Remove one comment from a product's set. Returns how many were removed. */
+export async function deleteGeneratedComment(product: string, text: string): Promise<number> {
+  await ensureCommentsTable()
+  const { rows } = await pool.query<{ comments: string[] }>(
+    'SELECT comments FROM generated_comments WHERE product = $1',
+    [product]
+  )
+  const before = Array.isArray(rows[0]?.comments) ? rows[0].comments : []
+  const after = before.filter((c) => String(c) !== text)
+  if (after.length === before.length) return 0
+  await pool.query('UPDATE generated_comments SET comments = $2::jsonb WHERE product = $1', [
+    product,
+    JSON.stringify(after),
+  ])
+  return before.length - after.length
+}
+
+/** Remove one comment from one audience's set. Returns how many were removed. */
+export async function deleteCategoryComment(
+  product: string,
+  category: string,
+  text: string
+): Promise<number> {
+  await ensureCommentsTable()
+  const { rows } = await pool.query<{ comments: string[] }>(
+    'SELECT comments FROM category_comments WHERE product = $1 AND category = $2',
+    [product, category]
+  )
+  const before = Array.isArray(rows[0]?.comments) ? rows[0].comments : []
+  const after = before.filter((c) => String(c) !== text)
+  if (after.length === before.length) return 0
+  await pool.query(
+    'UPDATE category_comments SET comments = $3::jsonb WHERE product = $1 AND category = $2',
+    [product, category, JSON.stringify(after)]
+  )
+  return before.length - after.length
 }
 
 export async function saveGeneratedComments(product: string, comments: string[]): Promise<void> {
@@ -4782,6 +5166,17 @@ export interface PendingPayments {
   comments: PendingTask
   video: PendingTask
   promo: PendingTask
+  /** Mailboxes an admin has validated. Payable, and part of `total`. */
+  accounts: PendingTask
+  /**
+   * Mailboxes submitted but NOT yet validated.
+   *
+   * Deliberately outside `total`: the address is worth nothing until someone
+   * has confirmed it exists, and approveUserPay snapshots `total`, so counting
+   * it there would let a payout approve work nobody had checked. The user is
+   * shown it as unapproved, which is what it is.
+   */
+  accountsAwaiting: PendingTask
   total: number
   approved: boolean // admin has approved (some of) the current pending pay
   approvedBirr: number // birr already approved (snapshot at approval)
@@ -4791,7 +5186,7 @@ export interface PendingPayments {
 export async function getUserPendingPayments(userId: string): Promise<PendingPayments> {
   await Promise.all([ensureAdminTables(), ensurePromoTables()])
   const resetAt = await getResetAt()
-  const [commentedRes, videoRes, promoRes, statusRes] = await Promise.all([
+  const [commentedRes, videoRes, promoRes, accountRes, statusRes] = await Promise.all([
     // Comment pay: counts comments after the effective reset AND after the last
     // time the admin marked this user's comment pay as paid.
     pool.query<{ n: number }>(
@@ -4815,6 +5210,15 @@ export async function getUserPendingPayments(userId: string): Promise<PendingPay
       `SELECT COUNT(*)::int AS n FROM promo_link WHERE user_id = $1 AND paid = false`,
       [userId]
     ),
+    // Two counts from one table: validated-and-unpaid (owed) and awaiting
+    // validation (shown, not owed).
+    pool.query<{ ok: number; waiting: number }>(
+      `SELECT
+         COUNT(*) FILTER (WHERE status = 'approved' AND paid = false)::int AS ok,
+         COUNT(*) FILTER (WHERE status = 'pending')::int                  AS waiting
+       FROM account_submission WHERE user_id = $1`,
+      [userId]
+    ),
     pool.query<{ approved_at: Date | null; approved_amount: string | null }>(
       `SELECT approved_at, approved_amount FROM user_pay_status WHERE user_id = $1`,
       [userId]
@@ -4823,10 +5227,18 @@ export async function getUserPendingPayments(userId: string): Promise<PendingPay
   const commentsCount = commentedRes.rows[0]?.n ?? 0
   const videoCount = videoRes.rows[0]?.n ?? 0
   const promoCount = promoRes.rows[0]?.n ?? 0
+  const accountCount = accountRes.rows[0]?.ok ?? 0
+  const awaitingCount = accountRes.rows[0]?.waiting ?? 0
   const comments: PendingTask = { count: commentsCount, birr: commentsCount * COMMENT_PAY_RATE }
   const video: PendingTask = { count: videoCount, birr: videoCount * VIDEO_PAYMENT_BIRR }
   const promo: PendingTask = { count: promoCount, birr: promoCount * PROMO_PAY_BIRR }
-  const total = comments.birr + video.birr + promo.birr
+  const accounts: PendingTask = { count: accountCount, birr: accountCount * ACCOUNT_PAY_BIRR }
+  const accountsAwaiting: PendingTask = {
+    count: awaitingCount,
+    birr: awaitingCount * ACCOUNT_PAY_BIRR,
+  }
+  // `accountsAwaiting` is NOT in the total — see the interface.
+  const total = comments.birr + video.birr + promo.birr + accounts.birr
 
   // The approved amount is frozen when the admin approves; anything earned after
   // that is unapproved. total only grows while approved (a paid-mark clears it).
@@ -4836,7 +5248,280 @@ export async function getUserPendingPayments(userId: string): Promise<PendingPay
   const approvedBirr = approved ? Math.min(approvedSnapshot, total) : 0
   const unapprovedBirr = Math.max(0, total - approvedBirr)
 
-  return { comments, video, promo, total, approved, approvedBirr, unapprovedBirr }
+  return {
+    comments,
+    video,
+    promo,
+    accounts,
+    accountsAwaiting,
+    total,
+    approved,
+    // Everything awaiting validation is unapproved by definition, so it joins
+    // the number the user is shown under that heading.
+    approvedBirr,
+    unapprovedBirr: unapprovedBirr + accountsAwaiting.birr,
+  }
+}
+
+// ── The mailbox task ─────────────────────────────────────────────────────────
+
+export interface AccountSubmission {
+  id: number
+  userId: string
+  email: string
+  status: 'pending' | 'approved' | 'rejected'
+  rejectReason: string | null
+  paid: boolean
+  submittedAt: string
+  reviewedAt: string | null
+}
+
+/** One submission plus who made it, for the admin queue. */
+export interface AccountSubmissionRow extends AccountSubmission {
+  userName: string
+  userEmail: string
+}
+
+const accountRow = (r: Record<string, unknown>): AccountSubmission => ({
+  id: Number(r.id),
+  userId: String(r.user_id),
+  email: String(r.email),
+  status: String(r.status) as AccountSubmission['status'],
+  rejectReason: r.reject_reason == null ? null : String(r.reject_reason),
+  paid: r.paid === true,
+  submittedAt: new Date(r.submitted_at as string).toISOString(),
+  reviewedAt: r.reviewed_at ? new Date(r.reviewed_at as string).toISOString() : null,
+})
+
+/**
+ * Record a mailbox a worker says they created.
+ *
+ * Returns why it was refused rather than throwing, because every refusal here
+ * is something the worker needs told in words: the address is already claimed,
+ * or it is not on the company domain.
+ */
+export async function submitAccountEmail(
+  userId: string,
+  email: string
+): Promise<{ ok: boolean; error?: string; submission?: AccountSubmission }> {
+  await ensureAdminTables()
+  const clean = String(email ?? '').trim().toLowerCase()
+  if (!clean) return { ok: false, error: 'Enter the email address you created.' }
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO account_submission (user_id, email) VALUES ($1, $2)
+       ON CONFLICT DO NOTHING
+       RETURNING id, user_id, email, status, reject_reason, paid, submitted_at, reviewed_at`,
+      [userId, clean]
+    )
+    if (rows.length === 0) {
+      return { ok: false, error: 'That address has already been submitted.' }
+    }
+    return { ok: true, submission: accountRow(rows[0]) }
+  } catch (e) {
+    return { ok: false, error: String(e) }
+  }
+}
+
+/** Everything one user has submitted, newest first. */
+export async function getUserAccountSubmissions(userId: string): Promise<AccountSubmission[]> {
+  await ensureAdminTables()
+  const { rows } = await pool.query(
+    `SELECT id, user_id, email, status, reject_reason, paid, submitted_at, reviewed_at
+       FROM account_submission WHERE user_id = $1 ORDER BY submitted_at DESC`,
+    [userId]
+  )
+  return rows.map(accountRow)
+}
+
+/** The admin queue: submissions with the worker who made each one. */
+export async function getAccountSubmissions(opts: {
+  status?: string
+  q?: string
+  limit?: number
+}): Promise<AccountSubmissionRow[]> {
+  await ensureAdminTables()
+  const where: string[] = []
+  const args: unknown[] = []
+  if (opts.status && opts.status !== 'all') {
+    args.push(opts.status)
+    where.push(`a.status = $${args.length}`)
+  }
+  if (opts.q && opts.q.trim()) {
+    args.push(`%${opts.q.trim().toLowerCase()}%`)
+    where.push(
+      `(lower(a.email) LIKE $${args.length} OR lower(u.name) LIKE $${args.length}` +
+        ` OR lower(u.email) LIKE $${args.length})`
+    )
+  }
+  args.push(Math.min(1000, Math.max(1, opts.limit ?? 500)))
+  const { rows } = await pool.query(
+    `SELECT a.id, a.user_id, a.email, a.status, a.reject_reason, a.paid,
+            a.submitted_at, a.reviewed_at,
+            COALESCE(u.name, '')  AS user_name,
+            COALESCE(u.email, '') AS user_email
+       FROM account_submission a
+       LEFT JOIN "user" u ON u.id = a.user_id
+      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+      ORDER BY (a.status = 'pending') DESC, a.submitted_at DESC
+      LIMIT $${args.length}`,
+    args
+  )
+  return rows.map((r) => ({
+    ...accountRow(r),
+    userName: String(r.user_name ?? ''),
+    userEmail: String(r.user_email ?? ''),
+  }))
+}
+
+/**
+ * Approve or reject one submission.
+ *
+ * Only a PENDING submission may be reviewed. Re-reviewing an approved one would
+ * either pay twice or claw back pay the worker has already been told they have,
+ * and neither belongs behind a single button.
+ */
+export async function reviewAccountSubmission(
+  id: number,
+  adminId: string,
+  approve: boolean,
+  reason: string
+): Promise<{ ok: boolean; error?: string }> {
+  await ensureAdminTables()
+  const { rowCount } = await pool.query(
+    `UPDATE account_submission
+        SET status = $2, reject_reason = $3, reviewed_at = now(), reviewed_by = $4
+      WHERE id = $1 AND status = 'pending'`,
+    [id, approve ? 'approved' : 'rejected', approve ? null : reason.trim() || null, adminId]
+  )
+  if (!rowCount) return { ok: false, error: 'That submission has already been reviewed.' }
+  return { ok: true }
+}
+
+/** How many mailboxes are waiting for someone to check them. */
+export async function countPendingAccountSubmissions(): Promise<number> {
+  await ensureAdminTables()
+  const { rows } = await pool.query<{ n: number }>(
+    `SELECT COUNT(*)::int AS n FROM account_submission WHERE status = 'pending'`
+  )
+  return rows[0]?.n ?? 0
+}
+
+/** The domain workers must create their mailbox on. Admin-settable. */
+const ACCOUNT_DOMAIN_KEY = 'account_task_domain'
+
+export async function getAccountTaskDomain(): Promise<string> {
+  const saved = await getAppState(ACCOUNT_DOMAIN_KEY).catch(() => null)
+  return (saved ?? '').trim() || ACCOUNT_TASK_DEFAULT_DOMAIN
+}
+
+export async function setAccountTaskDomain(domain: string): Promise<string> {
+  const clean = String(domain ?? '').trim().toLowerCase().replace(/^@/, '')
+  await setAppState(ACCOUNT_DOMAIN_KEY, clean)
+  return clean
+}
+
+/** The password workers set on the mailbox. Blank = do not tell them one. */
+const ACCOUNT_PASSWORD_KEY = 'account_task_password'
+
+export async function getAccountTaskPassword(): Promise<string> {
+  const saved = await getAppState(ACCOUNT_PASSWORD_KEY).catch(() => null)
+  return (saved ?? '').trim() || ACCOUNT_TASK_DEFAULT_PASSWORD
+}
+
+export async function setAccountTaskPassword(password: string): Promise<string> {
+  // Trimmed, never lowercased: a password is not a domain.
+  const clean = String(password ?? '').trim()
+  await setAppState(ACCOUNT_PASSWORD_KEY, clean)
+  return clean
+}
+
+/** Whether the task is open at all. Off by default: a task with no domain set
+ *  cannot be done, and one nobody is ready to review should not be advertised. */
+const ACCOUNT_OPEN_KEY = 'account_task_open'
+
+export async function getAccountTaskOpen(): Promise<boolean> {
+  const raw = await getAppState(ACCOUNT_OPEN_KEY).catch(() => null)
+  return raw === '1'
+}
+
+export async function setAccountTaskOpen(open: boolean): Promise<boolean> {
+  await setAppState(ACCOUNT_OPEN_KEY, open ? '1' : '0')
+  return open
+}
+
+// ── Which platforms each product's comments may be served on ─────────────────
+//
+// A product can be right for one site and wrong for another: what reads as
+// natural under a TikTok video is not what an Instagram audience is there for,
+// and a product with no Instagram landing page should not be advertised to
+// Instagram traffic at all.
+//
+// Stored as { product: platform[] }. A product that is ABSENT is allowed
+// everywhere — that is the default every product starts from, and it keeps this
+// setting opt-in: nothing changes until an admin narrows something. An EMPTY
+// array is a deliberate "nowhere", which is different, and is honoured.
+const PRODUCT_PLATFORMS_KEY = 'comment_product_platforms'
+
+export async function getProductPlatforms(): Promise<Record<string, string[]>> {
+  const raw = await getAppState(PRODUCT_PLATFORMS_KEY).catch(() => null)
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const out: Record<string, string[]> = {}
+    for (const [product, list] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!isProduct(product) || !Array.isArray(list)) continue
+      out[product] = list
+        .map((x) => String(x))
+        .filter((p): p is ClickPlatform => (CLICK_PLATFORMS as readonly string[]).includes(p))
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+export async function setProductPlatforms(map: Record<string, string[]>): Promise<
+  Record<string, string[]>
+> {
+  const clean: Record<string, string[]> = {}
+  for (const [product, list] of Object.entries(map ?? {})) {
+    if (!isProduct(product) || !Array.isArray(list)) continue
+    const platforms = Array.from(
+      new Set(
+        list
+          .map((x) => String(x))
+          .filter((p) => (CLICK_PLATFORMS as readonly string[]).includes(p))
+      )
+    )
+    // Every platform ticked is the same as no restriction. Stored as absent so
+    // the default and the "all of them" case cannot drift apart, and so adding
+    // a new platform later does not silently exclude it from every product.
+    if (platforms.length === CLICK_PLATFORMS.length) continue
+    clean[product] = platforms
+  }
+  await setAppState(PRODUCT_PLATFORMS_KEY, JSON.stringify(clean))
+  return getProductPlatforms()
+}
+
+/**
+ * The active products allowed on ONE platform, in their configured order.
+ *
+ * The order matters: serveCommentForUrl picks fairly among whatever this
+ * returns, so silently reordering would change which product leads a video.
+ */
+export async function activeProductsForPlatform(platform: string): Promise<string[]> {
+  const [active, byProduct] = await Promise.all([
+    getActiveCommentProducts().catch(() => [] as string[]),
+    getProductPlatforms().catch(() => ({}) as Record<string, string[]>),
+  ])
+  const p = String(platform ?? '')
+  return active.filter((product) => {
+    const allowed = byProduct[product]
+    // Absent = everywhere. Present = exactly these, empty included.
+    return allowed === undefined || allowed.includes(p)
+  })
 }
 
 // Admin approves a user's pending pay (does NOT reset counters). The user then
@@ -5031,7 +5716,7 @@ export async function consumePayNotice(userId: string): Promise<number | null> {
 export async function getAllPendingPay(): Promise<Record<string, PendingPayments>> {
   await Promise.all([ensureAdminTables(), ensurePromoTables()])
   const resetAt = await getResetAt()
-  const [commented, video, promo, status] = await Promise.all([
+  const [commented, video, promo, accounts, status] = await Promise.all([
     pool.query<{ user_id: string; n: number }>(
       `SELECT cs.user_id, COALESCE(SUM(cs.count), 0)::int AS n
          FROM commented_submission cs
@@ -5050,6 +5735,12 @@ export async function getAllPendingPay(): Promise<Record<string, PendingPayments
     pool.query<{ user_id: string; n: number }>(
       `SELECT user_id, COUNT(*)::int AS n FROM promo_link WHERE paid = false GROUP BY user_id`
     ),
+    pool.query<{ user_id: string; ok: number; waiting: number }>(
+      `SELECT user_id,
+              COUNT(*) FILTER (WHERE status = 'approved' AND paid = false)::int AS ok,
+              COUNT(*) FILTER (WHERE status = 'pending')::int                  AS waiting
+         FROM account_submission GROUP BY user_id`
+    ),
     pool.query<{ user_id: string; approved_at: Date | null; approved_amount: string | null }>(
       `SELECT user_id, approved_at, approved_amount FROM user_pay_status`
     ),
@@ -5060,6 +5751,8 @@ export async function getAllPendingPay(): Promise<Record<string, PendingPayments
       comments: { count: 0, birr: 0 },
       video: { count: 0, birr: 0 },
       promo: { count: 0, birr: 0 },
+      accounts: { count: 0, birr: 0 },
+      accountsAwaiting: { count: 0, birr: 0 },
       total: 0,
       approved: false,
       approvedBirr: 0,
@@ -5068,6 +5761,11 @@ export async function getAllPendingPay(): Promise<Record<string, PendingPayments
   for (const r of commented.rows) ensure(r.user_id).comments = { count: r.n, birr: r.n * COMMENT_PAY_RATE }
   for (const r of video.rows) ensure(r.user_id).video = { count: r.n, birr: r.n * VIDEO_PAYMENT_BIRR }
   for (const r of promo.rows) ensure(r.user_id).promo = { count: r.n, birr: r.n * PROMO_PAY_BIRR }
+  for (const r of accounts.rows) {
+    const p = ensure(r.user_id)
+    p.accounts = { count: r.ok, birr: r.ok * ACCOUNT_PAY_BIRR }
+    p.accountsAwaiting = { count: r.waiting, birr: r.waiting * ACCOUNT_PAY_BIRR }
+  }
   const snapshots: Record<string, number | null> = {}
   for (const r of status.rows) {
     if (r.approved_at) ensure(r.user_id).approved = true
@@ -5075,9 +5773,11 @@ export async function getAllPendingPay(): Promise<Record<string, PendingPayments
   }
   for (const uid of Object.keys(out)) {
     const p = out[uid]
-    p.total = p.comments.birr + p.video.birr + p.promo.birr
+    // Same rule as getUserPendingPayments: awaiting-validation mailboxes are
+    // shown as unapproved and are NOT payable.
+    p.total = p.comments.birr + p.video.birr + p.promo.birr + p.accounts.birr
     p.approvedBirr = p.approved ? Math.min(snapshots[uid] ?? 0, p.total) : 0
-    p.unapprovedBirr = Math.max(0, p.total - p.approvedBirr)
+    p.unapprovedBirr = Math.max(0, p.total - p.approvedBirr) + p.accountsAwaiting.birr
   }
   return out
 }

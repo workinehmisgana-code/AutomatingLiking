@@ -8,24 +8,25 @@ Usage:
     python upload.py --tiktok               # all TikTok CSVs merged
     python upload.py --youtube              # all YouTube CSVs merged
 
-    By default an upload APPENDS: genuinely new links are added, and links already
-    on the dashboard are UPDATED in place — they keep their row (clicks, cached
-    title, flags) and only their like/view count and search rank are refreshed.
-    Nothing is ever deleted, so uploads accumulate:
-    python upload.py                        # append the most recent CSV
-    python upload.py --all                  # append every CSV in results/
+    By default an upload REPLACES the search-rank links of the platforms it
+    contains: the CSV is the current scrape, so rank links that are no longer in
+    it have dropped out of the results and are removed with it. A URL that is
+    already stored is UPDATED rather than re-created — it keeps its row (clicks,
+    cached title, flags) and only its like/view count and rank are refreshed.
+    python upload.py                        # replace this CSV's platforms
+    python upload.py --all                  # every CSV in results/, merged
 
-    --replace is the DESTRUCTIVE opt-in: it wipes the stored SEARCH-RANK links
-    of the platforms present in the upload and keeps only what's in this batch
-    (other platforms are untouched). Use it only when you deliberately want to
-    start a platform over:
-    python upload.py --replace              # replace this CSV's platforms
+    --append adds without removing anything, which is what you want when a CSV
+    is one keyword out of several you are uploading separately:
+    python upload.py --append
 
     AN UPLOAD ONLY EVER TOUCHES SEARCH-RANK LINKS. A link with no search rank
     belongs to the posted-date clusters alone — it came from the verify list,
-    not from a keyword search — and neither --append nor --replace will edit or
-    delete one. That is 121,110 of the 130,184 stored links: before this rule, a
-    single `--replace` of a TikTok CSV deleted 93% of the pool.
+    not from a keyword search — and neither mode will edit or delete one.
+    Measured on the live pool: a TikTok upload puts 3,643 rank links up for
+    replacement and leaves 134,122 date-clustered ones untouched. Before that
+    rule existed, one --replace of a TikTok CSV deleted 93% of the pool, which
+    is why replacing used to be the scary option and no longer is.
 
     --dedupe cleans the dashboard in place: removes any duplicate links (keeps one
     row per URL). No CSV needed:
@@ -251,6 +252,38 @@ def upload(videos: list[dict], mode: str = "replace") -> None:
 def main():
     args = sys.argv[1:]
 
+    # A Windows console is cp1252, and this file's own messages contain em
+    # dashes. Without this the upload SUCCEEDS and then dies printing the result,
+    # which reads exactly like a failed upload.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - older Python, or a stream without it
+        pass
+
+    # An unrecognised flag must not fall through into a real upload. --help used
+    # to do exactly that: it matched nothing, was treated as "no arguments", and
+    # uploaded the most recent CSV in replace mode.
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        return
+    known = {
+        "--all", "--tiktok", "--youtube", "--append", "--replace", "--dedupe",
+        "--platform",
+    }
+    unknown = [
+        a
+        for i, a in enumerate(args)
+        if a.startswith("-")
+        and a not in known
+        # the value after --platform is not a flag
+        and not (i > 0 and args[i - 1] == "--platform")
+    ]
+    if unknown:
+        print(f"[!] Unknown option(s): {', '.join(unknown)}")
+        print("    Run `python upload.py --help` to see what is accepted.")
+        sys.exit(2)
+
     # --dedupe cleans the stored data in place (no CSV needed): removes any
     # duplicate links so only one row per URL remains.
     if "--dedupe" in args:
@@ -258,13 +291,21 @@ def main():
         upload([], mode="dedupe")
         return
 
-    # APPEND is the default: an upload adds new links and refreshes the ones it
-    # already has, never deleting. --replace is the opt-in destructive mode that
-    # wipes every stored link for the platforms present in the upload.
+    # REPLACE is the default: an upload IS the current search-rank scrape, so the
+    # stored rank links for its platforms are replaced by it. Rank links absent
+    # from the CSV have dropped out of the results and go with them.
+    #
+    # It stopped being the dangerous option when the server stopped letting an
+    # upload reach posted-date links at all. Measured on the live pool, a TikTok
+    # upload now puts 3,643 rank links up for replacement and leaves 134,122
+    # date-clustered ones untouched; it used to delete all 137,765.
+    #
+    # --append is the opt-in for adding to the rank set without dropping
+    # anything, which is what you want when a CSV is one keyword out of several.
     if "--append" in args and "--replace" in args:
         print("[!] Use only one of --append / --replace.")
         sys.exit(1)
-    mode = "replace" if "--replace" in args else "append"
+    mode = "append" if "--append" in args else "replace"
     args = [a for a in args if a not in ("--append", "--replace")]
 
     # --platform <tiktok|youtube_shorts|youtube_videos> forces the platform tag
@@ -313,10 +354,10 @@ def main():
     breakdown = ", ".join(f"{p}: {n}" for p, n in sorted(by_platform.items()))
     print(f"[*] Total unique videos: {len(videos)}  ({breakdown})")
     if mode == "replace":
-        print(f"[!] REPLACE mode: stored SEARCH-RANK links for {sorted(by_platform)} will "
-              f"be DELETED and replaced by this batch.")
-        print("    Other platforms are untouched, and so is every posted-date link "
-              "(no search rank) — an upload never drops those.")
+        print(f"[*] Replace mode: the stored SEARCH-RANK links for {sorted(by_platform)} "
+              f"are replaced by this batch — rank links not in the CSV are removed.")
+        print("    Untouched: other platforms, and every posted-date link (no search "
+              "rank). Pass --append to add without removing anything.")
     else:
         print("[*] Append mode: new links are added, existing ones refreshed; nothing is deleted.")
 

@@ -133,10 +133,27 @@ def run_pass(args, profiles, width):
             cmd.append("--unlike")
         if args.dry_run:
             cmd.append("--dry-run")
-        if args.keep_failures:
-            cmd.append("--keep-failures")
-        if args.headed:
-            cmd.append("--headed")
+        # Every remaining flag is a plain on/off that like.py understands and
+        # run_parallel has no opinion about. Driven from one table rather than
+        # a stack of ifs: the list used to be hand-maintained and drifted, so
+        # --keep-going existed in like.py and simply could not be reached from
+        # here. check_forwarding.py fails if the two ever diverge again.
+        for flag, on in (
+            ("--keep-failures", args.keep_failures),
+            ("--headed", args.headed),
+            ("--keep-going", args.keep_going),
+            ("--solve-captcha", args.solve_captcha),
+            ("--no-relogin", args.no_relogin),
+            ("--no-dom-sweep", args.no_dom_sweep),
+            ("--with-media", args.with_media),
+            ("--comment-empty", args.comment_empty),
+        ):
+            if on:
+                cmd.append(flag)
+        if args.mode != "dom":
+            cmd += ["--mode", args.mode]
+        if args.comment_product:
+            cmd += ["--comment-product", args.comment_product]
         proc = subprocess.Popen(
             cmd,
             cwd=str(HERE),
@@ -225,6 +242,25 @@ def main() -> int:
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--unlike", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    # Passed straight through to each like.py worker.
+    ap.add_argument("--keep-going", action="store_true",
+                    help="do not stop a worker on repeated video failures — work its list to the end")
+    ap.add_argument("--solve-captcha", action="store_true",
+                    help="let each worker try the solving API before asking you")
+    ap.add_argument("--no-relogin", action="store_true",
+                    help="do not try to sign a worker back in when TikTok drops its session")
+    ap.add_argument("--no-dom-sweep", action="store_true",
+                    help="do not read the open comment panel for product comments the api list missed")
+    ap.add_argument("--with-media", action="store_true",
+                    help="let the pages load video/images — slower, only for debugging")
+    ap.add_argument("--comment-empty", action="store_true",
+                    help="on a video carrying NONE of our product comments, post one. "
+                         "OFF by default: it is the only thing here that writes something public, "
+                         "and through this script it writes from every profile at once")
+    ap.add_argument("--comment-product", default="",
+                    help="which product's comment to post with --comment-empty")
+    ap.add_argument("--mode", default="dom", choices=["dom", "fast", "api"],
+                    help="passed to each worker; dom is the only mode that works")
     ap.add_argument("--keep-failures", action="store_true",
                     help="passed through to like.py: leave failed rows in the "
                          "ledger instead of retrying them")

@@ -2,9 +2,10 @@ import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { isAdminEmail } from '@/lib/config'
+import { isAdminRequest } from '@/lib/machineAuth'
 import { loadVideosJson } from '@/lib/videos'
 import { saveVerifyLinks, getAllVerifyLinkUrls, getBlockedUrls } from '@/lib/db'
-import { rankChannels, handleOf } from '@/lib/channelRank'
+import { rankChannels, handleOf, unattributedLinks } from '@/lib/channelRank'
 import { fetchChannelVideos, fetchVideoDetail } from '@/lib/linkStats'
 
 export const dynamic = 'force-dynamic'
@@ -31,15 +32,25 @@ export const maxDuration = 60
 // Blocked links count as held, or a link rejected once would be re-staged on
 // every single run, and dropping it from the mark would drag the mark backwards.
 
-/** GET — the ranked channel list, so the page can show the order first. */
-export async function GET() {
-  const session = await auth.api.getSession({ headers: await headers() })
-  if (!isAdminEmail(session?.user?.email)) {
+/**
+ * GET — the ranked channel list, so the page can show the order first.
+ *
+ * Also readable with LINKS_EXPORT_TOKEN, so the local scraper can ask which
+ * channels to visit instead of an operator exporting a file by hand.
+ */
+export async function GET(req: NextRequest) {
+  if (!(await isAdminRequest(req, 'read'))) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   try {
     const channels = await rankChannels()
-    return NextResponse.json({ channels, total: channels.length })
+    // Links whose channel cannot be read at all. Sent so the table can say so:
+    // a list that silently omits them looks like it is missing channels.
+    return NextResponse.json({
+      channels,
+      total: channels.length,
+      unattributed: unattributedLinks(),
+    })
   } catch (e) {
     return NextResponse.json({ error: `Could not rank channels: ${String(e)}` }, { status: 500 })
   }
@@ -90,7 +101,15 @@ export async function POST(req: NextRequest) {
     if (only.length > 0) {
       // Keep the client's order, and drop anything that is not a real ranked
       // channel — a handle typed or stale in the browser must not reach TikTok.
-      const known = new Map(ranked.map((c) => [c.handle.toLowerCase(), c]))
+      //
+      // TIKTOK ROWS ONLY. The ranked list now holds one row per SITE per handle,
+      // and 98 of our handles exist on two. Building this map over every row
+      // would let a same-named Instagram row win the lookup and be sent to
+      // TikTok's embed endpoint, which answers for a handle that is not the one
+      // the admin picked. Everything below is TikTok-only anyway.
+      const known = new Map(
+        ranked.filter((c) => c.platform === 'tiktok').map((c) => [c.handle.toLowerCase(), c])
+      )
       channels = only.map((h) => known.get(h)).filter((c): c is (typeof ranked)[number] => !!c)
     } else {
       channels = ranked

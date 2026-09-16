@@ -28,6 +28,15 @@ export interface GuideProps {
   promoPerPlatform: number
   promoDownloads: number
   reminderClicks: number
+  /** Birr per company email address a worker creates. */
+  accountBirr: number
+  /** The domain they must create it on. Blank while the task is closed. */
+  accountDomain: string
+  /** The password to set on the mailbox. Blank = not part of the instructions. */
+  accountPassword: string
+  /** Whether the task is being offered at all — a closed task is left out of
+   *  the guide entirely rather than described and then not there. */
+  accountOpen: boolean
 }
 
 export interface Section {
@@ -67,6 +76,14 @@ export function en(p: GuideProps): GuideCopy {
       { label: 'Per comment', value: `${p.commentRate} birr`, hint: 'on your reported count' },
       { label: 'Per video you make', value: `${p.videoBirr} birr`, hint: '30s–1min, once approved' },
       { label: 'Per repost link', value: `${p.promoBirr} birr`, hint: 'one per platform per day' },
+      ...(p.accountOpen
+        ? [{
+            label: 'Per company email',
+            value: `${p.accountBirr} birr`,
+            hint: 'once we have checked it',
+          }]
+        : []),
+      { label: 'Payday', value: 'Every Monday', hint: 'straight to your bank account' },
     ],
     videoHeading: 'Video walkthroughs',
     videoIntro:
@@ -82,7 +99,7 @@ export function en(p: GuideProps): GuideCopy {
           'Add your TikTok, YouTube and Instagram profile links. These are the accounts you will comment from, so they must be real accounts you control.',
           'Save. You land on the Links page, which is your dashboard.',
         ],
-        note: 'Type your bank account number carefully. You are paid weekly, and the money goes to exactly the account number you enter here — a wrong digit means a failed or misdirected payment.',
+        note: 'Type your bank account number carefully. You are paid every Monday, and the money goes to exactly the account number you enter here — a wrong digit means a failed or misdirected payment.',
       },
       {
         heading: '2. Install the Comment Helper app',
@@ -140,13 +157,13 @@ export function en(p: GuideProps): GuideCopy {
           'For each platform, enter how many videos you commented on.',
           'Upload screenshots of your comment history showing the comments you posted.',
           'Submit. Your pending pay updates on the dashboard right away.',
-          'Payment is sent once a week, straight to the bank account number you entered when you set up your account. What you see under pending pay is what is owed to you so far.',
+          'Payment is sent every Monday, straight to the bank account number you entered when you set up your account. Whatever you report during the week is paid on the following Monday, and what you see under pending pay is what is owed to you so far.',
         ],
         note: 'Report honestly. Your number is checked against the links you actually opened and against your screenshots. Inflated numbers are removed and can get your account blocked.',
       },
       {
-        heading: '7. The other two ways to earn',
-        intro: 'Both are optional and both live on the dashboard.',
+        heading: '7. The other ways to earn',
+        intro: 'All optional, and all on the dashboard.',
         rows: [
           {
             k: '🎥 Video task',
@@ -156,6 +173,22 @@ export function en(p: GuideProps): GuideCopy {
             k: '📢 Repost & earn',
             v: `Create a dedicated account on each platform, download a ready-made video and caption from the dashboard, post it, then paste the link back. ${p.promoBirr} birr per link. You may download ${p.promoDownloads} video per day and post ${p.promoPerPlatform} per platform per day.`,
           },
+          ...(p.accountOpen
+            ? [{
+                k: '✉️ Email task',
+                v:
+                  `Create an email address on our own domain — it must end in ` +
+                  `@${p.accountDomain} — and send us the address on the Email task page. ` +
+                  (p.accountPassword
+                    ? `Set the password to exactly ${p.accountPassword}, capitals and symbols ` +
+                      `included — an address we cannot sign in to is rejected and not paid. `
+                    : '') +
+                  `${p.accountBirr} birr for each one. The pay shows as UNAPPROVED until we ` +
+                  `open the mailbox and confirm it works; then it joins your approved pay. ` +
+                  `An address someone has already sent cannot be sent again, and a rejected ` +
+                  `one tells you why.`,
+              }]
+            : []),
         ],
       },
       {
@@ -167,6 +200,12 @@ export function en(p: GuideProps): GuideCopy {
           { k: 'Comments', v: 'The comment pool. Tap any comment to copy it manually if you need to.' },
           { k: 'Video task', v: 'Upload your own video and see whether it was approved.' },
           { k: 'Repost & earn', v: 'Download promo videos and captions, and submit your reposted links.' },
+          ...(p.accountOpen
+            ? [{
+                k: 'Email task',
+                v: 'Send us the addresses you created, and see which have been checked.',
+              }]
+            : []),
           { k: 'Finish', v: 'Report your counts and screenshots.' },
           { k: 'Messages', v: 'Messages from the admin appear at the top of the dashboard, and you can reply there.' },
         ],
@@ -198,6 +237,14 @@ export function am(p: GuideProps): GuideCopy {
       { label: 'ለአንድ አስተያየት', value: `${p.commentRate} ብር`, hint: 'ሪፖርት ባደረጉት ብዛት መሠረት' },
       { label: 'ለሠሩት አንድ ቪዲዮ', value: `${p.videoBirr} ብር`, hint: '30 ሰከንድ–1 ደቂቃ፣ ከጸደቀ በኋላ' },
       { label: 'ለአንድ ሪፖስት ሊንክ', value: `${p.promoBirr} ብር`, hint: 'በቀን በአንድ መድረክ አንድ' },
+      ...(p.accountOpen
+        ? [{
+            label: 'ለአንድ የኩባንያ ኢሜይል',
+            value: `${p.accountBirr} ብር`,
+            hint: 'ካረጋገጥነው በኋላ',
+          }]
+        : []),
+      { label: 'የክፍያ ቀን', value: 'በየሰኞው', hint: 'በቀጥታ ወደ ባንክ ሒሳብዎ' },
     ],
     videoHeading: 'የቪዲዮ ማብራሪያዎች',
     videoIntro:
@@ -213,7 +260,7 @@ export function am(p: GuideProps): GuideCopy {
           'የTikTok፣ የYouTube እና የInstagram አካውንት ሊንኮችዎን ያስገቡ። አስተያየት የሚሰጡት ከእነዚህ አካውንቶች ስለሆነ፣ በእርስዎ ቁጥጥር ሥር ያሉ እውነተኛ አካውንቶች መሆን አለባቸው።',
           'ያስቀምጡ። ወደ ሊንኮች ገጽ ይደርሳሉ፤ ይህም ዳሽቦርድዎ ነው።',
         ],
-        note: 'የባንክ ሒሳብ ቁጥርዎን በጥንቃቄ ይጻፉ። ክፍያ የሚፈጸመው በሳምንት አንድ ጊዜ ሲሆን፣ ገንዘቡ የሚላከው እዚህ ላይ በጻፉት የሒሳብ ቁጥር በትክክል ነው፤ አንድ የተሳሳተ ቁጥር ክፍያው እንዲቋረጥ ወይም ወደ ሌላ ሰው እንዲሄድ ያደርጋል።',
+        note: 'የባንክ ሒሳብ ቁጥርዎን በጥንቃቄ ይጻፉ። ክፍያ የሚፈጸመው በየሰኞው ሲሆን፣ ገንዘቡ የሚላከው እዚህ ላይ በጻፉት የሒሳብ ቁጥር በትክክል ነው፤ አንድ የተሳሳተ ቁጥር ክፍያው እንዲቋረጥ ወይም ወደ ሌላ ሰው እንዲሄድ ያደርጋል።',
       },
       {
         heading: '2. የComment Helper አፑን ይጫኑ',
@@ -271,13 +318,13 @@ export function am(p: GuideProps): GuideCopy {
           'ለእያንዳንዱ መድረክ በስንት ቪዲዮዎች ላይ አስተያየት እንደሰጡ ያስገቡ።',
           'የለጠፏቸውን አስተያየቶች የሚያሳዩ የአስተያየት ታሪክዎን ስክሪንሾቶች ይላኩ።',
           'ይላኩ። በዳሽቦርዱ ላይ ያለው ገና ያልተከፈለ ክፍያዎ ወዲያውኑ ይዘመናል።',
-          'ክፍያ በሳምንት አንድ ጊዜ ይላካል፤ አካውንትዎን ሲያዘጋጁ ባስገቡት የባንክ ሒሳብ ቁጥር በቀጥታ ይከፈላል። በዳሽቦርዱ ላይ በ"ገና ያልተከፈለ ክፍያ" ሥር የሚያዩት እስካሁን የሚገባዎትን ገንዘብ ያሳያል።',
+          'ክፍያ በየሰኞው ይላካል፤ አካውንትዎን ሲያዘጋጁ ባስገቡት የባንክ ሒሳብ ቁጥር በቀጥታ ይከፈላል። በሳምንቱ ውስጥ ሪፖርት ያደረጉት በሚቀጥለው ሰኞ ይከፈላል፤ በዳሽቦርዱ ላይ በ"ገና ያልተከፈለ ክፍያ" ሥር የሚያዩት እስካሁን የሚገባዎትን ገንዘብ ያሳያል።',
         ],
         note: 'በሐቀኝነት ሪፖርት ያድርጉ። ያስገቡት ቁጥር በእውነት ከከፈቷቸው ሊንኮች እና ከስክሪንሾቶችዎ ጋር ይመሳከራል። የተጋነኑ ቁጥሮች ይሰረዛሉ፤ አካውንትዎም ሊታገድ ይችላል።',
       },
       {
-        heading: '7. ሌሎቹ ሁለት የገቢ መንገዶች',
-        intro: 'ሁለቱም በፈቃደኝነት ላይ የተመሠረቱ ሲሆኑ በዳሽቦርዱ ላይ ይገኛሉ።',
+        heading: '7. ሌሎቹ የገቢ መንገዶች',
+        intro: 'ሁሉም በፈቃደኝነት ላይ የተመሠረቱ ሲሆኑ በዳሽቦርዱ ላይ ይገኛሉ።',
         rows: [
           {
             k: '🎥 የቪዲዮ ሥራ',
@@ -287,6 +334,20 @@ export function am(p: GuideProps): GuideCopy {
             k: '📢 ሪፖስት አድርገው ያግኙ',
             v: `በእያንዳንዱ መድረክ ላይ የተለየ አካውንት ይክፈቱ፣ ከዳሽቦርዱ ዝግጁ የሆነ ቪዲዮና ጽሑፍ አውርደው ይለጥፉ፣ ከዚያም ሊንኩን መልሰው ይለጥፉ። ለአንድ ሊንክ ${p.promoBirr} ብር። በቀን ${p.promoDownloads} ቪዲዮ ማውረድ እና በአንድ መድረክ በቀን ${p.promoPerPlatform} መለጠፍ ይችላሉ።`,
           },
+          ...(p.accountOpen
+            ? [{
+                k: '✉️ የኢሜይል ሥራ',
+                v:
+                  `በራሳችን ዶሜይን ላይ የኢሜይል አድራሻ ይክፈቱ — በ@${p.accountDomain} ማለቅ አለበት — ` +
+                  `ከዚያም አድራሻውን በ“የኢሜይል ሥራ” ገጽ ላይ ይላኩልን። ለእያንዳንዱ ${p.accountBirr} ብር። ` +
+                  (p.accountPassword
+                    ? `የይለፍ ቃሉን በትክክል ${p.accountPassword} ያድርጉት፤ ትላልቅ ፊደላትንና ምልክቶችን ጨምሮ — ` +
+                      `ልንገባበት የማንችለው አድራሻ ውድቅ ይደረጋል፤ ክፍያም አይከፈልም። `
+                    : '') +
+                  `ኢሜይሉን ከፍተን እስክናረጋግጥ ድረስ ክፍያው “ያልጸደቀ” ሆኖ ይታያል፤ ካረጋገጥን በኋላ ወደ ጸደቀው ` +
+                  `ክፍያዎ ይጨመራል። ሌላ ሰው የላከውን አድራሻ እንደገና መላክ አይቻልም፤ ውድቅ የተደረገም ከሆነ ምክንያቱ ይነገርዎታል።`,
+              }]
+            : []),
         ],
       },
       {

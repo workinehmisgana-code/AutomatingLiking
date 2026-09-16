@@ -14,6 +14,8 @@ import {
 import type { AdminData, AdminUserRow, PendingPayments, ApkInfo, UserClick, GuideVideo } from '@/lib/db'
 import ApkAdmin from '@/components/ApkAdmin'
 import GuideVideosAdmin from '@/components/GuideVideosAdmin'
+import LlmModelPicker from '@/components/LlmModelPicker'
+import ScrollX from '@/components/ScrollX'
 import PlatformLimits from '@/components/PlatformLimits'
 import ActiveProducts from '@/components/ActiveProducts'
 import { accountCreatedAt, accountAge } from '@/lib/tiktokId'
@@ -1182,12 +1184,17 @@ export default function AdminDashboard({
         acc.comments += p.comments.birr
         acc.video += p.video.birr
         acc.promo += p.promo.birr
+        acc.accounts += p.accounts.birr
+        acc.waiting += p.accountsAwaiting.count
         acc.total += p.total
       }
       return acc
     },
-    { comments: 0, video: 0, promo: 0, total: 0 }
+    { comments: 0, video: 0, promo: 0, accounts: 0, waiting: 0, total: 0 }
   )
+  // Addresses nobody has checked yet. Shown on the Email task button, because
+  // that number is the only thing standing between a worker and their pay.
+  const accountsWaiting = pendingSum.waiting
   const targetUser =
     resetTarget && resetTarget !== 'all' ? data.users.find((u) => u.id === resetTarget) : null
   const targetName = targetUser
@@ -1230,6 +1237,18 @@ export default function AdminDashboard({
               className="text-sm text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg px-3 py-1.5 transition-colors"
             >
               🎬 Promo videos
+            </button>
+            <button
+              onClick={() => router.push('/admin/tasks')}
+              title="Company email task — check the addresses workers sent, and approve their pay"
+              className="text-sm text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg px-3 py-1.5 transition-colors"
+            >
+              ✉️ Email task
+              {accountsWaiting > 0 && (
+                <span className="ml-1.5 text-[10px] font-semibold rounded px-1.5 py-0.5 bg-amber-500/25 border border-amber-400/50 tabular-nums">
+                  {accountsWaiting}
+                </span>
+              )}
             </button>
             <select
               value=""
@@ -1389,7 +1408,10 @@ export default function AdminDashboard({
           label="Of which video"
           value={`${fmtBirr(pendingSum.video)} birr`}
           accent="amber"
-          hint={`comments ${fmtBirr(pendingSum.comments)} · repost ${fmtBirr(pendingSum.promo)}`}
+          hint={
+            `comments ${fmtBirr(pendingSum.comments)} · repost ${fmtBirr(pendingSum.promo)}` +
+            (pendingSum.accounts > 0 ? ` · emails ${fmtBirr(pendingSum.accounts)}` : '')
+          }
         />
       </div>
 
@@ -1443,6 +1465,7 @@ export default function AdminDashboard({
           </div>
           <PlatformLimits />
           <ActiveProducts />
+          <LlmModelPicker />
           <ApkAdmin apk={apk} />
           <GuideVideosAdmin videos={guideVideos} />
         </div>
@@ -1871,10 +1894,9 @@ export default function AdminDashboard({
                       )}
                     </div>
                   </div>
-                  {/* Horizontal scroller. These columns are fixed-width and shrink-0,
-                      so on a narrow screen they overflow rather than squashing. Header
-                      and rows share ONE scroller or they stop lining up. */}
-                  <div className="overflow-x-auto">
+                  {/* Header and rows share ONE scroller or they stop lining up,
+                      and ScrollX fixes the width so filtering cannot remove it. */}
+                  <ScrollX min={720}>
                     <div className="flex items-center gap-3 px-4 py-1.5 text-[11px] text-zinc-500 border-b border-zinc-800">
                       <span className="flex-1 min-w-0">user</span>
                       <span className="w-40 shrink-0">tiktok</span>
@@ -1937,7 +1959,7 @@ export default function AdminDashboard({
                         </div>
                       ))}
                     </div>
-                  </div>
+                  </ScrollX>
                   <div className="p-3 border-t border-zinc-800 flex items-center justify-between gap-3">
                     <span className="text-[11px] text-zinc-600">
                       &ldquo;n/a&rdquo; means no link could be judged — not a score of zero.
@@ -2042,7 +2064,7 @@ export default function AdminDashboard({
             {/* Horizontal scroller. These columns are fixed-width and shrink-0,
                 so on a narrow screen they overflow rather than squashing. Header
                 and rows share ONE scroller or they stop lining up. */}
-            <div className="overflow-x-auto">
+            <ScrollX min={720}>
               <div className="flex items-center gap-3 px-4 py-1.5 text-[11px] text-zinc-500 border-b border-zinc-800">
                 <span className="w-16 shrink-0">result</span>
                 <span className="flex-1 min-w-0">link · comment</span>
@@ -2137,7 +2159,7 @@ export default function AdminDashboard({
                   ))
                 )}
               </div>
-            </div>
+            </ScrollX>
 
             <div className="p-3 border-t border-zinc-800 flex items-center justify-between gap-3">
               <span className="text-[11px] text-zinc-600">
@@ -2226,7 +2248,7 @@ export default function AdminDashboard({
 
             {/* Horizontal scroller: these rows carry fixed-width columns that
                 overflow rather than squash on a narrow screen. */}
-            <div className="overflow-x-auto">
+            <ScrollX min={720}>
               <div className="max-h-[60vh] overflow-y-auto divide-y divide-zinc-800/60">
                 {verifyReport.links.length === 0 ? (
                   <div className="p-6 text-center text-sm text-zinc-500">No links judged yet.</div>
@@ -2266,7 +2288,7 @@ export default function AdminDashboard({
                   ))
                 )}
               </div>
-            </div>
+            </ScrollX>
 
             <div className="p-3 border-t border-zinc-800 flex items-center justify-between gap-3">
               <span className="text-[11px] text-zinc-600">
@@ -3213,6 +3235,16 @@ function UserCard({
                 <span>Comments {fmtBirr(pending.comments.birr)} ({pending.comments.count})</span>
                 <span>Video {fmtBirr(pending.video.birr)} ({pending.video.count})</span>
                 <span>Repost {fmtBirr(pending.promo.birr)} ({pending.promo.count})</span>
+                <span>Emails {fmtBirr(pending.accounts.birr)} ({pending.accounts.count})</span>
+                {pending.accountsAwaiting.count > 0 && (
+                  <span
+                    className="text-amber-400/90"
+                    title="Addresses this worker sent that nobody has checked yet. Not in the total — approve them on the Email task page first."
+                  >
+                    + {fmtBirr(pending.accountsAwaiting.birr)} awaiting check (
+                    {pending.accountsAwaiting.count})
+                  </span>
+                )}
               </div>
             )}
             <div className="flex flex-wrap items-center gap-2">
@@ -3416,7 +3448,7 @@ function DayTable({
   const pay = payRate != null ? total * payRate : null
   return (
     <div className="overflow-x-auto">
-      <table className="text-xs border-collapse">
+      <table className="text-xs border-collapse min-w-[420px]">
         <tbody>
           <tr>
             <td className="text-zinc-300 font-medium pr-3 py-1 whitespace-nowrap">{title}</td>

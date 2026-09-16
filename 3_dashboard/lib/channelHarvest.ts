@@ -1,8 +1,17 @@
 // Hourly harvest: pull new videos from the channels worth watching, and sort
 // them without asking anyone.
 //
+// WHICH PLATFORMS
+// Whichever the admin has left switched on, per platform, on the Links page.
+// Off means the harvest never visits that platform's channels at all — no
+// listing fetch, no staging, no merge. Nothing else about the platform changes:
+// its links stay in the pool and keep being served, and its own hourly and
+// retirement switches are untouched. The switch is read on every slice, so it
+// takes effect on the next tick rather than the next deploy.
+//
 // WHICH CHANNELS
-// The ones whose links mostly SURVIVE: at least HARVEST_MIN_ACTIVE_PCT (50) per
+// Of those platforms, the ones whose links mostly SURVIVE: at least
+// HARVEST_MIN_ACTIVE_PCT (50) per
 // cent of everything we have ever held for that channel is still active rather
 // than blocked. Channels below that line are left alone for a person to extract
 // and filter by hand.
@@ -44,7 +53,9 @@ import {
   getBlockedUrls,
   getAppState,
   setAppState,
+  getHarvestPlatforms,
 } from './db'
+import { CHANNEL_SITE_PLATFORMS } from './config'
 
 /**
  * The share of a channel's links that must still be active for the automatic
@@ -70,6 +81,10 @@ const DETAIL_CONCURRENCY = 4
 export interface HarvestResult {
   /** Channels above the score threshold, in rank order. */
   eligible: number
+  /** Channels skipped because their platform's harvest switch is off. */
+  offPlatform: number
+  /** The platforms currently switched on, for the admin panel to report. */
+  platforms: string[]
   /** Channels actually looked at this run. */
   checked: number
   /** Videos we had never seen before. */
@@ -110,18 +125,33 @@ export async function getLastHarvest(): Promise<LastRun | null> {
  * caller always gets an answer inside its own time limit.
  */
 export async function harvestOnce(deadline: number): Promise<HarvestResult> {
-  const ranked = await rankChannels()
+  const [ranked, on] = await Promise.all([
+    rankChannels(),
+    getHarvestPlatforms().catch(() => new Set<string>()),
+  ])
+
+  // A channel belongs to a SITE while every switch is per click platform, and
+  // for YouTube those are not the same thing: one channel's uploads are Shorts
+  // and ordinary videos both, and which a new upload is cannot be known before
+  // it is fetched. So a site is on while any of its click platforms is.
+  const siteIsOn = (site: string) =>
+    (CHANNEL_SITE_PLATFORMS[site] ?? []).some((p) => on.has(p))
+
   // rankChannels returns best-first, so filtering keeps that order: the most
   // promising eligible channel is visited first on each pass.
   //
   // A null ratio means the channel has neither an active nor a blocked link —
   // nothing to judge it on — and it is excluded rather than assumed good.
-  const eligible = ranked.filter(
+  const qualified = ranked.filter(
     (c) => c.activePct !== null && c.activePct >= HARVEST_MIN_ACTIVE_PCT
   )
+  const eligible = qualified.filter((c) => siteIsOn(c.platform))
+  const platforms = Array.from(on).sort()
 
   const empty: HarvestResult = {
     eligible: eligible.length,
+    offPlatform: qualified.length - eligible.length,
+    platforms,
     checked: 0,
     found: 0,
     merged: 0,
@@ -239,6 +269,8 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
 
   return {
     eligible: eligible.length,
+    offPlatform: qualified.length - eligible.length,
+    platforms,
     checked: reached - cursor,
     found: rows.length,
     merged,

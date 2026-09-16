@@ -4,7 +4,15 @@ import { auth } from '@/lib/auth'
 import { profileGate } from '@/lib/profileGate'
 import { isProduct, VERIFY_VIDEO_URL, VERIFY_GATE_ENABLED } from '@/lib/config'
 import { serveCommentForUrl } from '@/lib/serveComment'
-import { getClickedUrls, recordClick, countRecentClicks, getEffectivePlatformLimit, isUserVerified } from '@/lib/db'
+import {
+  getClickedUrls,
+  recordClick,
+  recordCleanSessionClick,
+  getServeOnlyClean,
+  countRecentClicks,
+  getEffectivePlatformLimit,
+  isUserVerified,
+} from '@/lib/db'
 
 export const dynamic = 'force-dynamic'
 
@@ -79,11 +87,18 @@ export async function POST(req: NextRequest) {
     }
     // Server-side fair pick when the client didn't serve one itself. Fairness is
     // per link: the least-served product for THIS url wins (see serveCommentForUrl).
-    const served = servedProduct
+    const served: { product: string | null; comment: string | null } = servedProduct
       ? { product: servedProduct, comment: null }
       : await serveCommentForUrl(url).catch(() => ({ product: null, comment: null }))
 
     await recordClick(userId, url, searchQuery, platform, served.product, served.comment)
+    // While "only links with none of ours" is on the permanent record is
+    // ignored when serving, so without this the same link comes back on every
+    // fetch of the session. Recorded alongside, never instead: the permanent
+    // record still gets its row.
+    if (await getServeOnlyClean().catch(() => false)) {
+      await recordCleanSessionClick(userId, url).catch(() => {})
+    }
     return NextResponse.json({ ok: true, product: served.product, comment: served.comment })
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 })

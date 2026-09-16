@@ -4,3 +4,6 @@ node_modules/
 .env.local
 .env.*.local
 *.log
+
+# Verification builds (see distDir in next.config.mjs) — never the dev server's.
+.next-verify/

@@ -3,7 +3,16 @@
 import { useEffect, useState } from 'react'
 import { CLICK_PLATFORMS, CLICK_PLATFORM_LABELS } from '@/lib/config'
 
-type Limits = Record<string, { limit: number; windowMs: number; enabled: boolean; retireEnabled: boolean }>
+type Limits = Record<
+  string,
+  {
+    limit: number
+    windowMs: number
+    enabled: boolean
+    retireEnabled: boolean
+    harvestEnabled: boolean
+  }
+>
 
 // Quota options (links per window). 0 = unlimited.
 const LIMIT_OPTIONS = [0, 5, 10, 15, 20, 25, 30, 40, 50, 75, 100]
@@ -22,11 +31,14 @@ const WINDOW_OPTIONS: { ms: number; label: string }[] = [
 // Admin panel: set each platform's hourly link quota + the wait window it applies
 // over, and switch enforcement on/off PER PLATFORM.
 //
-// TWO INDEPENDENT RULES, each with its own per-platform switch. There is no
+// THREE INDEPENDENT RULES, each with its own per-platform switch. There is no
 // master switch — every platform is governed entirely by its own row:
-//   • Hourly — that platform's hourly link quota.
-//   • Retire — link retirement for that platform (a link leaving the pool once
+//   • Hourly  — that platform's hourly link quota.
+//   • Retire  — link retirement for that platform (a link leaving the pool once
 //     enough distinct users have clicked it).
+//   • Harvest — automatic extraction of NEW videos from that platform's
+//     channels, the pipeline's harvest stage. Off means its channels are never
+//     visited; links already in the pool are unaffected.
 // Saves immediately on change.
 export default function PlatformLimits() {
   const [open, setOpen] = useState(false)
@@ -49,7 +61,7 @@ export default function PlatformLimits() {
   // 'retireEnabled' = link retirement), independently of every other switch.
   async function savePlatformFlag(
     platform: string,
-    flag: 'enabled' | 'retireEnabled',
+    flag: 'enabled' | 'retireEnabled' | 'harvestEnabled',
     next: boolean
   ) {
     setSavingKey(platform)
@@ -80,7 +92,13 @@ export default function PlatformLimits() {
 
   async function save(
     platform: string,
-    next: { limit: number; windowMs: number; enabled: boolean; retireEnabled: boolean }
+    next: {
+      limit: number
+      windowMs: number
+      enabled: boolean
+      retireEnabled: boolean
+      harvestEnabled: boolean
+    }
   ) {
     setSavingKey(platform)
     setError('')
@@ -125,6 +143,8 @@ export default function PlatformLimits() {
   }).length
   // Platforms where retirement is live.
   const retiringCount = CLICK_PLATFORMS.filter((p) => limits?.[p]?.retireEnabled).length
+  // Platforms the automatic channel extraction may visit.
+  const harvestCount = CLICK_PLATFORMS.filter((p) => limits?.[p]?.harvestEnabled).length
 
   return (
     <div className="border border-zinc-800 rounded-xl bg-zinc-900/40">
@@ -135,7 +155,9 @@ export default function PlatformLimits() {
       >
         <span className="text-sm font-medium text-zinc-200">
           ⏱️ Link limits per platform
-          <span className="text-zinc-500 font-normal"> — hourly quota, wait time &amp; retirement</span>
+          <span className="text-zinc-500 font-normal">
+            {' '}— hourly quota, wait time, retirement &amp; auto extraction
+          </span>
           {open && (
             // Counts the platforms whose HOURLY quota is on. The master switch is
             // about retirement, so it would be the wrong thing to show here.
@@ -162,6 +184,20 @@ export default function PlatformLimits() {
               {retiringCount > 0 ? `${retiringCount}/${CLICK_PLATFORMS.length} RETIRING` : 'NO RETIRE'}
             </span>
           )}
+          {open && (
+            <span
+              className={`ml-1 text-[10px] font-semibold rounded px-1.5 py-0.5 border ${
+                harvestCount > 0
+                  ? 'text-sky-200 bg-sky-500/15 border-sky-500/40'
+                  : 'text-zinc-400 bg-zinc-700/30 border-zinc-700'
+              }`}
+              title="How many platforms the automatic channel extraction may visit"
+            >
+              {harvestCount > 0
+                ? `${harvestCount}/${CLICK_PLATFORMS.length} HARVESTING`
+                : 'NO HARVEST'}
+            </span>
+          )}
         </span>
         <span className={`text-zinc-500 transition-transform ${open ? 'rotate-90' : ''}`}>▸</span>
       </button>
@@ -176,8 +212,17 @@ export default function PlatformLimits() {
             switch, so you can cap one platform and leave the others open. The{' '}
             <span className="text-zinc-300">Retire</span> switch is separate and independent: it controls
             whether that platform’s links leave everyone’s pool once enough distinct users have clicked
-            them. Turning one off never affects the other, and there is no global switch — each platform
-            stands alone.
+            them. The <span className="text-zinc-300">Harvest</span> switch is separate again: it
+            controls whether the pipeline automatically looks at that platform’s channels for videos
+            we have never seen. Off, its channels are never visited — no new links arrive by
+            themselves — while everything already in the pool keeps being served exactly as before.
+            Turning one switch off never affects the others, and there is no global switch — each
+            platform stands alone.
+          </p>
+          <p className="text-xs text-zinc-600 mb-3">
+            YouTube Shorts and YouTube Videos share their channels: a channel’s uploads are both, and
+            which a new upload is cannot be known before it is fetched. So YouTube channels are
+            visited while <em>either</em> of those two Harvest switches is on.
           </p>
 
           {error && <p className="text-sm text-red-400 mb-3">{error}</p>}
@@ -186,16 +231,21 @@ export default function PlatformLimits() {
             <p className="text-sm text-zinc-500">Loading…</p>
           ) : (
             <div className="space-y-2">
-              <div className="hidden sm:grid grid-cols-[1fr_auto_auto_auto_auto] gap-3 px-1 text-[11px] uppercase tracking-wide text-zinc-500">
+              <div className="hidden sm:grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-3 px-1 text-[11px] uppercase tracking-wide text-zinc-500">
                 <span>Platform</span>
                 <span className="text-right" title="Enforce this platform's hourly link quota">Hourly</span>
                 <span className="text-right" title="Retire this platform's links once enough distinct users have clicked them">Retire</span>
+                <span className="text-right" title="Automatically extract new videos from this platform's channels">Harvest</span>
                 <span className="text-right">Quota (links)</span>
                 <span className="text-right">Wait window</span>
               </div>
               {CLICK_PLATFORMS.map((p) => {
                 const cur = limits[p] ?? {
-                  limit: 20, windowMs: 60 * 60 * 1000, enabled: true, retireEnabled: true,
+                  limit: 20,
+                  windowMs: 60 * 60 * 1000,
+                  enabled: true,
+                  retireEnabled: true,
+                  harvestEnabled: true,
                 }
                 // The hourly quota is live purely on this platform's own switch.
                 const live = cur.enabled
@@ -205,8 +255,8 @@ export default function PlatformLimits() {
                 return (
                   <div
                     key={p}
-                    className={`grid grid-cols-1 sm:grid-cols-[1fr_auto_auto_auto_auto] items-center gap-2 sm:gap-3 rounded-lg border border-zinc-800 p-2 ${
-                      cur.enabled || retiring ? '' : 'opacity-60'
+                    className={`grid grid-cols-1 sm:grid-cols-[1fr_auto_auto_auto_auto_auto] items-center gap-2 sm:gap-3 rounded-lg border border-zinc-800 p-2 ${
+                      cur.enabled || retiring || cur.harvestEnabled ? '' : 'opacity-60'
                     }`}
                   >
                     <span className="text-sm text-zinc-200">
@@ -241,6 +291,20 @@ export default function PlatformLimits() {
                             }
                           >
                             {retiring ? 'RETIRES' : 'NO RETIRE'}
+                          </span>
+                          <span
+                            className={`ml-1 text-[10px] font-semibold rounded px-1.5 py-0.5 border ${
+                              cur.harvestEnabled
+                                ? 'text-sky-200 bg-sky-500/15 border-sky-500/40'
+                                : 'text-zinc-400 bg-zinc-700/30 border-zinc-700'
+                            }`}
+                            title={
+                              cur.harvestEnabled
+                                ? 'New videos are extracted from this platform’s channels automatically.'
+                                : 'Switched off — this platform’s channels are never visited for new videos.'
+                            }
+                          >
+                            {cur.harvestEnabled ? 'HARVESTS' : 'NO HARVEST'}
                           </span>
                         </>
                       )}
@@ -280,6 +344,27 @@ export default function PlatformLimits() {
                       <span
                         className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
                           cur.retireEnabled ? 'translate-x-5' : 'translate-x-0.5'
+                        }`}
+                      />
+                    </button>
+                    {/* Automatic channel extraction — independent of both other
+                        switches. Off, the pipeline's harvest stage never visits
+                        this platform's channels; the pool is untouched. */}
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-label={`Automatically extract new videos from ${CLICK_PLATFORM_LABELS[p] || p} channels`}
+                      title="Automatically extract new videos from this platform's channels"
+                      aria-checked={cur.harvestEnabled}
+                      disabled={busy}
+                      onClick={() => savePlatformFlag(p, 'harvestEnabled', !cur.harvestEnabled)}
+                      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${
+                        cur.harvestEnabled ? 'bg-sky-600' : 'bg-zinc-600'
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
+                          cur.harvestEnabled ? 'translate-x-5' : 'translate-x-0.5'
                         }`}
                       />
                     </button>

@@ -1,6 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { userIdFromApp } from '@/lib/appAuth'
-import { countRecentClicks, recordClick, getEffectivePlatformLimit, isUserVerified } from '@/lib/db'
+import {
+  countRecentClicks,
+  recordClick,
+  recordCleanSessionClick,
+  getServeOnlyClean,
+  getEffectivePlatformLimit,
+  isUserVerified,
+} from '@/lib/db'
 import { isProduct, VERIFY_VIDEO_URL, VERIFY_GATE_ENABLED } from '@/lib/config'
 import { serveCommentForUrl } from '@/lib/serveComment'
 
@@ -62,11 +69,18 @@ export async function POST(req: NextRequest) {
     }
 
     // Only choose when the client didn't already serve something itself.
-    const served = clientProduct
+    const served: { product: string | null; comment: string | null } = clientProduct
       ? { product: clientProduct, comment: null }
       : await serveCommentForUrl(url).catch(() => ({ product: null, comment: null }))
 
     await recordClick(userId, url, searchQuery, platform, served.product, served.comment)
+    // While "only links with none of ours" is on the permanent record is
+    // ignored when serving, so without this the same link comes back on every
+    // fetch of the session. Recorded alongside, never instead: the permanent
+    // record still gets its row.
+    if (await getServeOnlyClean().catch(() => false)) {
+      await recordCleanSessionClick(userId, url).catch(() => {})
+    }
     return NextResponse.json({
       ok: true,
       // The app pastes this; absent when an older build already picked its own.

@@ -28,6 +28,10 @@ import {
   getUserValidity,
   getClusterDateShare,
   getConfirmedBrokenUrls,
+  getServeOnlyClean,
+  getUrlsWithProductComments,
+  getCleanSessionClicks,
+  getLinkCategoriesFor,
 } from '@/lib/db'
 import { retiredUrlSet } from '@/lib/videos'
 import { buildUserFeed, FEED_PER_PLATFORM } from '@/lib/userFeed'
@@ -141,7 +145,7 @@ export default async function Home() {
     ...Object.values(platformLimits).map((l) => l.windowMs || 0)
   )
 
-  const [allVideos, clickedUrls, clickCounts, todayCounts, hourly, messages, pending, paidNotice, apk, blockedUrls, brokenUrls] =
+  const [allVideos, clickedUrls, clickCounts, todayCounts, hourly, messages, pending, paidNotice, apk, blockedUrls, brokenUrls, onlyClean] =
     await Promise.all([
       getVideos(),
       getClickedUrls(session.user.id).catch(() => [] as string[]),
@@ -158,14 +162,21 @@ export default async function Home() {
       getBlockedUrls().catch(() => [] as string[]),
       // Links the platform no longer serves, confirmed over two passes.
       getConfirmedBrokenUrls(BROKEN_AFTER_MISSES).catch(() => [] as string[]),
+      // Off by default; on, links already carrying one of ours are withheld.
+      getServeOnlyClean().catch(() => false),
     ])
+  // Read only when the setting is on — a full scan of link_product_comment is
+  // not worth doing on every page load for an answer nobody uses.
+  const alreadyOurs = onlyClean
+    ? await getUrlsWithProductComments().catch(() => [] as string[])
+    : []
   // What share of workers the admin has put on the posted-date clustering.
   const dateShare = await getClusterDateShare().catch(() => DEFAULT_DATE_SHARE)
   // Permanently-blocked links never appear, even if a new videos.json re-adds them.
   // Blocked (a judgement we made) and broken (the platform no longer serves it)
   // are different facts with the same effect here: neither is worth anyone's
   // time to open.
-  const goneSet = new Set([...blockedUrls, ...brokenUrls])
+  const goneSet = new Set([...blockedUrls, ...brokenUrls, ...alreadyOurs])
   const videos = allVideos.filter((v) => !goneSet.has(String((v as { url?: unknown }).url ?? '')))
   // Retire links per their engagement-based quota (TikTok likes/10, YT views/100,
   // Instagram = the cap) — hidden from every user once they hit it. Retirement only
@@ -180,17 +191,42 @@ export default async function Home() {
   // pool, so the queue means the same thing it always did — see lib/userFeed.
   // Links already opened, and retired ones, are dropped before the cut, so the
   // cap is a hundred links per platform that can actually be worked on.
+  //
+  // ALREADY-OPENED LINKS COME BACK when "only links with none of ours" is on:
+  // that setting only serves links carrying none of ours, so one this user
+  // opened before and that still carries none is a link they opened without
+  // leaving a comment that stuck. Withholding it withholds the very work the
+  // setting exists to hand out. Passed on to Dashboard as an empty clicked
+  // list too, or its own filter would take them straight back out — and its
+  // remaining counts would be short by the same links.
+  const sessionClicks = onlyClean
+    ? await getCleanSessionClicks(session.user.id).catch(() => [] as string[])
+    : []
+  const alreadyOpened = onlyClean ? sessionClicks : clickedUrls
   const { served, remaining } = buildUserFeed(
     videos,
-    new Set([...clickedUrls, ...retiredUrls]),
+    new Set([...alreadyOpened, ...retiredUrls]),
     FEED_PER_PLATFORM
   )
 
+  // The audience each served link was sorted into, so the page copies a comment
+  // written for that kind of video. Read for the SLICE, not the pool: the whole
+  // link_category table is 150k rows to answer a question about four hundred
+  // links. A link with no row keeps no category and the page falls back to
+  // FALLBACK_COMMENT_CATEGORY when it picks.
+  const feedCategories = await getLinkCategoriesFor(served.map((v) => String(v.url))).catch(
+    () => ({}) as Record<string, string>
+  )
+  const withCategory = served.map((v) => ({
+    ...v,
+    category: feedCategories[String(v.url)] ?? null,
+  }))
+
   return (
     <Dashboard
-      videos={served}
+      videos={withCategory}
       remainingByPlatform={remaining}
-      clickedUrls={clickedUrls}
+      clickedUrls={alreadyOpened}
       retiredUrls={retiredUrls}
       dateShare={dateShare}
       todayCounts={todayCounts}

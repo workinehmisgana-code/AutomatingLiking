@@ -56,7 +56,9 @@ export default function Guide(props: Props & { signedIn?: boolean }) {
       </div>
 
       {/* Earnings summary */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 my-5">
+      {/* Four cards now that payday is one of them — three columns would leave
+          it stranded alone on a second row. */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 my-5">
         {t.rates.map((r) => (
           <div key={r.label} className="rounded-lg border border-zinc-800 bg-zinc-900/40 px-3 py-2.5">
             <div className="text-[11px] uppercase tracking-wide text-zinc-500">{r.label}</div>

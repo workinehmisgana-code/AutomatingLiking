@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
+import ScrollX from '@/components/ScrollX'
+import { CLICK_PLATFORMS, CLICK_PLATFORM_LABELS } from '@/lib/config'
 
 const PAGE_SIZE = 500
 const UPLOAD_CHUNK = 500 // rows per upload request
@@ -91,6 +93,12 @@ export default function VerifyLinks() {
   // Title-presence filter, applied server-side so the pager and totals match.
   // 'has' hides every link that has no title yet.
   const [titleFilter, setTitleFilter] = useState<'all' | 'has' | 'none'>('all')
+  // Platform filter, applied server-side like the title one so the pager and
+  // the totals describe the same set the table shows. '' = every platform.
+  const [platform, setPlatform] = useState('')
+  // How many links each platform holds, read from the URLs. Shown in the
+  // dropdown: an option that would empty the page should say so first.
+  const [platformCounts, setPlatformCounts] = useState<Record<string, number>>({})
   // Channels present in the verify list, for the whole-channel merge.
   const [accounts, setAccounts] = useState<{ account: string; platform: string; n: number }[]>([])
   // Channels ticked for merging. A set, so a search's worth can be cleared in
@@ -109,9 +117,20 @@ export default function VerifyLinks() {
   // extract in exactly that order. Extraction stages into verify_link ONLY —
   // nothing reaches the main pool without a manual merge.
   const [ranked, setRanked] = useState<ChannelRank[] | null>(null)
+  // Links we hold whose channel cannot be named at all. Shown beside the
+  // channel count, because otherwise their absence reads as channels missing
+  // from the list rather than links with nobody to attribute them to.
+  const [unattributed, setUnattributed] = useState<{
+    total: number
+    byPlatform: Record<string, number>
+  } | null>(null)
   const [ranking, setRanking] = useState(false)
   const [showRanked, setShowRanked] = useState(false)
   const [rankQuery, setRankQuery] = useState('')
+  // Which site's channels the ranked table shows. TikTok outnumbers Instagram
+  // 2,756 to 535, so without this the Instagram channels are real, ranked and
+  // effectively unreachable — they sit below two thousand rows.
+  const [rankSite, setRankSite] = useState('')
   const [extracting, setExtracting] = useState(false)
   const [exDone, setExDone] = useState(0)
   const [exTotal, setExTotal] = useState(0)
@@ -130,6 +149,7 @@ export default function VerifyLinks() {
       const accountsParam = Array.from(mergeAccounts).map(encodeURIComponent).join(',')
       const res = await fetch(
         `/api/admin/verify-links?page=${p}&limit=${PAGE_SIZE}&title=${titleFilter}` +
+          (platform ? `&platform=${platform}` : '') +
           (accountsParam ? `&accounts=${accountsParam}` : '')
       )
       const d = await res.json().catch(() => ({}))
@@ -137,6 +157,9 @@ export default function VerifyLinks() {
         setRows(Array.isArray(d.rows) ? d.rows : [])
         setTotal(Number(d.total) || 0)
         setTotalAll(Number(d.totalAll) || 0)
+        if (d.platformCounts && typeof d.platformCounts === 'object') {
+          setPlatformCounts(d.platformCounts as Record<string, number>)
+        }
       } else {
         alert(d?.error || 'Could not load the verify list.')
       }
@@ -146,7 +169,7 @@ export default function VerifyLinks() {
       setClassifiedThisPage(false) // a freshly-loaded page must be re-classified before merge
       setLoading(false)
     }
-  }, [titleFilter, mergeAccounts])
+  }, [titleFilter, platform, mergeAccounts])
 
   useEffect(() => { fetchPage(page) }, [page, fetchPage])
 
@@ -329,6 +352,14 @@ export default function VerifyLinks() {
     setPage(0)
   }
 
+  // Back to page 0 for the same reason the title filter does: page 7 of the
+  // old filter is rarely a page of the new one, and landing on an empty page
+  // reads as "there are none" rather than "you are past the end".
+  function changePlatform(next: string) {
+    setPlatform(next)
+    setPage(0)
+  }
+
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE))
 
   // Selected rows float to the top of the page after "Mark unrelated".
@@ -501,7 +532,13 @@ export default function VerifyLinks() {
     if (totalAll === 0) { alert('The verify list is already empty.'); return }
     // Clean ignores the Title filter — it wipes the whole list, so it must warn
     // with the UNFILTERED count, not the (possibly much smaller) filtered one.
-    if (!confirm(`Clean the WHOLE verify list?\n\nThis permanently removes ALL ${totalAll.toLocaleString()} link(s) from the "Links to verify" list${titleFilter !== 'all' ? ' — including the ones the Title filter is currently hiding' : ''}. It does NOT touch the main links list.`)) return
+    if (!confirm(`Clean the WHOLE verify list?\n\nThis permanently removes ALL ${totalAll.toLocaleString()} link(s) from the "Links to verify" list${
+      titleFilter !== 'all' || platform
+        ? ` — including the ones the ${[platform && 'Platform', titleFilter !== 'all' && 'Title']
+            .filter(Boolean)
+            .join(' and ')} filter${platform && titleFilter !== 'all' ? 's are' : ' is'} currently hiding`
+        : ''
+    }. It does NOT touch the main links list.`)) return
     setCleaning(true)
     try {
       const res = await fetch('/api/admin/verify-links', {
@@ -528,6 +565,7 @@ export default function VerifyLinks() {
       const d = await res.json().catch(() => ({}))
       if (!res.ok) { alert(d?.error || 'Could not rank channels.'); return }
       setRanked(Array.isArray(d.channels) ? d.channels : [])
+      setUnattributed(d.unattributed ?? null)
       setShowRanked(true)
     } finally {
       setRanking(false)
@@ -574,6 +612,7 @@ export default function VerifyLinks() {
     .map((c, i) => ({ ...c, rank: i + 1 }))
     .filter(
       (c) =>
+        (rankSite === '' || c.platform === rankSite) &&
         (needle === '' || c.handle.includes(needle)) &&
         inRange(c.links, fLinks) &&
         inRange(c.avgHearts, fHearts) &&
@@ -583,6 +622,72 @@ export default function VerifyLinks() {
         inRange(c.score, fScore)
     )
   const channelsFiltered = (ranked?.length ?? 0) !== visibleChannels.length
+  // Channels that match the handle search but were removed by the SITE chip.
+  //
+  // Searching a handle you know is there and getting "no channel matches" reads
+  // as a missing channel, not as a filter — the site chip is at the other end
+  // of the toolbar and easy to forget. So the empty state names the site the
+  // handle is actually on.
+  const hiddenBySite =
+    rankSite && needle
+      ? (ranked ?? []).filter((c) => c.platform !== rankSite && c.handle.includes(needle))
+      : []
+  // Only TikTok channels can have their recent posts listed — Instagram has no
+  // unauthenticated route to a profile's posts, and a YouTube Shorts URL carries
+  // no handle to ask about. Counted here so the button offers the number it can
+  // really check rather than promising all of them and reporting the shortfall
+  // afterwards.
+  const extractable = visibleChannels.filter((c) => c.platform === 'tiktok')
+  const unlistable = visibleChannels.length - extractable.length
+
+  // How many ranked channels each site has, so the chips can say so and an
+  // empty one is visibly empty rather than a filter that returns nothing.
+  const siteCounts = (ranked ?? []).reduce<Record<string, number>>((acc, c) => {
+    acc[c.platform] = (acc[c.platform] ?? 0) + 1
+    return acc
+  }, {})
+
+  /**
+   * Download the channels on screen as a profile-URL list.
+   *
+   * This is what makes the ranked table useful for the sites the ⬇ button
+   * cannot reach. Instagram gives no unauthenticated way to list a profile's
+   * posts, but 1_tiktok_search_scraper CAN — it drives a real signed-in browser
+   * — and its load_accounts() reads exactly this format: one profile URL per
+   * line, blank lines and # comments ignored.
+   *
+   *   python scrape_channels.py --accounts channels-instagram.txt --platform instagram
+   *
+   * then upload the resulting results/instagram_videos_*.csv back to this page.
+   *
+   * The FILTERED set, not the whole list, for the same reason extraction uses
+   * it: narrowing the table is how a subset gets chosen.
+   */
+  function exportHandles() {
+    if (visibleChannels.length === 0) return
+    const stamp = new Date().toISOString().slice(0, 10)
+    const site = rankSite || 'all'
+    const header = [
+      `# ${visibleChannels.length} channel(s) from the ranked list, ${stamp}`,
+      `# site: ${site}${channelsFiltered ? ' (filtered)' : ''}`,
+      '#',
+      '# Scrape these with 1_tiktok_search_scraper, then upload the CSV here:',
+      `#   python scrape_channels.py --accounts ${`channels-${site}-${stamp}.txt`}` +
+        (rankSite ? ` --platform ${rankSite}` : ''),
+      '',
+    ]
+    const lines = visibleChannels.map((c) => channelUrl(c.handle, c.platform)).filter(Boolean)
+    const blob = new Blob([[...header, ...lines].join('\n') + '\n'], {
+      type: 'text/plain;charset=utf-8',
+    })
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = `channels-${site}-${stamp}.txt`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000)
+  }
 
   // Walk the ranked channels in order, staging each one's new videos. Each POST
   // works ~40s and says where to resume; this loop drives the progress bar.
@@ -591,11 +696,17 @@ export default function VerifyLinks() {
     if (!ranked || ranked.length === 0) return
     // Exactly the channels left on screen. Filtering the table IS the way to
     // choose a subset, so extraction must follow it rather than the full list.
-    const handles = visibleChannels.map((c) => c.handle)
+    const handles = extractable.map((c) => c.handle)
     if (handles.length === 0) return
     if (!confirm(
       `Check ${handles.length.toLocaleString()}` +
-      `${channelsFiltered ? ' filtered' : ''} channel(s) for new videos?\n\n` +
+      `${channelsFiltered ? ' filtered' : ''} TikTok channel(s) for new videos?\n\n` +
+      (unlistable
+        ? `${unlistable.toLocaleString()} channel(s) on screen are not TikTok and cannot be ` +
+          'checked: Instagram exposes no way to list a profile\u2019s posts without a login, ' +
+          'and a YouTube Shorts link carries no handle. Scrape those with ' +
+          '1_tiktok_search_scraper and upload the CSV here.\n\n'
+        : '') +
       'New videos are added to THIS verify list only — nothing goes into the main ' +
       'links until you merge it yourself. TikTok exposes only about a dozen recent ' +
       'videos per channel, so this catches up recent posts, not old backlogs.'
@@ -699,9 +810,11 @@ export default function VerifyLinks() {
             Independent staging list ({total.toLocaleString()} link{total === 1 ? '' : 's'}
             {mergeAccounts.size > 0 &&
               ` from ${mergeAccounts.size === 1 ? `@${Array.from(mergeAccounts)[0]}` : `${mergeAccounts.size} channels`}`}
+            {platform && ` on ${CLICK_PLATFORM_LABELS[platform] ?? platform}`}
             {titleFilter !== 'all' &&
               ` ${titleFilter === 'has' ? 'with' : 'without'} a title`}
-            {(mergeAccounts.size > 0 || titleFilter !== 'all') && `, of ${totalAll.toLocaleString()}`}
+            {(mergeAccounts.size > 0 || titleFilter !== 'all' || !!platform) &&
+              `, of ${totalAll.toLocaleString()}`}
             ). Upload a
             channel CSV, mark &amp; block the humanizer-unrelated ones, then merge the rest into the main list.
           </p>
@@ -769,12 +882,15 @@ export default function VerifyLinks() {
         <button
           type="button"
           onClick={extractNew}
-          disabled={!ranked || visibleChannels.length === 0}
+          disabled={!ranked || extractable.length === 0}
           title={
             !ranked
               ? 'Rank the channels first — extraction follows that order.'
               : channelsFiltered
-              ? `Check the ${visibleChannels.length.toLocaleString()} filtered channel(s) for videos we do not have yet, and stage them in this list.`
+              ? `Check the ${extractable.length.toLocaleString()} filtered TikTok channel(s) for videos we do not have yet, and stage them in this list.` +
+                (unlistable
+                  ? ` ${unlistable.toLocaleString()} non-TikTok channel(s) on screen cannot be checked — there is no way to list their posts without a login.`
+                  : '')
               : 'Check each channel in ranked order for videos we do not have yet, and stage them in this list. Nothing is added to the main links.'
           }
           className={`text-sm rounded-lg px-3 py-1.5 border transition-colors disabled:opacity-40 ${
@@ -785,8 +901,61 @@ export default function VerifyLinks() {
         >
           {extracting
             ? '■ Stop extracting'
-            : `⬇ Extract new videos${ranked && channelsFiltered ? ` (${visibleChannels.length})` : ''}`}
+            // A greyed button with "(0)" on it looks broken. When the reason is
+            // the site rather than an empty table, the label says the reason.
+            : extractable.length === 0 && visibleChannels.length > 0
+              ? '⬇ Extract — TikTok only'
+              : `⬇ Extract new videos${ranked ? ` (${extractable.length})` : ''}`}
         </button>
+        {/* The way in for every site the button above cannot reach. */}
+        <button
+          type="button"
+          onClick={exportHandles}
+          disabled={!ranked || visibleChannels.length === 0}
+          title={
+            'Download the channels on screen as a profile-URL list, ready for ' +
+            '1_tiktok_search_scraper.\n\n' +
+            'This is how Instagram channels get extracted: the scraper drives a ' +
+            'real signed-in browser, which is the only thing that can list an ' +
+            'Instagram profile. Scrape, then upload the CSV back to this page.'
+          }
+          className={`text-sm border disabled:opacity-40 rounded-lg px-3 py-1.5 transition-colors ${
+            // Highlighted exactly when it is the only one of the two that can
+            // do anything — on a site whose profiles cannot be listed.
+            extractable.length === 0 && visibleChannels.length > 0
+              ? 'text-white bg-teal-700 hover:bg-teal-600 border-teal-600'
+              : 'text-zinc-200 bg-zinc-800 hover:bg-zinc-700 border-zinc-700'
+          }`}
+        >
+          📄 Export handles{ranked && visibleChannels.length ? ` (${visibleChannels.length})` : ''}
+        </button>
+        <label
+          className="flex items-center gap-1.5 text-sm text-zinc-400"
+          title={
+            'Filter the list by platform.\n\n' +
+            'Read from each link\u2019s URL, not from the platform it was uploaded ' +
+            'as \u2014 an Instagram link mislabelled tiktok still lists under Instagram.'
+          }
+        >
+          Platform:
+          <select
+            value={platform}
+            onChange={(e) => changePlatform(e.target.value)}
+            disabled={loading}
+            className="bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-emerald-500 disabled:opacity-40"
+          >
+            <option value="">All platforms</option>
+            {CLICK_PLATFORMS.map((k) => {
+              const n = platformCounts[k] ?? 0
+              return (
+                <option key={k} value={k} disabled={n === 0 && platform !== k}>
+                  {CLICK_PLATFORM_LABELS[k] ?? k}
+                  {n > 0 ? ` (${n.toLocaleString()})` : ' — none'}
+                </option>
+              )
+            })}
+          </select>
+        </label>
         <label
           className="flex items-center gap-1.5 text-sm text-zinc-400"
           title="Filter the list by whether a link has a title. “Has title” hides every link with no title yet."
@@ -915,6 +1084,25 @@ export default function VerifyLinks() {
               <span className="text-zinc-500 font-normal">
                 {' '}· links, avg hearts, post rate and active% weighted 25% each
               </span>
+              {/* Every link we hold is either attributed to a channel above or
+                  counted here. Without this, links whose channel cannot be read
+                  look like channels missing from the list. */}
+              {unattributed && unattributed.total > 0 && (
+                <span
+                  className="ml-2 text-[11px] text-amber-400/80 font-normal"
+                  title={
+                    'Links whose channel cannot be worked out, so they belong to no row above.\n\n' +
+                    Object.entries(unattributed.byPlatform)
+                      .sort((a, b) => b[1] - a[1])
+                      .map(([p, n]) => `${p}: ${n.toLocaleString()}`)
+                      .join('\n') +
+                    '\n\nA YouTube Shorts URL is /shorts/<id> and names nobody. An Instagram ' +
+                    'post is /p/<code>/ and only names its account when the scrape stored one.'
+                  }
+                >
+                  {unattributed.total.toLocaleString()} link(s) have no readable channel
+                </span>
+              )}
             </span>
             <button
               onClick={() => setShowRanked(false)}
@@ -937,6 +1125,46 @@ export default function VerifyLinks() {
               </div>
               {/* One min/max pair per column. Extraction runs over exactly what
                   survives these, so this is how a subset is chosen. */}
+              {/* Site chips. Ranking works for every platform — it reads only
+                  data we already hold — so this is what makes the Instagram
+                  channels reachable. Extraction is a separate question, marked
+                  on each chip. */}
+              <div className="flex flex-wrap items-center gap-1.5 px-3 pt-2">
+                {([
+                  ['', 'All'],
+                  ['tiktok', 'TikTok'],
+                  ['instagram', 'Instagram'],
+                  ['youtube', 'YouTube'],
+                ] as const).map(([key, label]) => {
+                  const n = key === '' ? (ranked?.length ?? 0) : siteCounts[key] ?? 0
+                  const listable = key === '' || key === 'tiktok'
+                  return (
+                    <button
+                      key={key || 'all'}
+                      type="button"
+                      onClick={() => setRankSite(key)}
+                      disabled={n === 0 && rankSite !== key}
+                      title={
+                        listable
+                          ? 'Rank and extract both work here'
+                          : 'Ranking works here. Extracting does not: this site gives no way ' +
+                            'to list a profile’s posts without a login. Use “Export handles” ' +
+                            'and scrape them with 1_tiktok_search_scraper instead.'
+                      }
+                      className={`text-[11px] rounded px-2 py-0.5 border transition-colors disabled:opacity-30 ${
+                        rankSite === key
+                          ? 'bg-teal-600 text-white border-teal-500'
+                          : 'bg-zinc-900 text-zinc-400 border-zinc-700 hover:bg-zinc-800'
+                      }`}
+                    >
+                      {label} {n.toLocaleString()}
+                      {!listable && n > 0 && (
+                        <span className="ml-1 text-amber-400/80">export to scrape</span>
+                      )}
+                    </button>
+                  )
+                })}
+              </div>
               <div className="flex items-center gap-3 px-3 pb-1.5 pt-1">
                 <span className="w-12 shrink-0" />
                 <span className="flex-1 min-w-0">
@@ -977,11 +1205,31 @@ export default function VerifyLinks() {
             {visibleChannels.length === 0 ? (
               <div className="px-3 py-6 text-center text-xs text-zinc-500">
                 No channel matches these filters.
+                {hiddenBySite.length > 0 && (
+                  <>
+                    <br />
+                    <span className="text-zinc-400">
+                      {hiddenBySite.length === 1
+                        ? `@${hiddenBySite[0].handle} is on ${hiddenBySite[0].platform}`
+                        : `${hiddenBySite.length} matching channel(s) are on other sites`}
+                      {' — '}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setRankSite('')}
+                      className="text-teal-400 underline hover:text-teal-300"
+                    >
+                      show all sites
+                    </button>
+                  </>
+                )}
               </div>
             ) : (
               visibleChannels.map((c) => (
                 <div
-                  key={c.handle}
+                  // Site AND handle: 98 handles exist on two sites, and a
+                  // duplicate key makes React reuse the wrong row.
+                  key={`${c.platform}:${c.handle}`}
                   className="flex items-center gap-3 px-3 py-1 text-xs border-b border-zinc-800/50 hover:bg-zinc-800/40"
                 >
                   <span className="w-12 shrink-0 text-right text-zinc-600 tabular-nums">{c.rank}</span>
@@ -993,6 +1241,20 @@ export default function VerifyLinks() {
                     className="flex-1 min-w-0 truncate text-zinc-300 hover:text-emerald-400"
                   >
                     @{c.handle}
+                    {/* Which site this handle is on. The same name can exist on
+                        two of them, and the row is otherwise identical. */}
+                    <span
+                      className={`ml-1.5 text-[10px] ${
+                        c.platform === 'tiktok' ? 'text-zinc-600' : 'text-amber-400/70'
+                      }`}
+                      title={
+                        c.platform === 'tiktok'
+                          ? 'Can be ranked and extracted'
+                          : 'Ranked only — its posts cannot be listed without a login'
+                      }
+                    >
+                      {c.platform}
+                    </span>
                   </a>
                   <span className="w-16 shrink-0 text-right text-zinc-400 tabular-nums">
                     {c.links.toLocaleString()}
@@ -1046,6 +1308,9 @@ export default function VerifyLinks() {
 
       {/* Table */}
       <div className="rounded-xl border border-zinc-800 overflow-hidden">
+      {/* Header and rows in ONE scroller, at a fixed minimum width, so a
+          search that narrows the rows cannot take the scroll away. */}
+      <ScrollX min={860}>
         <div className="flex items-center gap-2 px-3 py-2 bg-zinc-900 border-b border-zinc-800 text-xs text-zinc-400 font-medium">
           <span className="w-6 flex justify-center">
             <input type="checkbox" checked={allSelected} onChange={toggleAll} className="accent-teal-500 cursor-pointer" />
@@ -1217,6 +1482,7 @@ export default function VerifyLinks() {
             </div>
           )})
         )}
+      </ScrollX>
       </div>
       {/* Every staged channel, to be reviewed one at a time */}
       {channelsOpen && (

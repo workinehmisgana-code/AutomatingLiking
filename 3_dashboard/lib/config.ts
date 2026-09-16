@@ -74,6 +74,21 @@ export type LinkCategory = (typeof LINK_CATEGORIES)[number]
 
 export const DEFAULT_LINK_CATEGORY: LinkCategory = 'generic'
 
+/**
+ * The audience whose comments are served for a link that HAS NO CATEGORY —
+ * never classified, or classified into something no longer recognised.
+ *
+ * Not the same decision as DEFAULT_LINK_CATEGORY above, which is what the
+ * CLASSIFIER writes down when it cannot tell. This one is what the SERVER reads
+ * when nothing was written down at all, and the two want opposite things: a
+ * label should admit it knows nothing ('generic'), while a comment still has to
+ * be worth pasting. 'competitors' is the safer guess by a distance — it is where
+ * three quarters of the classified pool ended up, and its comments assume only
+ * that the viewer is shopping for a tool like ours, which is true of almost any
+ * video we scraped from these keywords.
+ */
+export const FALLBACK_COMMENT_CATEGORY: LinkCategory = 'competitors'
+
 export function isLinkCategory(v: unknown): v is LinkCategory {
   return typeof v === 'string' && (LINK_CATEGORIES as readonly string[]).includes(v)
 }
@@ -488,6 +503,95 @@ export const PROMO_DAILY_LIMIT_PER_PLATFORM = 1
 // (not-yet-downloaded) videos are locked with a countdown to the next day.
 export const PROMO_DOWNLOAD_DAILY_LIMIT = 1
 
+// ── What the Links page search box looks in ──────────────────────────────────
+//
+// Five fields, each answering a different question, which is why they are
+// pickable rather than all searched at once:
+//
+//   url      the link itself — an id, and the handle for TikTok/YouTube
+//   keyword  the search term the link was SCRAPED under, not what it contains
+//   title    the video's own caption: what it is actually about
+//   channel  the account that posted it
+//   bio      that account's profile description — what the channel is FOR,
+//            which the individual captions often do not say
+//
+// A wider search is not a better one: typing "humanizer" with bio on matches
+// every link from every channel whose profile mentions humanizers, which is
+// thousands, and buries the caption you were looking for.
+export const SEARCH_FIELDS = [
+  { key: 'url', label: 'URL' },
+  { key: 'keyword', label: 'Keyword' },
+  { key: 'title', label: 'Title' },
+  { key: 'channel', label: 'Channel name' },
+  { key: 'bio', label: 'Channel bio' },
+] as const
+
+export type SearchField = (typeof SEARCH_FIELDS)[number]['key']
+
+/**
+ * What the box searches when nothing is chosen.
+ *
+ * The three that describe the LINK. Channel and bio describe the account, so a
+ * hit on them is a hit on every one of that channel's links at once — useful
+ * deliberately, surprising by default.
+ */
+export const DEFAULT_SEARCH_FIELDS: readonly SearchField[] = ['url', 'keyword', 'title']
+
+export function isSearchField(v: unknown): v is SearchField {
+  return typeof v === 'string' && SEARCH_FIELDS.some((f) => f.key === v)
+}
+
+// ── Mailbox task (users create addresses on the company's own domain) ────────
+// A worker creates a mailbox on a domain THE COMPANY OWNS and submits the
+// address. Nothing is transferred from the worker: the domain, the mailbox and
+// the credentials belong to the company from the moment the address exists.
+//
+// The address is worth ACCOUNT_PAY_BIRR, and it is worth NOTHING until an admin
+// has checked it really exists on the domain. So a submission earns in two
+// steps — see PendingPayments.accountsAwaiting (submitted, unapproved, not
+// payable) and .accounts (validated, payable).
+export const ACCOUNT_PAY_BIRR = 50
+
+/** Fallback domain, used until an admin saves one on the admin tasks page. */
+export const ACCOUNT_TASK_DEFAULT_DOMAIN = process.env.ACCOUNT_TASK_DOMAIN ?? ''
+
+/**
+ * The password workers are told to set on the mailbox they create.
+ *
+ * Set on the admin tasks page and stored in the database, with this env var as
+ * the fallback — NOT written into the source. It is shown to every worker, so
+ * it is not a secret in any useful sense, but a literal password in a committed
+ * file is a thing that outlives the reason for it and turns up in a repository
+ * search years later. Blank means "we do not tell them", and the page then says
+ * nothing about a password rather than showing an empty box.
+ *
+ * ONE PASSWORD ACROSS EVERY MAILBOX is the operator's decision. It means one
+ * leak is all of them and no single mailbox can be locked out on its own; since
+ * the company owns the domain, generating a different password per address
+ * costs the same effort and avoids both.
+ */
+export const ACCOUNT_TASK_DEFAULT_PASSWORD = process.env.ACCOUNT_TASK_PASSWORD ?? ''
+
+/**
+ * Is this an address on the company's domain?
+ *
+ * The whole point of the task is addresses WE control, so an address anywhere
+ * else is not a smaller version of the work — it is the thing we declined to
+ * pay for. Checked on submission rather than only at review, so a worker is
+ * told immediately instead of waiting for a rejection.
+ *
+ * A blank domain means one has not been configured; the caller must refuse the
+ * submission rather than accept anything.
+ */
+export function isCompanyEmail(email: string, domain: string): boolean {
+  const e = String(email ?? '').trim().toLowerCase()
+  const d = String(domain ?? '').trim().toLowerCase().replace(/^@/, '')
+  if (!d) return false
+  // One @, a non-empty local part, and no whitespace anywhere.
+  if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(e)) return false
+  return e.endsWith(`@${d}`)
+}
+
 // Tags every promo caption MUST include, appended after the product-name tag.
 // Groq adds more relevant tags on top of these; users may add even more.
 export const PROMO_MANDATORY_TAGS = [
@@ -558,11 +662,17 @@ export const CLICK_PLATFORM_LABELS: Record<string, string> = {
 //   • `retireEnabled` — LINK RETIREMENT for this platform (a link leaving the pool
 //                       once enough distinct users have clicked it). Applies only
 //                       when the MASTER switch and this flag are both on.
+//   • `harvestEnabled` — AUTOMATIC CHANNEL EXTRACTION for this platform: the
+//                       pipeline's harvest stage looking at this platform's
+//                       channels for videos we have never seen. Off means the
+//                       pipeline never visits them; nothing else changes, and
+//                       links already in the pool keep being served.
 export interface PlatformLimit {
   limit: number
   windowMs: number
   enabled: boolean
   retireEnabled: boolean
+  harvestEnabled: boolean
 }
 
 // Default rule for every platform (used until the admin overrides it). Both
@@ -573,6 +683,22 @@ export const DEFAULT_PLATFORM_LIMIT: PlatformLimit = {
   windowMs: HOURLY_WINDOW_MS,
   enabled: true,
   retireEnabled: true,
+  harvestEnabled: true,
+}
+
+/**
+ * The click platforms a CHANNEL on one site can produce links for.
+ *
+ * The harvest works on channels, and a channel belongs to a site, while every
+ * switch in the dashboard is per click platform. YouTube is the reason this
+ * mapping is not the identity: one channel's uploads are Shorts AND ordinary
+ * videos, and which of the two a new upload is cannot be known before it is
+ * fetched. So a YouTube channel is visited while EITHER switch is on.
+ */
+export const CHANNEL_SITE_PLATFORMS: Record<string, readonly ClickPlatform[]> = {
+  tiktok: ['tiktok'],
+  instagram: ['instagram'],
+  youtube: ['youtube_shorts', 'youtube_videos'],
 }
 
 // ── AI comment rewriting (Groq) ──────────────────────────────────────────────
@@ -583,7 +709,25 @@ export const COMMENT_REFRESH_MS = 24 * 60 * 60 * 1000 // regenerate every 24 hou
 export const GROQ_MODEL = 'openai/gpt-oss-120b'
 // Models tried in order; on a rate-limit/quota error (HTTP 429) the request
 // automatically falls back to the next one.
-export const GROQ_MODELS = ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'qwen/qwen3.6-27b']
+// The models an admin can choose between, and the one used when nothing is
+// chosen. Both are checked against what the API key can actually serve — the
+// previous list carried 'llama-3.3-70b-versatile' and 'qwen/qwen3.6-27b'; the
+// first is not served to this key at all, so as a fallback it could only ever
+// turn a rate limit into a hard error.
+export const LLM_MODELS = ['openai/gpt-oss-120b', 'qwen/qwen3.8-27b'] as const
+export type LlmModel = (typeof LLM_MODELS)[number]
+export const DEFAULT_LLM_MODEL: LlmModel = 'openai/gpt-oss-120b'
+
+export function isLlmModel(v: unknown): v is LlmModel {
+  return typeof v === 'string' && (LLM_MODELS as readonly string[]).includes(v)
+}
+
+/** Human labels for the picker. */
+export const LLM_MODEL_LABELS: Record<LlmModel, string> = {
+  'openai/gpt-oss-120b': 'GPT-OSS 120B (OpenAI)',
+  'qwen/qwen3.8-27b': 'Qwen3.8 27B',
+}
+
 export const GROQ_BASE_URL = 'https://api.groq.com/openai/v1'
 // Rewrites must be this many words (inclusive) and mention the product name.
 export const COMMENT_WORD_MIN = 3

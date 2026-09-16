@@ -52,6 +52,7 @@ skipped, so a re-run resumes rather than repeating.
 """
 import argparse
 import csv
+import hashlib
 import json
 import random
 import re
@@ -331,16 +332,46 @@ def wait_out_captcha(page, profile: str, headed: bool, timeout_s: int = 240,
            if tried_api else "")
         + f"\n  Waiting up to {timeout_s}s…"
     )
-    with notify.nagging(
-        f"Captcha — profile {profile}",
-        f"Drag the slider in the browser window. The run stops in {timeout_s // 60} minutes.",
-        every=20,
-    ):
-        for waited in range(0, timeout_s, 3):
-            page.wait_for_timeout(3000)
-            if not captcha_present(page):
-                print(f"  solved after {waited + 3}s, carrying on.\n")
-                return True
+    # Bring THIS account's window forward, even if it is minimised behind the
+    # other eight. The title is made unique first: nine accounts on the same
+    # video otherwise share one title and the wrong window would be raised. It
+    # doubles as a taskbar label saying which account is stuck.
+    marker = f"CAPTCHA profile {profile}"
+    original_title = ""
+    try:
+        original_title = page.title()
+        page.evaluate("(t) => { document.title = t }", marker)
+        # Raises the TAB inside its own browser; focus_window raises the WINDOW,
+        # which is the half that also un-minimises it.
+        page.bring_to_front()
+    except Exception:  # noqa: BLE001 - focusing is a courtesy, not the job
+        pass
+    notify.focus_window(marker)
+
+    try:
+        with notify.nagging(
+            f"Captcha — profile {profile}",
+            f"Drag the slider in the browser window. The run stops in {timeout_s // 60} minutes.",
+            every=20,
+        ):
+            for waited in range(0, timeout_s, 3):
+                page.wait_for_timeout(3000)
+                if not captcha_present(page):
+                    print(f"  solved after {waited + 3}s, carrying on.\n")
+                    return True
+                # One more attempt a minute in, in case the first was missed.
+                # NOT on every nag: stealing focus every 20 seconds from someone
+                # working in another window is worse than the missed captcha.
+                if waited + 3 == 60:
+                    notify.focus_window(marker)
+    finally:
+        # Put the title back, so the window stops claiming to be a captcha once
+        # it is not one and a later match cannot hit a stale marker.
+        try:
+            if original_title:
+                page.evaluate("(t) => { document.title = t }", original_title)
+        except Exception:  # noqa: BLE001
+            pass
     print("  still there — giving up on this run.")
     return False
 
@@ -831,6 +862,81 @@ def wanted(c: dict, products: list[str], users: set[str], take_all: bool) -> boo
     return False
 
 
+def dom_cid(aweme: str, user: str, text: str) -> str:
+    """A stable id for a comment we only ever saw in the DOM.
+
+    The ledger is keyed by cid, and that is also the skip list — without an id
+    these comments would be re-liked on every run and could never be told apart
+    in done.csv. The API never gave us one, so this stands in: a hash of the
+    video, the handle and the text, which is the same on every run and different
+    for every comment. Prefixed so it is obvious in the ledger that this row
+    came from the panel rather than the endpoint.
+    """
+    key = f"{aweme}|{norm(user)}|{norm(text)[:120]}"
+    return "dom:" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+
+
+def dom_extras(
+    rows: list[dict],
+    aweme: str,
+    products: list[str],
+    users: set[str],
+    handled: list[dict],
+    done: set[str],
+) -> list[dict]:
+    """Product comments in the panel that the API list never returned.
+
+    `handled` is every comment the API DID return for this video — not just the
+    ones we liked. A comment it listed has already been through the normal path,
+    including the ones it said were liked already, and pressing those again
+    would UNLIKE them.
+
+    Rows whose like count cannot be read are dropped. The heart is a toggle and
+    these comments have no cid, so the count is the only way to find out what a
+    press did; without it there is no safe way to press at all. That covers a
+    count TikTok abbreviates ("1.2K"), where a +1 would be invisible.
+
+    NOTE that --all is deliberately not honoured here. It means "like every
+    comment the API listed", which is a bounded set an operator chose; applied
+    to whatever the panel happens to render it would like the entire comment
+    section of every video. The sweep only ever adds comments that name a
+    product or a watched handle.
+    """
+    known: list[tuple[str, str]] = [
+        (norm(c.get("user", "")), norm(c.get("text", ""))[:30]) for c in handled
+    ]
+    out: list[dict] = []
+    for r in rows:
+        user = str(r.get("user") or "")
+        text = str(r.get("text") or "")
+        if not text.strip():
+            continue
+        if not r.get("heart"):
+            # No heart in the row means nothing to press — a deleted comment's
+            # placeholder, or a build we cannot read. Not a failure to report.
+            continue
+        if r.get("likes") is None:
+            # Unreadable or abbreviated count. See the docstring.
+            continue
+        c = {"cid": dom_cid(aweme, user, text), "text": text, "user": norm(user),
+             "likes": 0, "already": False}
+        if not wanted(c, products, users, False):
+            continue
+        if c["cid"] in done:
+            continue
+        hay = norm(text)
+        # Matched on handle AND text, and the text must be non-empty. About one
+        # comment in ten comes back from the API with `text` empty — measured at
+        # 13 of 116 across six real videos — and those can never match a product
+        # name, so extraction has always been blind to them. The panel renders
+        # what they actually say. Suppressing a row because its author appears
+        # somewhere in the API list with no text would throw exactly those away.
+        if any(u == c["user"] and t and t in hay for u, t in known):
+            continue
+        out.append(c)
+    return out
+
+
 def load_done() -> set[str]:
     if not DONE.exists():
         return set()
@@ -1215,6 +1321,185 @@ async ([awemeId, pages]) => {
 """
 
 
+# ── what the panel shows that the API never returned ─────────────────────────
+#
+# /api/comment/list/ is not the whole comment section. Three things live in the
+# panel and not in that response:
+#
+#   * REPLIES. The list endpoint returns top-level comments; a reply naming a
+#     product is a comment on the video as far as anyone reading it is
+#     concerned, and it was invisible to us.
+#   * anything past --pages. Three pages is 150 comments, and a busy video has
+#     more.
+#   * whatever the endpoint simply omits on the day — it throttles by answering
+#     200 with a short list rather than an error.
+#
+# So once the panel is open and scrolled, read the rows themselves and like any
+# product comment the API never mentioned. The panel is already open at that
+# point; this costs one evaluate per video, not a page load.
+DOM_SCAN_JS = """
+() => {
+  const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+  const heartIn = (row) => row.querySelector('[class*="DivLikeContainer"]')
+
+  // Climb from the username until an ancestor holds exactly one heart — the
+  // same rule CLICK_JS uses, and for the same reason: which wrapper carries
+  // data-e2e changes between builds, "the block with the name and one heart"
+  // does not.
+  const rowFor = (userEl) => {
+    let el = userEl
+    for (let up = 0; up < 8 && el; up++) {
+      if (el.querySelectorAll('[class*="DivLikeContainer"]').length === 1) return el
+      el = el.parentElement
+    }
+    return null
+  }
+
+  // The handle, from the link. The visible text is the DISPLAY name, which for
+  // most people is not the handle.
+  const handleOf = (u) => {
+    const a = u.querySelector('a[href^="/@"]') || u.closest('a[href^="/@"]')
+    if (!a) return norm(u.innerText)
+    return norm((a.getAttribute('href') || '').replace(/^\\/@/, '').split('?')[0])
+  }
+
+  // The comment BODY, not the whole row. row.innerText also carries the
+  // username, the timestamp, "Reply" and the like count — matching a product
+  // name against those would like a comment for saying nothing.
+  const bodyOf = (row) => {
+    const el = row.querySelector('[data-e2e^="comment-level-"]')
+    return ((el ? el.innerText : row.innerText) || '').trim()
+  }
+
+  // THE LIKE COUNT BESIDE THE HEART — the only honest signal there is.
+  //
+  // This was the heart's rendered colour, tested for "looks red". On the live
+  // build neither state reads as red, so a comment we had just successfully
+  // liked looked unliked, the caller concluded it had been ours all along, and
+  // clicked again to "restore" it — undoing every like the sweep made. 52 real
+  // product comments in one run.
+  //
+  // A count is semantic, not cosmetic: liking adds one, unliking removes one,
+  // and no theme can change that. Returns null when the number cannot be read
+  // or is abbreviated ("1.2K"), because a +1 is invisible in an abbreviation
+  // and a row we cannot verify is a row we must not touch.
+  const likesOf = (row) => {
+    const h = heartIn(row)
+    if (!h) return null
+    const box = h.closest('[class*="DivLikeInfo"]') || h.parentElement
+    if (!box) return null
+    const t = (box.innerText || '').trim()
+    if (/[KMkm]/.test(t)) return null
+    const m = t.match(/\\d[\\d,]*/)
+    if (!m) return null
+    const n = Number(m[0].replace(/,/g, ''))
+    return Number.isFinite(n) ? n : null
+  }
+
+  const seen = new Set()
+  const out = []
+  const users = document.querySelectorAll(
+    '[data-e2e="comment-username-1"], [data-e2e*="comment-username"]'
+  )
+  for (const u of users) {
+    const row = rowFor(u)
+    if (!row) continue
+    const user = handleOf(u)
+    const text = bodyOf(row)
+    const key = user + '|' + norm(text).slice(0, 60)
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ user, text, likes: likesOf(row), heart: !!heartIn(row) })
+  }
+  return out
+}
+"""
+
+# Press the heart of ONE row found by handle + the start of its text, and report
+# whether the heart's paint changed.
+#
+# The paint IS the confirmation here. Every other like in this tool is confirmed
+# by reading user_digged back from the API, and that is not available for a
+# comment the API never returned — asking about a cid we do not have is not a
+# question that can be asked. A heart that looks identical after the click was
+# not pressed, which is the failure that mattered.
+DOM_LIKE_JS = """
+async ([wantUser, wantText]) => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+  const heartIn = (row) => row.querySelector('[class*="DivLikeContainer"]')
+  const rowFor = (userEl) => {
+    let el = userEl
+    for (let up = 0; up < 8 && el; up++) {
+      if (el.querySelectorAll('[class*="DivLikeContainer"]').length === 1) return el
+      el = el.parentElement
+    }
+    return null
+  }
+  const handleOf = (u) => {
+    const a = u.querySelector('a[href^="/@"]') || u.closest('a[href^="/@"]')
+    if (!a) return norm(u.innerText)
+    return norm((a.getAttribute('href') || '').replace(/^\\/@/, '').split('?')[0])
+  }
+  const bodyOf = (row) => {
+    const el = row.querySelector('[data-e2e^="comment-level-"]')
+    return ((el ? el.innerText : row.innerText) || '').trim()
+  }
+  const likesOf = (row) => {
+    const h = heartIn(row)
+    if (!h) return null
+    const box = h.closest('[class*="DivLikeInfo"]') || h.parentElement
+    if (!box) return null
+    const t = (box.innerText || '').trim()
+    if (/[KMkm]/.test(t)) return null
+    const m = t.match(/\\d[\\d,]*/)
+    if (!m) return null
+    const n = Number(m[0].replace(/,/g, ''))
+    return Number.isFinite(n) ? n : null
+  }
+
+  const want = norm(wantText).slice(0, 40)
+  let row = null
+  for (const u of document.querySelectorAll(
+    '[data-e2e="comment-username-1"], [data-e2e*="comment-username"]'
+  )) {
+    const r = rowFor(u)
+    if (!r) continue
+    if (handleOf(u) !== norm(wantUser)) continue
+    if (want.length && !norm(bodyOf(r)).includes(want)) continue
+    row = r
+    break
+  }
+  if (!row) return { found: false }
+
+  const btn = heartIn(row)
+  if (!btn) return { found: true, clicked: false, why: 'no heart in row' }
+  const before = likesOf(row)
+  // No readable count means no way to tell afterwards what the click did, and a
+  // heart is a toggle. Refuse rather than guess.
+  if (before === null) return { found: true, clicked: false, why: 'like count not readable' }
+  try {
+    btn.scrollIntoView({ block: 'center' })
+    await sleep(200)
+    ;(btn.closest('button, [role="button"]') || btn).click()
+  } catch (e) {
+    return { found: true, clicked: false, why: String(e).slice(0, 60) }
+  }
+  await sleep(900)
+  const after = likesOf(row)
+  return {
+    found: true,
+    clicked: true,
+    before,
+    after,
+    // +1 the like landed. -1 it was already ours and the press removed it.
+    // 0 or null: the press did nothing, or the row stopped being readable.
+    delta: after === null ? null : after - before,
+  }
+}
+"""
+
+
 # Per-request signatures. Stale ones are worse than none — they are computed over
 # the exact URL, and ours differs by cid — so they are dropped and left to the
 # page's own fetch hook to re-add.
@@ -1279,6 +1564,10 @@ def main() -> int:
                          "fast/api: signed requests — accepted by TikTok and "
                          "silently not applied. Kept for re-testing, not for use")
     ap.add_argument("--scrolls", type=int, default=6, help="comment scrolls per video in dom mode")
+    ap.add_argument("--no-dom-sweep", action="store_true",
+                    help="do not read the open comment panel for product comments the "
+                         "api list never returned (replies, anything past --pages). "
+                         "The sweep is on by default and costs no extra page load")
     ap.add_argument("--headed", action="store_true",
                     help="show the browser window instead of running headless")
     ap.add_argument("--solve-captcha", action="store_true",
@@ -1390,10 +1679,11 @@ def main() -> int:
     # link. Doing every read first meant a 500-link run spent eight minutes
     # building a list before it liked anything, and a run stopped early had
     # nothing to show for that time. Now the first like lands within seconds.
-    def targets_for(aweme: str) -> tuple[list[dict], int, int, int]:
+    def targets_for(aweme: str) -> tuple[list[dict], int, int, int, list[dict]]:
         """Comments on this video worth liking.
 
-        Returns (todo, matched, already, product_hits). The last one counts ONLY
+        Returns (todo, matched, already, product_hits, all_comments). The
+        fourth counts ONLY
         comments naming a product, which is what "this video carries none of
         ours" means — `matched` also includes --users and --all matches, and a
         video full of a watched handle's comments is not an empty one.
@@ -1402,13 +1692,15 @@ def main() -> int:
         picks = [c for c in comments if wanted(c, products, users, args.all)]
         fresh = [c for c in picks if c["cid"] not in done and not c["already"]]
         hits = sum(1 for c in comments if products and wanted(c, products, set(), False))
-        return fresh, len(picks), len(picks) - len(fresh), hits
+        # The whole list comes back too: the dom sweep needs to know what the
+        # API DID return, so it can report only what it did not.
+        return fresh, len(picks), len(picks) - len(fresh), hits, comments
 
     if args.dry_run:
         found = 0
         would_post = 0
         for url, aweme in targets_videos:
-            todo, matched, already, hits = targets_for(aweme)
+            todo, matched, already, hits, _all = targets_for(aweme)
             # The same test the real run makes, so a dry run shows exactly which
             # videos would be written on before any of them are.
             if args.comment_empty and not todo and hits == 0:
@@ -1606,7 +1898,7 @@ def main() -> int:
                 total_videos = len(targets_videos)
                 for vn, (url, aweme) in enumerate(targets_videos, 1):
                     # Read THIS link's comments now, not all of them up front.
-                    wants, matched, already_liked, product_hits = targets_for(aweme)
+                    wants, matched, already_liked, product_hits, api_comments = targets_for(aweme)
                     # A video carrying NONE of our comments is the one worth
                     # writing on, and with --comment-empty that is what happens:
                     # the dashboard hands over one of its stored comments (the
@@ -1838,11 +2130,72 @@ def main() -> int:
                             # which need completely different fixes.
                             record(url, aweme, c, "fail:dom", note)
                             failed += 1
+
+                    # ── the panel is open and scrolled: read it ──────────────
+                    # The API list is not the whole comment section (see
+                    # DOM_SCAN_JS). Anything it missed is on screen right now,
+                    # and this is the only moment in the run when that is true.
+                    extra_ok = extra_fail = 0
+                    if not args.no_dom_sweep:
+                        rows = safe_eval(page, DOM_SCAN_JS) or []
+                        extras = dom_extras(rows, aweme, products, users, api_comments, done)
+                        for c in extras:
+                            res = safe_eval(page, DOM_LIKE_JS, [c["user"], c["text"]]) or {}
+                            if not res.get("found"):
+                                # It was in the scan a moment ago, so the list
+                                # re-rendered under us. Not worth a ledger row.
+                                continue
+                            delta = res.get("delta")
+                            if delta == 1:
+                                # The count went up by one. That is the like.
+                                record(url, aweme, c, "ok", "dom sweep: not in the api list")
+                                done.add(c["cid"])
+                                ok += 1
+                                extra_ok += 1
+                            elif delta == -1:
+                                # It was already ours and the press removed it.
+                                # Put it back, and check that it went back.
+                                undo = safe_eval(page, DOM_LIKE_JS, [c["user"], c["text"]]) or {}
+                                if undo.get("delta") == 1:
+                                    # Nothing was lost, and nothing is owed: it
+                                    # was liked before we arrived and it is
+                                    # liked now. Recorded as DONE rather than
+                                    # failed, so the sweep never presses it
+                                    # again \u2014 a failure row is dropped on the
+                                    # next run and retried forever.
+                                    record(url, aweme, c, "ok", "dom sweep: was already liked")
+                                    done.add(c["cid"])
+                                    ok += 1
+                                else:
+                                    # The restore did not land. Say so loudly:
+                                    # this is the one outcome that leaves a
+                                    # comment worse than we found it.
+                                    record(url, aweme, c, "fail:dom",
+                                           "dom sweep: UNLIKED and could not restore")
+                                    failed += 1
+                                    extra_fail += 1
+                            else:
+                                # 0, null, or never clicked. The press achieved
+                                # nothing, so there is nothing to undo \u2014 and
+                                # pressing again to find out is exactly the bug
+                                # this replaced.
+                                why = res.get("why") or (
+                                    f"like count did not move ({res.get('before')} -> {res.get('after')})"
+                                    if res.get("clicked")
+                                    else "not clicked"
+                                )
+                                record(url, aweme, c, "fail:dom", f"dom sweep: {why}")
+                                failed += 1
+                                extra_fail += 1
+                            time.sleep(random.uniform(lo, hi))
+
                     rate = vn / max(0.001, time.time() - started)
                     print(
                         f"     {landed}/{len(todo)} liked"
                         + (f", {skipped_already} already" if skipped_already else "")
                         + (f", {unreachable} too deep to reach" if unreachable else "")
+                        + (f", +{extra_ok} from the panel" if extra_ok else "")
+                        + (f", {extra_fail} panel fail" if extra_fail else "")
                         + f"   {rate:.2f} video/s",
                         flush=True,
                     )

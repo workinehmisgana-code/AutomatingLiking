@@ -424,8 +424,41 @@ export interface ChannelVideo {
 }
 
 /**
+ * Which sites we can list a channel's recent posts from, without a login.
+ *
+ * TIKTOK ONLY, and not for want of trying. Instagram has no unauthenticated
+ * route to a profile's posts — measured on 2026-09-15 against real handles from
+ * the pool:
+ *
+ *   /api/v1/users/web_profile_info/  HTTP 429, empty body
+ *   /<handle>/?__a=1&__d=dis         HTTP 400
+ *   /<handle>/ as a browser          HTTP 200, 626 KB of JS shell, no post codes
+ *   /<handle>/ as facebookexternalhit HTTP 200, 727 KB, no post codes
+ *
+ * A single POST is readable (/p/<code>/embed/ — see fetchInstagramStat), which
+ * is why link stats work for Instagram and listing does not: reading a post you
+ * already know about is a different question from asking what a profile has
+ * posted. YouTube is the same story for a different reason — a Shorts URL
+ * carries no handle, so we do not even know whose channel to ask about.
+ *
+ * Exported so callers can SKIP those channels deliberately instead of spending
+ * a request each to be told nothing. Returning [] for them made an unsupported
+ * site indistinguishable from a dead channel, and a sweep of 535 Instagram
+ * channels reported 535 failures.
+ */
+export const LISTABLE_SITES = new Set(['tiktok'])
+
+/** Can this channel's recent posts be listed at all? */
+export function canListChannel(site: string): boolean {
+  return LISTABLE_SITES.has(String(site ?? '').toLowerCase())
+}
+
+/**
  * The channel's ten most recent videos, newest first. Empty on any failure —
  * a channel that is gone, renamed or rate-limited must not abort a sweep.
+ *
+ * TikTok only; see LISTABLE_SITES. Callers must check canListChannel() first,
+ * or an Instagram channel looks exactly like a TikTok one that has vanished.
  */
 export async function fetchChannelVideos(
   handle: string,

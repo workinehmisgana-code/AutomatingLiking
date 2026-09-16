@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { isAdminEmail, SCAN_MAX_LINKS } from '@/lib/config'
-import { buildAdminLinks, filterAdminLinks, type LinkQuery, type ClusterBy } from '@/lib/adminLinks'
+import { buildAdminLinks, filterAdminLinks, parseLinkQuery, type LinkQuery } from '@/lib/adminLinks'
 import { saveLinkScan, startScanRun, getScanRunUrls, recordScanRunBatch } from '@/lib/db'
 import { scanLink } from '@/lib/commentScan'
 
@@ -32,34 +32,6 @@ export const maxDuration = 60
 const BUDGET_MS = 45_000
 /** Comment reads in flight. Same ceiling as the presence sweep. */
 const CONCURRENCY = 4
-
-function parseQuery(sp: URLSearchParams): LinkQuery {
-  const num = (v: string | null) => {
-    if (v == null || v.trim() === '') return null
-    const n = Number(v)
-    return Number.isFinite(n) ? n : null
-  }
-  const list = (v: string | null) =>
-    (v ?? '')
-      .split(',')
-      .map((x) => Number(x))
-      .filter((n) => Number.isFinite(n))
-  return {
-    platform: sp.get('platform') || '',
-    product: sp.get('product') || '',
-    keyword: sp.get('keyword') || '',
-    uploadDate: sp.get('uploadDay') || sp.get('uploadDate') || '',
-    titleFilter: (sp.get('titleFilter') || '') as LinkQuery['titleFilter'],
-    mediaFilter: (sp.get('media') || '') as LinkQuery['mediaFilter'],
-    clusters: list(sp.get('clusters')),
-    clusterBy: (sp.get('clusterBy') || 'rank') as ClusterBy,
-    minClicks: num(sp.get('minClicks')),
-    maxClicks: num(sp.get('maxClicks')),
-    minRatio: num(sp.get('minRatio')),
-    maxRatio: num(sp.get('maxRatio')),
-    q: sp.get('q') || '',
-  }
-}
 
 /**
  * What set of links a run covered, as a key and a readable label.
@@ -96,7 +68,7 @@ function scopeFor(qy: LinkQuery): { key: string; label: string } {
 
 /** The filtered URLs this endpoint may scan, in a stable order. */
 async function targetUrls(sp: URLSearchParams): Promise<{ urls: string[]; error?: string }> {
-  const qy = parseQuery(sp)
+  const qy = parseLinkQuery(sp)
   const { rows, retirePlatforms } = await buildAdminLinks(qy.product ?? '')
   const filtered = filterAdminLinks(rows, qy, retirePlatforms)
   // TikTok only: the comment endpoint has no equivalent elsewhere. Blocked links
@@ -161,7 +133,7 @@ export async function POST(req: NextRequest) {
 
     // The first request of a press opens the run; the client echoes its id on
     // every request after, so one press is one row in the history.
-    const scope = scopeFor(parseQuery(sp))
+    const scope = scopeFor(parseLinkQuery(sp))
     const run = runId ?? (await startScanRun(scope.key, scope.label))
 
     // Only what THIS run has read. Links read by an earlier press are read

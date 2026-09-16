@@ -7,6 +7,7 @@ import {
   setPlatformLimit,
   setPlatformEnabled,
   setPlatformRetireEnabled,
+  setPlatformHarvestEnabled,
 } from '@/lib/db'
 
 export const dynamic = 'force-dynamic'
@@ -16,8 +17,9 @@ async function requireAdmin(): Promise<boolean> {
   return isAdminEmail(session?.user?.email)
 }
 
-// GET — every platform's { limit, windowMs, enabled, retireEnabled }. There is no
-// global master switch: each platform is governed entirely by its own two flags.
+// GET — every platform's { limit, windowMs, enabled, retireEnabled,
+// harvestEnabled }. There is no global master switch: each platform is governed
+// entirely by its own flags.
 export async function GET() {
   if (!(await requireAdmin())) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   try {
@@ -31,6 +33,8 @@ export async function GET() {
 // POST — one of (all are per-platform; `platform` is always required):
 //   { platform, enabled }              flip that platform's HOURLY quota switch
 //   { platform, retireEnabled }        flip that platform's RETIREMENT switch
+//   { platform, harvestEnabled }       flip that platform's AUTOMATIC CHANNEL
+//                                      EXTRACTION switch
 //   { platform, limit, windowMs }      save that platform's quota + wait window
 export async function POST(req: NextRequest) {
   if (!(await requireAdmin())) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
@@ -43,6 +47,17 @@ export async function POST(req: NextRequest) {
 
   const platformArg = String(b?.platform ?? '').trim()
   const knownPlatform = CLICK_PLATFORMS.includes(platformArg as (typeof CLICK_PLATFORMS)[number])
+
+  // Per-platform AUTOMATIC CHANNEL EXTRACTION toggle — { platform, harvestEnabled }.
+  if (platformArg && typeof b?.harvestEnabled === 'boolean') {
+    if (!knownPlatform) return NextResponse.json({ error: 'Unknown platform' }, { status: 400 })
+    try {
+      await setPlatformHarvestEnabled(platformArg, b.harvestEnabled)
+      return NextResponse.json({ ok: true, limits: await getPlatformLimits() })
+    } catch (e) {
+      return NextResponse.json({ error: String(e) }, { status: 500 })
+    }
+  }
 
   // Per-platform RETIREMENT toggle — { platform, retireEnabled }.
   if (platformArg && typeof b?.retireEnabled === 'boolean') {

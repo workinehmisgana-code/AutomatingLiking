@@ -15,6 +15,9 @@ import {
   DATE_CLUSTER_COUNT,
   PRODUCTS,
   retireThreshold,
+  DEFAULT_SEARCH_FIELDS,
+  isSearchField,
+  type SearchField,
 } from './config'
 import { loadVideosJson } from './videos'
 import {
@@ -29,6 +32,7 @@ import {
   type ScanCoverage,
   type LinkStat,
   getLinkCategories,
+  getChannelBios,
 } from './db'
 import { overlayStats } from './linkStats'
 import { parsePostedDate } from './cluster'
@@ -61,6 +65,22 @@ export interface AdminLinkRow {
   date_score: number | null
   /** Audience the link was categorised into, or '' if not categorised yet. */
   category: string
+  /**
+   * The account that posted it, bare and lowercased, or '' when unknown.
+   *
+   * From the URL where the URL carries it (TikTok, YouTube), and from the
+   * stored author otherwise. INSTAGRAM IS THE REASON THE FALLBACK EXISTS: a
+   * post is /p/<code>/ and names nobody, so without the author an Instagram
+   * link has no channel at all and could never be searched by one.
+   *
+   * Deliberately NOT the key channelOf() builds for the Active% column. That
+   * one is URL-only on purpose, because the blocked list is a list of URLs with
+   * no author beside them — grouping active links by author while blocked ones
+   * group by nothing would count every Instagram channel as 100% active.
+   */
+  channel: string
+  /** The channel's profile bio, or '' when we have never fetched one. */
+  bio: string
   /** The score's three parts, 0-1 each (video is 1 or 0). null until rescored. */
   dsRecency: number | null
   dsVideo: number | null
@@ -127,15 +147,35 @@ export interface LinkQuery {
    * which is the difference between a gap you can act on and one you invented.
    */
   oursFilter?: '' | 'none' | 'some' | 'unscanned'
+  /**
+   * Only links carrying THIS product's comment.
+   *
+   * Separate from oursFilter, which asks whether ANY of ours is there. "which
+   * of our products is already on this video" is a different question, and the
+   * answer decides which product to serve next — a video already led by one is
+   * meant to stay with it (see pickFairProductForUrl).
+   */
+  oursProduct?: string
   /** photo = image carousels only, video = real videos only, unknown = not yet
    *  checked by the counts refresh. '' = any. */
   mediaFilter?: '' | 'photo' | 'video' | 'unknown'
   clusters?: number[]
   clusterBy?: ClusterBy
+  /**
+   * How many of OUR comments are on the video, across every product.
+   *
+   * A link nobody has extracted has NO count — not a count of zero — so it can
+   * never satisfy a bound. "at least 1 of ours" must not return 135k links
+   * whose comment sections nobody has read.
+   */
+  minOurs?: number | null
+  maxOurs?: number | null
   minClicks?: number | null
   maxClicks?: number | null
   q?: string
-  sortCol?: 'cluster' | 'clicked_by' | 'unrelated' | null
+  /** Which fields `q` looks in. Null/empty = DEFAULT_SEARCH_FIELDS. */
+  searchIn?: SearchField[] | null
+  sortCol?: 'cluster' | 'clicked_by' | 'unrelated' | 'ours' | 'pos' | 'rank' | null
   sortDir?: 'asc' | 'desc'
   offset?: number
   limit?: number
@@ -147,6 +187,13 @@ export interface LinkCounts {
   retired: number
   unrelated: number
   blocked: number
+  /**
+   * Active links with NO search rank (merged from the verify list). They are
+   * hidden while "Cluster by: Search rank" is on, so the page can say how many
+   * the tab is holding back. Blocked links are left out: they are already
+   * hidden for a different reason.
+   */
+  dateOnly: number
 }
 
 export interface LinkPage {
@@ -172,6 +219,27 @@ function channelOf(url: string): string | null {
   return null
 }
 
+/**
+ * The posting account, for SEARCH: bare handle, lowercased, '' when unknown.
+ *
+ * The URL first, because it cannot be mislabelled, then the stored author.
+ * TikTok and YouTube put the handle in the URL; Instagram does not, so for
+ * Instagram the author is the only source there is — and 11,443 of its 15,594
+ * links have one.
+ *
+ * Returns a BARE handle, not the "platform:handle" key channelOf() returns:
+ * somebody searching "mrbeast" should find them on every platform at once.
+ */
+function searchChannelOf(url: string, author: unknown): string {
+  const tt = url.match(/tiktok\.com\/@([A-Za-z0-9._]+)/i)
+  if (tt) return tt[1].toLowerCase()
+  const yt = url.match(/youtube\.com\/@([A-Za-z0-9._-]+)/i)
+  if (yt) return yt[1].toLowerCase()
+  const ig = url.match(/instagram\.com\/([A-Za-z0-9._]+)\/(?:p|reel)\//i)
+  if (ig) return ig[1].toLowerCase()
+  return String(author ?? '').trim().replace(/^@/, '').toLowerCase()
+}
+
 const uploadDayOf = (scrapedAt: string): string => {
   const m = (scrapedAt || '').match(/^(\d{4}-\d{2}-\d{2})/)
   return m ? m[1] : ''
@@ -190,9 +258,22 @@ function assignClusters<T>(
   list: T[],
   key: (x: T) => number,
   set: (x: T, cluster: number, posInCluster: number) => void,
-  n: number
+  nWanted: number
 ): void {
   const s = [...list].sort((a, b) => key(a) - key(b))
+  // CAPPED AT THE NUMBER OF LINKS, which matters only for a thin platform — and
+  // is exactly where it used to go wrong.
+  //
+  // The chunk size is floor(remaining / clusters left), so with fewer links than
+  // clusters every early cluster takes ZERO and the links pile into the last
+  // ones: a platform with 20 links and 30 clusters had its best link land in
+  // cluster 11, and a platform with 1 link put it in cluster 30. Users work
+  // clusters 1-3, so a small platform's best links were never reached at all.
+  //
+  // Capping gives that platform as many clusters as it has links, starting at 1.
+  // lib/cluster.ts (the app's own feed) has always done this; the admin page and
+  // the pipeline read from here, so the two disagreed about the same links.
+  const n = Math.max(1, Math.min(nWanted, s.length))
   let start = 0
   for (let i = 0; i < n; i++) {
     const size = Math.floor((s.length - start) / (n - i))
@@ -241,6 +322,9 @@ export async function buildAdminLinks(product: string): Promise<{
   // keyword: which viewers a link reaches decides what comment it should get,
   // and the keyword it was scraped under no longer tells anyone much.
   const categories = await getLinkCategories().catch(() => ({}) as Record<string, string>)
+  // Channel bios, by bare handle. Only ~4k channels have one, so most links
+  // carry '' here and simply never match a bio search.
+  const bios = await getChannelBios().catch(() => ({}) as Record<string, string>)
   // Refreshed engagement counts live in their own table; fold them onto the pool
   // rows before anything reads like_count, so the table, the retire threshold and
   // the cluster scores all see the same number.
@@ -261,9 +345,12 @@ export async function buildAdminLinks(product: string): Promise<{
     if (!url.startsWith('http')) continue
     const platform = String(v.platform ?? 'unknown')
     const like = Number(v.like_count ?? 0) || 0
+    const channel = searchChannelOf(url, (v as { author?: unknown }).author)
     rows.push({
       url,
       platform,
+      channel,
+      bio: channel ? bios[channel] ?? '' : '',
       search_query: String(v.search_query ?? ''),
       search_rank: Number(v.search_rank ?? 0) || 0,
       like_count: like,
@@ -375,12 +462,14 @@ export async function buildAdminLinks(product: string): Promise<{
     retired: 0,
     unrelated: 0,
     blocked: 0,
+    dateOnly: 0,
   }
   for (const l of rows) {
     counts.byPlatform[l.platform] = (counts.byPlatform[l.platform] ?? 0) + 1
     if (retireSet.has(l.platform) && l.clicks >= l.retireAt) counts.retired++
     if (l.unrelated > 0) counts.unrelated++
     if (l.blocked) counts.blocked++
+    else if (l.date_only) counts.dateOnly++
   }
 
   const keywords = Array.from(new Set(rows.map((l) => l.search_query).filter(Boolean))).sort((a, b) =>
@@ -400,6 +489,98 @@ export async function buildAdminLinks(product: string): Promise<{
   }
 }
 
+/**
+ * Read a LinkQuery out of a request's query string.
+ *
+ * ONE parser, shared by every endpoint that answers a question about "the links
+ * currently filtered on the page". There used to be two, and they disagreed:
+ * the scan endpoint read the title filter from `titleFilter` while the page
+ * sends `title`, ignored eight filters outright, and — the one that bit — kept
+ * NON-POSITIVE cluster numbers. With no cluster ticked the page omits the
+ * parameter, which parsed as `[0]`: a filter for "cluster zero", a cluster no
+ * link belongs to. A press then covered a set nobody had asked for.
+ *
+ * Any endpoint that scopes work to the page's filters must call this rather than
+ * roll its own, or the number in the confirm dialog stops describing the work.
+ */
+export function parseLinkQuery(sp: URLSearchParams): LinkQuery {
+  const num = (v: string | null) => {
+    if (v == null || v.trim() === '') return null
+    const n = Number(v)
+    return Number.isFinite(n) ? n : null
+  }
+  const tf = sp.get('title') ?? sp.get('titleFilter')
+  const mf = sp.get('media')
+  const ours = sp.get('ours')
+  const sortCol = sp.get('sortCol')
+  return {
+    platform: sp.get('platform') ?? '',
+    product: sp.get('product') ?? '',
+    retiredOnly: sp.get('retired') === '1',
+    unrelatedOnly: sp.get('unrelated') === '1',
+    blockedOnly: sp.get('blocked') === '1',
+    keyword: sp.get('keyword') ?? '',
+    oursFilter: (['none', 'some', 'unscanned'] as const).includes(
+      ours as 'none' | 'some' | 'unscanned'
+    )
+      ? (ours as 'none' | 'some' | 'unscanned')
+      : '',
+    // A specific product's comment on the video, rather than "any of ours".
+    oursProduct: String(sp.get('oursProduct') ?? '').trim(),
+    category: sp.get('category') ?? '',
+    uploadDate: sp.get('uploadDate') ?? sp.get('uploadDay') ?? '',
+    titleFilter: tf === 'has' || tf === 'none' ? tf : '',
+    mediaFilter: mf === 'photo' || mf === 'video' || mf === 'unknown' ? mf : '',
+    // `n > 0` is load-bearing: a missing parameter splits to [''], which is 0,
+    // and a zero here means "only links in cluster 0" rather than "no cluster
+    // filter". Every link has a cluster of 1 or more, so that matches nothing.
+    clusters: (sp.get('clusters') ?? '')
+      .split(',')
+      .map((x) => Number(x))
+      .filter((n) => Number.isFinite(n) && n > 0),
+    clusterBy: ((sp.get('clusterBy') as ClusterBy) || 'rank') as ClusterBy,
+    minOurs: num(sp.get('minOurs')),
+    maxOurs: num(sp.get('maxOurs')),
+    minClicks: num(sp.get('minClicks')),
+    maxClicks: num(sp.get('maxClicks')),
+    minRatio: num(sp.get('minRatio')),
+    maxRatio: num(sp.get('maxRatio')),
+    q: sp.get('q') ?? '',
+    // Absent means "the default fields", not "no fields" — an omitted parameter
+    // must never turn the search box into something that matches nothing.
+    searchIn: (sp.get('searchIn') ?? '')
+      .split(',')
+      .map((x) => x.trim())
+      .filter(isSearchField),
+    sortCol:
+      sortCol === 'cluster' ||
+      sortCol === 'clicked_by' ||
+      sortCol === 'unrelated' ||
+      sortCol === 'ours' ||
+      sortCol === 'pos' ||
+      sortCol === 'rank'
+        ? sortCol
+        : null,
+    sortDir: sp.get('sortDir') === 'asc' ? 'asc' : 'desc',
+  }
+}
+
+/** The text one search field offers, already lowercased. */
+function searchText(l: AdminLinkRow, field: SearchField): string {
+  switch (field) {
+    case 'url':
+      return l.url.toLowerCase()
+    case 'keyword':
+      return l.search_query.toLowerCase()
+    case 'title':
+      return l.title.toLowerCase()
+    case 'channel':
+      return l.channel
+    case 'bio':
+      return l.bio.toLowerCase()
+  }
+}
+
 /** Apply the page's filters. A faithful port of the component's `filtered`. */
 export function filterAdminLinks(
   rows: AdminLinkRow[],
@@ -408,6 +589,11 @@ export function filterAdminLinks(
 ): AdminLinkRow[] {
   const retireSet = new Set(retirePlatforms)
   const needle = (qy.q ?? '').toLowerCase().trim()
+  // Empty or unrecognised picks fall back to the default rather than matching
+  // nothing: a search box that silently returns zero results is worse than one
+  // that searches the obvious fields.
+  const picked = (qy.searchIn ?? []).filter(isSearchField)
+  const fields: readonly SearchField[] = picked.length ? picked : DEFAULT_SEARCH_FIELDS
   const clusterSet = qy.clusters && qy.clusters.length ? new Set(qy.clusters) : null
   const clusterBy: ClusterBy = qy.clusterBy ?? 'rank'
   const clusterOf = (l: AdminLinkRow) =>
@@ -415,6 +601,12 @@ export function filterAdminLinks(
   const isRetired = (l: AdminLinkRow) => retireSet.has(l.platform) && l.clicks >= l.retireAt
 
   return rows.filter((l) => {
+    // "Cluster by: Search rank" means exactly that: only links that HAVE a
+    // search rank. Links merged from the verify list carry none, so
+    // assignClusters leaves them out of the rank dimension entirely (rankCluster
+    // 0, no position) and they used to fill the list with rows of dashes. They
+    // are untouched under Posted date and Combined, which is where they belong.
+    if (clusterBy === 'rank' && l.date_only) return false
     if (qy.platform && l.platform !== qy.platform) return false
     if (qy.retiredOnly && !isRetired(l)) return false
     if (qy.unrelatedOnly && l.unrelated <= 0) return false
@@ -433,21 +625,39 @@ export function filterAdminLinks(
       if (qy.oursFilter === 'none' && (ours === null || has)) return false
       if (qy.oursFilter === 'some' && !has) return false
     }
+    // A named product, rather than "any of ours". A link nobody has extracted
+    // cannot match: we do not know what is on it.
+    if (qy.oursProduct && !((l.ourComments?.[qy.oursProduct] ?? 0) > 0)) return false
     if (qy.mediaFilter === 'photo' && l.isPhoto !== true) return false
     if (qy.mediaFilter === 'video' && l.isPhoto !== false) return false
     if (qy.mediaFilter === 'unknown' && l.isPhoto !== null) return false
     if (clusterSet && !clusterSet.has(clusterOf(l))) return false
+    if (qy.minOurs != null || qy.maxOurs != null) {
+      // Never extracted is excluded from BOTH bounds — see minOurs.
+      if (l.ourComments === null) return false
+      const n = Object.values(l.ourComments).reduce((a, x) => a + x, 0)
+      if (qy.minOurs != null && n < qy.minOurs) return false
+      if (qy.maxOurs != null && n > qy.maxOurs) return false
+    }
     if (qy.minClicks != null && l.clicks < qy.minClicks) return false
     if (qy.maxClicks != null && l.clicks > qy.maxClicks) return false
     // A ratio bound also excludes links with NO channel — "below 50%" can't
     // meaningfully include links whose ratio is unknown.
     if (qy.minRatio != null && (l.activePct == null || l.activePct < qy.minRatio)) return false
     if (qy.maxRatio != null && (l.activePct == null || l.activePct > qy.maxRatio)) return false
-    if (needle && !(l.url.toLowerCase().includes(needle) || l.search_query.toLowerCase().includes(needle)))
-      return false
+    // The free-text search, over whichever fields the admin picked.
+    //
+    // A field the link has nothing for simply never matches: those are '', and
+    // ''.includes(needle) is false for any real needle. So an untitled link
+    // cannot be found by title, and a link whose channel we never learned
+    // cannot be found by channel — which is the honest answer, not a bug.
+    if (needle && !fields.some((f) => searchText(l, f).includes(needle))) return false
     return true
   })
 }
+
+/** Where a link with no search rank sorts. See the 'rank' branch below. */
+const UNRANKED_LAST = Number.MAX_SAFE_INTEGER
 
 /** Apply the page's sort. Unsorted keeps the pool order, as before. */
 export function sortAdminLinks(rows: AdminLinkRow[], qy: LinkQuery): AdminLinkRow[] {
@@ -460,6 +670,40 @@ export function sortAdminLinks(rows: AdminLinkRow[], qy: LinkQuery): AdminLinkRo
         : clusterBy === 'date'
           ? l.dateCluster
           : l.combinedCluster
+      : qy.sortCol === 'pos'
+        // Where the link sits INSIDE its cluster. Read from the same dimension
+        // that chose the cluster: under 'combined' that is whichever put the
+        // link earliest, so taking the rank position beside a cluster the date
+        // dimension chose would be two different numbers pretending to be one.
+        ? clusterBy === 'rank'
+          ? l.rankPos
+          : clusterBy === 'date'
+            ? l.datePos
+            : l.date_only
+              ? l.datePos
+              : l.dateCluster < l.rankCluster
+                ? l.datePos
+                : l.rankPos
+      : qy.sortCol === 'rank'
+        // The link's placing in the search results for its keyword. A PLACING,
+        // not a quantity: #1 is the best, so ascending is the useful direction
+        // and the header opens on it.
+        //
+        // A link with no rank sorts as UNRANKED_LAST rather than 0, which would
+        // otherwise make "no rank at all" the best rank in the table. Finite on
+        // purpose: Infinity - Infinity is NaN, and a comparator that returns NaN
+        // for a pair leaves the whole order undefined.
+        ? l.search_rank > 0
+          ? l.search_rank
+          : UNRANKED_LAST
+      : qy.sortCol === 'ours'
+        // How many of OUR comments the extraction found, across every product.
+        // A link nobody has extracted sorts as -1, not 0: "never looked" and
+        // "looked and found none" are different, and descending order should
+        // not open with thousands of unknowns.
+        ? l.ourComments === null
+          ? -1
+          : Object.values(l.ourComments).reduce((a, n) => a + n, 0)
       : qy.sortCol === 'unrelated'
         // How many users reported the link as nothing to do with humanizers.
         // Sorted DESC by default like the others, which puts the most-reported

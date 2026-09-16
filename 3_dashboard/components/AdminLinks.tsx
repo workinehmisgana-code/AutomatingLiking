@@ -1,11 +1,19 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import ScrollX from '@/components/ScrollX'
 import { clampShare } from '@/lib/clusterMix'
 import ScanHistory from '@/components/ScanHistory'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { RETIRE_MIN_TIKTOK_YT, clusterCountForDimension, SCAN_MAX_LINKS } from '@/lib/config'
+import {
+  RETIRE_MIN_TIKTOK_YT,
+  clusterCountForDimension,
+  SCAN_MAX_LINKS,
+  SEARCH_FIELDS,
+  DEFAULT_SEARCH_FIELDS,
+  type SearchField,
+} from '@/lib/config'
 
 // Default (px) widths for the resizable columns; the Link column flexes to fill.
 /** Audience labels and colours, matching the categorise progress bar. */
@@ -91,8 +99,26 @@ export interface LinkRow {
   scanComplete?: boolean
 }
 
-type SortCol = 'cluster' | 'clicked_by' | 'unrelated'
+type SortCol = 'cluster' | 'clicked_by' | 'unrelated' | 'ours' | 'pos' | 'rank'
 type ClusterBy = 'rank' | 'date' | 'combined'
+
+// What the search box does, in the words someone needs while looking at it.
+const SEARCH_HINT =
+  'Matches anywhere in the fields ticked under "in:".\n\n' +
+  'URL, Keyword and Title describe the LINK. Channel name and Channel bio ' +
+  'describe the ACCOUNT, so a hit on either returns every link that channel ' +
+  'posted.\n\n' +
+  'A field we hold nothing for never matches: a link with no title cannot be ' +
+  'found by title, and one whose channel we never learned cannot be found by ' +
+  'channel.'
+
+// Why the Rank header sorts the way it does. Long enough to be worth naming
+// rather than inlining into the JSX.
+const RANK_SORT_HINT =
+  "Sort by the link's placing in the search results for its keyword.\n\n" +
+  'First click puts #1 at the top, since a low number is a good placing. ' +
+  'Click again for the worst placings, once more to turn it off.\n\n' +
+  'Links with no search rank always sit at the far end, never at the #1 end.'
 
 const PLATFORMS: { key: string; label: string; dot: string }[] = [
   { key: 'tiktok', label: 'TikTok', dot: 'bg-pink-500' },
@@ -254,7 +280,8 @@ export default function AdminLinks({
     retired: number
     unrelated: number
     blocked: number
-  }>({ total: 0, byPlatform: {}, retired: 0, unrelated: 0, blocked: 0 })
+    dateOnly: number // active links with no search rank — hidden in rank mode
+  }>({ total: 0, byPlatform: {}, retired: 0, unrelated: 0, blocked: 0, dateOnly: 0 })
   const [uploadDays, setUploadDays] = useState<string[]>([])
   const [products, setProducts] = useState<string[]>([])
   const [retirePlatforms, setRetirePlatforms] = useState<string[]>([])
@@ -326,6 +353,10 @@ export default function AdminLinks({
   // extraction READ it and found none — proof — while 'unscanned' means nobody
   // has looked. Kept apart on purpose; see LinkQuery.oursFilter.
   const [oursFilter, setOursFilter] = useState<'' | 'none' | 'some' | 'unscanned'>('')
+  // WHICH of our products is on the video, as opposed to whether any is. The
+  // answer decides what to serve next — a video already led by one product is
+  // meant to stay with it — so it is worth being able to list them.
+  const [oursProduct, setOursProduct] = useState('')
   const [keywords, setKeywords] = useState<string[]>([])
   const [uploadDate, setUploadDate] = useState('') // '' = all upload days (YYYY-MM-DD)
   const [titleFilter, setTitleFilter] = useState<'' | 'has' | 'none'>('')
@@ -583,6 +614,7 @@ export default function AdminLinks({
       if (platform) p.set('platform', platform)
       if (keyword) p.set('keyword', keyword)
       if (oursFilter) p.set('ours', oursFilter)
+      if (oursProduct) p.set('oursProduct', oursProduct)
       if (productSel) p.set('product', productSel)
       if (withBlocked) p.set('includeBlocked', '1')
       const res = await fetch(`/api/admin/links/rank-only-channels?${p.toString()}`)
@@ -726,11 +758,25 @@ export default function AdminLinks({
   // Selected clusters. EMPTY = no filter (all clusters), otherwise only these.
   const [clusters, setClusters] = useState<Set<number>>(new Set())
   const [clusterMenuOpen, setClusterMenuOpen] = useState(false)
+  // Which fields the search box looks in. Starts at the three that describe the
+  // LINK; channel and bio describe the ACCOUNT, so a hit on either matches
+  // every one of that channel's links at once — useful on purpose, surprising
+  // by default.
+  const [searchIn, setSearchIn] = useState<Set<SearchField>>(
+    () => new Set<SearchField>(DEFAULT_SEARCH_FIELDS)
+  )
+  const [searchMenuOpen, setSearchMenuOpen] = useState(false)
+  const searchBoxRef = useRef<HTMLDivElement>(null)
   const [clusterBy, setClusterBy] = useState<ClusterBy>('rank') // which dimension
   // The posted-date score's three parts. Only shown when the DATE dimension is
   // what orders the table — under "Search rank" these numbers explain nothing
   // about the order on screen.
   const partsColumn = clusterBy !== 'rank'
+  // How many of OUR comments the video carries, as a range. Separate from the
+  // none/some dropdown: "has ours" and "has at least three of ours" are
+  // different questions, and the second is what says a video is already owned.
+  const [minOurs, setMinOurs] = useState('')
+  const [maxOurs, setMaxOurs] = useState('')
   const [minClicks, setMinClicks] = useState('')
   const [maxClicks, setMaxClicks] = useState('')
 
@@ -770,6 +816,17 @@ export default function AdminLinks({
   // worse than a plain <select>.
   const clusterMenuRef = useRef<HTMLDivElement>(null)
   const clusterBtnRef = useRef<HTMLButtonElement>(null)
+
+  // Close the field picker on any click outside it. Without this it stays open
+  // over the table, and the table is the thing you opened it to change.
+  useEffect(() => {
+    if (!searchMenuOpen) return
+    const onDown = (e: MouseEvent) => {
+      if (!searchBoxRef.current?.contains(e.target as Node)) setSearchMenuOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [searchMenuOpen])
   // The table container is `overflow-hidden` for its rounded corners, which would
   // clip an absolutely-positioned panel whenever the list is short. Anchor it with
   // position:fixed to the button's on-screen box so it can never be cut off.
@@ -1015,8 +1072,15 @@ export default function AdminLinks({
             ? 'six hours are up — starting a cycle'
             : `waiting · next cycle in ${dt.minutesLeft} min`,
         harvest: () =>
+          (Array.isArray(dt.platforms) && dt.platforms.length === 0
+            ? 'every platform’s auto extraction is switched off — '
+            : '') +
           `${dt.checked} of ${dt.eligible} channel(s) · ${dt.found} new · ` +
-          `${dt.merged} merged · ${dt.staged} to verify`,
+          `${dt.merged} merged · ${dt.staged} to verify` +
+          // Says WHY a channel was passed over, so "0 of 0" is never a mystery.
+          (Number(dt.offPlatform) > 0
+            ? ` · ${Number(dt.offPlatform).toLocaleString()} skipped, platform off`
+            : ''),
         extract: () => `read ${dt.read} link(s) · ${dt.progress} · ${dt.withOurs} carry ours`,
         categorise: () => `categorised ${dt.processed} · ${dt.remaining} left`,
         recluster: () => `rescored ${dt.scored} of ${dt.total} link(s)`,
@@ -1261,6 +1325,52 @@ export default function AdminLinks({
       loadWindow(winStart)
     } finally {
       setBrokenLoading(false)
+    }
+  }
+
+  // ── Serve only links that carry none of our comments ──────────────────────
+  // Off by default. On, every link already known to carry one of ours is
+  // withheld from the app and the web dashboard.
+  const [onlyClean, setOnlyClean] = useState(false)
+  const [onlyCleanCost, setOnlyCleanCost] = useState<{ withheld: number; remaining: number } | null>(null)
+  const [onlyCleanBusy, setOnlyCleanBusy] = useState(false)
+
+  useEffect(() => {
+    fetch('/api/admin/links/only-clean')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!d || d.error) return
+        setOnlyClean(d.on === true)
+        setOnlyCleanCost({ withheld: Number(d.withheld) || 0, remaining: Number(d.remaining) || 0 })
+      })
+      .catch(() => {})
+  }, [])
+
+  async function toggleOnlyClean(next: boolean) {
+    if (onlyCleanBusy) return
+    // Say what it costs BEFORE it is on: the pool it leaves is the whole point,
+    // and it is not visible anywhere else on the page.
+    if (next && onlyCleanCost && !confirm(
+      'Serve only links with none of our comments?\n\n' +
+      `${onlyCleanCost.withheld.toLocaleString()} link(s) already carry one of ours and ` +
+      `would be withheld, leaving ${onlyCleanCost.remaining.toLocaleString()}.\n\n` +
+      'Links nobody has extracted are still served — unextracted is not the same ' +
+      'as empty, and withholding those too would leave only what has been read.'
+    )) return
+    setOnlyCleanBusy(true)
+    const previous = onlyClean
+    setOnlyClean(next)
+    try {
+      const res = await fetch('/api/admin/links/only-clean', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ on: next }),
+      })
+      if (!res.ok) setOnlyClean(previous)
+    } catch {
+      setOnlyClean(previous)
+    } finally {
+      setOnlyCleanBusy(false)
     }
   }
 
@@ -1573,6 +1683,7 @@ export default function AdminLinks({
       if (platform) p.set('platform', platform)
       if (keyword) p.set('keyword', keyword)
       if (oursFilter) p.set('ours', oursFilter)
+      if (oursProduct) p.set('oursProduct', oursProduct)
       if (productSel) p.set('product', productSel)
       if (retiredOnly) p.set('retired', '1')
       if (unrelatedOnly) p.set('unrelated', '1')
@@ -1583,18 +1694,25 @@ export default function AdminLinks({
       if (mediaFilter) p.set('media', mediaFilter)
       if (clusters.size) p.set('clusters', Array.from(clusters).join(','))
       p.set('clusterBy', clusterBy)
+      if (minOurs.trim() !== '') p.set('minOurs', minOurs.trim())
+      if (maxOurs.trim() !== '') p.set('maxOurs', maxOurs.trim())
       if (minClicks.trim() !== '') p.set('minClicks', minClicks.trim())
       if (maxClicks.trim() !== '') p.set('maxClicks', maxClicks.trim())
       if (minRatio.trim() !== '') p.set('minRatio', minRatio.trim())
       if (maxRatio.trim() !== '') p.set('maxRatio', maxRatio.trim())
-      if (q.trim()) p.set('q', q.trim())
+      if (q.trim()) {
+        p.set('q', q.trim())
+        // Sent only alongside a real search: the parameter narrows nothing on
+        // its own, and an empty box with it set would look like a filter.
+        p.set('searchIn', Array.from(searchIn).join(','))
+      }
       if (sort) { p.set('sortCol', sort.col); p.set('sortDir', sort.dir) }
       p.set('offset', String(winOffset))
       p.set('limit', String(WINDOW_SIZE))
       return p.toString()
     },
-    [platform, productSel, retiredOnly, unrelatedOnly, blockedOnly, category, keyword, oursFilter, uploadDate,
-     titleFilter, mediaFilter, clusters, clusterBy, minClicks, maxClicks, minRatio, maxRatio, q, sort]
+    [platform, productSel, retiredOnly, unrelatedOnly, blockedOnly, category, keyword, oursFilter, oursProduct, uploadDate,
+     titleFilter, mediaFilter, clusters, clusterBy, minOurs, maxOurs, minClicks, maxClicks, minRatio, maxRatio, q, searchIn, sort]
   )
 
   const loadWindow = useCallback(
@@ -1975,11 +2093,26 @@ export default function AdminLinks({
 
   // Cycle a column's sort: none → desc → asc → none.
   const cycleSort = (col: SortCol) => {
+    // Most columns count something, and the interesting end is the big one, so
+    // they open descending. Search rank is a PLACING: #1 is the best, so it
+    // opens ascending or the first click would hand back the worst links in the
+    // table. The cycle is the same either way -- best, worst, off.
+    const first: 'asc' | 'desc' = col === 'rank' ? 'asc' : 'desc'
+    const second: 'asc' | 'desc' = first === 'desc' ? 'asc' : 'desc'
     setSort((s) =>
-      !s || s.col !== col ? { col, dir: 'desc' } : s.dir === 'desc' ? { col, dir: 'asc' } : null
+      !s || s.col !== col ? { col, dir: first } : s.dir === first ? { col, dir: second } : null
     )
     setOffset(0)
   }
+  // The placeholder says what is ticked, so the box never claims to search
+  // something it is not. Two or fewer are named; more would not fit.
+  const searchLabel = (() => {
+    const on = SEARCH_FIELDS.filter((f) => searchIn.has(f.key))
+    if (on.length === SEARCH_FIELDS.length) return 'everything'
+    if (on.length <= 2) return on.map((f) => f.label.toLowerCase()).join(' or ')
+    return `${on.length} fields`
+  })()
+
   const arrowFor = (col: SortCol) =>
     sort?.col !== col ? ' ↕' : sort.dir === 'desc' ? ' ↓' : ' ↑'
 
@@ -2003,6 +2136,18 @@ export default function AdminLinks({
           <>
             {' '}· showing {clampedOffset + 1}–{Math.min(matched, clampedOffset + PAGE_SIZE)}
           </>
+        )}
+        {clusterBy === 'rank' && counts.dateOnly > 0 && (
+          <span
+            className="text-zinc-600"
+            title={
+              'Links merged from the verify list have no search rank, so they ' +
+              'cannot belong to a rank cluster.\n\nThey are all there under ' +
+              'Cluster by: Posted date or Combined.'
+            }
+          >
+            {' '}· {counts.dateOnly.toLocaleString()} without a search rank hidden
+          </span>
         )}
         {loading && <span className="text-zinc-600"> · loading…</span>}
         {loadErr && <span className="text-red-400"> · {loadErr}</span>}
@@ -2176,6 +2321,7 @@ export default function AdminLinks({
           <div className="flex rounded-lg overflow-hidden border border-zinc-700">
             <button
               onClick={() => { setClusterBy('rank'); reset() }}
+              title="Search-rank links only. Links merged from the verify list have no rank and are hidden here."
               className={`px-2.5 py-1.5 text-sm transition-colors ${clusterBy === 'rank' ? 'bg-teal-600 text-white' : 'bg-zinc-900 text-zinc-400 hover:bg-zinc-800'}`}
             >
               Search rank
@@ -2195,6 +2341,35 @@ export default function AdminLinks({
             </button>
           </div>
         </div>
+        <label
+          className="flex items-center gap-1.5 text-zinc-400"
+          title={
+            'How many of OUR comments are on the video, across every product, as found ' +
+            'by "Extract comments".\n\n' +
+            'Links nobody has extracted are excluded from both bounds — they have no ' +
+            'count, which is not a count of zero.'
+          }
+        >
+          Ours:
+          <input
+            type="number"
+            min={0}
+            value={minOurs}
+            onChange={(e) => { setMinOurs(e.target.value); reset() }}
+            placeholder="min"
+            className="w-20 bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-emerald-500"
+          />
+          <span className="text-zinc-600">–</span>
+          <input
+            type="number"
+            min={0}
+            value={maxOurs}
+            onChange={(e) => { setMaxOurs(e.target.value); reset() }}
+            placeholder="max"
+            className="w-20 bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-emerald-500"
+          />
+          <span className="text-xs text-zinc-600">comments</span>
+        </label>
         <label className="flex items-center gap-1.5 text-zinc-400">
           Clicked by:
           <input
@@ -2288,12 +2463,69 @@ export default function AdminLinks({
             </button>
           )}
         </label>
-        <input
-          value={q}
-          onChange={(e) => { setQ(e.target.value); reset() }}
-          placeholder="Filter by URL or keyword…"
-          className="flex-1 min-w-[160px] bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-emerald-500"
-        />
+        <div ref={searchBoxRef} className="relative flex-1 min-w-[220px] flex">
+          <input
+            value={q}
+            onChange={(e) => { setQ(e.target.value); reset() }}
+            placeholder={`Search ${searchLabel}…`}
+            title={SEARCH_HINT}
+            className="flex-1 min-w-0 bg-zinc-900 border border-zinc-700 rounded-l-lg px-3 py-2 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-emerald-500"
+          />
+          <button
+            type="button"
+            onClick={() => setSearchMenuOpen((o) => !o)}
+            title="Choose which fields the search looks in"
+            aria-expanded={searchMenuOpen}
+            className={`shrink-0 border border-l-0 border-zinc-700 rounded-r-lg px-2.5 text-sm transition-colors ${
+              searchMenuOpen ? 'bg-zinc-700 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+            }`}
+          >
+            in: {searchIn.size} ▾
+          </button>
+          {searchMenuOpen && (
+            <div className="absolute z-50 top-full right-0 mt-1 w-44 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl p-1">
+              <div className="flex items-center justify-between gap-1 px-1 pb-1 mb-1 border-b border-zinc-800">
+                <span className="text-[10px] text-zinc-500">search in</span>
+                <button
+                  type="button"
+                  onClick={() => { setSearchIn(new Set(DEFAULT_SEARCH_FIELDS)); reset() }}
+                  className="text-[10px] text-zinc-400 hover:text-white"
+                >
+                  Reset
+                </button>
+              </div>
+              {SEARCH_FIELDS.map((f) => (
+                <label
+                  key={f.key}
+                  className="flex items-center gap-2 px-1 py-1 rounded hover:bg-zinc-800 cursor-pointer text-sm text-zinc-200"
+                >
+                  <input
+                    type="checkbox"
+                    checked={searchIn.has(f.key)}
+                    onChange={() =>
+                      setSearchIn((prev) => {
+                        const next = new Set(prev)
+                        if (next.has(f.key)) next.delete(f.key)
+                        else next.add(f.key)
+                        // Never leave it empty: with no field ticked the box
+                        // would match nothing and look broken. Unticking the
+                        // last one puts the defaults back.
+                        if (next.size === 0) return new Set(DEFAULT_SEARCH_FIELDS)
+                        return next
+                      })
+                    }
+                    className="accent-teal-500"
+                  />
+                  {f.label}
+                </label>
+              ))}
+              <p className="text-[10px] text-zinc-600 px-1 pt-1.5 mt-1 border-t border-zinc-800 leading-snug">
+                Channel name and bio describe the ACCOUNT — a match returns all of
+                that channel&rsquo;s links.
+              </p>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Actions that get run often. Everything occasional lives behind
@@ -2533,6 +2765,34 @@ export default function AdminLinks({
           <div>
             <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">How links are served</div>
             <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void toggleOnlyClean(!onlyClean)}
+                disabled={onlyCleanBusy}
+                title={
+                  'Serve only links that carry NONE of our product comments, so a ' +
+                  'session goes to videos nobody has commented on yet.\n\n' +
+                  'Links nobody has extracted are still served: unextracted is not the ' +
+                  'same as empty, and withholding those would leave only the fraction ' +
+                  'that has actually been read.' +
+                  (onlyCleanCost
+                    ? `\n\n${onlyCleanCost.withheld.toLocaleString()} link(s) would be withheld, ` +
+                      `${onlyCleanCost.remaining.toLocaleString()} left.`
+                    : '')
+                }
+                className={`text-sm rounded-lg px-3 py-1.5 border transition-colors disabled:opacity-40 ${
+                  onlyClean
+                    ? 'text-emerald-200 bg-emerald-600/20 border-emerald-500/40 hover:bg-emerald-600/30'
+                    : 'text-zinc-300 bg-zinc-800 hover:bg-zinc-700 border-zinc-700'
+                }`}
+              >
+                {onlyClean ? '✓ Only links with none of ours' : 'Only links with none of ours'}
+                {onlyClean && onlyCleanCost && (
+                  <span className="text-emerald-300/70 ml-1.5 tabular-nums">
+                    ({onlyCleanCost.remaining.toLocaleString()})
+                  </span>
+                )}
+              </button>
         {/* How the two clusterings are mixed when links are served. */}
               <div
                 title={
@@ -2637,17 +2897,16 @@ export default function AdminLinks({
             spilled out of the card and took the whole page sideways with them.
             Header and rows share ONE scroller so they cannot drift apart.
 
-            The inner min-w-max is what makes the scroll a property of the
-            COLUMNS rather than of what happens to be listed. Without it the
-            header and every row are laid out at the scroller's own width while
-            their shrink-0 children hang off the right edge: measured, a row came
-            out 898px wide inside a 1182px scroll, so scrolling right left the
-            last columns sitting on bare card background with no row stripe,
-            border or selection highlight under them. At max-content the rows are
-            as wide as the scroll, and an empty result still scrolls because the
-            header alone sets the width. */}
-        <div className="overflow-x-auto">
-        <div className="min-w-max">
+            The inner wrapper is what makes the scroll a property of the COLUMNS
+            rather than of what happens to be listed. Without it the header and
+            every row are laid out at the scroller's own width while their
+            shrink-0 children hang off the right edge: measured, a row came out
+            898px wide inside a 1182px scroll, so scrolling right left the last
+            columns sitting on bare card background with no row stripe, border or
+            selection highlight under them. */}
+        <ScrollX>
+        {/* The FIRST child of ScrollX: it measures this to set the table's
+            width, so it must stay the header. */}
         <div className="flex items-center gap-2 px-3 py-2 text-[11px] uppercase tracking-wide text-zinc-500 border-b border-zinc-800 bg-zinc-900/60">
           <span className="w-6 shrink-0 flex items-center justify-center">
             <input
@@ -2742,12 +3001,20 @@ export default function AdminLinks({
           )}
           {!titleMode && (
             <div className="shrink-0 relative text-right" style={{ width: cw.pos }}>
-              <span
-                className="text-[11px] uppercase tracking-wide"
-                title="Where the link sits inside its own cluster, in the order the feed serves it — 1 is served first. Follows the Cluster-by dimension above."
+              <button
+                onClick={() => cycleSort('pos')}
+                title={
+                  'Where the link sits inside its own cluster, in the order the feed ' +
+                  'serves it — 1 is served first. Follows the Cluster-by dimension ' +
+                  'above.\n\nClick to sort by it. Ascending puts the links served ' +
+                  'first at the top.'
+                }
+                className={`text-[11px] uppercase tracking-wide hover:text-zinc-200 transition-colors ${
+                  sort?.col === 'pos' ? 'text-teal-300' : ''
+                }`}
               >
-                # in cl.
-              </span>
+                # in cl.{arrowFor('pos')}
+              </button>
               <span onMouseDown={(e) => startResize('pos', e)} title="Drag to resize" className="absolute top-0 -right-1 h-full w-2 cursor-col-resize hover:bg-teal-500/60 z-10" />
             </div>
           )}
@@ -2849,7 +3116,15 @@ export default function AdminLinks({
           )}
           {!titleMode && (
             <span className="shrink-0 relative text-right" style={{ width: cw.rank }}>
-              Rank / Likes
+              <button
+                onClick={() => cycleSort('rank')}
+                title={RANK_SORT_HINT}
+                className={`text-[11px] uppercase tracking-wide hover:text-zinc-200 transition-colors ${
+                  sort?.col === 'rank' ? 'text-teal-300' : ''
+                }`}
+              >
+                Rank / Likes{arrowFor('rank')}
+              </button>
               <span onMouseDown={(e) => startResize('rank', e)} title="Drag to resize" className="absolute top-0 -right-1 h-full w-2 cursor-col-resize hover:bg-teal-500/60 z-10" />
             </span>
           )}
@@ -2881,16 +3156,21 @@ export default function AdminLinks({
           )}
           {!titleMode && (
             <div className="shrink-0 relative text-right flex flex-col items-end gap-1" style={{ width: cw.ours }}>
-              <span
-                className="text-[11px] uppercase tracking-wide"
+              <button
+                onClick={() => cycleSort('ours')}
                 title={
                   'How many of OUR comments are on the video, per product, as found by ' +
                   '"Extract comments". A dash means the link has never been extracted — ' +
-                  'that is not the same as none being found.'
+                  'that is not the same as none being found.\n\n' +
+                  'Click to sort by the total. Never-extracted links sort last in ' +
+                  'descending order rather than counting as zero.'
                 }
+                className={`text-[11px] uppercase tracking-wide hover:text-zinc-200 transition-colors ${
+                  sort?.col === 'ours' ? 'text-teal-300' : ''
+                }`}
               >
-                Ours
-              </span>
+                Ours{arrowFor('ours')}
+              </button>
               <select
                 value={oursFilter}
                 onChange={(e) => {
@@ -2911,6 +3191,26 @@ export default function AdminLinks({
                 <option value="none">None found</option>
                 <option value="some">Has ours</option>
                 <option value="unscanned">Never checked</option>
+              </select>
+              <select
+                value={oursProduct}
+                onChange={(e) => { setOursProduct(e.target.value); reset() }}
+                title={
+                  'Show only links that already carry THIS product’s comment.\n\n' +
+                  'Different from the filter above, which asks whether any of ours is ' +
+                  'there. A link nobody has extracted can never match: we do not know ' +
+                  'what is on it.'
+                }
+                className={`w-full bg-zinc-900 border rounded px-1 py-0.5 text-[10px] normal-case tracking-normal focus:outline-none focus:border-emerald-500 ${
+                  oursProduct ? 'border-teal-500 text-teal-200' : 'border-zinc-700 text-zinc-300'
+                }`}
+              >
+                <option value="">Any product</option>
+                {products.map((p) => (
+                  <option key={p} value={p}>
+                    has {p}
+                  </option>
+                ))}
               </select>
               <span onMouseDown={(e) => startResize('ours', e)} title="Drag to resize" className="absolute top-0 -right-1 h-full w-2 cursor-col-resize hover:bg-teal-500/60 z-10" />
             </div>
@@ -2950,7 +3250,7 @@ export default function AdminLinks({
               // has been rendered, so a wrapped URL does not make the page jump.
               <div
                 key={l.url}
-                className={`flex items-center gap-2 px-3 py-2 border-b border-zinc-800/60 text-sm [content-visibility:auto] [contain-intrinsic-size:auto_37px] ${selected.has(l.url) ? 'bg-teal-500/25 border-l-4 border-l-teal-400 pl-2' : ''}`}
+                className={`flex items-center gap-2 px-3 py-2 border-b border-zinc-800/60 text-sm [content-visibility:auto] [contain-intrinsic-size:auto_none_auto_37px] ${selected.has(l.url) ? 'bg-teal-500/25 border-l-4 border-l-teal-400 pl-2' : ''}`}
               >
                 <span className="w-6 shrink-0 flex items-center justify-center">
                   <input
@@ -3254,8 +3554,7 @@ export default function AdminLinks({
             )
           })
         )}
-        </div>
-        </div>
+        </ScrollX>
       </div>
 
       {/* Long-job progress, pinned so it stays visible while the table scrolls.

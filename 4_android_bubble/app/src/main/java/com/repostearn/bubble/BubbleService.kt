@@ -15,7 +15,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.os.SystemClock
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.LayoutInflater
@@ -31,7 +30,6 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.concurrent.thread
-import kotlin.random.Random
 
 /**
  * Foreground service that shows the floating bubble on top of every app. It
@@ -56,13 +54,10 @@ class BubbleService : Service() {
     private var platformButton: Button? = null
     private var nextButton: Button? = null
     private var unrelatedButton: Button? = null
-    /** The Next button's resting label, so the countdown can put it back. */
-    private var nextLabel: CharSequence = "Next"
-    private var cooldownTicker: Runnable? = null
 
-    // Guards against a burst of taps: while an action (open/advance) is in flight —
-    // and for a short cooldown after — Next/Unrelated are ignored, so users can't
-    // skip several links before the video has loaded.
+    // Guards a double tap while an action (open/advance) is IN FLIGHT: the second
+    // tap would record a second click and skip a link the user never saw. It
+    // lasts one request, not one pause — there is no cooldown any more.
     private var busy = false
     // Set when the server refuses links because this app build is out of date. While
     // true the bubble tells the user to update instead of opening links.
@@ -125,7 +120,6 @@ class BubbleService : Service() {
         val next = v.findViewById<Button>(R.id.btnNext)
         val unrelated = v.findViewById<Button>(R.id.btnUnrelated)
         nextButton = next
-        nextLabel = next.text
         unrelatedButton = unrelated
         val comments = v.findViewById<Button>(R.id.btnComments)
         // The comment LIST is no longer shown — the app auto-copies a random comment
@@ -225,100 +219,38 @@ class BubbleService : Service() {
         counterView?.text = if (n == 0) "…" else "$i/$n"
     }
 
-    // How long the Next/Unrelated buttons stay locked after opening a link, so a
-    // burst of taps can't skip several links before the video has loaded.
-    // How long the actions stay dead after a link is opened.
-    //
-    // Randomised, not fixed: a tap at exactly the same interval every time is a
-    // pattern in its own right, and the pause is also the point - it leaves room
-    // to read the video and write the comment before the next link is queued,
-    // instead of racing down the list.
-    private val cooldownMinMs = 12_000L
-    private val cooldownMaxMs = 22_000L
-
     /**
-     * Put the two buttons in the state the current guards call for.
+     * Put the two buttons in the state the current guard calls for.
      *
-     * They are NOT the same state, and that is the point:
+     * NEITHER IS EVER SHOWN AS DISABLED. There used to be a randomised 12-22
+     * second cooldown after each link that greyed Next out and counted down on
+     * it, on the reasoning that the pause left room to read the video and write
+     * the comment. It was removed: a button that refuses to work is the app
+     * arguing with the person using it, and how long a video is worth is their
+     * call, not the bubble's.
      *
-     *   NEXT is held by both guards - an operation in flight AND the cooldown.
-     *   UNRELATED is held only while an operation is in flight.
-     *
-     * Unrelated has to stay live through the cooldown because the cooldown is
-     * time to read the video and write a comment, and the whole reason to press
-     * Unrelated is that this video is not one you can comment on. Making people
-     * sit out twenty seconds before they can say so wasted exactly the time the
-     * pause exists to give them.
-     *
-     * It is still shut while an operation is in flight, which is a different
-     * guard: that one stops a double tap flagging the same link twice or racing
-     * the advance.
+     * The in-flight guard stays, and it is a different thing: `busy` is set only
+     * while a click is actually being recorded — one request — and a tap that
+     * lands inside that window is ignored rather than recording a second click
+     * and skipping a link nobody saw. Both buttons keep their normal appearance
+     * throughout, because that window is a round trip, not a wait.
      */
     private fun refreshActionButtons() {
-        val cooling = cooldownTicker != null
-        val nextOn = !busy && !cooling
-        val unrelatedOn = !busy
-        nextButton?.isEnabled = nextOn
-        nextButton?.alpha = if (nextOn) 1f else 0.5f
-        unrelatedButton?.isEnabled = unrelatedOn
-        unrelatedButton?.alpha = if (unrelatedOn) 1f else 0.5f
+        nextButton?.isEnabled = true
+        nextButton?.alpha = 1f
+        unrelatedButton?.isEnabled = true
+        unrelatedButton?.alpha = 1f
     }
 
     private fun lock() { busy = true; refreshActionButtons() }
-    private fun unlock() { cancelCooldown(); busy = false; refreshActionButtons() }
-
-    /**
-     * Hold the actions closed for a random 12-22 seconds, counting down on the
-     * button.
-     *
-     * The countdown is not decoration: a button that is simply dead for twenty
-     * seconds reads as a broken app, and people force-close it and reopen it.
-     * Showing the seconds turns the same wait into an obvious rule.
-     *
-     * Unrelated stays live throughout. It does call openNextLink() itself, so it
-     * can be used to move on early - but only by first declaring the current
-     * link unrelated, which drops that click server-side. It is a way out of a
-     * link you cannot comment on, not a way to skip the pause.
-     */
-    private fun startCooldown() {
-        cancelCooldown()
-        val endAt = SystemClock.elapsedRealtime() + Random.nextLong(cooldownMinMs, cooldownMaxMs + 1)
-        val tick = object : Runnable {
-            override fun run() {
-                val left = endAt - SystemClock.elapsedRealtime()
-                if (left <= 0L) {
-                    cooldownTicker = null
-                    unlock()
-                    return
-                }
-                // Rounded up, so the last number shown is 1s rather than 0s.
-                nextButton?.text = "$nextLabel  ${(left + 999L) / 1000L}s"
-                ui.postDelayed(this, 250L)
-            }
-        }
-        cooldownTicker = tick
-        // The OPERATION is over - the link is open and the click is recorded.
-        // What remains is the pause, and the pause is Next's alone. Leaving
-        // `busy` set here is what used to hold Unrelated shut for the whole
-        // countdown: it was standing in for two different things at once.
-        busy = false
-        ui.post(tick)
-        refreshActionButtons()
-    }
-
-    private fun cancelCooldown() {
-        cooldownTicker?.let { ui.removeCallbacks(it) }
-        cooldownTicker = null
-        nextButton?.text = nextLabel
-        refreshActionButtons()
-    }
+    private fun unlock() { busy = false; refreshActionButtons() }
 
     // ── Next → record click, then open the link ──────────────────────────────
     private fun onNext() {
-        // Both guards apply here. The button is disabled in either state, so this
-        // is belt and braces - but a stray tap that arrives in the same frame as
-        // the disable must not open a link.
-        if (busy || cooldownTicker != null) return
+        // The button is never disabled, so this guard is the only one there is:
+        // a second tap while the first click is still being recorded must not
+        // open a second link.
+        if (busy) return
         openNextLink()
     }
 
@@ -381,10 +313,9 @@ class BubbleService : Service() {
                         urlView?.text = item.url
                         refreshCounter()
                         copyCommentThen(commentText) { openUrl(item.url) }
-                        // Only this branch opened a link, so only this branch waits.
-                        // A 401 or a spent quota unlocks at once: there is nothing to
-                        // go and comment on.
-                        startCooldown()
+                        // The click is recorded and the link is open: the
+                        // operation is over, so the guard comes off immediately.
+                        unlock()
                     }
                 }
             }
@@ -396,8 +327,8 @@ class BubbleService : Service() {
     // it from this user from now on — then move straight on to the next link, so
     // one tap replaces "Unrelated, then Next".
     private fun onMarkUnrelated() {
-        // `busy`, not the cooldown: an operation in flight blocks this, a running
-        // countdown does not. Pressing Unrelated mid-cooldown is the normal case.
+        // Blocked only while an operation is in flight, so a double tap cannot
+        // flag the same link twice or race the advance.
         if (busy) return
         val token = AuthStore.token(this) ?: run { promptSignIn(); return }
         val current = LinkStore.current(this)
@@ -735,6 +666,19 @@ class BubbleService : Service() {
         strip.addView(payChip("Comments", pending?.optJSONObject("comments")))
         strip.addView(payChip("Video", pending?.optJSONObject("video")))
         strip.addView(payChip("Repost", pending?.optJSONObject("promo")))
+        strip.addView(payChip("Emails", pending?.optJSONObject("accounts")))
+        // Addresses sent but not yet checked. Shown apart and in amber because
+        // it is NOT in the total above: an address is worth nothing until
+        // someone has opened the mailbox. It is already counted in the
+        // (Unapproved) figure beside the total.
+        val waiting = pending?.optJSONObject("accountsAwaiting")
+        if ((waiting?.optInt("count", 0) ?: 0) > 0) {
+            val row = rowH().apply { setPadding(0, 0, dp(12), 0) }
+            row.addView(label("Emails awaiting check", 0xFFFBBF24.toInt(), 12f).apply { setPadding(0, 0, dp(4), 0) })
+            row.addView(label(fmtBirr(waiting!!.optDouble("birr", 0.0)), 0xFFFBBF24.toInt(), 13f, bold = true).apply { setPadding(0, 0, dp(3), 0) })
+            row.addView(label("(${waiting.optInt("count", 0)})", 0xFF6B7280.toInt(), 11f))
+            strip.addView(row)
+        }
         c.addView(hScroll(strip))
         return c
     }
@@ -928,10 +872,7 @@ class BubbleService : Service() {
                 } catch (_: Exception) {}
             }
             ui.post {
-                // Only when nothing is cooling down. This runs on the background
-                // refresh, and unlocking here would hand back a Next button the
-                // cooldown is deliberately holding shut.
-                if (cooldownTicker == null) unlock()
+                unlock()
                 refreshCounter()
                 showMessages(msgs)
                 if (needsUpdate) {
@@ -1149,8 +1090,6 @@ class BubbleService : Service() {
         super.onDestroy()
         updatePoll?.let { ui.removeCallbacks(it) }
         updatePoll = null
-        cooldownTicker?.let { ui.removeCallbacks(it) }
-        cooldownTicker = null
         removePanel()
         removeMessageBanner()
         removeUpdateBanner()

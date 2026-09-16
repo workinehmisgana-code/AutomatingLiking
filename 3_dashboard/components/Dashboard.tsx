@@ -11,6 +11,7 @@ import {
   HOURLY_WINDOW_MS,
   PLATFORM_ROTATE_MS,
   REMINDER_CLICKS,
+  FALLBACK_COMMENT_CATEGORY,
 } from '@/lib/config'
 import { pickDimension, seedFrom } from '@/lib/clusterMix'
 import FinishButton from '@/components/FinishButton'
@@ -45,6 +46,13 @@ export interface Video {
   rankPos?: number
   dateCluster?: number
   datePos?: number
+  /**
+   * The audience this video was sorted into ('competitors' | 'ai_detector' |
+   * 'generic'), which decides WHICH comments are offered for it. Null when the
+   * link has never been categorised — those fall back to
+   * FALLBACK_COMMENT_CATEGORY at the moment of the pick.
+   */
+  category?: string | null
 }
 
 interface UserInfo {
@@ -295,7 +303,7 @@ const LinkRow = memo(function LinkRow({ v, onOpen }: { v: Video; onOpen: (v: Vid
     // intrinsic-size hint keeps the scrollbar honest; `auto` means the browser
     // remembers each row's real height once it has been rendered, so wrapped
     // (long) URLs don't cause scroll jumps.
-    <div className="flex items-center gap-3 group py-2 sm:py-1 [content-visibility:auto] [contain-intrinsic-size:auto_32px]">
+    <div className="flex items-center gap-3 group py-2 sm:py-1 [content-visibility:auto] [contain-intrinsic-size:auto_none_auto_32px]">
       <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${platformDot(v.platform)}`} />
       {v.search_rank > 0 && (
         <span
@@ -541,27 +549,86 @@ export default function Dashboard({
   // Rolling hourly quota: click timestamps (ms) per platform in the last hour.
   const [hourlyTimes, setHourlyTimes] = useState<Record<string, number[]>>(() => ({ ...hourly }))
   const hourlyRef = useRef<Record<string, number[]>>({ ...hourly })
-  // The shared cross-product comment pool (same one the app uses). Each entry is
-  // paired with the product it advertises so a click can be attributed to the
-  // comment we actually put on the clipboard — that is the ONLY thing per-product
-  // click counts measure, since users aren't assigned to a product.
-  const poolRef = useRef<{ text: string; product: string | null }[]>([])
+  // The shared cross-product comment pool (same one the app uses), ONE POOL PER
+  // AUDIENCE. Comments are written per product and per audience, and a link is
+  // only ever offered the set matching its own — so a comment aimed at someone
+  // shopping for a rival humanizer never lands under a video about beating
+  // Turnitin. Each entry is paired with the product it advertises so a click can
+  // be attributed to the comment we actually put on the clipboard — that is the
+  // ONLY thing per-product click counts measure, since users aren't assigned to
+  // a product.
+  const poolRef = useRef<Record<string, { text: string; product: string | null }[]>>({})
+  // { product: platforms } — which sites each product's comments may be served
+  // on. A product absent from it is allowed everywhere, which is every product
+  // until an admin narrows one.
+  const productPlatformsRef = useRef<Record<string, string[]>>({})
   useEffect(() => {
     let cancelled = false
     fetch('/api/comments', { cache: 'no-store' })
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
-        if (cancelled || !d || !Array.isArray(d.comments)) return
-        const products: unknown[] = Array.isArray(d.commentProducts) ? d.commentProducts : []
-        poolRef.current = d.comments.map((text: unknown, i: number) => ({
-          text: String(text),
-          product: typeof products[i] === 'string' && products[i] ? String(products[i]) : null,
-        }))
+        if (cancelled || !d) return
+        const pair = (texts: unknown, owners: unknown) => {
+          if (!Array.isArray(texts)) return []
+          const ps: unknown[] = Array.isArray(owners) ? owners : []
+          return texts.map((text: unknown, i: number) => ({
+            text: String(text),
+            product: typeof ps[i] === 'string' && ps[i] ? String(ps[i]) : null,
+          }))
+        }
+        const next: Record<string, { text: string; product: string | null }[]> = {}
+        const by = d.byCategory && typeof d.byCategory === 'object' ? d.byCategory : {}
+        const byP =
+          d.productsByCategory && typeof d.productsByCategory === 'object' ? d.productsByCategory : {}
+        for (const k of Object.keys(by)) next[k] = pair(by[k], byP[k])
+        // The flat pool is the fallback audience's own set; keep it under that
+        // key so a response without byCategory still serves something sensible.
+        if (!next[FALLBACK_COMMENT_CATEGORY]?.length) {
+          const flat = pair(d.comments, d.commentProducts)
+          if (flat.length) next[FALLBACK_COMMENT_CATEGORY] = flat
+        }
+        poolRef.current = next
+        productPlatformsRef.current =
+          d.productPlatforms && typeof d.productPlatforms === 'object'
+            ? (d.productPlatforms as Record<string, string[]>)
+            : {}
       })
       .catch(() => {})
     return () => {
       cancelled = true
     }
+  }, [])
+
+  /**
+   * The comments on offer for one video: the set written for ITS audience.
+   *
+   * An uncategorised link uses FALLBACK_COMMENT_CATEGORY, the same guess the
+   * server makes. The last resort is any audience that actually has comments —
+   * an empty clipboard is worse than a comment written for a near-enough video.
+   */
+  const poolFor = useCallback((v: Video) => {
+    const pools = poolRef.current
+    // Drop products this platform is not allowed to advertise. Applied to every
+    // candidate pool, including the fallbacks, or narrowing a product would
+    // hold on the video's own audience and quietly lapse the moment that
+    // audience was empty.
+    const byProduct = productPlatformsRef.current
+    const allowed = (entries: { text: string; product: string | null }[]) =>
+      entries.filter((e) => {
+        if (!e.product) return true // unattributed: no product to restrict
+        const sites = byProduct[e.product]
+        return sites === undefined || sites.includes(v.platform)
+      })
+
+    const own = v.category ? allowed(pools[v.category] ?? []) : []
+    if (own.length) return own
+    const fallback = allowed(pools[FALLBACK_COMMENT_CATEGORY] ?? [])
+    if (fallback.length) return fallback
+    for (const p of Object.values(pools)) {
+      const ok = allowed(p)
+      if (ok.length) return ok
+    }
+    return []
   }, [])
 
   // A per-second clock so lock states and countdowns update live.
@@ -887,7 +954,7 @@ export default function Dashboard({
     // Pick and copy a comment BEFORE anything else, so the click can be recorded
     // against the product we actually served. The clipboard write must happen in
     // the click handler itself — browsers only allow it during a user gesture.
-    const pool = poolRef.current
+    const pool = poolFor(v)
     const pick = pool.length ? pool[Math.floor(Math.random() * pool.length)] : null
     if (pick) {
       try {
@@ -961,6 +1028,12 @@ export default function Dashboard({
               className="inline-flex items-center gap-1.5 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg px-3 py-1.5 shadow-sm transition-colors"
             >
               📢 Repost &amp; earn
+            </Link>
+            <Link
+              href="/tasks"
+              className="inline-flex items-center gap-1.5 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg px-3 py-1.5 shadow-sm transition-colors"
+            >
+              ✉️ Email task
             </Link>
             <Link
               href="/guide"
@@ -1039,16 +1112,38 @@ export default function Dashboard({
             </>
           )}
           {([
-            { label: 'Comments', t: pendingPay.comments },
-            { label: 'Video', t: pendingPay.video },
-            { label: 'Repost', t: pendingPay.promo },
-          ] as const).map(({ label, t }) => (
-            <span key={label} className="flex items-center gap-1.5 text-sm" title={`${t.count} unpaid`}>
+            { label: 'Comments', t: pendingPay.comments, note: `${pendingPay.comments.count} unpaid` },
+            { label: 'Video', t: pendingPay.video, note: `${pendingPay.video.count} unpaid` },
+            { label: 'Repost', t: pendingPay.promo, note: `${pendingPay.promo.count} unpaid` },
+            {
+              label: 'Emails',
+              t: pendingPay.accounts,
+              note: `${pendingPay.accounts.count} checked and owed`,
+            },
+          ] as const).map(({ label, t, note }) => (
+            <span key={label} className="flex items-center gap-1.5 text-sm" title={note}>
               <span className="text-zinc-400">{label}</span>
               <span className="tabular-nums font-medium text-zinc-200">{fmtBirr(t.birr)}</span>
               <span className="text-[11px] text-zinc-600 tabular-nums">({t.count})</span>
             </span>
           ))}
+          {/* Sits apart from the four above because it is NOT owed yet: an
+              address is worth nothing until someone has opened the mailbox. */}
+          {pendingPay.accountsAwaiting.count > 0 && (
+            <Link
+              href="/tasks"
+              title="Email addresses you have sent that we have not checked yet. Not payable until we do."
+              className="flex items-center gap-1.5 text-sm hover:opacity-80 transition-opacity"
+            >
+              <span className="text-amber-400/90">Emails awaiting check</span>
+              <span className="tabular-nums font-medium text-amber-400">
+                {fmtBirr(pendingPay.accountsAwaiting.birr)}
+              </span>
+              <span className="text-[11px] text-zinc-600 tabular-nums">
+                ({pendingPay.accountsAwaiting.count})
+              </span>
+            </Link>
+          )}
         </div>
       )}
     </div>

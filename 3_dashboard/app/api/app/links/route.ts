@@ -5,6 +5,9 @@ import {
   getClickCountsByUrl,
   getBlockedUrls,
   getConfirmedBrokenUrls,
+  getServeOnlyClean,
+  getUrlsWithProductComments,
+  getCleanSessionClicks,
   getApk,
   getEffectivePlatformLimits,
   getUnrelatedUrls,
@@ -24,7 +27,7 @@ import {
   VERIFY_VIDEO_URL,
   VERIFY_GATE_ENABLED,
   APP_LINK_BATCH,
-  DEFAULT_LINK_CATEGORY,
+  FALLBACK_COMMENT_CATEGORY,
 } from '@/lib/config'
 
 export const dynamic = 'force-dynamic'
@@ -79,7 +82,7 @@ export async function GET(req: NextRequest) {
   // Retirement counts every distinct user who opened the link, across all
   // products — users aren't assigned to a product, so there is no per-product
   // audience to scope it to.
-  const [clicked, clickCounts, videos, blocked, effective, unrelated, broken] =
+  const [clicked, clickCounts, videos, blocked, effective, unrelated, broken, onlyClean] =
     await Promise.all([
       getClickedUrls(userId).catch(() => [] as string[]),
       getClickCountsByUrl().catch(() => ({}) as Record<string, number>),
@@ -91,7 +94,20 @@ export async function GET(req: NextRequest) {
       // dead reading is a suspicion, and withholding on it would let one bad
       // minute on TikTok's side shrink everyone's list.
       getConfirmedBrokenUrls(BROKEN_AFTER_MISSES).catch(() => [] as string[]),
+      // Off by default; on, links already carrying one of ours are withheld.
+      getServeOnlyClean().catch(() => false),
     ])
+  // Read only when the setting is on: it is a full scan of link_product_comment
+  // and pointless on every request when the answer is not used.
+  const alreadyOurs = onlyClean
+    ? await getUrlsWithProductComments().catch(() => [] as string[])
+    : []
+  // What this user has opened since the setting was switched on. It takes the
+  // place of the permanent record while the setting is on — otherwise the same
+  // link comes back on every fetch of the session.
+  const sessionClicks = onlyClean
+    ? await getCleanSessionClicks(userId).catch(() => [] as string[])
+    : []
   // Withheld: clicked (already opened), retired (quota done), admin-blocked, and
   // links THIS user flagged as unrelated.
   //
@@ -102,11 +118,19 @@ export async function GET(req: NextRequest) {
   //
   // Retirement applies per platform (hourly quotas are a separate switch).
   const retired = retiredUrlSet(videos, clickCounts, effective.retirePlatforms)
-  const hidden = new Set<string>(clicked)
+  // ALREADY-OPENED LINKS COME BACK when "only links with none of ours" is on.
+  //
+  // That setting only ever serves a link the extraction has NOT found one of
+  // ours on. A link this user opened before and that still carries none of ours
+  // is a link they opened without leaving a comment that stuck — so withholding
+  // it is withholding exactly the work the setting exists to hand out. The
+  // moment a comment does appear on it, the setting withholds it anyway.
+  const hidden = new Set<string>(onlyClean ? sessionClicks : clicked)
   retired.forEach((u) => hidden.add(u))
   blocked.forEach((u) => hidden.add(u))
   unrelated.forEach((u) => hidden.add(u))
   broken.forEach((u) => hidden.add(u))
+  alreadyOurs.forEach((u) => hidden.add(u))
   const platform = req.nextUrl.searchParams.get('platform')
 
   // How the two clusterings are mixed: a percentage set on the admin Links page
@@ -166,7 +190,9 @@ export async function GET(req: NextRequest) {
 
   // Each link carries the audience it was categorised into, so the app copies a
   // comment written for that kind of video. Uncategorised links fall back to
-  // 'generic', whose comments assume nothing about the viewer.
+  // FALLBACK_COMMENT_CATEGORY ('competitors') — the audience most of the pool
+  // turned out to belong to, and the one whose comments assume least about a
+  // video we never managed to read.
   const categories = await getLinkCategories().catch(() => ({}) as Record<string, string>)
 
   // What "Extract comments" found on each link — used ONLY to choose which
@@ -181,7 +207,7 @@ export async function GET(req: NextRequest) {
     platform: v.platform ?? '',
     search_query: v.search_query ?? '',
     posted_date: v.posted_date ?? '',
-    category: categories[String(v.url)] ?? DEFAULT_LINK_CATEGORY,
+    category: categories[String(v.url)] ?? FALLBACK_COMMENT_CATEGORY,
     // Products whose comment is ALREADY on this video, so the app can pick one
     // that is not — a video ending up with five variants of the same pitch helps
     // nobody. Empty when the link has not been scanned.

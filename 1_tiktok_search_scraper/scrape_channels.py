@@ -67,6 +67,7 @@ import json
 import os
 import random
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -679,6 +680,14 @@ def main():
                          "Much slower: it opens every video.")
     ap.add_argument("--comment-scrolls", type=int, default=15,
                     help="Max scrolls of a video's comment panel (default 15).")
+    # The help text and the progress lines contain arrows and bullets, and a
+    # Windows console defaults to cp1252 — which cannot encode them, so
+    # `--help` died with UnicodeEncodeError before printing anything useful.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     args = ap.parse_args()
 
     accounts_file = args.accounts
