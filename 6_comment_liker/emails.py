@@ -31,6 +31,10 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
+import console
+
+console.fix()
+
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "emails.csv"
 ACCOUNTS = HERE / "accounts.json"
@@ -44,13 +48,16 @@ def safe(s: str) -> str:
 
 
 def profiles() -> list[str]:
-    """Every profile-<name> directory, by suffix. 'profile' itself is 'default'."""
-    out = []
-    for d in sorted(HERE.glob("profile*")):
-        if not d.is_dir():
-            continue
-        out.append("default" if d.name == "profile" else d.name[len("profile-"):])
-    return out
+    """Every TikTok profile on disk, by name.
+
+    sessions.discover, not a glob: the three sites\' prefixes nest — TikTok\'s is
+    "profile", Instagram\'s "profile-ig", YouTube\'s "profile-yt" — so
+    `HERE.glob("profile*")` reports profile-ig-b as a TikTok profile called
+    "ig-b" and then asks TikTok who that is.
+    """
+    import sessions
+
+    return sessions.discover("tiktok")
 
 
 def dir_for(name: str) -> Path:
@@ -101,11 +108,24 @@ def read_profile(p, name: str) -> dict:
         row["note"] = "no profile directory"
         return row
 
-    ctx = p.chromium.launch_persistent_context(
-        user_data_dir=str(user_dir),
-        headless=True,
-        args=["--disable-blink-features=AutomationControlled"],
-    )
+    try:
+        ctx = p.chromium.launch_persistent_context(
+            user_data_dir=str(user_dir),
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+    except Exception as e:  # noqa: BLE001
+        # Chromium locks a user data directory while it holds it, so a profile
+        # a liker is working cannot be opened. Reported as itself: a blank row
+        # would read as an account with no address, and somebody would go
+        # looking for one that was never missing.
+        from sessions import IN_USE_MARKERS
+
+        low = str(e).lower()
+        row["note"] = ("in use by another process — stop the run and re-check"
+                       if any(m in low for m in IN_USE_MARKERS)
+                       else f"could not open: {safe(e)[:80]}")
+        return row
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
@@ -192,6 +212,38 @@ def read_profile(p, name: str) -> dict:
     return row
 
 
+FIELDS = ("profile", "tiktok_username", "screen_name", "user_id",
+          "tiktok_email_masked", "google_email", "confirmed", "note")
+
+
+def read_csv() -> dict[str, dict]:
+    """What emails.csv already says, by profile. {} if there is none."""
+    if not OUT.exists():
+        return {}
+    try:
+        with OUT.open(encoding="utf-8", newline="") as f:
+            return {r["profile"]: r for r in csv.DictReader(f)
+                    if (r.get("profile") or "").strip()}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def write_csv(rows: list[dict]) -> None:
+    """Every row, in the order the profiles sit on disk.
+
+    A fixed field list rather than rows[0].keys(): a row carried over from an
+    earlier file and a freshly-read one need not agree on key order, and the
+    first row deciding the header is how a column ends up silently dropped.
+    """
+    order = {n: i for i, n in enumerate(profiles())}
+    rows = sorted(rows, key=lambda r: (order.get(r["profile"], 999), r["profile"]))
+    with OUT.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(FIELDS))
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in FIELDS})
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--profile", nargs="*", help="profile suffixes; default is all")
@@ -208,7 +260,20 @@ def main() -> int:
         return 1
     print(f"reading {len(names)} profile(s): {', '.join(names)}")
 
-    rows = []
+    # READING SOME OF THEM MUST NOT DELETE THE REST.
+    #
+    # `--profile j` writes the same file a full read does, and without this it
+    # would write a file containing only j, throwing away eighteen addresses
+    # that were never in question. Anything already on file and not read now is
+    # carried over untouched.
+    kept = read_csv() if args.profile else {}
+    for n in names:
+        kept.pop(n, None)
+    if kept:
+        print(f"keeping {len(kept)} profile(s) already in {OUT.name} "
+              "that this run does not read")
+
+    rows = list(kept.values())
     with sync_playwright() as p:
         for name in names:
             row = read_profile(p, name)
@@ -219,10 +284,7 @@ def main() -> int:
                 f"{safe(row['google_email']) or '-':<32} {row['confirmed'] or row['note']}"
             )
 
-    with OUT.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        w.writeheader()
-        w.writerows(rows)
+    write_csv(rows)
     print(f"\nwrote {OUT.name} ({len(rows)} row(s))")
 
     if args.write_accounts:

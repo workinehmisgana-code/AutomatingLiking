@@ -147,7 +147,10 @@ export default function AdminReplies() {
   return (
     <div className="max-w-5xl mx-auto px-4 py-6">
       <div className="flex flex-wrap items-center gap-3 mb-4">
-        <Link href="/admin/links" className="text-sm text-zinc-400 hover:text-white">
+        <Link
+          href="/admin/links"
+          className="inline-flex items-center min-h-[32px] text-sm text-zinc-400 hover:text-white"
+        >
           ← Links
         </Link>
         <h1 className="text-lg font-semibold text-white">Reply drafts</h1>

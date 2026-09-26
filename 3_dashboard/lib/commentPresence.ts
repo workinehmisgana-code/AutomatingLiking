@@ -21,6 +21,7 @@ import {
   recordTiktokAccount,
 } from './db'
 
+
 /**
  * Comment reads in flight at once.
  *
@@ -193,6 +194,100 @@ export async function scoreUserDay(
     remaining: todo.length - judged.length,
     total: all.length,
     opened: opened.length,
+  }
+}
+
+/**
+ * How many of a user's most recent links the per-user check reads.
+ *
+ * The admin's "verify" button used to read ONE DAY — the user's last active day,
+ * in full. That was the wrong population for the question it is pressed to
+ * answer. A day is whatever length it happens to be: a quiet day gave a verdict
+ * on eleven links, and a heavy one needed a dozen resumed passes to get through
+ * 1,373. Neither is "is this person doing the work".
+ *
+ * The last hundred links, across however many days they span, is the same
+ * question asked the same way for everybody, and it is the population the
+ * auto-block rule already samples from.
+ */
+export const RECENT_SAMPLE = 100
+
+/**
+ * Judge a user's most recent links, newest first, spanning days.
+ *
+ * Same reads, same judging and same ledger as the per-day sweep — only the
+ * population differs. Resumable in the same way: it judges what it can before
+ * the deadline and reports how many are left.
+ *
+ * THE DAY SCORES ARE LEFT ALONE. Every verdict is written to the ledger, because
+ * a reading is a reading and the next sweep should not repeat it, but the
+ * per-day score rows are not recomputed from this sample — see refreshDay in
+ * saveJudgedLinks. A hundred links spread over five days is a slice of each of
+ * them, and a slice must not be allowed to redefine a day.
+ */
+export async function scoreUserRecent(
+  userId: string,
+  tiktokUrl: string,
+  limit: number,
+  deadline: number,
+  freshSince?: string | null
+): Promise<{
+  judged: number
+  remaining: number
+  total: number
+  days: string[]
+  links: (JudgedLink & { day: string })[]
+} | null> {
+  const username = handleFromProfile(tiktokUrl)
+  if (!username) return null
+  const recent = await getRecentClickedLinks(userId, limit).catch(
+    () => [] as { url: string; day: string }[]
+  )
+  if (recent.length === 0) return null
+
+  // What this check has already judged. Anything older than freshSince counts as
+  // unjudged and is read again, so the answer is about now.
+  const done = await getJudgedVerdicts(userId, recent, freshSince).catch(
+    () => new Map<string, { found: boolean; judgeable: boolean }>()
+  )
+  const todo = recent.filter((r) => !done.has(`${r.day}|${r.url}`))
+
+  // ONE READ PER URL, not per row. The same video can be in the list twice —
+  // clicked on two days — and it has one comment section either way.
+  const byUrl = new Map<string, string[]>()
+  for (const r of todo) byUrl.set(r.url, [...(byUrl.get(r.url) ?? []), r.day])
+  const judged = todo.length
+    ? await judgeLinks(username, Array.from(byUrl.keys()), deadline)
+    : []
+
+  // Written per day, because the ledger is keyed by day — a verdict for a url
+  // that appears on two days is recorded against both.
+  const perDay = new Map<string, JudgedLink[]>()
+  for (const l of judged) {
+    for (const day of byUrl.get(l.url) ?? []) {
+      perDay.set(day, [...(perDay.get(day) ?? []), l])
+    }
+  }
+  for (const day of Array.from(perDay.keys())) {
+    await saveJudgedLinks(userId, day, perDay.get(day) ?? [], freshSince, false)
+  }
+  await rememberAccount(userId, username, judged)
+
+  // The report is over the SAMPLE, in the order the user opened it: this pass's
+  // verdicts plus the ones it made on an earlier request.
+  const fresh = new Map(judged.map((l) => [l.url, l]))
+  const links: (JudgedLink & { day: string })[] = []
+  for (const r of recent) {
+    const got = fresh.get(r.url) ?? done.get(`${r.day}|${r.url}`)
+    if (got) links.push({ ...got, url: r.url, day: r.day })
+  }
+  return {
+    judged: judged.length,
+    // Counted in urls, which is what the work is measured in.
+    remaining: byUrl.size - judged.length,
+    total: recent.length,
+    days: Array.from(new Set(recent.map((r) => r.day))).sort(),
+    links,
   }
 }
 

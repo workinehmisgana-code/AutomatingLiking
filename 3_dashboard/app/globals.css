@@ -14,3 +14,69 @@ body {
 ::-webkit-scrollbar-track { background: #18181b; }
 ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: #52525b; }
+
+/* ── On a phone ───────────────────────────────────────────────────────────────
+ *
+ * The admin screens were built at a desk, where an 11px button with no padding
+ * is a perfectly good target for a mouse. Measured on a 390px viewport, the
+ * admin dashboard had 325 tap targets under 32px tall and the links page had
+ * checkboxes rendering at THIRTEEN pixels — smaller than the tip of a finger,
+ * in a table where ticking the wrong row blocks the wrong link.
+ *
+ * Fixed here rather than in fifty components because it is one rule about
+ * fingers, not fifty decisions about layout — and `pointer: coarse` means the
+ * desktop admin, where all of this was fine, is untouched.
+ */
+@media (pointer: coarse) {
+  /* A finger is about 9mm across. 32px is the smallest that can be hit without
+   * aiming; buttons in dense tables get there by growing their hit area, not
+   * their text, so the layout and the type scale stay as they were. */
+  button,
+  select,
+  summary,
+  [role='button'] {
+    min-height: 32px;
+  }
+
+  /* Inline links in a sentence are left alone — a link inside a paragraph is
+   * not a button and making it 32px tall would break the line. Only ones that
+   * are already laid out as controls are grown. */
+  a[href].inline-flex,
+  a[href].inline-block,
+  a[href].block,
+  a[href][class*='border'],
+  a[href][class*='rounded'] {
+    min-height: 32px;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  /* THIRTEEN PIXELS. The default checkbox, at the size the browser picks for a
+   * mouse. In the links table each row has several, side by side. */
+  input[type='checkbox'],
+  input[type='radio'] {
+    width: 1.5rem;
+    height: 1.5rem;
+  }
+
+  /* iOS ZOOMS THE WHOLE PAGE when a field smaller than 16px takes focus, and
+   * does not zoom back out. Every input here is text-xs — 12px — so every tap
+   * on a filter box left the admin scrolled sideways into a corner of a page
+   * that no longer fitted. The 16px is what stops it; the min-height is the
+   * same finger rule as above. */
+  input:not([type='checkbox']):not([type='radio']),
+  textarea,
+  select {
+    font-size: 16px;
+    min-height: 36px;
+  }
+
+  /* A table too wide for the screen scrolls, which is right — but a table that
+   * looks cut off with no hint that it moves reads as broken. Momentum makes it
+   * feel like the rest of the phone. */
+  .overflow-x-auto,
+  .overflow-auto {
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+  }
+}

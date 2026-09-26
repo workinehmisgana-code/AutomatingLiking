@@ -173,6 +173,15 @@ export async function POST(req: NextRequest) {
   let consumed = 0
   let failed = 0
   let newLinks = 0
+  /**
+   * Channels whose listing came back with nothing.
+   *
+   * NAMED, not just counted. Over four thousand channels a number is all
+   * anybody can use; over the handful somebody just added by hand, "1 failed"
+   * is useless and "@ace_the_page returned nothing" is the whole answer —
+   * a handle typo, a deleted account, or the embed endpoint throttling us.
+   */
+  const failedHandles: string[] = []
   /** Listed videos passed over for being older than what we already hold. */
   let olderSkipped = 0
   let next = 0
@@ -187,6 +196,8 @@ export async function POST(req: NextRequest) {
       consumed = Math.max(consumed, i + 1)
       if (listed.length === 0) {
         failed++
+        // Capped: this is a diagnostic, not a second copy of the request.
+        if (failedHandles.length < 40) failedHandles.push(handle)
         continue
       }
       // Only what the channel posted AFTER the newest video we already hold for
@@ -264,6 +275,7 @@ export async function POST(req: NextRequest) {
     olderSkipped,
     staged: written,
     failed,
+    failedHandles,
     done: nextOffset >= total,
   })
 }

@@ -62,6 +62,10 @@ from like import (
     wanted,
 )
 
+import console
+
+console.fix()
+
 # How long one account will wait at the barrier for the others. Past this the
 # run continues without whoever is stuck — a hung browser must not freeze
 # everybody else indefinitely.

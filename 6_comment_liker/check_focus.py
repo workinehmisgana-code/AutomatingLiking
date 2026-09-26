@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """
-Does the captcha actually bring its window to the front?
+Does a window that opens end up somewhere a person can see it?
 
-The case that matters is the hard one: a window that is MINIMISED behind eight
-others. Playwright's own bring_to_front() does not restore a minimised window,
-which is the whole reason notify.focus_window exists — so this test minimises the
-window first and checks it comes back.
+Two halves, both measured against a real window rather than asserted.
+
+FRONT. A window that is MINIMISED behind eight others is the hard case.
+Playwright's own bring_to_front() does not restore one, which is the whole
+reason notify.focus_window exists — so this minimises the window first and
+checks it comes back.
+
+PLACE. Headed windows used to be tiled: the screen cut into `slots` boxes, one
+per account. With seventeen accounts that is three columns and six rows of a
+screen that has one, so most windows were positioned hundreds of pixels below
+the bottom edge, and the report was that they "get hidden somewhere". They are
+put on the main monitor and maximised instead — by asking Windows after the
+fact, because the flags alone do not do it: --window-size is in Chrome's
+device-independent pixels and the shell's coordinates are in this process's, and
+on a scaled display a window asked to be 1707 wide measured 1296.
 
     python check_focus.py
 """
@@ -96,6 +107,48 @@ def main() -> int:
             print(f"   {'ok  ' if fg == hwnd else '??  '} it is the foreground window: {fg == hwnd}")
             if fg != hwnd:
                 print("        (Windows can refuse the raise; it is un-minimised and flashing)")
+
+            print("\nthe screen it is told to fill is the MAIN one:")
+            x, y, w, h = notify.primary_screen()
+            check("  the work area has a size", w > 200 and h > 200, True)
+            # The primary monitor's origin is (0, 0) by definition; a second
+            # screen sits at an offset from it. Positioning there is what keeps
+            # the window off the monitor Chrome happened to close on.
+            check("  starting at the primary origin", (x, y), (0, 0))
+            # Minus the taskbar: a window sized to the whole screen has its
+            # bottom edge under it, and on TikTok that edge is the comment box.
+            check("  and it is the work area, not the whole screen",
+                  h < user32.GetSystemMetrics(1), True)
+            flags = " ".join(notify.screen_args())
+            check("  the flags carry that size", f"--window-size={w},{h}" in flags, True)
+            check("  and that position", f"--window-position={x},{y}" in flags, True)
+
+            print("\nand the window really lands there:")
+            page.evaluate("(t) => { document.title = t }", marker)
+            placed = notify.show_window(page, marker)
+            time.sleep(1.0)
+            check("  show_window found and placed it", placed, True)
+            hwnd = find(marker)
+            check("  it is maximised", bool(user32.IsZoomed(hwnd)), True)
+            r = wintypes.RECT() if hasattr(wintypes, "RECT") else None
+            if r is None:
+                class RECT(ctypes.Structure):
+                    _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                                ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+                r = RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+            sw, sh = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+            # A maximised window's frame sits a few pixels outside the work
+            # area, which is why this is a range rather than an equality.
+            check("  its left edge is on the main screen", -20 <= r.left < sw, True)
+            check("  its top edge too", -20 <= r.top < sh, True)
+            check("  it covers the width", (r.right - r.left) > sw * 0.9, True)
+            check("  and the height", (r.bottom - r.top) > sh * 0.8, True)
+            # The one that used to fail silently: Chrome renames its window a
+            # moment after the page does, so a lookup at 0ms found nothing and
+            # the window was left wherever Chrome had put it.
+            check("  the lookup waits for the title", "wait_ms=3000" in
+                  Path("notify.py").read_text(encoding="utf-8"), True)
 
             print("\nthe title is restorable:")
             page.evaluate("(t) => { document.title = t }", "about:blank")

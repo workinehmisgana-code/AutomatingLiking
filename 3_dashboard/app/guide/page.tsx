@@ -6,6 +6,7 @@ import {
   getAccountTaskDomain,
   getAccountTaskOpen,
   getAccountTaskPassword,
+  getAccountTaskRecovery,
 } from '@/lib/db'
 import {
   COMMENT_PAY_RATE,
@@ -39,11 +40,13 @@ export default async function GuidePage() {
   // The guide describes the email task only while it is actually being
   // offered. A guide that explains a task nobody can do is worse than one that
   // does not mention it.
-  const [guideVideos, accountDomain, accountOpen, accountPassword] = await Promise.all([
+  const [guideVideos, accountDomain, accountOpen, accountPassword, accountRecovery] =
+    await Promise.all([
     getGuideVideos().catch(() => []),
     getAccountTaskDomain().catch(() => ''),
     getAccountTaskOpen().catch(() => false),
     getAccountTaskPassword().catch(() => ''),
+    getAccountTaskRecovery().catch(() => ''),
   ])
 
   return (
@@ -58,6 +61,7 @@ export default async function GuidePage() {
       accountBirr={ACCOUNT_PAY_BIRR}
       accountDomain={accountDomain}
       accountPassword={accountPassword}
+      accountRecovery={accountRecovery}
       accountOpen={accountOpen && !!accountDomain}
       videos={guideVideos}
       signedIn={!!session}

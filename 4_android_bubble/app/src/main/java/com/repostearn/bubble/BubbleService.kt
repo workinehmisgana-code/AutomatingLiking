@@ -667,6 +667,12 @@ class BubbleService : Service() {
         strip.addView(payChip("Video", pending?.optJSONObject("video")))
         strip.addView(payChip("Repost", pending?.optJSONObject("promo")))
         strip.addView(payChip("Emails", pending?.optJSONObject("accounts")))
+        // 20% of the comment pay of everybody this worker referred. The count is
+        // THEIR comments, not this worker's, so the chip is only shown once
+        // there is something in it - a "Referrals 0 (0)" beside the others would
+        // read as this worker having made no comments.
+        val ref = pending?.optJSONObject("referrals")
+        if ((ref?.optInt("count", 0) ?: 0) > 0) strip.addView(payChip("Referrals", ref))
         // Addresses sent but not yet checked. Shown apart and in amber because
         // it is NOT in the total above: an address is worth nothing until
         // someone has opened the mailbox. It is already counted in the

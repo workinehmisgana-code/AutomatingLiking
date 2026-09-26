@@ -1,0 +1,864 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Liker</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0a0a0a; color: #e5e7eb;
+    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  a { color: #34d399; }
+  .wrap { max-width: 1500px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 18px; margin: 0 0 2px; }
+  .sub { color: #71717a; font-size: 12px; }
+  .cols { display: grid; grid-template-columns: minmax(340px, 1fr) minmax(0, 1.35fr); gap: 16px; }
+  @media (max-width: 1050px) { .cols { grid-template-columns: 1fr; } }
+  .card {
+    border: 1px solid #27272a; background: #131316; border-radius: 12px;
+    padding: 12px; margin-bottom: 14px;
+  }
+  .card > h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+    color: #71717a; margin: 0 0 8px; font-weight: 600;
+  }
+  button {
+    font: inherit; border-radius: 8px; padding: 5px 11px; cursor: pointer;
+    border: 1px solid #3f3f46; background: #27272a; color: #e5e7eb;
+  }
+  button:hover { background: #3f3f46; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.go { background: #047857; border-color: #059669; color: #fff; }
+  button.go:hover { background: #059669; }
+  button.stop { background: #7f1d1d; border-color: #b91c1c; color: #fee2e2; }
+  button.ghost { background: transparent; }
+  button.small { padding: 2px 7px; font-size: 11px; }
+  input, select {
+    font: inherit; background: #18181b; color: #e5e7eb;
+    border: 1px solid #3f3f46; border-radius: 7px; padding: 4px 7px; width: 100%;
+  }
+  input[type=checkbox] { width: auto; accent-color: #10b981; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 11px; color: #71717a; font-weight: 600; padding: 3px 6px; }
+  td { padding: 4px 6px; border-top: 1px solid #27272a; vertical-align: middle; }
+  tr.off td { opacity: .45; }
+  .who { color: #a1a1aa; font-size: 12px; }
+  .pill { font-size: 10px; padding: 1px 6px; border-radius: 99px; border: 1px solid; }
+  .p-running { color: #fbbf24; border-color: #78350f; background: #78350f33; }
+  .p-done    { color: #34d399; border-color: #065f46; background: #065f4633; }
+  .p-failed  { color: #fca5a5; border-color: #7f1d1d; background: #7f1d1d33; }
+  .p-some-failed { color: #fbbf24; border-color: #78350f; background: #78350f33; }
+  .p-stopping{ color: #a1a1aa; border-color: #3f3f46; }
+  .p-stopped { color: #a1a1aa; border-color: #3f3f46; background: #27272a; }
+  .p-none    { color: #52525b; border-color: #27272a; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; }
+  .fld { display: grid; grid-template-columns: 1fr 118px; gap: 8px; align-items: center; }
+  .fld label { font-size: 12px; color: #d4d4d8; }
+  .fld .hint { display: block; color: #52525b; font-size: 11px; }
+  .grp { border-top: 1px solid #27272a; padding-top: 8px; margin-top: 8px; }
+  .grp:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
+  .grp h3 { font-size: 11px; color: #71717a; margin: 0 0 6px; text-transform: uppercase; letter-spacing: .05em; }
+  pre.out {
+    background: #09090b; border: 1px solid #27272a; border-radius: 8px;
+    padding: 8px; margin: 0; font-size: 11.5px; line-height: 1.35;
+    max-height: 340px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  }
+  .cmd { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px;
+         color: #a1a1aa; background: #09090b; border: 1px solid #27272a;
+         border-radius: 8px; padding: 7px; overflow-x: auto; white-space: pre-wrap;
+         word-break: break-all; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .danger { color: #fca5a5; }
+  .warn { color: #fbbf24; }
+  .ovr { outline: 1px solid #0d9488; }
+</style>
+
+<div class="wrap">
+  <div class="row" style="align-items:baseline;gap:12px">
+    <h1 style="margin:0">Liker</h1>
+    <!-- Top of the page, because it changes the profile list, the session
+         file, the ledgers, the jobs and which script runs. Anything lower
+         would look like a filter on what is shown. -->
+    <label class="row" style="gap:6px">
+      <span class="sub">Platform</span>
+      <select id="platform" onchange="setPlatform(this.value)" style="width:auto"></select>
+    </label>
+    <span class="sub" id="platformNote"></span>
+  </div>
+  <p class="sub" id="head">loading…</p>
+
+  <div class="cols">
+    <div>
+      <div class="card">
+        <h2>Profiles</h2>
+        <div class="row" style="margin-bottom:8px">
+          <button class="small ghost" onclick="pick('all')">All</button>
+          <button class="small ghost" onclick="pick('none')">None</button>
+          <button class="small ghost" onclick="pick('known')">Signed in</button>
+          <span style="flex:1"></span>
+          <button class="small" onclick="addProfile()">+ New profile</button>
+          <button class="small" id="cloneAll" onclick="cloneAll()"
+            style="display:none">Copy all from TikTok</button>
+          <button class="small" onclick="tool('sessions','')">Re-scan all sessions</button>
+        </div>
+        <table id="ptable"></table>
+      </div>
+
+      <div class="card">
+        <h2>Run</h2>
+        <div class="row" style="margin-bottom:8px">
+          <label class="row" style="gap:5px"><input type="radio" name="mode" value="collection" checked onchange="renderPreview()"> in collection</label>
+          <label class="row" style="gap:5px"><input type="radio" name="mode" value="independent" onchange="renderPreview()"> independently</label>
+        </div>
+        <p class="sub" id="modeNote" style="margin:0 0 8px"></p>
+        <div class="row">
+          <button class="go" onclick="run()">▶ Start</button>
+          <button class="stop" onclick="stopAll()">■ Stop everything</button>
+          <label class="row" style="gap:5px" title="Off, the browsers run headless: they work, they just never appear. On, each profile gets its own window, tiled.">
+            <input type="checkbox" id="headedNow" onchange="setHeaded(this.checked)"> show the browsers
+          </label>
+          <span style="flex:1"></span>
+          <button class="small ghost" onclick="togglePreview()">show command</button>
+        </div>
+        <div id="preview" style="display:none; margin-top:8px"></div>
+      </div>
+
+      <div class="card">
+        <h2>Tools</h2>
+        <p class="sub" style="margin:0 0 8px">
+          Anything about ONE profile lives on its own row — press ⚙ beside it.
+          These are the ones that are not about a profile at all.
+        </p>
+        <div class="row">
+          <button class="small" onclick="tool('why','')">Why skipped</button>
+          <button class="small" onclick="tool('comments','')"
+            title="Every profile: open the videos it commented on and count how many of those comments are still there — read signed-out, and by a DIFFERENT account, because TikTok shows a restricted comment to its author and to nobody else. Nothing is written.">
+            Check posted comments</button>
+          <button class="small" onclick="tool('commented','')"
+            title="Every link we have commented on, per account: the video, the product, the exact words, and what the last check found. Read from the ledger — no browser, so it answers at once even mid-run.">
+            Links we commented on</button>
+          <button class="small" onclick="tool('sessions','')">Re-scan all sessions</button>
+          <button class="small" onclick="tool('emails','')">Find every registered email</button>
+        </div>
+        <p class="sub" style="margin:8px 0 0" id="emailsAt"></p>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>Settings <span id="whose" style="text-transform:none;letter-spacing:0"></span></h2>
+        <div class="row" style="margin-bottom:8px">
+          <select id="scope" onchange="renderFields()" style="width:auto"></select>
+          <button class="small" onclick="saveSettings()">Save</button>
+          <button class="small ghost" id="clearOvr" onclick="clearOverrides()" style="display:none">Clear this profile's overrides</button>
+          <span class="sub" id="saved"></span>
+        </div>
+        <div id="fields"></div>
+      </div>
+
+      <div class="card">
+        <h2>Output</h2>
+        <div class="row" style="margin-bottom:8px" id="jobtabs"></div>
+        <div class="row" style="margin-bottom:8px">
+          <button class="small ghost" id="copyOne" onclick="copyShown(this)">Copy</button>
+          <button class="small ghost" id="copyAll" onclick="copyEveryJob(this)">Copy all jobs</button>
+          <button class="small ghost" id="copyLog" onclick="copyWholeLog(this)">Copy the whole log</button>
+          <span class="sub" id="copyNote"></span>
+        </div>
+        <pre class="out" id="out">nothing running yet.</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let S = null;                 // last state from the server
+let SEL = new Set();          // selected profile names
+let SEEN = {};                // job -> lines already received
+let BUF = {};                 // job -> the lines themselves
+let TAB = null;               // which job's output is shown
+let OPEN = null;              // which profile's configuration panel is open
+let SHOWPRE = false;
+let dirty = false;            // unsaved edits in the settings form
+// Which settings the form was built from. Compared on every poll so a setting
+// added while this page was open shows up without a reload.
+let FIELDSIG = '';
+const fieldSig = (st) => (st.fields || []).map(f => f.key).join(',');
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+  });
+  return r.json().catch(() => ({}));
+}
+
+// ── polling ────────────────────────────────────────────────────────────────
+async function poll() {
+  const st = await api('/api/state?since=' + encodeURIComponent(JSON.stringify(SEEN)));
+  if (!st || !st.profiles) return;
+  const first = S === null;
+  S = st;
+  for (const [name, j] of Object.entries(st.jobs || {})) {
+    BUF[name] = (BUF[name] || []).concat(j.new || []).slice(-600);
+    SEEN[name] = j.seq;
+    if (TAB === null) TAB = name;
+  }
+  if (first) {
+    SEL = openingSelection(st);
+    buildScope();
+    renderFields();
+  } else if (fieldSig(st) !== FIELDSIG && !dirty) {
+    // A NEW SETTING MUST APPEAR BY ITSELF.
+    //
+    // The form was built once, on first load, and never again. So a tab left
+    // open across a restart of this server went on showing the old set of
+    // settings for as long as it stayed open — the server was offering the new
+    // one on every poll and the page was throwing it away. The answer was
+    // "press F5", which is only obvious to somebody who already knows.
+    //
+    // Not while there are unsaved edits: rebuilding the form would throw away
+    // what somebody is in the middle of typing, and a setting that appears a
+    // second later is a smaller problem than a value that vanishes.
+    buildScope();
+    renderFields();
+  }
+  renderPlatform(); renderHead(); renderProfiles(); renderJobs(); renderModeNote();
+}
+
+function renderHead() {
+  const live = Object.values(S.jobs || {}).filter(j => j.state === 'running').length;
+  // The run's own total, which is the number somebody reads out loud. Summed
+  // from the same per-profile figures rather than counted separately, so the
+  // header and the rows can never disagree.
+  const lv = S.profiles.map(p => p.live || {}).filter(x => x.since);
+  const likes = lv.reduce((a, x) => a + (x.likes || 0), 0);
+  const links = lv.reduce((a, x) => a + (x.links || 0), 0);
+  $('head').innerHTML =
+    `${S.profiles.length} profile(s) · sessions last checked ${S.sessionsAt ? esc(S.sessionsAt) : '<span class="warn">never</span>'}` +
+    ` · ${live} job(s) running` +
+    (lv.length ? ` · <b style="color:#5eead4">${likes.toLocaleString()}</b> like(s) on ${links.toLocaleString()} link(s) this run` : '') +
+    ` · logs in <span class="sub">${esc(S.runDir)}</span>`;
+  const ea = $('emailsAt');
+  if (ea) ea.innerHTML = S.emailsAt
+    ? `Registered addresses last looked up ${esc(S.emailsAt)}. Opens every profile\'s browser, so it takes a few minutes.`
+    : `<span class="warn">Registered addresses have never been looked up.</span> It opens every profile\'s browser, so it takes a few minutes.`;
+}
+
+// A job's state in the words somebody needs. "failed" and "some-failed" are one
+// character apart and mean opposite things — worked the whole list, versus died
+// partway — so they are never shown as their own names.
+const STATE_LABEL = {
+  'some-failed': 'done · some likes failed',
+  failed: 'CRASHED',
+  done: 'done',
+};
+const stateLabel = (st) => STATE_LABEL[st] || st;
+
+// ── what a profile is doing right now ───────────────────────────────────────
+// The ledger column is a career total and barely moves; this one answers the
+// question somebody actually has while a run is going: is this account working,
+// and is it liking anything.
+function liveCell(p, state) {
+  const lv = p.live || {};
+  if (!lv.since) return '<span style="color:#3f3f46">—</span>';
+  const running = state === 'running' || state === 'stopping';
+  const title = `${lv.likes} like(s) on ${lv.links} link(s) since ${esc(lv.since).replace('T', ' ')}`
+    + (lv.failed ? `, ${lv.failed} failed` : '')
+    + (lv.total ? `. At video ${lv.seen} of ${lv.total} — most are already done and`
+                + ` write nothing, which is why the likes can sit still while this moves` : '')
+    + (lv.at ? ` · last wrote ${esc(lv.at)}` : '');
+  // Nothing yet is worth saying plainly: a run that has liked nothing for ten
+  // minutes is the thing you want to notice, and a 0 says it where a blank
+  // does not.
+  const body = `<b style="color:${lv.likes ? '#5eead4' : '#71717a'}">${lv.likes}</b>`
+    + `<span style="color:#52525b"> on ${lv.links}</span>`
+    + (lv.failed ? `<span class="danger"> · ${lv.failed}✗</span>` : '')
+    // Where it has got to in its list. Most videos are already done and write
+    // nothing, so without this a working profile looks idle — or, if its one
+    // new row was a failure, looks like it is failing at everything.
+    + (lv.total ? `<span style="color:#52525b"> · ${lv.seen}/${lv.total}</span>` : '');
+  return `<span title="${title}">${running ? '● ' : ''}${body}</span>`;
+}
+
+// ── profiles ───────────────────────────────────────────────────────────────
+function renderProfiles() {
+  const rows = S.profiles.map(p => {
+    // A job is a profile ON A PLATFORM: the same letter can be working TikTok
+    // and Instagram at once, in two browsers, from two directories.
+    const job = S.jobs[jobKey(p.name)];
+    const st = job ? job.state : 'none';
+    const ovr = Object.keys(p.overrides || {}).length;
+    const open = OPEN === p.name;
+    return `<tr class="${p.enabled ? '' : 'off'}">
+      <td style="width:22px"><input type="checkbox" ${SEL.has(p.name) ? 'checked' : ''}
+           ${p.here ? '' : 'disabled title="No browser for this name on this platform yet — sign in first"'}
+           onchange="toggleSel('${p.name}', this.checked)"></td>
+      <td><b>${esc(p.name)}</b>
+        ${p.label ? `<span class="who"> · ${esc(p.label)}</span>` : ''}
+        ${p.enabled ? '' : '<span class="pill p-none">off</span>'}
+        ${ovr ? `<span class="pill" style="color:#5eead4;border-color:#134e4a" title="${ovr} setting(s) differ from the shared ones">${ovr} override${ovr>1?'s':''}</span>` : ''}
+      </td>
+      <td class="who">${!p.here
+        // The name is TikTok's; this site has no browser for it yet. Not an
+        // error and not "signed out": nothing has been set up, and signing in
+        // is what sets it up.
+        ? `<span style="color:#52525b"
+             title="This name comes from your TikTok profiles. ${esc(p.dir)} does not exist yet — press ⚙ then Sign in, and it is created with the account you sign in with.">`
+          + `not set up here</span>`
+        : p.known
+        ? `<span title="${p.said
+            ? 'Said by this profile&#39;s own run, from inside the browser that holds the session'
+            : 'From the last session scan. A scan taken while the profile was open in another browser cannot read its cookies, so an old name can survive here'}"
+           >@${esc(p.account)}${p.said ? '' : '<span style="color:#3f3f46"> ·</span>'}</span>`
+        : p.checked
+          ? `<span class="warn" title="A scan looked at this profile and found no session. Sign it in.">signed out</span>`
+          : `<span style="color:#52525b" title="No scan has ever looked at this profile — it was probably created after the last one. Press Re-check session.">not checked yet</span>`}</td>
+      <td class="who" style="text-align:right" title="liked / failed in its ledger">
+        ${p.ledger.ok.toLocaleString()}<span style="color:#52525b"> / ${p.ledger.failed}</span></td>
+      <td class="who" style="text-align:right">${liveCell(p, st)}</td>
+      <td style="width:96px"><span class="pill p-${st}"
+        title="${st === 'some-failed'
+          ? 'It printed its closing summary, so it worked its list to the end. Some individual likes failed — the ledger says which.'
+          : st === 'failed'
+            ? 'It stopped without printing its closing summary, so it died partway. Its log has the traceback.'
+            : ''}">${st === 'none' ? '—' : stateLabel(st)}</span></td>
+      <td style="width:84px">
+        <button class="small ghost" title="Configure this profile"
+          onclick="OPEN = OPEN === '${p.name}' ? null : '${p.name}'; renderProfiles()">${open ? '×' : '⚙'}</button>
+        ${job && job.state === 'running'
+          ? `<button class="small stop" onclick="stopOne('${jobKey(p.name)}')">stop</button>` : ''}</td>
+    </tr>` + (open ? profilePanel(p) : '');
+  });
+  const here = (S.platforms || []).find((p) => p.key === S.platform) || {};
+  $('ptable').innerHTML =
+    `<tr><th></th><th>profile</th><th>account</th><th style="text-align:right">ledger</th>`
+    + `<th style="text-align:right" title="What this profile has done since the run started">this run</th>`
+    + `<th>state</th><th></th></tr>`
+    + (rows.length ? rows.join('')
+        // A platform nobody has signed in to yet has no profiles at all, and an
+        // empty table reads as a broken page rather than as work to do.
+        : `<tr><td colspan="7" class="sub" style="padding:10px 4px">`
+          + `No ${esc(here.label || '')} profiles yet. These are separate browsers from the`
+          + ` other platforms' — a TikTok login does not sign you in here.<br>`
+          + `Press <b>+ New profile</b>, then <b>Sign in</b> on it.</td></tr>`);
+}
+
+// One Chrome profile, and everything you would want to do to it. A directory
+// called profile-j means nothing six weeks later, so the label is the first
+// field; the rest is what you actually open the browser for.
+function profilePanel(p) {
+  return `<tr><td></td><td colspan="6" style="padding-bottom:10px">
+    <div style="border:1px solid #134e4a;border-radius:9px;padding:9px;background:#0b1a18">
+      <div class="row" style="margin-bottom:7px">
+        <input id="lab_${p.name}" placeholder="What is this profile for?" value="${esc(p.label || '')}"
+               style="flex:1;min-width:150px">
+        <label class="row" style="gap:5px;white-space:nowrap"><input type="checkbox"
+          id="en_${p.name}" ${p.enabled ? 'checked' : ''}> switched on</label>
+        <button class="small" onclick="saveProfile('${p.name}')">Save</button>
+      </div>
+      <p class="sub" style="margin:0 0 7px">
+        ${p.email && p.email.email
+          ? `Registered with <b style="color:#d4d4d8">${esc(p.email.email)}</b>` +
+            (p.email.confirmed === 'yes'
+              ? ` <span class="pill p-done" title="The full address fits the masked one TikTok reports, so it is the right account">confirmed</span>`
+              : ` <span class="pill" style="color:#fbbf24;border-color:#78350f" title="Taken from the Google account chooser but NOT matched against TikTok's masked address — it may be another account signed in to the same browser">unconfirmed</span>`) +
+            (p.email.masked ? ` <span style="color:#52525b">· TikTok shows ${esc(p.email.masked)}</span>` : '')
+          : `<span style="color:#52525b">No registered address on file${p.email && p.email.note ? ' — ' + esc(p.email.note) : ''}.</span>`}
+      </p>
+      <div class="row" style="margin-bottom:7px">
+        <input id="url_${p.name}" placeholder="Open the browser at… (https://…, blank = the site's home page)"
+               value="${esc(p.start_url || '')}" style="flex:1;min-width:190px">
+        <button class="small" onclick="openAt('${p.name}')">Open browser</button>
+      </div>
+      <div class="row">
+        <button class="small" onclick="tool('login','${p.name}')">Sign in</button>
+        <button class="small" onclick="tool('verify','${p.name}')">Verify ledger</button>
+        <button class="small" onclick="tool('commented','${p.name}')"
+          title="The links this account commented on, with the words it wrote and what the last check found.">
+          Its commented links</button>
+        <button class="small" onclick="tool('comments','${p.name}')"
+          title="Open every video this profile commented on and check the comment is still there - read by a DIFFERENT signed-in account, since TikTok shows a restricted comment to its author and to nobody else. Nothing is written.">
+          Check its comments</button>
+        <button class="small" onclick="tool('captcha','${p.name}')">Solve captcha</button>
+        <button class="small ${p.known || p.checked ? '' : 'go'}"
+          onclick="tool('sessions','${p.name}')">Re-check session</button>
+        <button class="small" onclick="tool('emails','${p.name}')">Find its email</button>
+        <span style="flex:1"></span>
+        <button class="small" onclick="$('scope').value='${p.name}';renderFields();
+          document.getElementById('fields').scrollIntoView({block:'nearest'})">
+          Settings${Object.keys(p.overrides||{}).length ? ' (' + Object.keys(p.overrides).length + ')' : ''}</button>
+      </div>
+      <p class="sub" style="margin:7px 0 0">
+        Directory <b>${esc(p.dir)}</b>. Opening it while a run is using it is refused —
+        two browsers on one directory is how a profile gets corrupted.
+      </p>
+      ${!p.here && S.site !== 'tiktok' ? `<div class="row" style="margin-top:9px">
+        <button class="small go" onclick="cloneOne('${p.name}')">Copy from its TikTok profile</button>
+        <span class="sub">Brings the Google account across, so signing in here is a click
+          rather than a password.</span>
+      </div>` : ''}
+      ${p.here ? `<div class="row" style="margin-top:9px;border-top:1px solid #27272a;padding-top:8px">
+        <button class="small stop" onclick="deleteProfile('${p.name}')">Delete ${esc(p.dir)}</button>
+        <span class="sub">Signs this account out on this machine. There is no undo, and
+          the ledger is kept.</span>
+      </div>` : `<p class="sub" style="margin:7px 0 0">
+        <span class="warn">Not set up on this platform yet.</span> Press <b>Sign in</b>:
+        the browser opens empty, and the account you sign in with becomes this one.
+      </p>`}
+    </div></td></tr>`;
+}
+
+async function saveProfile(n) {
+  await api('/api/settings', { profiles: { [n]: {
+    label: $('lab_' + n).value,
+    enabled: $('en_' + n).checked,
+    start_url: $('url_' + n).value,
+  } } });
+  await poll();
+}
+
+async function openAt(n) {
+  const url = $('url_' + n).value.trim();
+  if (url && !/^https?:\/\//i.test(url)) return alert('A start URL has to begin with http:// or https://');
+  await saveProfile(n);
+  const r = await api('/api/tool', { tool: 'open', profile: n, url });
+  if (!r.ok) alert(r.note || 'Could not start.'); else { TAB = r.job; poll(); }
+}
+
+// DELETING A PROFILE IS DELETING AN ACCOUNT'S SESSION. There is no undo — a
+// Chrome user data directory is thousands of files and it is removed outright —
+// so the name has to be typed rather than a dialog dismissed. Whoever does this
+// needs the account's password to get back in.
+async function deleteProfile(n) {
+  const p = (S.profiles || []).find((x) => x.name === n) || {};
+  const who = p.account ? `, signed in as @${p.account}` : '';
+  const typed = prompt(
+    `Delete ${p.dir}${who}?\n\n`
+    + `This signs that account out on this machine and cannot be undone.\n`
+    + `Its ledger (${p.ledger ? p.ledger.ok.toLocaleString() : 0} likes) is kept, and its `
+    + `profiles on the other platforms are untouched.\n\n`
+    + `Type the profile name to confirm:`);
+  if (typed === null) return;
+  if (typed.trim() !== n) { alert('Not deleted — the name did not match.'); return; }
+  const r = await api('/api/profile', { name: n, site: S.site, delete: true });
+  alert(r.note || (r.ok ? 'Deleted.' : 'Could not delete it.'));
+  if (r.ok) { OPEN = null; SEL.delete(n); await poll(); }
+}
+
+// COPYING A PROFILE, not creating an empty one.
+//
+// The TikTok profiles were set up by signing in to Google — that is how the
+// accounts were made — so the Google session, the saved passwords and the
+// mailbox all live in profile-a. An empty profile-ig-a threw that away, and the
+// whole point was to reuse it. The copy carries it across; signing in to the
+// new site then happens on top of it.
+async function cloneOne(n) {
+  const r = await api('/api/profile', { name: n, site: S.site, clone: true });
+  alert(r.note || (r.ok ? 'Copied.' : 'Could not copy it.'));
+  if (r.ok) await poll();
+}
+
+async function cloneAll() {
+  const missing = (S.profiles || []).filter((p) => !p.here).map((p) => p.name);
+  if (!missing.length) { alert('Every profile already has a browser here.'); return; }
+  if (!confirm(`Copy ${missing.length} TikTok profile(s) into ${S.site} browsers?\n\n`
+    + `${missing.join(', ')}\n\n`
+    + `Each copy carries the Google account that is signed in there, so signing in `
+    + `to ${S.site} is a click rather than a password. Nothing already here is touched.`)) return;
+  const r = await api('/api/profile', { name: '', site: S.site, clone: true });
+  alert(r.note || (r.ok ? 'Copied.' : 'Could not copy.'));
+  await poll();
+}
+
+async function addProfile() {
+  const n = (prompt('Name for the new Chrome profile (letters, digits, . - _):') || '').trim();
+  if (!n) return;
+  // For THIS platform's site: "a" on Instagram is profile-ig-a, a different
+  // directory from TikTok's profile-a, and creating the wrong one leaves
+  // somebody signing in to a browser the run will never open.
+  const r = await api('/api/profile', { name: n, site: S.site });
+  alert(r.note || (r.ok ? 'Created.' : 'Could not create it.'));
+  if (r.ok) { OPEN = n; await poll(); }
+}
+
+function toggleSel(n, on) { on ? SEL.add(n) : SEL.delete(n); renderPreview(); renderModeNote(); }
+function pick(what) {
+  SEL = new Set(
+    what === 'all' ? S.profiles.map(p => p.name)
+    : what === 'known' ? S.profiles.filter(p => p.known).map(p => p.name)
+    : []);
+  renderProfiles(); renderPreview(); renderModeNote();
+}
+const mode = () => document.querySelector('input[name=mode]:checked').value;
+const jobKey = (name) => `${name}@${(S && S.platform) || 'tiktok'}`;
+
+// WHO IS TICKED WHEN THE PAGE OPENS.
+//
+// The profiles the last run on this platform used, which is almost always the
+// set somebody wants again — a run is a decision, and repeating it should not
+// mean re-ticking seventeen boxes. Only the ones that still exist and can
+// actually run here: a profile deleted since then, or one whose browser is on
+// another platform, is quietly dropped rather than ticked and refused.
+//
+// Nothing remembered yet (a first run, or a platform never used) falls back to
+// what this always did: every profile that is switched on and signed in.
+function openingSelection(st) {
+  const usable = new Map((st.profiles || [])
+    .filter(p => p.here !== false)
+    .map(p => [p.name, p]));
+  const remembered = (st.selected || []).filter(n => usable.has(n));
+  if (remembered.length) return new Set(remembered);
+  return new Set((st.profiles || [])
+    .filter(p => p.enabled && p.known && p.here !== false)
+    .map(p => p.name));
+}
+
+async function setPlatform(value) {
+  // Saved like any other shared setting, and then everything reloads: the
+  // profiles, the sessions, the ledgers and the jobs are all a different set.
+  // The endpoint replaces the whole shared block, so it is sent whole with one
+  // field changed — posting { platform } alone would reset every other setting
+  // to its default.
+  await api('/api/settings', { shared: { ...(S.shared || {}), platform: value } });
+  SEL = new Set();
+  OPEN = null;
+  TAB = null;
+  S = null;          // force the first-load path: the selection is per platform
+  await poll();
+}
+
+function renderPlatform() {
+  // Only where there is something to copy INTO. On TikTok it would be a button
+  // that copies a profile onto itself.
+  const cl = $('cloneAll');
+  if (cl) cl.style.display = (S.site && S.site !== 'tiktok') ? '' : 'none';
+  const sel = $('platform');
+  if (!sel || !S.platforms) return;
+  if (document.activeElement !== sel) {
+    sel.innerHTML = S.platforms
+      .map((p) => `<option value="${esc(p.key)}" ${p.key === S.platform ? 'selected' : ''}>${esc(p.label)}</option>`)
+      .join('');
+  }
+  const here = (S.platforms || []).find((p) => p.key === S.platform) || {};
+  // Which directory and which script, said out loud: it is the answer to "can
+  // I run these at the same time" (yes — different directories) and to "why
+  // does this platform have no collection mode" (different script).
+  $('platformNote').innerHTML =
+    `${esc(here.script || '')} · profiles in <code>${esc(S.site === 'tiktok' ? 'profile-x'
+      : S.site === 'instagram' ? 'profile-ig-x' : 'profile-yt-x')}</code>`
+    + ` — its own browser, so the same profile can work every platform at once`;
+}
+
+function renderModeNote() {
+  const n = SEL.size;
+  const sh = (S && S.shared) || {};
+  const hb = $('headedNow');
+  if (hb && document.activeElement !== hb) hb.checked = !!sh.headed;
+  if (mode() === 'collection' && S && S.platform !== 'tiktok') {
+    // run_parallel.py starts like.py children; the web liker has no equivalent.
+    // Said here rather than at the moment somebody presses Start.
+    $('modeNote').innerHTML =
+      `<span class="warn">${esc((S.platforms.find((p) => p.key === S.platform) || {}).label || '')}`
+      + ` has no collection mode.</span> Choose <b>independently</b> — the profiles do the`
+      + ` same work, they just do not divide the list between them.`;
+  } else if (mode() === 'collection') {
+    $('modeNote').innerHTML = n
+      ? `One run over one pool of links, ${sh.share === 'stack'
+          ? '<b>every profile visiting every link</b>' : '<b>each link going to one profile</b>'}.`
+        + ` Per-profile overrides are ignored here — there is one run, so there is one answer.`
+      : 'Select some profiles.';
+  } else {
+    $('modeNote').innerHTML = n
+      ? `${n} separate run(s), each with its own settings, each window tiled into its own corner of the screen.`
+        + ` <span class="warn">Any profile without its own links file pulls the same query, so they will work the same list.</span>`
+      : 'Select some profiles.';
+  }
+  // WHAT THIS RUN WILL DO, from the switches as they actually are.
+  //
+  // Three of them combine into four different jobs, and working out which one
+  // you have set means reading three checkboxes in two groups and knowing how
+  // they interact. That is how somebody ends up watching a run like nothing for
+  // an hour, or comment on links that already had a comment.
+  if (n) {
+    const job = !sh.comment_empty
+      ? `<b>Likes only.</b> Videos with none of our comments are passed over.`
+      : sh.no_like
+        ? `<b>Comments only.</b> Nothing is liked; a comment is posted on videos that`
+          + ` carry none of ours, and the rest are not even opened.`
+        : `<b>Every link is addressed:</b> comments of ours get liked, and a video with`
+          + ` none of ours gets one written on it.`;
+    $('modeNote').innerHTML += ` <span class="sub">${job}`
+      + (sh.comment_empty && sh.mimic_comments
+          ? ` Where the thread already recommends a rival, the comment is written to match it.`
+          : '')
+      + `</span>`;
+  }
+  if (n && !sh.headed) {
+    $('modeNote').innerHTML += sh.no_captcha_window
+      ? ` <span class="sub">Headless: no windows at all, and an account that meets a captcha`
+        + ` is given up on. Untick <b>No window for captchas</b> to be asked instead.</span>`
+      : ` <span class="sub">Headless, so no windows — except when a captcha needs solving:`
+        + ` that profile opens one, waits for you, then goes back to headless.</span>`;
+  } else if (n && sh.headed) {
+    $('modeNote').innerHTML +=
+      ` <span class="warn">${n} browser window(s) will open, one per profile.</span>`
+      + ` <span class="sub">Each is seven processes; untick <b>show the browsers</b> to run them`
+      + ` headless and get windows only for captchas.</span>`;
+  }
+}
+
+// Saved straight away rather than left in the form: it is a one-click decision
+// made next to the Start button, and a run that used the old value because
+// nobody pressed Save would be exactly the surprise this is here to remove.
+async function setHeaded(on) {
+  if (!S) return;
+  await api('/api/settings', { shared: { ...S.shared, headed: on } });
+  await poll();
+  if (currentScope() === '') renderFields();
+}
+
+// ── settings ───────────────────────────────────────────────────────────────
+function buildScope() {
+  $('scope').innerHTML = '<option value="">Shared (everything)</option>'
+    + S.profiles.map(p => `<option value="${esc(p.name)}">Only ${esc(p.name)}</option>`).join('');
+}
+
+function currentScope() { return $('scope').value; }
+
+function renderFields() {
+  const who = currentScope();
+  $('whose').textContent = who ? `— ${who}` : '— shared';
+  $('clearOvr').style.display = who ? '' : 'none';
+  const prof = who ? S.profiles.find(p => p.name === who) : null;
+  const ovr = prof ? (prof.overrides || {}) : {};
+  let html = '';
+  for (const g of S.groups) {
+    const fs = S.fields.filter(f => f.group === g.key && (!who || f.per_profile));
+    if (!fs.length) continue;
+    html += `<div class="grp"><h3>${esc(g.label)}</h3><div class="grid2">`;
+    for (const f of fs) {
+      const val = who ? (f.key in ovr ? ovr[f.key] : S.shared[f.key]) : S.shared[f.key];
+      const overridden = who && (f.key in ovr);
+      html += `<div class="fld ${f.group === 'danger' ? 'danger' : ''}">
+        <label for="f_${f.key}" title="${esc(f.help || '')}">${esc(f.label)}
+          ${f.help ? `<span class="hint">${esc(f.help)}</span>` : ''}</label>
+        ${control(f, val, overridden)}
+      </div>`;
+    }
+    html += `</div></div>`;
+  }
+  if (who) html += `<p class="sub" style="margin-top:10px">Only per-profile settings are shown.
+    How the work is shared out belongs to the run, not to one profile.</p>`;
+  $('fields').innerHTML = html;
+  FIELDSIG = fieldSig(S);
+  renderPreview();
+}
+
+function control(f, val, overridden) {
+  const cls = overridden ? 'ovr' : '';
+  const id = `f_${f.key}`;
+  if (f.kind === 'bool')
+    return `<input class="${cls}" id="${id}" type="checkbox" ${val ? 'checked' : ''} onchange="edited()">`;
+  if (f.kind === 'choice')
+    return `<select class="${cls}" id="${id}" onchange="edited()">`
+      + f.choices.map(c => `<option ${c === val ? 'selected' : ''}>${esc(c)}</option>`).join('')
+      + `</select>`;
+  return `<input class="${cls}" id="${id}" type="${f.kind === 'int' ? 'number' : 'text'}"
+            value="${esc(val ?? '')}" oninput="edited(true)">`;
+}
+
+// A SWITCH YOU TICKED IS A SWITCH THAT IS ON.
+//
+// It used to need Save. Ticking "Comment only, never like" and pressing Start
+// ran the SAVED settings — liking away, with the box on screen still ticked,
+// because the page went on showing a value that was not in force. There is a
+// confirm dialog about unsaved changes, and it is one press away from being the
+// thing you click through on the way to starting a run.
+//
+// So every change saves itself. Switches and dropdowns save at once; a text box
+// saves when you stop typing, because saving each keystroke would write the
+// file thirty times while somebody types a delay range.
+let saveTimer = null;
+
+function edited(slow) {
+  dirty = true;
+  $('saved').textContent = 'saving…';
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => { saveTimer = null; void saveSettings(); }, slow ? 700 : 0);
+}
+
+function readForm() {
+  const who = currentScope();
+  const out = {};
+  for (const f of S.fields) {
+    const el = $(`f_${f.key}`);
+    if (!el) continue;
+    out[f.key] = f.kind === 'bool' ? el.checked : el.value;
+  }
+  return { who, out };
+}
+
+async function saveSettings() {
+  const { who, out } = readForm();
+  const body = who
+    // For one profile: only what differs from the shared value is an override.
+    // Storing everything would freeze that profile at today's shared settings,
+    // so a later change to the shared ones would silently skip it.
+    ? { profiles: { [who]: { overrides: Object.fromEntries(
+        Object.entries(out).filter(([k, v]) => String(v) !== String(S.shared[k]))) } } }
+    : { shared: out };
+  await api('/api/settings', body);
+  dirty = false; $('saved').textContent = 'saved';
+  setTimeout(() => { if (!dirty) $('saved').textContent = ''; }, 1500);
+  await poll();
+  // NOT renderFields(): rebuilding the form under somebody's cursor after every
+  // keystroke-triggered save moves the caret to the end of the box. The values
+  // on screen are the ones just saved, so there is nothing to redraw.
+  renderPreview();
+}
+
+async function clearOverrides() {
+  const who = currentScope();
+  if (!who) return;
+  await api('/api/settings', { profiles: { [who]: { overrides: {} } } });
+  await poll(); renderFields();
+}
+
+// ── running ────────────────────────────────────────────────────────────────
+function togglePreview() { SHOWPRE = !SHOWPRE; $('preview').style.display = SHOWPRE ? '' : 'none'; renderPreview(); }
+
+async function renderPreview() {
+  renderModeNote();
+  if (!SHOWPRE || !S) return;
+  const p = await api('/api/preview', { profiles: [...SEL] });
+  $('preview').innerHTML = mode() === 'collection'
+    ? `<div class="cmd">${esc(p.collection)}</div>`
+    : (p.independent || []).map(x =>
+        `<div class="cmd" style="margin-bottom:5px"><b>${esc(x.profile)}</b>  ${esc(x.cmd)}</div>`).join('');
+}
+
+async function run() {
+  if (!SEL.size) return alert('Select at least one profile.');
+  // A change made a fraction of a second ago may still be on its way to disk,
+  // and the run reads the file. Flush it rather than start with the old value —
+  // which is exactly the bug the auto-save above exists to end.
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; await saveSettings(); }
+  else if (dirty) await saveSettings();
+  const r = await api('/api/run', { mode: mode(), profiles: [...SEL] });
+  if (!r.ok) alert(r.note || 'Could not start.');
+  else if (r.note) alert(r.note);
+  poll();
+}
+async function stopOne(n) { await api('/api/stop', { name: n }); poll(); }
+async function stopAll() {
+  if (!confirm('Stop every running job?')) return;
+  await api('/api/stop', {}); poll();
+}
+async function tool(t, forced) {
+  const p = forced !== undefined ? forced : [...SEL][0];
+  if (p === undefined && forced === undefined) return alert('Select a profile first.');
+  const r = await api('/api/tool', { tool: t, profile: p || '' });
+  if (!r.ok) alert(r.note || 'Could not start.');
+  else { TAB = r.job; poll(); }
+}
+
+// ── copying it out ─────────────────────────────────────────────────────────
+// navigator.clipboard is available here — 127.0.0.1 counts as a secure context
+// even over http — but it still fails when the page is not focused or the
+// permission is refused, and failing silently on a Copy button is worse than
+// not having one. So every path falls back to a hidden textarea, and every path
+// says what happened.
+async function copyText(text, btn, what) {
+  if (!text) { flash(btn, 'nothing to copy'); return; }
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e2) { ok = false; }
+    ta.remove();
+    if (!ok) { flash(btn, 'could not copy — select it and press Ctrl+C'); return; }
+  }
+  const lines = text.split('\n').length;
+  flash(btn, `copied ${what} · ${lines} line(s)`);
+}
+
+function flash(btn, note) {
+  $('copyNote').textContent = note;
+  const was = btn.textContent;
+  btn.textContent = 'Copied';
+  setTimeout(() => { btn.textContent = was; }, 1200);
+}
+
+// What is on screen, which is what somebody pointing at it means by "the
+// output" — including the command and log path underneath it.
+function copyShown(btn) {
+  if (!TAB) { flash(btn, 'no job selected'); return; }
+  copyText($('out').textContent, btn, `${TAB}`);
+}
+
+// Seventeen profiles is seventeen tabs, and a question about a run is usually a
+// question about all of them.
+function copyEveryJob(btn) {
+  const names = Object.keys(S && S.jobs || {});
+  if (!names.length) { flash(btn, 'no jobs yet'); return; }
+  const parts = names.map(n => {
+    const j = S.jobs[n];
+    return `===== ${n} (${j.state}${j.code === null ? '' : ', exit ' + j.code}) =====\n`
+      + `$ ${j.cmd}\nlog: ${j.log}\n\n`
+      + ((BUF[n] || []).join('\n') || '(no output)');
+  });
+  copyText(parts.join('\n\n'), btn, `${names.length} job(s)`);
+}
+
+// THE PANE IS A TAIL. The page keeps the last 600 lines and the server keeps
+// 400, so a run of any length has already lost its beginning by the time
+// anybody asks — and the beginning is where the command, the link count and the
+// first failure are. This reads the file the job is writing.
+async function copyWholeLog(btn) {
+  if (!TAB) { flash(btn, 'no job selected'); return; }
+  let text = '';
+  try {
+    const r = await fetch('/api/log?job=' + encodeURIComponent(TAB));
+    text = await r.text();
+    if (!r.ok) { flash(btn, text.slice(0, 80) || 'could not read the log'); return; }
+  } catch (e) {
+    flash(btn, 'could not read the log'); return;
+  }
+  copyText(text, btn, `${TAB}'s whole log`);
+}
+
+// ── output ─────────────────────────────────────────────────────────────────
+function renderJobs() {
+  const names = Object.keys(S.jobs || {});
+  if (!names.length) { $('jobtabs').innerHTML = '<span class="sub">no jobs yet</span>'; return; }
+  $('jobtabs').innerHTML = names.map(n => {
+    const j = S.jobs[n];
+    return `<button class="small ${n === TAB ? '' : 'ghost'}" onclick="TAB='${n}';renderJobs()">
+      ${esc(n)} <span class="pill p-${j.state}">${stateLabel(j.state)}</span></button>`;
+  }).join('');
+  const j = S.jobs[TAB];
+  const el = $('out');
+  const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+  el.textContent = (BUF[TAB] || []).join('\n') || '(no output yet)';
+  if (j) el.textContent += `\n\n$ ${j.cmd}\nlog: ${j.log}`;
+  if (stick) el.scrollTop = el.scrollHeight;
+}
+
+poll();
+setInterval(poll, 1500);
+// Only while a debounced save is still pending — a second at most. With
+// auto-save there is no draft to lose, and a page that asks 'are you sure'
+// every time it is closed trains somebody to dismiss it.
+window.addEventListener('beforeunload', e => {
+  if (saveTimer) { e.preventDefault(); e.returnValue = ''; }
+});
+</script>

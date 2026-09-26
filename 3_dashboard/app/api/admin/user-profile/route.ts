@@ -80,7 +80,9 @@ export async function PATCH(req: NextRequest) {
         { status: 409 }
       )
     }
-    await upsertUserProfile(userId, next)
+    // phone/telegram are not part of this editor: an admin fixes links here,
+    // and the upsert COALESCEs null so the person's contact details survive it.
+    await upsertUserProfile(userId, { ...next, phone: null, telegram: null })
     return NextResponse.json({ ok: true, profile: next })
   } catch (e) {
     if (e instanceof ProfileLinkConflictError) {

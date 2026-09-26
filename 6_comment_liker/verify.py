@@ -31,6 +31,10 @@ from playwright.sync_api import sync_playwright
 
 from like import UA, HERE, done_path
 
+import console
+
+console.fix()
+
 READ_JS = """
 async ([awemeId]) => {
   const url = `/api/comment/list/?aweme_id=${awemeId}&count=50&cursor=0&aid=1988`

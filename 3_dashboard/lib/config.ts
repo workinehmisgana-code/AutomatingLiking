@@ -370,20 +370,61 @@ export const FIRST_ON_EMPTY_PRODUCT: Product = 'purifytext'
 
 // How a product is WRITTEN inside a comment.
 //
-// Compound names are split into two words and every mention is wrapped in
-// double quotes, so the brand reads as a name a person typed rather than as one
-// keyword string. Nothing downstream breaks: every product matcher normalises
-// by stripping non-alphanumerics before comparing (see norm() in commentScan,
-// replyGen and linkCategory), so "\"purify text\"" still resolves to purifytext.
+// NOT AS A BRAND. A comment that announces a name — capitalised, in quotes, one
+// keyword string — reads as an advert to a person and as a brand mention to a
+// filter, which is the one thing these comments cannot afford to look like.
+// Measured: 21 comments posted from four accounts, every one of them naming a
+// product as one word, and not one of them was served to any other account that
+// went looking for it (see verify_comments.py in 6_comment_liker).
+//
+// So the name is split into the ordinary words it is made of and written
+// lowercase, as part of the sentence: "i just purify text mine before handing
+// it in". No quotes, no capital, no hashtag.
+//
+// NOTHING DOWNSTREAM BREAKS, and that is a constraint on the split rather than
+// a happy accident: every product matcher strips non-alphanumerics before
+// comparing (norm() in commentScan, replyGen and linkCategory) and then asks
+// whether the flattened product name is a SUBSTRING. "purify text" flattens to
+// purifytext, and so does "purify texting" — the suffix lands at the end, after
+// the whole name. A form that changed the stem, "purity texting", would read
+// just as well and would be invisible to every check we have, including the
+// admin's own "does this worker's comment exist" read. So the stem is never
+// touched; only the seam and the tail.
 const PRODUCT_WORDS: Record<string, string> = {
   purifytext: 'purify text',
   acoustictext: 'acoustic text',
   prohumanly: 'pro humanly',
+  humlexic: 'hum lexic',
+  kinprose: 'kin prose',
+  tintfolio: 'tint folio',
+  cohumanly: 'co humanly',
+}
+
+// The forms a comment may use, first one canonical.
+//
+// Only where the inflection is real English. "purify texted my essay" is a
+// sentence; "pro humanlyed" is not, so those products get the split form alone
+// and the model is not invited to invent one.
+const PRODUCT_FORMS: Record<string, readonly string[]> = {
+  purifytext: ['purify text', 'purify texts', 'purify texted', 'purify texting'],
+  acoustictext: ['acoustic text', 'acoustic texts', 'acoustic texting'],
+  tintfolio: ['tint folio', 'tint folios'],
 }
 
 /** The product name as it should appear in a comment, without the quotes. */
 export function productWords(product: string, split = true): string {
   return split ? PRODUCT_WORDS[product] ?? product : product
+}
+
+/**
+ * Every phrasing a comment is allowed to use for this product, canonical first.
+ *
+ * Handed to the model so it can pick the one that fits the sentence it is
+ * writing, which is the difference between a name dropped into a gap and a
+ * product somebody is talking about.
+ */
+export function productForms(product: string): readonly string[] {
+  return PRODUCT_FORMS[product] ?? [productWords(product)]
 }
 
 /**
@@ -403,7 +444,12 @@ export interface CommentStyle {
   emoji: boolean
   /** Write compound names as two words: purifytext -> purify text. */
   splitBrand: boolean
-  /** Wrap the name in double quotes. */
+  /**
+   * No longer honoured: a quoted name is a name being announced, which is what
+   * a comment must not do. Kept so stored settings and the API still parse.
+   *
+   * @deprecated
+   */
   quoteBrand: boolean
   /**
    * Which of three pitches the comment makes. Not three wordings — three
@@ -446,14 +492,21 @@ export function isCommentVoice(v: unknown): v is CommentVoice {
 export const DEFAULT_COMMENT_STYLE: CommentStyle = {
   emoji: true,
   splitBrand: true,
-  quoteBrand: true,
+  quoteBrand: false,
   voice: 'question',
 }
 
-/** The brand exactly as it should appear in a comment, under these settings. */
+/**
+ * The brand exactly as it should appear in a comment, under these settings.
+ *
+ * QUOTING IS GONE, whatever the stored style says. It was on by default, so
+ * every comment generated up to now announced its product in double quotes —
+ * the most brand-like way there is to write a name, and unlike the splitting
+ * it fooled nobody. The switch is left in the type and the table only because
+ * rows already hold it.
+ */
 export function productMention(product: string, style: CommentStyle = DEFAULT_COMMENT_STYLE): string {
-  const words = productWords(product, style.splitBrand)
-  return style.quoteBrand ? '"' + words + '"' : words
+  return productWords(product, style.splitBrand).toLowerCase()
 }
 
 export function isProduct(v: unknown): v is Product {
@@ -470,8 +523,27 @@ export const DEACTIVATED_PRODUCTS: readonly Product[] = []
 export const VIDEO_PAYMENT_BIRR = 150
 
 // Birr paid per comment a user makes. Total owed for comments =
-// (total comments since last reset) × COMMENT_PAY_RATE.
+// (total comments since last reset) x COMMENT_PAY_RATE.
 export const COMMENT_PAY_RATE = 0.5
+
+// ── Referrals ────────────────────────────────────────────────────────────────
+// Every user has a referral username. Somebody entering it when they register
+// is permanently attributed to them, and from then on 20% of that person's
+// COMMENT pay is paid to the referrer ON TOP -- it is never deducted from the
+// worker, who is paid exactly what they would have been paid anyway.
+//
+// ONE LEVEL ONLY. The referrer of a referrer earns nothing from the second
+// level: a chain pays a percentage of a percentage forever, and the first
+// person to notice builds a pyramid out of it.
+//
+// Comments are the only task that pays a commission. The video, repost and
+// email tasks are one-off amounts an admin approves by hand, and attaching a
+// silent 20% to a 150-birr approval is the kind of thing that is discovered
+// afterwards.
+export const REFERRAL_SHARE = 0.2
+
+/** Birr a referrer earns per comment made by somebody they referred. */
+export const REFERRAL_PAY_RATE = COMMENT_PAY_RATE * REFERRAL_SHARE
 
 // How often the click-to-copy comments are re-shuffled (order only) so users
 // see a different arrangement. Order is stable within the window and changes
@@ -571,6 +643,22 @@ export const ACCOUNT_TASK_DEFAULT_DOMAIN = process.env.ACCOUNT_TASK_DOMAIN ?? ''
  * costs the same effort and avoids both.
  */
 export const ACCOUNT_TASK_DEFAULT_PASSWORD = process.env.ACCOUNT_TASK_PASSWORD ?? ''
+
+/**
+ * The recovery address workers are told to put on the mailbox they create.
+ *
+ * Written into the source, unlike the password, because it is not a credential:
+ * it is where the provider sends a reset link, and the whole point is that it is
+ * OURS. A mailbox whose recovery address belongs to the worker is one we can be
+ * locked out of the day they change their mind, and the task exists to produce
+ * addresses the company controls.
+ *
+ * Overridable on the admin tasks page and by ACCOUNT_TASK_RECOVERY, so it can be
+ * changed without a deploy when the address does. Blank means "we do not ask for
+ * one", and the page then says nothing about it rather than showing an empty box.
+ */
+export const ACCOUNT_TASK_DEFAULT_RECOVERY =
+  process.env.ACCOUNT_TASK_RECOVERY ?? 'workinehmisgana@gmail.com'
 
 /**
  * Is this an address on the company's domain?

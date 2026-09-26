@@ -175,5 +175,43 @@ if "--live" in sys.argv:
     print(f"   {len(with_id)} of {len(rows)} carry a native comment id "
           f"(the rest fall back to a hash)")
 
+print("\nthe Instagram collector must never reach the POST'S OWN like")
+# Measured signed out on a real post: the post's Like button was the ONLY
+# control found, and it was presented as a comment by the post's author whose
+# text was the caption. Liking it would have liked the POST, publicly, on
+# somebody else's content.
+for name in ("IG_COLLECT", "IG_LIKE", "IG_STATE"):
+    js = getattr(lw, name)
+    check(f"  {name} uses the shared control list", "igCommentControls()" in js, True)
+    check(f"  {name} excludes the post action bar", "inPostBar" in js, True)
+# The three index into that list by POSITION. Built differently, index 3 would
+# be a different control in each — and the one that CLICKS would be clicking
+# something the one that READ never saw.
+bodies = [
+    getattr(lw, n).split("const igCommentControls")[1].split("};")[0]
+    for n in ("IG_COLLECT", "IG_LIKE", "IG_STATE")
+]
+check("  and all three build it identically", len(set(bodies)), 1)
+
+print("\na probe needs no session, because it clicks nothing")
+src = Path("like_web.py").read_text(encoding="utf-8")
+check("  a missing profile still probes", "probing signed OUT" in src, True)
+check("  a login wall does not stop it", "Probing anyway." in src, True)
+check("  but a real run still stops", 'f"{site}: not signed in"' in src, True)
+check("  and it never claims to be signed in when it is not",
+      'f"signed in as {who}" if live else' in src, True)
+
+print("\nand a site that will not answer is not a session that died")
+# A 4xx/5xx to the sign-in probe is the site throttling this machine, which
+# running many browsers at once causes. "Not signed in to tiktok" sends
+# somebody to re-authenticate an account that was never signed out; see
+# check_throttled.py for the run this came from.
+check("  the two are told apart", "refused = is_refusal(who)" in src, True)
+check("  the message blames the machine", "throttling this machine" in src, True)
+check("  and says what to do instead",
+      "browsers at once, wait a while, and try again." in src, True)
+check("  the toast says it too", "check got no answer" in src, True)
+check("  rather than telling anyone to log in", "Throttled — wait and retry" in src, True)
+
 print(f"\n{'all correct' if fails == 0 else str(fails) + ' FAILED'}")
 sys.exit(0 if fails == 0 else 1)

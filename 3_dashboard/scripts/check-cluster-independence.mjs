@@ -176,7 +176,12 @@ const feed = read('lib/userFeed.ts')
 check('  web feed groups first', /const byPlatform = new Map<string, T\[\]>\(\)/.test(feed), true)
 check('  and chunks inside one platform', /function forPlatform<T extends FeedVideo>/.test(feed), true)
 const appRoute = read('app/api/app/links/route.ts')
-check('  app feed filters to one platform', /const pool = available\.filter\(\(v\) => String\(v\.platform \?\? ''\) === p\)/.test(appRoute), true)
+// Written inline now that every platform goes through the same mix; the
+// guarantee is unchanged - one platform's links are clustered alone.
+check('  app feed filters to one platform',
+      /available\.filter\(\(v\) => String\(v\.platform \?\? ''\) === p\)/.test(appRoute), true)
+check('  and every platform goes through the same mix',
+      /const forPlatform = \(p: string\) =>\s*\n?\s*mixed\(/.test(appRoute), true)
 const dash = read('components/Dashboard.tsx')
 check('  the web page clusters its own platform', /const base = videos\.filter\(\(v\) => v\.platform === platform\)/.test(dash), true)
 check('  and reads the stamped cluster per platform', /if \(v\.platform !== platform\) continue/.test(dash), true)

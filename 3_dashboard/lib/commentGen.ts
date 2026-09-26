@@ -81,9 +81,15 @@ function escapeRe(s: string): string {
 /**
  * Rewrite however the model spelled the product into the one canonical form.
  *
- * Accepts purifytext / purify text / purify-text / \"Purify Text\" and returns the
- * comment with exactly \"purify text\" in its place. Returns null when the product is
- * not mentioned at all, which is still a rejection.
+ * Accepts purifytext / purify text / purify-text / \"Purify Text\" / #PurifyText
+ * and returns the comment with exactly \"purify text\" in its place, lowercase and
+ * unquoted. Returns null when the product is not mentioned at all, which is still
+ * a rejection.
+ *
+ * AN INFLECTION SURVIVES, because only the name itself is replaced: \"purifytexted\"
+ * matches on its first ten letters and comes back \"purify texted\", \"PurifyTexting\"
+ * comes back \"purify texting\". That is the trick — the sentence keeps the grammar
+ * the model wrote and the name stops looking like one.
  */
 function canonicaliseMention(s: string, product: Product, style: CommentStyle): string | null {
   // Matched on the SPLIT form so either spelling is recognised, emitted in
@@ -92,9 +98,13 @@ function canonicaliseMention(s: string, product: Product, style: CommentStyle): 
   const re = new RegExp(match.split(' ').map(escapeRe).join('[\\s._-]*'), 'i')
   const m = re.exec(s)
   if (!m) return null
-  // Existing quotes are stripped either way: with quoting off they must go, and
-  // with it on they would otherwise be doubled.
-  const before = s.slice(0, m.index).replace(/["'\u201C\u2018]$/, '')
+  // WHATEVER MADE IT LOOK LIKE A NAME COMES OFF: the quotes a model puts around
+  // it, and the hash in front of it. Both announce a brand, which is the one
+  // thing these comments cannot read as.
+  const before = s
+    .slice(0, m.index)
+    .replace(/["'\u201C\u2018]$/, '')
+    .replace(/#$/, '')
   const after = s.slice(m.index + m[0].length).replace(/^["'\u201D\u2019]/, '')
   return before + productMention(product, style) + after
 }
@@ -265,7 +275,11 @@ function isQuestion(s: string): boolean {
   return /\?\s*$/.test(stripEmoji(s).trim())
 }
 
-function sanitize(
+// Exported for the mimic path, which needs exactly this: a model's line is not
+// a comment until it has been through the mention rule, the word band, the
+// jargon filter and the cliche filter. A second implementation of those rules
+// is how two comment paths end up with two different ideas of what is postable.
+export function sanitize(
   product: Product,
   lines: unknown,
   band: WordBand,
@@ -283,9 +297,10 @@ function sanitize(
     if (typeof raw !== 'string') continue
     let s = raw.trim().replace(/^["'\s]+|["'\s]+$/g, '')
     if (!s) continue
-    // MUST mention the product; the mention is normalised to \"purify text\" here
-    // rather than trusted to the model, so every stored comment is identical
-    // in that one respect.
+    // MUST mention the product; the name is normalised here rather than trusted
+    // to the model, so nothing goes out announcing a brand however the model
+    // chose to write it — split, lowercase, unquoted, un-hashed, with whatever
+    // inflection the sentence needs left alone.
     const named = canonicaliseMention(s, product, style)
     if (named === null) continue
     s = named
@@ -363,7 +378,9 @@ function sanitize(
   return out
 }
 
-async function settingsFor(product: Product): Promise<{ band: WordBand; style: CommentStyle }> {
+export async function settingsFor(
+  product: Product
+): Promise<{ band: WordBand; style: CommentStyle }> {
   const dflt = { min: COMMENT_WORD_MIN, max: COMMENT_WORD_MAX }
   return getProductCommentSettings(product, dflt).catch(() => ({
     band: dflt,
@@ -513,10 +530,10 @@ async function callGroqForAudience(
   band: WordBand,
   style: CommentStyle
 ): Promise<string[]> {
-  // The BARE form the model is asked for. Any quoting is applied by
-  // canonicaliseMention() after the JSON is parsed: asking the model to emit
-  // quotes inside a JSON string is a needless escaping hazard, and
-  // json_validate_failed is how that shows up.
+  // The form the model is asked for. canonicaliseMention() normalises whatever
+  // comes back anyway — including stripping quotes the model adds by itself,
+  // which inside a JSON string is also an escaping hazard, and
+  // json_validate_failed is how that used to show up.
   const mention = productWords(product, style.splitBrand)
   const targets = targetLengths(base.length, band)
   const system = buildAudiencePrompt(product, category, band, style)

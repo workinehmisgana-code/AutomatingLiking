@@ -65,9 +65,15 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 
 from playwright.sync_api import sync_playwright
 
+import busy
 import captcha
 import notify
 import relogin
+from login import is_refusal, profile_dir
+
+import console
+
+console.fix()
 
 HERE = Path(__file__).resolve().parent
 
@@ -83,6 +89,15 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 # Chromium flags that matter when several of these share one machine.
+#
+# The first group keeps a backgrounded window working; the second is about
+# MEMORY, which is the binding constraint once more than a handful of accounts
+# run at once — a Chromium is seven processes, and nine accounts is sixty-three.
+#
+# Nothing here changes what the page can do: the comment panel is text and DOM,
+# and media, images and fonts are already blocked at the network layer (see
+# BLOCKED_RESOURCES). These switch off machinery that only exists to make a
+# browser pleasant to sit in front of.
 LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--mute-audio",
@@ -90,6 +105,28 @@ LAUNCH_ARGS = [
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
+    # One page at a time is all a worker ever has, so the extra renderers
+    # Chromium keeps warm for other sites are pure cost.
+    "--renderer-process-limit=1",
+    # Nothing is ever rendered to a screen we look at, and the GPU process is a
+    # process like any other.
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+    # Extensions, sync, field trials, crash upload, the component updater: all
+    # of it is a browser being a product. None of it likes a comment.
+    "--disable-extensions",
+    "--disable-sync",
+    "--disable-component-update",
+    "--disable-background-networking",
+    "--no-default-browser-check",
+    "--no-first-run",
+    "--metrics-recording-only",
+    "--disable-breakpad",
+    # Chromium keeps caches proportional to what it thinks it has. Told it is
+    # small, it keeps less; the pages here are visited once each, so a cache
+    # buys nothing anyway.
+    "--disk-cache-size=1",
+    "--media-cache-size=1",
 ]
 
 # Resource types we never need. The comment panel is text and DOM.
@@ -123,6 +160,24 @@ def _is_video_bytes(url: str) -> bool:
     return any(bit in url for bit in VIDEO_URL_BITS)
 
 
+def raise_window(ctx, profile: str) -> None:
+    """Bring a just-opened browser window to the front.
+
+    Matched by TITLE, because that is all EnumWindows can see, and the title is
+    made unique first — several accounts on about:blank otherwise share one and
+    the wrong window comes forward. It is replaced by the page's own title on
+    the first navigation, a second later, which is fine: this is only needed
+    now.
+
+    A courtesy, not the job: every failure here is swallowed.
+    """
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        notify.show_window(page, f"liker {profile}")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def launch_liker(
     p,
     profile: str,
@@ -142,15 +197,19 @@ def launch_liker(
     pdir = HERE / ("profile" if profile == "default" else f"profile-{profile}")
     args = list(LAUNCH_ARGS)
     if headed:
-        # Tile the windows across the screen so every account is visible at once.
-        # Stacked on top of each other they are useless for seeing what a
-        # particular account is doing, which is the only reason to run headed.
-        cols = min(max(1, slots), 3)
-        rows = max(1, -(-slots // cols))  # ceil
-        w = max(560, 1900 // cols)
-        h = max(520, 1020 // rows)
-        x = (slot % cols) * w
-        y = (slot // cols) * h
+        # FULL SIZE, ON THE MAIN SCREEN, EVERY TIME.
+        #
+        # These used to be tiled: the screen divided into `slots` boxes, one per
+        # account. With seventeen accounts that is three columns and six rows of
+        # a screen that has one, so most windows were positioned hundreds of
+        # pixels below the bottom edge — off-screen, un-clickable, and looking
+        # for all the world like the browser never opened. A window that opens
+        # where a captcha can actually be solved is worth more than a mosaic.
+        #
+        # The size comes from the main monitor's WORK area, so the bottom of the
+        # page is not under the taskbar — on TikTok that bottom strip is the
+        # comment box.
+        x, y, w, h = notify.primary_screen()
         args += [f"--window-size={w},{h}", f"--window-position={x},{y}"]
     ctx = p.chromium.launch_persistent_context(
         user_data_dir=str(pdir),
@@ -164,6 +223,12 @@ def launch_liker(
         viewport=None if headed else {"width": 1280, "height": 900},
         args=args,
     )
+    if headed:
+        # Opening it is not the same as being able to find it. Chrome does not
+        # reliably take the foreground when it is started by a script, so the
+        # window can be full-size on the right monitor and still be behind
+        # everything else.
+        raise_window(ctx, profile)
     if block_media:
         def _filter(route):
             # Wrapped: an exception in a route handler leaves that request
@@ -175,10 +240,16 @@ def launch_liker(
                     route.abort()
                 else:
                     route.continue_()
-            except Exception:  # noqa: BLE001
+            except BaseException:  # noqa: BLE001
+                # BaseException, not Exception: when the page is torn down under
+                # a handler that is mid-continue_(), Playwright raises
+                # asyncio.CancelledError, and CancelledError has not inherited
+                # from Exception since 3.8. Catching Exception here let it out
+                # of the handler, where it surfaced as a stray traceback from a
+                # thread nobody owns.
                 try:
                     route.continue_()
-                except Exception:  # noqa: BLE001
+                except BaseException:  # noqa: BLE001
                     pass
 
         ctx.route("**/*", _filter)
@@ -227,17 +298,223 @@ def safe_eval(page, js, arg=None, tries=3):
     one machine it happens often enough to kill a run: "Execution context was
     destroyed" is not a bug in the script, it is the page moving while we were
     reading it. Retry rather than crash.
+
+    And when the retries run out on a navigation, return None rather than
+    raising. Every caller already reads the result as `or {}` / `or []`, so a
+    None costs ONE video, recorded as a failure. Raising cost the whole shard:
+    nothing between here and sys.exit(main()) catches it, so the worker died
+    and left its remaining links untouched.
     """
     for attempt in range(tries):
         try:
             return page.evaluate(js, arg) if arg is not None else page.evaluate(js)
         except Exception as e:  # noqa: BLE001
             transient = "Execution context was destroyed" in str(e) or "navigating" in str(e)
-            if transient and attempt + 1 < tries:
-                page.wait_for_timeout(1500)
-                continue
+            if transient:
+                if attempt + 1 < tries:
+                    try:
+                        page.wait_for_timeout(1500)
+                    except Exception:  # noqa: BLE001 - page gone; nothing to retry on
+                        return None
+                    continue
+                return None
             raise
     return None
+
+
+# Consecutive videos that would not render. Not a count of failures — a count
+# of failures IN A ROW, because one is a bad link and six is a machine that
+# cannot keep up.
+_render_streak = 0
+_render_diagnosed = False
+
+
+def render_failed(window_count: int) -> None:
+    """Report a video that never rendered, and after a few, say why.
+
+    "page did not render, skipping" is true and useless. The message is almost
+    always the same story: open_video waits 30s for the comment icon, and with
+    enough browsers on one machine the page genuinely has not painted yet.
+    Measured on a real 17-account run: the accounts that started LAST hit it
+    within ten lines of output, the ones that started first got through thirty,
+    and throughput fell from 0.32 to 0.02 videos a second — a sixteenfold
+    slowdown, on a machine doing the same work.
+
+    So the count is the diagnosis, and it is printed once per run rather than
+    per video: the run is already drowning in output when this happens.
+    """
+    global _render_streak, _render_diagnosed
+    _render_streak += 1
+    print("     page did not render, skipping")
+    if _render_streak < 3 or _render_diagnosed:
+        return
+    _render_diagnosed = True
+    print(
+        f"\n  {_render_streak} videos in a row would not finish loading.\n"
+        "  This is nearly always the machine rather than the links: a page is given\n"
+        "  30 seconds to show its comment icon, and enough browsers at once means it\n"
+        "  genuinely has not painted yet."
+        + (f"\n  This run has {window_count} accounts going at the same time."
+           if window_count > 1 else "")
+        + "\n  Fewer at once finishes the same list faster:\n"
+          "    run_parallel.py --at-once 4 ...    (or 'Browsers at once' on the dashboard)\n"
+    )
+
+
+# Hearts pressed whose like TikTok did not keep. Not a count of failures — a
+# count of CLICKS THAT WORKED and changed nothing on the server.
+_clicked_nothing = 0
+_ever_landed = False
+_discard_said = False
+
+
+def clicked_but_not_kept(profile: str, account: str) -> bool:
+    """Report a like that was pressed and not kept, and say what it means.
+
+    THE CLICK IS NOT THE LIKE. The heart fills in immediately — that is the page
+    being optimistic, not the server agreeing — and every like here is confirmed
+    by reading user_digged back from TikTok afterwards. When the click reports
+    success and the read-back says nothing happened, the like was discarded.
+
+    Measured on profiles k, m and p, on the same video and the same comment as
+    three healthy accounts:
+
+        k  user3995128760667   product comments 1   liked by it 0
+        m  user7251079252826                    1               0
+        p  Hailu8692                            1               0
+        n  user739216320986                     1               1
+        q  Abel9749                             1               1
+        a  Misgana a                            1               1
+
+    k had just pressed that heart and watched it fill. A full page reload, and a
+    read past any cache, both still said user_digged=false. Those three accounts
+    have never landed a single like in their entire ledger.
+
+    Nothing in this tool can fix that: it is the account, not the click, and a
+    run that keeps going is spending an hour to write failures. Said once, with
+    the account name, because that is what somebody has to go and look at.
+
+    Returns True when the run should stop this profile. IT SHOULD. --keep-going
+    means "a bad video is not a reason to stop", which is about videos; an
+    account whose every like is discarded is not a run having a bad patch.
+    Measured on the run this came from: k, m and p wrote 384, 379 and 391
+    failure rows and landed nothing, while taking a third of a machine the five
+    working accounts were starving on — their render failures are partly the
+    price of these three.
+    """
+    global _clicked_nothing, _discard_said
+    _clicked_nothing += 1
+    if _ever_landed or _clicked_nothing < 8:
+        return False
+    if _discard_said:
+        return True
+    _discard_said = True
+    print(
+        f"\n  {_clicked_nothing} hearts pressed on profile '{profile}'"
+        f"{f' (@{account})' if account else ''} and not one like was kept.\n"
+        "  The heart fills in on screen — that is the page being optimistic — but\n"
+        "  TikTok reports the comment as un-liked afterwards, even after a reload.\n"
+        "  This account's likes are being discarded. Nothing here can change that:\n"
+        "  open it by hand, like something, reload, and see for yourself:\n"
+        f"    python open_profile.py --profile {profile}\n"
+        "  Stopping this profile: there is nothing here to keep going for, and the\n"
+        "  browser it is using is one the working accounts need.\n"
+    )
+    return True
+
+
+def like_landed() -> None:
+    """A like TikTok kept. Whatever the last few did, the account works."""
+    global _clicked_nothing, _ever_landed
+    _clicked_nothing = 0
+    _ever_landed = True
+
+
+def render_ok() -> None:
+    """A video that did render. Breaks the streak."""
+    global _render_streak
+    _render_streak = 0
+
+
+# --debug. Off by default: a stamp and a page dump on two thousand videos is
+# noise, and the ordinary log is meant to be readable.
+DEBUG = False
+
+
+def dbg(msg: str) -> None:
+    """A line that only exists when somebody is debugging."""
+    if DEBUG:
+        print(f"       · {msg}")
+
+
+# What a page looks like when it will not do what it is told.
+#
+# "page did not render, skipping" names the symptom and nothing else, and by the
+# time anybody reads it the browser is gone. This asks the page the questions
+# somebody would ask by hand — where did it end up, what is on it, is it signed
+# in, is there a puzzle over it — in one evaluate, so it costs one round trip
+# even when a machine is struggling.
+PAGE_STATE_JS = """() => {
+    const has = (s) => Boolean(document.querySelector(s))
+    const btns = Array.from(document.querySelectorAll('button, a'))
+    return {
+        url: location.href,
+        title: (document.title || '').slice(0, 70),
+        ready: document.readyState,
+        nodes: document.getElementsByTagName('*').length,
+        icon: has('[data-e2e="comment-icon"]'),
+        video: has('video'),
+        rows: document.querySelectorAll('[data-e2e="comment-level-1"]').length,
+        panel: has('[data-e2e="comment-list"], [data-e2e="search-comment-container"]'),
+        login: btns.some((b) => {
+            const t = (b.textContent || '').trim().toLowerCase()
+            return t === 'log in' || t === 'login' || t === 'sign up'
+        }),
+        me: has('[data-e2e="profile-icon"], [data-e2e="nav-profile"], [data-e2e="inbox-icon"]'),
+        // TikTok's own words for it, when it has any.
+        notice: (document.body ? (document.body.innerText || '') : '')
+            .split('\\n').map((x) => x.trim())
+            .filter((x) => /not available|removed|violat|try again|too many|unavailable|error/i.test(x))
+            .slice(0, 2),
+    }
+}"""
+
+
+def page_state(page) -> dict:
+    """Everything worth knowing about the page right now, or why not."""
+    try:
+        return safe_eval(page, PAGE_STATE_JS) or {"error": "no answer"}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e).splitlines()[0][:80]}
+
+
+def why_stuck(page, waited: float = 0.0) -> str:
+    """One line naming what is actually wrong, for the log AND for the ledger.
+
+    Goes into the ledger note as well as the terminal, because a failure is
+    usually read the next morning out of done-x.csv, long after the browser it
+    happened in was closed.
+    """
+    st = page_state(page)
+    if st.get("error"):
+        return f"the page could not be asked: {st['error']}"
+    bits = [
+        f"url={str(st.get('url', ''))[-46:]}",
+        f"ready={st.get('ready')}",
+        f"nodes={st.get('nodes')}",
+        f"icon={'yes' if st.get('icon') else 'NO'}",
+        f"video={'yes' if st.get('video') else 'no'}",
+        f"rows={st.get('rows')}",
+    ]
+    if st.get("login") and not st.get("me"):
+        bits.append("LOGGED OUT")
+    if captcha_present(page):
+        bits.append("CAPTCHA on screen")
+    for n in (st.get("notice") or []):
+        bits.append(f'page says "{n[:60]}"')
+    if waited:
+        bits.append(f"waited={waited:.1f}s")
+    return ", ".join(bits)
 
 
 def open_video(page, url: str, timeout_ms: int = 30000) -> bool:
@@ -249,18 +526,24 @@ def open_video(page, url: str, timeout_ms: int = 30000) -> bool:
     page" for what was only slowness. One reload before giving up, because a
     first load that stalls often succeeds second time.
     """
+    started = time.time()
     for attempt in range(2):
         try:
             page.goto(url, wait_until="domcontentloaded")
-        except Exception:  # noqa: BLE001 - a timeout here is still worth waiting out
-            pass
+            dbg(f"document in {time.time() - started:.1f}s (try {attempt + 1})")
+        except Exception as e:  # noqa: BLE001 - a timeout here is still worth waiting out
+            dbg(f"goto raised after {time.time() - started:.1f}s: "
+                f"{str(e).splitlines()[0][:80]}")
         try:
             page.wait_for_selector('[data-e2e="comment-icon"]', timeout=timeout_ms)
             # A breath after it appears: the icon renders slightly before its
             # click handler is attached.
             page.wait_for_timeout(400)
+            dbg(f"rendered in {time.time() - started:.1f}s")
             return True
         except Exception:  # noqa: BLE001
+            dbg(f"no comment icon after {time.time() - started:.1f}s"
+                + (" — reloading once" if attempt == 0 else ""))
             if attempt == 0:
                 page.wait_for_timeout(2000)
     return False
@@ -296,6 +579,144 @@ def captcha_present(page) -> bool:
         )
     except Exception:  # noqa: BLE001
         return False
+
+
+# Window swaps that opened onto no puzzle at all. Two of those and the run stops
+# opening windows: see show_for_captcha.
+_fruitless_swaps = 0
+_window_pointless = False
+# Puzzles that simply went away on a reload, no window involved.
+_captchas_faded = 0
+
+
+def captcha_faded(page, url: str, wait_s: int = 8) -> bool:
+    """Wait a moment, load the video again, and see if the puzzle is still there.
+
+    TikTok's slider is triggered by RATE, not by the account: it shows up when a
+    machine asks for too much too quickly, and it stops being asked for when the
+    asking stops. Measured on one browser doing exactly what a run does — load a
+    video, open the comments — across eight videos on a profile that had been
+    challenged repeatedly during a seventeen-account run: not one puzzle.
+
+    Which is why this is tried FIRST. Eight seconds of doing nothing, then a
+    reload, against thirty seconds of closing a browser and starting another one.
+    """
+    global _captchas_faded
+    try:
+        page.wait_for_timeout(wait_s * 1000)
+        if not open_video(page, url):
+            return False
+        # The comments are what summons it, so ask for them before believing it
+        # is gone (see show_for_captcha).
+        if not captcha_present(page):
+            open_comments(page)
+            page.wait_for_timeout(1000)
+        if not captcha_present(page):
+            _captchas_faded += 1
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def show_for_captcha(pw, ctx, page, args, url: str, tried_api: bool):
+    """Clear a captcha a headless run cannot drag a slider for.
+
+    Two ways, cheapest first.
+
+    WAIT IT OUT. The puzzle is rate-triggered, and a browser that pauses for
+    eight seconds and reloads is usually not asked again. Costs eight seconds
+    and no browser.
+
+    OPEN A WINDOW. A HEADLESS BROWSER CANNOT BE MADE HEADED: Playwright decides
+    at launch, and headless is a different binary (headless_shell.exe, not
+    chrome.exe). So the browser is closed and the same profile is opened again
+    with a window — the session lives in the profile directory, not in the
+    process, so it is the same account either way. That also means the directory
+    has to be released first: two Chromiums cannot share one. About thirty
+    seconds, against a headless run that otherwise gives up on the account.
+
+    WHAT THIS GOT WRONG, and it showed as one line printed on video after video
+    — "the captcha was gone by the time the window opened":
+
+      * It went straight to the window. By the time one was up, thirty seconds
+        of not asking TikTok for anything had already cleared the puzzle, so the
+        window had nothing in it and the same thing happened on the next video.
+      * It checked the wrong moment. The puzzle is gated on the ACTION: it
+        appears when the comments are opened. A fresh window sitting on a
+        freshly loaded video is not being asked anything yet, so "no captcha
+        here" was never evidence of anything. The window now opens the comments.
+
+    Returns (ctx, page, solved) — the caller must rebind both, because neither
+    survives.
+    """
+    global _fruitless_swaps, _window_pointless
+    # Cheapest first, and on the evidence usually enough.
+    if captcha_faded(page, url):
+        print("     the puzzle cleared on its own after a pause")
+        return ctx, page, True
+    if _window_pointless:
+        # Two windows have already opened onto nothing. A third costs thirty
+        # seconds to learn the same thing.
+        return ctx, page, False
+
+    print("     captcha — opening a window so it can be solved")
+    try:
+        ctx.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+    solved = False
+    found = False
+    # Did a window actually open? A swap that failed to launch proves nothing
+    # about what a window would have been shown.
+    window_ok = False
+    try:
+        ctx = launch_liker(pw, args.profile, block_media=not args.with_media,
+                           headed=True, slot=args.window_slot, slots=args.window_count)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        window_ok = True
+        if open_video(page, url):
+            if not captcha_present(page):
+                # Do the thing that summoned it.
+                open_comments(page)
+                page.wait_for_timeout(1000)
+            if captcha_present(page):
+                found = True
+                solved = wait_out_captcha(page, args.profile, True, tried_api=tried_api)
+            else:
+                print("     no puzzle in the window, even with the comments open")
+                solved = True
+        else:
+            print("     the window opened but the video would not load")
+    except Exception as e:  # noqa: BLE001
+        print(f"     could not open a window: {str(e).splitlines()[0][:110]}")
+
+    if window_ok and not found:
+        _fruitless_swaps += 1
+        if _fruitless_swaps >= 2:
+            _window_pointless = True
+            print(
+                "  Twice now a window has opened onto no puzzle. These are clearing\n"
+                "  themselves while the browser restarts, so this run will stop opening\n"
+                "  windows and just pause instead — it is the same result, thirty seconds\n"
+                "  cheaper. They are triggered by how fast this machine is asking, so\n"
+                "  fewer accounts at once (--at-once) is what stops them."
+            )
+
+    # Back to headless. Staying headed would quietly double the memory of a run
+    # somebody chose headless for, for the rest of its life.
+    try:
+        ctx.close()
+    except Exception:  # noqa: BLE001
+        pass
+    ctx = launch_liker(pw, args.profile, block_media=not args.with_media,
+                       headed=False, slot=args.window_slot, slots=args.window_count)
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    if solved:
+        open_video(page, url)
+        print("     back to headless, carrying on")
+    return ctx, page, solved
 
 
 def wait_out_captcha(page, profile: str, headed: bool, timeout_s: int = 240,
@@ -407,6 +828,125 @@ def page_is_logged_out(page) -> bool:
         return False
 
 
+# ── A logged-out page that is not a logged-out session ───────────────────────
+#
+# TikTok sometimes serves a logged-out shell part-way through a run: the page
+# renders a Log in button, the side panel pins itself to "You may like", and no
+# comment is ever shown. The cookies on disk are fine. A HARD REFRESH brings the
+# session straight back.
+#
+# That matters because the old response was to run the whole Google re-login
+# flow — minutes of navigation, a real risk of tripping a captcha, and on a
+# profile that simply needed reloading. Reload first; re-login is the fallback,
+# not the reflex.
+
+# How many hard refreshes before a logged-out page is believed.
+SESSION_RELOAD_TRIES = 3
+
+# Recoveries this run, for the closing summary: a profile that needs reloading
+# on every other video is not healthy, and one line at the end says so where a
+# scroll-back through the log would not.
+_recovered = 0
+
+
+def hard_reload(page, url: str, timeout_ms: int = 30000) -> bool:
+    """Reload ignoring the cache, and wait until the video has really rendered.
+
+    Ignoring the cache is the point: a plain reload can be answered from the
+    same cached logged-out shell that caused the problem. Chromium will only do
+    that through CDP, so that is tried first and an ordinary reload is the
+    fallback for when the CDP session cannot be opened.
+    """
+    done = False
+    try:
+        cdp = getattr(page, "_liker_cdp", None)
+        if cdp is None:
+            cdp = page.context.new_cdp_session(page)
+            page._liker_cdp = cdp
+        cdp.send("Page.reload", {"ignoreCache": True})
+        done = True
+    except Exception:  # noqa: BLE001
+        try:
+            page.reload(wait_until="domcontentloaded")
+            done = True
+        except Exception:  # noqa: BLE001
+            done = False
+    if done:
+        try:
+            page.wait_for_selector('[data-e2e="comment-icon"]', timeout=timeout_ms)
+            page.wait_for_timeout(400)
+            return True
+        except Exception:  # noqa: BLE001
+            pass
+    # Neither reload got us a rendered page. Navigate to it outright, which is
+    # also what recovers a tab that the reload left somewhere else entirely.
+    return open_video(page, url, timeout_ms)
+
+
+def recover_session(page, url: str, tries: int = SESSION_RELOAD_TRIES, verbose: bool = True) -> bool:
+    """Is this page signed in — and if it does not look it, can a refresh fix it?
+
+    Returns True when the page is (or becomes) signed in, False when it stays
+    logged out through every refresh, which is when the session really is gone
+    and a re-login is worth its cost.
+    """
+    global _recovered
+    if not page_is_logged_out(page):
+        return True
+    for attempt in range(max(1, tries)):
+        if verbose:
+            print(f"     looks logged out — hard refresh {attempt + 1}/{tries}")
+        hard_reload(page, url)
+        try:
+            page.wait_for_timeout(1200)
+        except Exception:  # noqa: BLE001
+            return False
+        if not page_is_logged_out(page):
+            _recovered += 1
+            if verbose:
+                print("     signed in again after the refresh")
+            return True
+    return False
+
+
+def current_url(page) -> str:
+    """Where the tab actually is, or '' when it cannot be asked."""
+    try:
+        return page.url or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def recovered_note() -> str:
+    """A closing word about refreshes, when there were any.
+
+    A profile that needed reloading on every other video is not healthy even if
+    every like landed, and one line at the end says so where a scroll back
+    through a nine-way parallel log would not.
+    """
+    return (
+        (f", {_recovered} session refresh(es)" if _recovered else "")
+        # Captchas that went away on their own are worth a number too: a run
+        # that cleared nine of them was being rate-limited nine times, and that
+        # is a reason to run fewer at once even though every like landed.
+        + (f", {_captchas_faded} captcha(s) waited out" if _captchas_faded else "")
+    )
+
+
+def has_comment_rows(page) -> bool:
+    """Are comment rows on the page right now?
+
+    Guarded, because this is asked while the page is free to navigate under us:
+    a query_selector that lands during a re-route raises "Execution context was
+    destroyed", and unguarded it took the whole run with it. A page that is
+    moving has no comment rows we can use, which is exactly False.
+    """
+    try:
+        return bool(page.query_selector('[data-e2e="comment-level-1"]'))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def open_comments(page, timeout_ms: int = 12000) -> bool:
     """Open the comment panel and wait for rows to exist.
 
@@ -418,7 +958,7 @@ def open_comments(page, timeout_ms: int = 12000) -> bool:
     The icon click is retried: it renders slightly before its handler attaches,
     so the first press is sometimes swallowed.
     """
-    if page.query_selector('[data-e2e="comment-level-1"]'):
+    if has_comment_rows(page):
         return True
     for attempt in range(3):
         # Anything modal — a consent banner, an app-install prompt — sits over
@@ -454,10 +994,13 @@ def open_comments(page, timeout_ms: int = 12000) -> bool:
         # nothing and then waits out the whole timeout on the wrong tab.
         deadline = time.time() + timeout_ms / 1000
         while time.time() < deadline:
-            if page.query_selector('[data-e2e="comment-level-1"]'):
+            if has_comment_rows(page):
                 return True
             select_comments_tab(page)
-            page.wait_for_timeout(700)
+            try:
+                page.wait_for_timeout(700)
+            except Exception:  # noqa: BLE001
+                return False
     return False
 
 
@@ -506,7 +1049,11 @@ def load_more_comments(page, rounds: int) -> int:
     last = 0
     stalls = 0
     for _ in range(max(1, rounds)):
-        count = page.evaluate(
+        # safe_eval, not page.evaluate: scrolling is the moment TikTok is most
+        # likely to re-route under us, and this call raising took down the whole
+        # worker rather than costing one video.
+        count = safe_eval(
+            page,
             """() => {
                 const rows = document.querySelectorAll('[data-e2e="comment-level-1"]')
                 if (!rows.length) return 0
@@ -524,8 +1071,13 @@ def load_more_comments(page, rounds: int) -> int:
                     el = el.parentElement
                 }
                 return rows.length
-            }"""
+            }""",
         )
+        if count is None:
+            # The page moved while we were reading it. Nothing more will load
+            # from here, so stop rather than spend the remaining rounds on a
+            # context that no longer exists.
+            break
         if count == last:
             # Give it two more tries before believing the list is exhausted:
             # one quiet round usually means slow loading, not the end.
@@ -535,7 +1087,10 @@ def load_more_comments(page, rounds: int) -> int:
         else:
             stalls = 0
             last = count
-        page.wait_for_timeout(1500)
+        try:
+            page.wait_for_timeout(1500)
+        except Exception:  # noqa: BLE001
+            break
     return last
 
 
@@ -652,6 +1207,15 @@ def from_dashboard(cluster_by: str, clusters: str, extra: dict) -> tuple[list[st
         f"dashboard: {data.get('matched', 0)} link(s) match {cluster_by} "
         f"cluster(s) {clusters or 'all'}, taking {len(links)}"
     )
+    # Only sent back when the caller asked for withoutOurs, and only by a
+    # dashboard new enough to know the parameter — an older one ignores it and
+    # answers with everything, which the per-video check still handles.
+    dropped = int(data.get("droppedWithOurs") or 0)
+    if dropped:
+        print(f"  {dropped} link(s) already carry one of our comments — not pulled")
+    elif extra.get("withoutOurs") == "1" and "droppedWithOurs" not in data:
+        print("  (this dashboard does not know the withoutOurs filter yet — every "
+              "link was pulled, and each video is checked before anything is written)")
     if products:
         print(f"active products: {', '.join(products)}")
     return links, products
@@ -692,6 +1256,210 @@ def comment_from_dashboard(url: str, product: str = "") -> tuple[str, str]:
     return str(data.get("comment") or ""), str(data.get("product") or "")
 
 
+# Rival names, from the dashboard rather than from a copy kept here. Fetched
+# once per run: two lists of competitor brands in two projects is one list that
+# is wrong within a month.
+_RIVALS: list[str] | None = None
+
+
+def rival_brands() -> list[str]:
+    global _RIVALS
+    if _RIVALS is not None:
+        return _RIVALS
+    _RIVALS = []
+    env = load_env()
+    base = (env.get("DASHBOARD_URL") or "").rstrip("/")
+    token = env.get("LINKS_EXPORT_TOKEN") or ""
+    if not base or not token:
+        return _RIVALS
+    try:
+        req = urllib.request.Request(
+            base + "/api/links/mimic?" + urlencode({"token": token}),
+            headers={"User-Agent": UA},
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+        _RIVALS = [str(b) for b in (data.get("brands") or [])]
+    except Exception as e:  # noqa: BLE001
+        print(f"     could not fetch the rival list: {str(e)[:70]}")
+    return _RIVALS
+
+
+def flatten(text: str) -> str:
+    """Lowercase, letters and digits only — how a brand is matched.
+
+    "Walter Writes", "walterwrites" and "#WalterWrites!" are one name, and a
+    comment recommending a rival spells it however it feels like.
+    """
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+def rival_comment(comments: list[dict]) -> tuple[str, str]:
+    """The comment under this video that recommends somebody else's tool.
+
+    Returns (text, brand), or ("", "") when the thread mentions no rival. The
+    LONGEST match wins: a one-liner gives the model almost nothing to match,
+    and "walterwrites 🔥" and "ngl walterwrites got me through finals, tried
+    everything else first" are not equally useful as a style reference.
+    """
+    brands = rival_brands()
+    if not brands:
+        return "", ""
+    best, best_brand = "", ""
+    for c in comments:
+        text = str(c.get("text") or "")
+        flat = flatten(text)
+        for b in brands:
+            if b in flat:
+                if len(text) > len(best):
+                    best, best_brand = text, b
+                break
+    return best, best_brand
+
+
+def mimic_from_dashboard(url: str, sample: str, product: str = "") -> tuple[str, str, str]:
+    """Ask the dashboard for a comment in the same vein as `sample`.
+
+    Returns (comment, product, rival). ("", "", "") means nothing usable came
+    back, which is a reason to post a stored comment instead — never a reason to
+    post something that has not been through the dashboard's filters.
+    """
+    env = load_env()
+    base = (env.get("DASHBOARD_URL") or "").rstrip("/")
+    token = env.get("LINKS_EXPORT_TOKEN") or ""
+    if not base or not token:
+        return "", "", ""
+    payload = {"url": url, "sample": sample}
+    if product:
+        payload["product"] = product
+    req = urllib.request.Request(
+        base + "/api/links/mimic?" + urlencode({"token": token}),
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"User-Agent": UA, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        # Longer than the other calls: there is a language model at the other
+        # end of it, and the alternative to waiting is a worse comment.
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:110]
+        print(f"     dashboard would not write one: HTTP {e.code} {detail}")
+        return "", "", ""
+    except Exception as e:  # noqa: BLE001
+        print(f"     could not reach the dashboard to write one: {str(e)[:70]}")
+        return "", "", ""
+    return (
+        str(data.get("comment") or ""),
+        str(data.get("product") or ""),
+        str(data.get("rival") or ""),
+    )
+
+
+# THE PRODUCT NAME AS ORDINARY WORDS. The same table as PRODUCT_WORDS in the
+# dashboard's lib/config.ts, and the same reason: a name written as one word,
+# capitalised or in quotes, reads as an advert to a person and as a brand mention
+# to a filter. Twenty-one comments posted that way reached no other account at
+# all (verify_comments.py).
+#
+# THIS IS THE SAFETY NET, not the mechanism. The comments are written by the
+# dashboard, and the prompt there now asks for the spaced form. A prompt is a
+# request; this is the last thing that touches the text before it is typed, and
+# it does not depend on a deploy having happened or on a model having listened.
+#
+# THE STEM IS NEVER TOUCHED. Every product matcher in this project and in the
+# dashboard flattens text to letters and digits and then asks whether the
+# product name is a SUBSTRING, so "purify text" and "purify texting" both still
+# resolve to purifytext — the suffix lands after the whole name. "purity
+# texting" would read just as naturally and would be invisible to every check we
+# have, including the admin's own "does this comment exist" read, so the seam and
+# the tail are all that move.
+PRODUCT_WORDS = {
+    "purifytext": "purify text",
+    "acoustictext": "acoustic text",
+    "prohumanly": "pro humanly",
+    "humlexic": "hum lexic",
+    "kinprose": "kin prose",
+    "tintfolio": "tint folio",
+    "cohumanly": "co humanly",
+}
+
+_BRAND_RES: list[tuple[re.Pattern, str]] | None = None
+
+
+def brand_forms() -> list[tuple[re.Pattern, str]]:
+    """One pattern per product, matching however a model chose to write it.
+
+    Matches purifytext, Purify Text, purify-text, #PurifyText and "purify text",
+    and leaves any inflection where it is: the pattern covers the NAME only, so
+    "purifytexted" matches on its first ten letters and the "ed" stays put.
+    """
+    global _BRAND_RES
+    if _BRAND_RES is None:
+        _BRAND_RES = []
+        for name, words in PRODUCT_WORDS.items():
+            body = r"[\s._\-]*".join(re.escape(w) for w in words.split(" "))
+            _BRAND_RES.append((
+                re.compile("[#\"\u201c\u2018]?" + body + "[\"\u201d\u2019]?", re.I),
+                words,
+            ))
+    return _BRAND_RES
+
+
+def debrand(text: str) -> tuple[str, str]:
+    """(text, note). The note is '' when nothing needed changing.
+
+    The note is printed, because a comment that was silently rewritten before
+    posting is a comment nobody can explain afterwards.
+    """
+    out = str(text or "")
+    changed = []
+    for pat, words in brand_forms():
+        m = pat.search(out)
+        if not m or m.group(0) == words:
+            continue
+        changed.append(f"{m.group(0).strip()} -> {words}")
+        out = pat.sub(words, out)
+    return out, "; ".join(changed)
+
+
+def comment_for(url: str, aweme_comments: list[dict], args) -> tuple[str, str, str]:
+    """The comment to post under this video, and where it came from.
+
+    IN ORDER, and the order is the feature:
+
+      1. If --mimic-comments is on and somebody under this video is recommending
+         a rival tool, a comment in that same vein. A stored comment is written
+         to be good anywhere, which is what makes it read as imported when it
+         lands in a thread that is all about one particular tool.
+      2. Otherwise the dashboard's stored set — the same comments the Android
+         app hands its workers.
+
+    Returns (text, product, source) where source is 'mimic' or 'bank', for the
+    log and the ledger: a comment nobody can explain later is worse than none.
+    """
+    text, prod, source = "", "", "bank"
+    if getattr(args, "mimic_comments", False):
+        sample, brand = rival_comment(aweme_comments)
+        if sample:
+            print(f"     thread mentions {brand or 'a rival'} — writing to match it")
+            text, prod, rival = mimic_from_dashboard(url, sample, args.comment_product)
+            if text:
+                source = f"mimic:{rival or brand}"
+            else:
+                print("     nothing usable came back — using a stored comment")
+    if not text:
+        text, prod = comment_from_dashboard(url, args.comment_product)
+    # LAST STOP BEFORE IT IS TYPED. Whatever wrote it, the name goes in as words.
+    if text:
+        fixed, note = debrand(text)
+        if note:
+            print(f"     written as words, not a brand: {note}")
+            text = fixed
+    return text, prod, source
+
+
 # Where the comment goes, and what sends it.
 #
 # TikTok's box is a contenteditable div, not an input, so its value cannot be
@@ -724,8 +1492,44 @@ def post_comment(page, text: str, timeout_ms: int = 15000) -> tuple[bool, str]:
     if not box:
         return False, "no comment box on the page"
 
+    # THE BOX CANNOT BE CLICKED, and every comment failed on it:
+    #
+    #   NOT posted - could not type: ElementHandle.click: Timeout 30000ms exceeded
+    #
+    # TikTok's editor is Draft.js, and its placeholder ("Add comment...") sits
+    # ON TOP of the contenteditable. Measured: a click at the centre of the box
+    # lands on DIV.public-DraftEditorPlaceholder-inner, so Playwright waits for
+    # the element to start receiving pointer events, and waits, and gives up
+    # thirty seconds later — three times a video, on every video.
+    #
+    # Focus is what typing actually needs, and there are three ways to get it.
+    # The wrapper is a real trusted click, which is the closest to what a person
+    # does; the others are there because the panel does not always render the
+    # wrapper. Short timeouts: a route that is not going to work should cost
+    # three seconds, not thirty.
+    focused = False
     try:
-        box.click()
+        page.click('[data-e2e="comment-input"]', timeout=3000)
+        focused = True
+    except Exception:  # noqa: BLE001
+        pass
+    if not focused:
+        try:
+            box.click(force=True, timeout=3000)
+            focused = True
+        except Exception:  # noqa: BLE001
+            pass
+    if not focused:
+        # Last resort, and the one that always works: focus it outright. The
+        # keys that follow are real key events either way — it is the click
+        # that was never possible, not the typing.
+        try:
+            box.evaluate("el => el.focus()")
+            focused = True
+        except Exception as e:  # noqa: BLE001
+            return False, f"could not focus the box: {str(e)[:50]}"
+
+    try:
         page.wait_for_timeout(250)
         # Typed, not pasted: the Post button stays disabled until React has seen
         # input events, and a paste does not always produce them.
@@ -1570,6 +2374,25 @@ def main() -> int:
                          "The sweep is on by default and costs no extra page load")
     ap.add_argument("--headed", action="store_true",
                     help="show the browser window instead of running headless")
+    ap.add_argument("--mimic-comments", action="store_true",
+                    help="when commenting, first look at the comments already under "
+                         "the video. If one of them recommends a rival tool, write ours "
+                         "in the same vein instead of taking a stored comment. Falls "
+                         "back to the stored set when the thread mentions no rival")
+    ap.add_argument("--no-like", action="store_true",
+                    help="do not like anything — only post comments. For a run whose "
+                         "job is to seed comments on links that carry none of ours; "
+                         "pointless without --comment-empty, which is what posts them")
+    ap.add_argument("--debug", action="store_true",
+                    help="say far more, for debugging: elapsed time on every line, "
+                         "how long each page took, what a failed page actually "
+                         "contained, and the same detail written into the ledger's "
+                         "note column so a failure can be read the next morning")
+    ap.add_argument("--no-captcha-window", action="store_true",
+                    help="headless only: do NOT open a window when a captcha appears. "
+                         "By default one is opened so the puzzle can be solved and the "
+                         "run carries on; with this, the account is given up on as it "
+                         "used to be. For a run nobody is sitting in front of")
     ap.add_argument("--solve-captcha", action="store_true",
                     help="try the solving API before asking you. OFF by default: a "
                          "captcha now sounds and notifies straight away so you can "
@@ -1595,6 +2418,23 @@ def main() -> int:
                     help="leave failed rows in done.csv, so failed comments are "
                          "never retried (by default they are dropped and tried again)")
     args = ap.parse_args()
+    # A SECOND BROWSER ON A HELD PROFILE IS NOT A SECOND BROWSER.
+    #
+    # It starts, it renders TikTok, and it reports the account as signed out,
+    # because the first browser holds the cookie database and this one reads
+    # nothing. Then the run stops with "Not signed in on profile 'a'" about a
+    # profile that is signed in and working in the window next to it.
+    pdir = profile_dir(args.profile, "tiktok")
+    if busy.is_busy(pdir):
+        print(busy.note(pdir))
+        return 1
+    if args.debug:
+        # Both of them: dbg() lines are worthless without knowing when.
+        global DEBUG
+        DEBUG = True
+        console.stamp()
+        print("debug on — elapsed time on every line, and failures say what was "
+              "on the page")
 
     global DONE
     DONE = done_path(args.profile)
@@ -1609,6 +2449,26 @@ def main() -> int:
     # matching any would be a silent no-op.
     want_products = args.products or args.all_products
     products = NORM_PRODUCTS if want_products else []
+    # COMMENTING NEEDS THE PRODUCT LIST, even when nothing is being liked.
+    #
+    # "Post on a video that carries none of our comments" is decided by counting
+    # the comments that name one of our products. With the product list empty
+    # that count is zero on every video in the world, so the run would comment
+    # under videos we have already commented under — in public, repeatedly, from
+    # accounts that are trying not to look automated.
+    #
+    # It is a likely combination, too: switching off liking and switching off
+    # "active products only" both feel like ways of saying "do not like things".
+    if args.comment_empty and not want_products:
+        print(
+            "--comment-empty needs --products (or --all-products), even with --no-like.\n"
+            "  Whether a video already carries one of our comments is decided by looking\n"
+            "  for our product names in its comments. With no product list that check\n"
+            "  finds nothing on every video, and the run would comment under videos it\n"
+            "  has already commented under.\n"
+            "  On the dashboard: tick 'Active products only'."
+        )
+        return 2
     if args.from_dashboard:
         pulled, live = from_dashboard(
             args.cluster_by,
@@ -1620,6 +2480,23 @@ def main() -> int:
                 # Ask the dashboard for the full list, deactivated included, so
                 # this stays right if a product is ever added there.
                 "allProducts": "1" if args.all_products else "",
+                # ONLY THE LINKS THAT CARRY NONE OF OURS — but ONLY for a run
+                # that is doing nothing else.
+                #
+                # --comment-empty on its own means "like what is there, and
+                # write on the videos that have nothing of ours", which is every
+                # link addressed one way or the other. Dropping the links that
+                # already carry our comments would throw away exactly the ones
+                # with something to like, and the run would like nothing at all.
+                #
+                # With --no-like there is nothing to lose: those links have no
+                # work left on them, and skipping them saves opening the ~50%
+                # the dashboard already knows about — 669 videos out of 1,381 on
+                # a real cluster, which is most of an hour of page loads.
+                #
+                # A link nobody has scanned is NOT known to be clean and still
+                # comes back; the per-video check is what decides either way.
+                "withoutOurs": "1" if (args.comment_empty and args.no_like) else "",
             },
         )
         links += pulled
@@ -1645,7 +2522,14 @@ def main() -> int:
         # Say what will actually be matched. "active products" above is what the
         # dashboard reports, which is not the same list once --all-products is
         # in play, and the difference is worth seeing before a long run.
-        print(f"liking comments for: {', '.join(products)}")
+        # What the run will actually do. Under --no-like it likes nothing, and a
+        # banner saying "liking comments for" is the run describing work it is
+        # not going to do.
+        if args.no_like:
+            print(f"NOT liking anything. Looking for videos with no comment of ours: "
+                  f"{', '.join(products)}")
+        else:
+            print(f"liking comments for: {', '.join(products)}")
     ids = [(u, video_id(u)) for u in links]
     targets_videos = [(u, i) for u, i in ids if i]
     if not targets_videos:
@@ -1689,7 +2573,12 @@ def main() -> int:
         video full of a watched handle's comments is not an empty one.
         """
         comments = fetch_comments(aweme, args.pages)
-        picks = [c for c in comments if wanted(c, products, users, args.all)]
+        # --no-like empties the like list and nothing else. Everything below
+        # still runs: `hits` is what decides whether this video carries a
+        # comment of ours, and that question is the whole basis of the
+        # commenting path.
+        picks = ([] if args.no_like
+                 else [c for c in comments if wanted(c, products, users, args.all)])
         fresh = [c for c in picks if c["cid"] not in done and not c["already"]]
         hits = sum(1 for c in comments if products and wanted(c, products, set(), False))
         # The whole list comes back too: the dom sweep needs to know what the
@@ -1700,15 +2589,17 @@ def main() -> int:
         found = 0
         would_post = 0
         for url, aweme in targets_videos:
-            todo, matched, already, hits, _all = targets_for(aweme)
+            todo, matched, already, hits, all_comments = targets_for(aweme)
             # The same test the real run makes, so a dry run shows exactly which
-            # videos would be written on before any of them are.
+            # videos would be written on before any of them are — and, with
+            # --mimic-comments, the comment it would actually write rather than
+            # the stored one it would not have used.
             if args.comment_empty and not todo and hits == 0:
-                text, prod = comment_from_dashboard(url, args.comment_product)
+                text, prod, source = comment_for(url, all_comments, args)
                 if text:
                     would_post += 1
                     print(f"  {url}")
-                    print(f"      WOULD COMMENT ({prod}): {text[:70]}")
+                    print(f"      WOULD COMMENT ({prod}, {source}): {text[:70]}")
             if not todo:
                 continue
             print(f"  {url}")
@@ -1744,26 +2635,109 @@ def main() -> int:
             # The home page is only where the session gets confirmed. In dom mode
             # each video is then opened in turn; in api mode this stays the one
             # and only navigation.
-            page.goto("https://www.tiktok.com/", wait_until="domcontentloaded")
+            #
+            # AND A SLOW HOME PAGE IS NOT A REASON TO DIE. Unguarded, this one
+            # line ended a whole worker:
+            #
+            #   playwright._impl._errors.TimeoutError: Page.goto: Timeout
+            #   30000ms exceeded. navigating to "https://www.tiktok.com/"
+            #
+            # Thirty seconds is nothing unusual with several browsers competing
+            # for one machine — the same slowness that makes videos miss their
+            # render deadline — and the cost there is one video, while the cost
+            # here was every video the profile had left.
+            for attempt in range(3):
+                try:
+                    page.goto("https://www.tiktok.com/", wait_until="domcontentloaded",
+                              timeout=45000)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    print(f"  the home page did not load ({str(e).splitlines()[0][:70]})"
+                          + (" — trying again" if attempt < 2 else ""))
+                    if attempt == 2:
+                        print(
+                            "  Three tries, so this is the machine rather than the site.\n"
+                            "  Run fewer browsers at once (--at-once, or 'Browsers at once')."
+                        )
+                        ctx.close()
+                        return 1
+                    page.wait_for_timeout(5000)
             page.wait_for_timeout(2500)
 
             # Confirm the session BEFORE spending the queue. An expired login
             # fails every like with the same opaque code, and finding that out
             # twenty rows into done.csv wastes both the run and the evidence.
-            who = safe_eval(
-                page,
-                """async () => {
+            # The reason comes back too, because "no" and "would not say" are
+            # different answers with opposite responses — see is_refusal().
+            ACCOUNT_JS = """async () => {
                     const r = await fetch('/passport/web/account/info/?aid=1459', {
                         credentials: 'include',
                     })
-                    if (!r.ok) return null
+                    if (!r.ok) return { reason: 'HTTP ' + r.status }
                     const j = await r.json().catch(() => null)
-                    const d = (j || {}).data || {}
+                    if (!j) return { reason: 'no JSON' }
+                    const d = j.data || {}
                     return d.user_id_str || d.user_id
-                        ? (d.screen_name || d.username || String(d.user_id_str || d.user_id))
-                        : null
+                        ? { who: (d.screen_name || d.username || String(d.user_id_str || d.user_id)) }
+                        : { reason: j.message || 'not signed in' }
                 }"""
-            )
+
+            def ask_who():
+                return safe_eval(page, ACCOUNT_JS) or {"reason": "probe failed"}
+
+            acct = ask_who()
+            who = acct.get("who")
+            if not who and is_refusal(acct.get("reason")):
+                # A REFUSAL IS NOT A REASON TO ABANDON THE SHARD.
+                #
+                # 403 here is the site throttling this machine — seventeen
+                # browsers all asking the same endpoint within a few seconds of
+                # launch is enough to earn one. Stopping costs the whole
+                # profile's list (1,363 links, in the run this was written for)
+                # over a question that has a second, better source: the page
+                # itself. A logged-out TikTok renders a Log in button, and this
+                # one does not.
+                #
+                # So: wait it out, ask again, and if it still will not answer,
+                # let the PAGE decide. Only a page that genuinely renders
+                # logged out stops the run.
+                print(f"TikTok would not answer who profile '{args.profile}' is "
+                      f"({acct.get('reason')}) — waiting, then asking again")
+                for wait_s in (10, 30, 60):
+                    page.wait_for_timeout(wait_s * 1000)
+                    # Straight to the home page, not hard_reload(): that one
+                    # waits for a comment icon, which a home page does not have,
+                    # so it would spend a minute timing out on every attempt.
+                    try:
+                        page.goto("https://www.tiktok.com/", wait_until="domcontentloaded")
+                        page.wait_for_timeout(2500)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    acct = ask_who()
+                    who = acct.get("who")
+                    if who or not is_refusal(acct.get("reason")):
+                        break
+                    print(f"     still {acct.get('reason')} after {wait_s}s")
+                if not who and is_refusal(acct.get("reason")):
+                    if page_is_logged_out(page):
+                        print(
+                            f"The check was refused AND the page renders logged out on "
+                            f"'{args.profile}'.\n"
+                            f"  Run: python login.py --profile {args.profile}"
+                        )
+                        ctx.close()
+                        return 1
+                    # Throttled, and the page says the session is fine. Carrying
+                    # on is the right call: nothing has said otherwise, and the
+                    # likes themselves will say if it is wrong.
+                    who = "unknown — TikTok would not say, but the page is signed in"
+                    print(
+                        "  TikTok still will not answer, but the page shows no Log in\n"
+                        "  button, so the session is there. Carrying on.\n"
+                        f"  This is throttling, from {args.window_count} accounts at once —\n"
+                        "  fewer at a time (--at-once, or 'Browsers at once') avoids it.\n"
+                        "  Do NOT sign this profile in again on the strength of it."
+                    )
             if not who:
                 print(
                     f"Not signed in on profile '{args.profile}'. "
@@ -1782,6 +2756,9 @@ def main() -> int:
                 )
 
             digg_type = 0 if args.unlike else 1
+            # Set when this account's likes turn out to be discarded — see
+            # clicked_but_not_kept(). Ends the profile even under --keep-going.
+            dead_account = False
             started = time.time()
 
             def record_post(url, aweme, key, prod, text, status, note):
@@ -1807,7 +2784,10 @@ def main() -> int:
                         c["user"],
                         c["text"][:200],
                         status,
-                        note[:120],
+                        # 120 characters is a note; a diagnosis needs room.
+                        # Only when it was asked for: an ordinary run's notes
+                        # are short and the file is read by eye.
+                        note[:600 if DEBUG else 120],
                     ]
                 )
                 f.flush()
@@ -1842,9 +2822,13 @@ def main() -> int:
                             print(f"  [{vn}/{total_videos}] {aweme}: {len(picks)} match, all done")
                         continue
 
-                    if page_is_logged_out(page):
+                    # A refresh first: the page renders logged out far more
+                    # often than the session actually dies, and stopping the
+                    # whole run on a bad render costs the rest of the list.
+                    if not recover_session(page, url):
                         print(
-                            f"\n  THIS PROFILE IS LOGGED OUT. Sign in again:\n"
+                            f"\n  THIS PROFILE IS LOGGED OUT and would not come back"
+                            f" after {SESSION_RELOAD_TRIES} refreshes. Sign in again:\n"
                             f"    python login.py --profile {args.profile}"
                         )
                         break
@@ -1888,7 +2872,7 @@ def main() -> int:
                         break
                 ctx.close()
                 f.close()
-                print(f"\n{ok} liked, {failed} failed. Log: {DONE}")
+                print(f"\n{ok} liked, {failed} failed{recovered_note()}. Log: {DONE}")
                 return 0 if failed == 0 else 1
 
             if args.mode == "dom":
@@ -1897,321 +2881,416 @@ def main() -> int:
                 # click reports nothing useful, and the endpoint lies.
                 total_videos = len(targets_videos)
                 for vn, (url, aweme) in enumerate(targets_videos, 1):
-                    # Read THIS link's comments now, not all of them up front.
-                    wants, matched, already_liked, product_hits, api_comments = targets_for(aweme)
-                    # A video carrying NONE of our comments is the one worth
-                    # writing on, and with --comment-empty that is what happens:
-                    # the dashboard hands over one of its stored comments (the
-                    # same set the Android app gives its workers) and it is
-                    # posted here. Off by default — it is the only thing in this
-                    # script that writes something public.
-                    if not wants and args.comment_empty and product_hits == 0:
-                        key = f"post:{aweme}"
-                        if key in done:
-                            print(f"  [{vn}/{total_videos}] {aweme}: already commented on")
+                    # Everything a video needs is inside this try.
+                    #
+                    # TikTok re-routes on its own, and with nine browsers on one
+                    # machine a page can be torn down while we are reading it.
+                    # Nothing between here and sys.exit(main()) caught that, so one
+                    # destroyed execution context ended the whole worker and left
+                    # the rest of its shard unworked while the other profiles
+                    # carried on. A video is the right unit of loss.
+                    try:
+                        # Read THIS link's comments now, not all of them up front.
+                        wants, matched, already_liked, product_hits, api_comments = targets_for(aweme)
+                        # A video carrying NONE of our comments is the one worth
+                        # writing on, and with --comment-empty that is what happens:
+                        # the dashboard hands over one of its stored comments (the
+                        # same set the Android app gives its workers) and it is
+                        # posted here. Off by default — it is the only thing in this
+                        # script that writes something public.
+                        if not wants and args.comment_empty and product_hits == 0:
+                            key = f"post:{aweme}"
+                            if key in done:
+                                print(f"  [{vn}/{total_videos}] {aweme}: already commented on")
+                                continue
+                            text, prod, source = comment_for(url, api_comments, args)
+                            if not text:
+                                print(f"  [{vn}/{total_videos}] {aweme}: no comment to post")
+                                continue
+                            print(
+                                f"  [{vn}/{total_videos}] {aweme}: none of ours — "
+                                f"commenting as {prod or args.comment_product} ({source})"
+                            )
+                            print(f"       {text[:70]}")
+                            if not open_video(page, url):
+                                render_failed(args.window_count)
+                                time.sleep(random.uniform(lo, hi))
+                                continue
+                            if not recover_session(page, url):
+                                print("     logged out — skipping the comment")
+                                continue
+                            if captcha_present(page):
+                                if not wait_out_captcha(page, args.profile, args.headed,
+                                                        tried_api=args.solve_captcha):
+                                    break
+                            if not open_comments(page):
+                                record_post(url, aweme, key, prod, text,
+                                            "fail:dom", "comment panel did not open")
+                                print("     comment panel did not open")
+                                time.sleep(random.uniform(lo, hi))
+                                continue
+                            posted, note = post_comment(page, text)
+                            record_post(url, aweme, key, prod, text,
+                                        "ok" if posted else "fail:post", note)
+                            done.add(key)
+                            commented += 1 if posted else 0
+                            print(f"     {'commented' if posted else 'NOT posted'} - {note}")
+                            # A comment is a much bigger action than a like, so the
+                            # pause after one is longer than the like delay.
+                            time.sleep(random.uniform(lo * 2, hi * 2))
                             continue
-                        text, prod = comment_from_dashboard(url, args.comment_product)
-                        if not text:
-                            print(f"  [{vn}/{total_videos}] {aweme}: no comment to post")
+
+                        if not wants:
+                            # Nothing to do here, so the page is never even loaded —
+                            # which is most of the list and costs nothing.
+                            if matched:
+                                print(f"  [{vn}/{total_videos}] {aweme}: {matched} match, all done already")
                             continue
                         print(
-                            f"  [{vn}/{total_videos}] {aweme}: none of ours — "
-                            f"commenting as {prod or args.comment_product}"
+                            f"  [{vn}/{total_videos}] {aweme}: {matched} match, {len(wants)} to like"
+                            + (f" ({already_liked} already)" if already_liked else "")
                         )
-                        print(f"       {text[:70]}")
                         if not open_video(page, url):
-                            print("     page did not render, skipping")
+                            # The page never rendered. That is not the same as the
+                            # comments being unopenable, and it must not count
+                            # towards the three-strikes stop.
+                            #
+                            # WHAT was on it goes into the ledger, not only the
+                            # terminal: a failure is usually read out of
+                            # done-x.csv the next morning, when the browser it
+                            # happened in is long gone. "page did not render in
+                            # time" is a symptom shared by a busy machine, a
+                            # deleted video, a logged-out session and a captcha,
+                            # and those want four different responses.
+                            why = why_stuck(page) if DEBUG else ""
+                            note = "page did not render in time" + (f" — {why}" if why else "")
+                            for c in wants:
+                                record(url, aweme, c, "fail:load", note)
+                            if why:
+                                print(f"     {why}")
+                            render_failed(args.window_count)
                             time.sleep(random.uniform(lo, hi))
                             continue
-                        if page_is_logged_out(page):
-                            print("     logged out — skipping the comment")
-                            continue
-                        if captcha_present(page):
-                            if not wait_out_captcha(page, args.profile, args.headed,
-                                                    tried_api=args.solve_captcha):
-                                break
-                        if not open_comments(page):
-                            record_post(url, aweme, key, prod, text,
-                                        "fail:dom", "comment panel did not open")
-                            print("     comment panel did not open")
-                            time.sleep(random.uniform(lo, hi))
-                            continue
-                        posted, note = post_comment(page, text)
-                        record_post(url, aweme, key, prod, text,
-                                    "ok" if posted else "fail:post", note)
-                        done.add(key)
-                        commented += 1 if posted else 0
-                        print(f"     {'commented' if posted else 'NOT posted'} - {note}")
-                        # A comment is a much bigger action than a like, so the
-                        # pause after one is longer than the like delay.
-                        time.sleep(random.uniform(lo * 2, hi * 2))
-                        continue
 
-                    if not wants:
-                        # Nothing to do here, so the page is never even loaded —
-                        # which is most of the list and costs nothing.
-                        if matched:
-                            print(f"  [{vn}/{total_videos}] {aweme}: {matched} match, all done already")
-                        continue
-                    print(
-                        f"  [{vn}/{total_videos}] {aweme}: {matched} match, {len(wants)} to like"
-                        + (f" ({already_liked} already)" if already_liked else "")
-                    )
-                    if not open_video(page, url):
-                        # The page never rendered. That is not the same as the
-                        # comments being unopenable, and it must not count
-                        # towards the three-strikes stop.
-                        for c in wants:
-                            record(url, aweme, c, "fail:load", "page did not render in time")
-                        print("     page did not render, skipping")
-                        time.sleep(random.uniform(lo, hi))
-                        continue
-
-                    before = safe_eval(page, READ_MINE_JS, [aweme, 4]) or {}
-                    todo = [c for c in wants if not (before.get(c["cid"]) or {}).get("mine")]
-                    if todo and page_is_logged_out(page):
-                        # TikTok drops sessions mid-run while the cookies stay on
-                        # disk, so this is not rare and not fatal — sign back in
-                        # through Google and carry on rather than losing the rest
-                        # of the list.
-                        print(f"     session dropped by TikTok")
-                        back = False
-                        if not args.no_relogin:
-                            try:
-                                back = relogin.relogin(
-                                    page, args.profile, headed=args.headed
-                                )
-                            except Exception as e:  # noqa: BLE001
-                                print(f"     re-login error: {str(e)[:70]}")
-                        if not back:
-                            print(
-                                "\n  Could not sign back in. Do it once by hand:\n"
-                                f"    python login.py --profile {args.profile}"
-                            )
-                            break
-                        # Signed in again, but on whatever page Google left us —
-                        # get back to this video before carrying on.
-                        if not open_video(page, url):
-                            print("     back in, but this video would not reload")
-                            time.sleep(random.uniform(lo, hi))
-                            continue
+                        # The page rendered, so whatever the last few did, the
+                        # machine is keeping up again.
+                        render_ok()
                         before = safe_eval(page, READ_MINE_JS, [aweme, 4]) or {}
-                        todo = [
-                            c for c in wants
-                            if not (before.get(c["cid"]) or {}).get("mine")
-                        ]
-                        if not todo:
-                            continue
-                    # A captcha hides the comments behind placeholders while
-                    # everything else looks healthy. Check before blaming the
-                    # panel, or the whole run reads as a DOM problem.
-                    if todo and captcha_present(page):
-                        # Straight to the alarm. The solving API is opt-in
-                        # (--solve-captcha) because trying it first costs half a
-                        # minute of silence before anyone is told there is
-                        # anything to look at, and it does not reliably clear
-                        # TikTok's puzzle anyway.
-                        solved = False
-                        if args.solve_captcha:
-                            print("     captcha - attempting to solve")
-                            solved = solve_captcha_here(page)
-                        if not solved and not wait_out_captcha(
-                            page, args.profile, args.headed, tried_api=args.solve_captcha
-                        ):
-                            print(
-                                f"\n  TikTok is showing its slider captcha to profile "
-                                f"'{args.profile}'.\n"
-                                "  Solve it once by hand and it usually stays quiet for a while:\n"
-                                f"    python solve_captcha.py --profile {args.profile}"
-                            )
-                            break
-                    panel = True
-                    if todo:
-                        panel = open_comments(page)
-                        if not panel and captcha_present(page):
-                            # Opening the comments is itself a common trigger, so
-                            # the check above passes and the puzzle appears in
-                            # response to the click. Checking only beforehand
-                            # meant the solver never ran once.
-                            print("     captcha appeared on opening the comments")
-                            cleared = False
-                            if args.solve_captcha:
-                                cleared = solve_captcha_here(page)
-                            if not cleared:
-                                cleared = wait_out_captcha(
-                                    page, args.profile, args.headed,
-                                    tried_api=args.solve_captcha,
+                        todo = [c for c in wants if not (before.get(c["cid"]) or {}).get("mine")]
+                        # A HARD REFRESH FIRST. Most of the time the cookies are
+                        # still good and the page merely rendered signed-out, and a
+                        # reload brings it back in a couple of seconds. Only when it
+                        # does not is the session really gone — and only then is the
+                        # Google re-login, which is minutes of navigation and a good
+                        # chance of a captcha, worth running.
+                        if todo and not recover_session(page, url):
+                            # TikTok drops sessions mid-run while the cookies stay on
+                            # disk, so this is not rare and not fatal — sign back in
+                            # through Google and carry on rather than losing the rest
+                            # of the list.
+                            print(f"     session dropped by TikTok")
+                            back = False
+                            if not args.no_relogin:
+                                try:
+                                    back = relogin.relogin(
+                                        page, args.profile, headed=args.headed
+                                    )
+                                except Exception as e:  # noqa: BLE001
+                                    print(f"     re-login error: {str(e)[:70]}")
+                            if not back:
+                                print(
+                                    "\n  Could not sign back in. Do it once by hand:\n"
+                                    f"    python login.py --profile {args.profile}"
                                 )
-                            if cleared:
-                                panel = open_comments(page)
-                    if todo and not panel:
-                        note = (
-                            "captcha blocked the comments"
-                            if captcha_present(page)
-                            else "comment panel did not open"
-                        )
-                        for c in todo:
-                            record(url, aweme, c, "fail:dom", note)
-                            failed += 1
-                        print(f"     {note}")
-                        time.sleep(random.uniform(lo, hi))
-                        continue
-                    skipped_already = len(wants) - len(todo)
-                    if not todo:
-                        for c in wants:
-                            record(url, aweme, c, "ok", "already liked before this run")
-                            ok += 1
-                        print(f"     all {len(wants)} already liked")
-                        continue
-
-                    payload = [{"cid": c["cid"], "user": c["user"], "text": c["text"]} for c in todo]
-                    clicks = safe_eval(page, CLICK_JS, [payload, args.scrolls]) or {}
-
-                    # Scroll ONLY if something was not on screen. Most videos hold
-                    # fewer comments than the panel renders, so scrolling every
-                    # one of them spent ~13 seconds a video finding nothing new.
-                    if not clicks.get("_error"):
-                        missing = [c for c in todo if str(clicks.get(c["cid"], "")) == "not found"]
-                        if missing:
-                            load_more_comments(page, args.scrolls)
-                            again = safe_eval(
-                                page,
-                                CLICK_JS,
-                                [[{"cid": c["cid"], "user": c["user"], "text": c["text"]} for c in missing],
-                                 args.scrolls],
-                            ) or {}
-                            clicks.update(again)
-                    if clicks.get("_error"):
-                        # The panel never opened, so nothing was pressed. Say so
-                        # rather than reporting every target as a failed like.
-                        print(f"     {clicks['_error']}")
-                        for c in todo:
-                            record(url, aweme, c, "fail:dom", clicks["_error"])
-                            failed += 1
-                        if failed >= 5 and ok == 0 and not args.keep_going:
-                            print(
-                                "\nEvery video so far has failed to open its comments. "
-                                "Stopping — inspect this profile in a headed browser:\n"
-                                f"  python inspect_dom.py --headed --profile {args.profile}\n"
-                                "  (or pass --keep-going to work the list regardless)"
-                            )
-                            break
-                        time.sleep(random.uniform(lo, hi))
-                        continue
-                    page.wait_for_timeout(1200)
-                    after = safe_eval(page, READ_MINE_JS, [aweme, 4]) or {}
-
-                    seen = clicks.get("_seen")
-                    sample = clicks.get("_sample") or ""
-                    landed = 0
-                    # "Not found" is a property of ONE video — our comment sits
-                    # below what the list will render — not a sign the run is
-                    # broken. Counting it towards the three-strikes stop killed
-                    # an account whose first video happened to be a busy one.
-                    unreachable = 0
-                    for c in todo:
-                        state = after.get(c["cid"]) or {}
-                        note = str(clicks.get(c["cid"], "?"))
-                        if note == "not found" and seen is not None:
-                            note = f"not found among {seen} row(s) [{sample}]"
-                        # Only the re-read counts. A click that reported success
-                        # and changed nothing is exactly what the API did for
-                        # three rounds, and it must not reach done.csv as "ok".
-                        if state.get("mine"):
-                            record(url, aweme, c, "ok", f"digg_count={state.get('digg')}")
-                            ok += 1
-                            landed += 1
-                        elif note.startswith("not found"):
-                            record(url, aweme, c, "fail:deep", note)
-                            unreachable += 1
-                        else:
-                            # The click result distinguishes "never found the
-                            # comment" from "pressed it and nothing happened",
-                            # which need completely different fixes.
-                            record(url, aweme, c, "fail:dom", note)
-                            failed += 1
-
-                    # ── the panel is open and scrolled: read it ──────────────
-                    # The API list is not the whole comment section (see
-                    # DOM_SCAN_JS). Anything it missed is on screen right now,
-                    # and this is the only moment in the run when that is true.
-                    extra_ok = extra_fail = 0
-                    if not args.no_dom_sweep:
-                        rows = safe_eval(page, DOM_SCAN_JS) or []
-                        extras = dom_extras(rows, aweme, products, users, api_comments, done)
-                        for c in extras:
-                            res = safe_eval(page, DOM_LIKE_JS, [c["user"], c["text"]]) or {}
-                            if not res.get("found"):
-                                # It was in the scan a moment ago, so the list
-                                # re-rendered under us. Not worth a ledger row.
+                                break
+                            # Signed in again, but on whatever page Google left us —
+                            # get back to this video before carrying on.
+                            if not open_video(page, url):
+                                print("     back in, but this video would not reload")
+                                time.sleep(random.uniform(lo, hi))
                                 continue
-                            delta = res.get("delta")
-                            if delta == 1:
-                                # The count went up by one. That is the like.
-                                record(url, aweme, c, "ok", "dom sweep: not in the api list")
-                                done.add(c["cid"])
+                            before = safe_eval(page, READ_MINE_JS, [aweme, 4]) or {}
+                            todo = [
+                                c for c in wants
+                                if not (before.get(c["cid"]) or {}).get("mine")
+                            ]
+                            if not todo:
+                                continue
+                        elif todo and aweme not in current_url(page):
+                            # A refresh that recovered the session can leave the tab
+                            # on a different video — TikTok re-routes on its own, and
+                            # a reload lands wherever it decides. Everything below
+                            # reads THIS one, so go back to it before doing so; the
+                            # alternative is liking a stranger's comments under this
+                            # link.
+                            if not open_video(page, url):
+                                print("     refreshed, but this video would not reload")
+                                time.sleep(random.uniform(lo, hi))
+                                continue
+                            before = safe_eval(page, READ_MINE_JS, [aweme, 4]) or {}
+                            todo = [
+                                c for c in wants
+                                if not (before.get(c["cid"]) or {}).get("mine")
+                            ]
+                            if not todo:
+                                continue
+                        # A captcha hides the comments behind placeholders while
+                        # everything else looks healthy. Check before blaming the
+                        # panel, or the whole run reads as a DOM problem.
+                        if todo and captcha_present(page):
+                            # Straight to the alarm. The solving API is opt-in
+                            # (--solve-captcha) because trying it first costs half a
+                            # minute of silence before anyone is told there is
+                            # anything to look at, and it does not reliably clear
+                            # TikTok's puzzle anyway.
+                            solved = False
+                            if args.solve_captcha:
+                                print("     captcha - attempting to solve")
+                                solved = solve_captcha_here(page)
+                            if not solved and not args.headed and not args.no_captcha_window:
+                                # Headless has nobody to drag the slider. Rather
+                                # than give up on the account, put a window on
+                                # screen for as long as it takes, then go back.
+                                ctx, page, solved = show_for_captcha(
+                                    p, ctx, page, args, url, args.solve_captcha
+                                )
+                            if not solved and not wait_out_captcha(
+                                page, args.profile, args.headed, tried_api=args.solve_captcha
+                            ):
+                                print(
+                                    f"\n  TikTok is showing its slider captcha to profile "
+                                    f"'{args.profile}'.\n"
+                                    "  Solve it once by hand and it usually stays quiet for a while:\n"
+                                    f"    python solve_captcha.py --profile {args.profile}"
+                                )
+                                break
+                        panel = True
+                        if todo:
+                            panel = open_comments(page)
+                            if not panel and captcha_present(page):
+                                # Opening the comments is itself a common trigger, so
+                                # the check above passes and the puzzle appears in
+                                # response to the click. Checking only beforehand
+                                # meant the solver never ran once.
+                                print("     captcha appeared on opening the comments")
+                                cleared = False
+                                if args.solve_captcha:
+                                    cleared = solve_captcha_here(page)
+                                if not cleared and not args.headed and not args.no_captcha_window:
+                                    ctx, page, cleared = show_for_captcha(
+                                        p, ctx, page, args, url, args.solve_captcha
+                                    )
+                                if not cleared:
+                                    cleared = wait_out_captcha(
+                                        page, args.profile, args.headed,
+                                        tried_api=args.solve_captcha,
+                                    )
+                                if cleared:
+                                    panel = open_comments(page)
+                        if todo and not panel:
+                            note = (
+                                "captcha blocked the comments"
+                                if captcha_present(page)
+                                else "comment panel did not open"
+                            )
+                            if DEBUG:
+                                why = why_stuck(page)
+                                print(f"     {why}")
+                                note = f"{note} — {why}"
+                            for c in todo:
+                                record(url, aweme, c, "fail:dom", note)
+                                failed += 1
+                            print(f"     {note}")
+                            time.sleep(random.uniform(lo, hi))
+                            continue
+                        skipped_already = len(wants) - len(todo)
+                        if not todo:
+                            for c in wants:
+                                record(url, aweme, c, "ok", "already liked before this run")
                                 ok += 1
-                                extra_ok += 1
-                            elif delta == -1:
-                                # It was already ours and the press removed it.
-                                # Put it back, and check that it went back.
-                                undo = safe_eval(page, DOM_LIKE_JS, [c["user"], c["text"]]) or {}
-                                if undo.get("delta") == 1:
-                                    # Nothing was lost, and nothing is owed: it
-                                    # was liked before we arrived and it is
-                                    # liked now. Recorded as DONE rather than
-                                    # failed, so the sweep never presses it
-                                    # again \u2014 a failure row is dropped on the
-                                    # next run and retried forever.
-                                    record(url, aweme, c, "ok", "dom sweep: was already liked")
+                            print(f"     all {len(wants)} already liked")
+                            continue
+
+                        payload = [{"cid": c["cid"], "user": c["user"], "text": c["text"]} for c in todo]
+                        clicks = safe_eval(page, CLICK_JS, [payload, args.scrolls]) or {}
+
+                        # Scroll ONLY if something was not on screen. Most videos hold
+                        # fewer comments than the panel renders, so scrolling every
+                        # one of them spent ~13 seconds a video finding nothing new.
+                        if not clicks.get("_error"):
+                            missing = [c for c in todo if str(clicks.get(c["cid"], "")) == "not found"]
+                            if missing:
+                                load_more_comments(page, args.scrolls)
+                                again = safe_eval(
+                                    page,
+                                    CLICK_JS,
+                                    [[{"cid": c["cid"], "user": c["user"], "text": c["text"]} for c in missing],
+                                     args.scrolls],
+                                ) or {}
+                                clicks.update(again)
+                        if clicks.get("_error"):
+                            # The panel never opened, so nothing was pressed. Say so
+                            # rather than reporting every target as a failed like.
+                            print(f"     {clicks['_error']}")
+                            for c in todo:
+                                record(url, aweme, c, "fail:dom", clicks["_error"])
+                                failed += 1
+                            if failed >= 5 and ok == 0 and not args.keep_going:
+                                print(
+                                    "\nEvery video so far has failed to open its comments. "
+                                    "Stopping — inspect this profile in a headed browser:\n"
+                                    f"  python inspect_dom.py --headed --profile {args.profile}\n"
+                                    "  (or pass --keep-going to work the list regardless)"
+                                )
+                                break
+                            time.sleep(random.uniform(lo, hi))
+                            continue
+                        page.wait_for_timeout(1200)
+                        after = safe_eval(page, READ_MINE_JS, [aweme, 4]) or {}
+
+                        seen = clicks.get("_seen")
+                        sample = clicks.get("_sample") or ""
+                        landed = 0
+                        # "Not found" is a property of ONE video — our comment sits
+                        # below what the list will render — not a sign the run is
+                        # broken. Counting it towards the three-strikes stop killed
+                        # an account whose first video happened to be a busy one.
+                        unreachable = 0
+                        for c in todo:
+                            state = after.get(c["cid"]) or {}
+                            note = str(clicks.get(c["cid"], "?"))
+                            if note == "not found" and seen is not None:
+                                note = f"not found among {seen} row(s) [{sample}]"
+                            # Only the re-read counts. A click that reported success
+                            # and changed nothing is exactly what the API did for
+                            # three rounds, and it must not reach done.csv as "ok".
+                            if state.get("mine"):
+                                record(url, aweme, c, "ok", f"digg_count={state.get('digg')}")
+                                ok += 1
+                                landed += 1
+                                like_landed()
+                            elif note.startswith("not found"):
+                                record(url, aweme, c, "fail:deep", note)
+                                unreachable += 1
+                            else:
+                                # The click result distinguishes "never found the
+                                # comment" from "pressed it and nothing happened",
+                                # which need completely different fixes.
+                                record(url, aweme, c, "fail:dom", note)
+                                failed += 1
+                                if note.startswith("clicked"):
+                                    # Pressed, and not kept. Eight of those in a
+                                    # row with nothing ever landing is an account
+                                    # whose likes are being thrown away.
+                                    if clicked_but_not_kept(args.profile, str(who or "")):
+                                        dead_account = True
+
+                        if dead_account:
+                            # Not `continue`: every remaining video would press a
+                            # heart TikTok throws away, and write a row saying so.
+                            break
+
+                        # ── the panel is open and scrolled: read it ──────────────
+                        # The API list is not the whole comment section (see
+                        # DOM_SCAN_JS). Anything it missed is on screen right now,
+                        # and this is the only moment in the run when that is true.
+                        extra_ok = extra_fail = 0
+                        # AND NOT UNDER --no-like. Unreachable today — an empty
+                        # like list makes the loop skip this video long before
+                        # here — but this is the second path that can press a
+                        # heart, and a switch that means 'like nothing' should
+                        # not depend on control flow three screens away.
+                        if not args.no_dom_sweep and not args.no_like:
+                            rows = safe_eval(page, DOM_SCAN_JS) or []
+                            extras = dom_extras(rows, aweme, products, users, api_comments, done)
+                            for c in extras:
+                                res = safe_eval(page, DOM_LIKE_JS, [c["user"], c["text"]]) or {}
+                                if not res.get("found"):
+                                    # It was in the scan a moment ago, so the list
+                                    # re-rendered under us. Not worth a ledger row.
+                                    continue
+                                delta = res.get("delta")
+                                if delta == 1:
+                                    # The count went up by one. That is the like.
+                                    record(url, aweme, c, "ok", "dom sweep: not in the api list")
                                     done.add(c["cid"])
                                     ok += 1
+                                    extra_ok += 1
+                                elif delta == -1:
+                                    # It was already ours and the press removed it.
+                                    # Put it back, and check that it went back.
+                                    undo = safe_eval(page, DOM_LIKE_JS, [c["user"], c["text"]]) or {}
+                                    if undo.get("delta") == 1:
+                                        # Nothing was lost, and nothing is owed: it
+                                        # was liked before we arrived and it is
+                                        # liked now. Recorded as DONE rather than
+                                        # failed, so the sweep never presses it
+                                        # again \u2014 a failure row is dropped on the
+                                        # next run and retried forever.
+                                        record(url, aweme, c, "ok", "dom sweep: was already liked")
+                                        done.add(c["cid"])
+                                        ok += 1
+                                    else:
+                                        # The restore did not land. Say so loudly:
+                                        # this is the one outcome that leaves a
+                                        # comment worse than we found it.
+                                        record(url, aweme, c, "fail:dom",
+                                               "dom sweep: UNLIKED and could not restore")
+                                        failed += 1
+                                        extra_fail += 1
                                 else:
-                                    # The restore did not land. Say so loudly:
-                                    # this is the one outcome that leaves a
-                                    # comment worse than we found it.
-                                    record(url, aweme, c, "fail:dom",
-                                           "dom sweep: UNLIKED and could not restore")
+                                    # 0, null, or never clicked. The press achieved
+                                    # nothing, so there is nothing to undo \u2014 and
+                                    # pressing again to find out is exactly the bug
+                                    # this replaced.
+                                    why = res.get("why") or (
+                                        f"like count did not move ({res.get('before')} -> {res.get('after')})"
+                                        if res.get("clicked")
+                                        else "not clicked"
+                                    )
+                                    record(url, aweme, c, "fail:dom", f"dom sweep: {why}")
                                     failed += 1
                                     extra_fail += 1
-                            else:
-                                # 0, null, or never clicked. The press achieved
-                                # nothing, so there is nothing to undo \u2014 and
-                                # pressing again to find out is exactly the bug
-                                # this replaced.
-                                why = res.get("why") or (
-                                    f"like count did not move ({res.get('before')} -> {res.get('after')})"
-                                    if res.get("clicked")
-                                    else "not clicked"
-                                )
-                                record(url, aweme, c, "fail:dom", f"dom sweep: {why}")
-                                failed += 1
-                                extra_fail += 1
-                            time.sleep(random.uniform(lo, hi))
+                                time.sleep(random.uniform(lo, hi))
 
-                    rate = vn / max(0.001, time.time() - started)
-                    print(
-                        f"     {landed}/{len(todo)} liked"
-                        + (f", {skipped_already} already" if skipped_already else "")
-                        + (f", {unreachable} too deep to reach" if unreachable else "")
-                        + (f", +{extra_ok} from the panel" if extra_ok else "")
-                        + (f", {extra_fail} panel fail" if extra_fail else "")
-                        + f"   {rate:.2f} video/s",
-                        flush=True,
-                    )
-                    if args.limit and ok >= args.limit:
-                        print(f"\n  reached --limit {args.limit}")
-                        break
-                    if failed >= 3 and ok == 0 and not args.keep_going:
+                        rate = vn / max(0.001, time.time() - started)
                         print(
-                            "\nFirst three all failed — stopping. Check done.csv, "
-                            "or pass --keep-going to work the list regardless."
+                            f"     {landed}/{len(todo)} liked"
+                            + (f", {skipped_already} already" if skipped_already else "")
+                            + (f", {unreachable} too deep to reach" if unreachable else "")
+                            + (f", +{extra_ok} from the panel" if extra_ok else "")
+                            + (f", {extra_fail} panel fail" if extra_fail else "")
+                            + f"   {rate:.2f} video/s",
+                            flush=True,
                         )
-                        break
-                    time.sleep(random.uniform(lo, hi))
+                        if args.limit and ok >= args.limit:
+                            print(f"\n  reached --limit {args.limit}")
+                            break
+                        if failed >= 3 and ok == 0 and not args.keep_going:
+                            print(
+                                "\nFirst three all failed — stopping. Check done.csv, "
+                                "or pass --keep-going to work the list regardless."
+                            )
+                            break
+                        time.sleep(random.uniform(lo, hi))
+                    except Exception as e:  # noqa: BLE001
+                        # Nothing is written to the ledger: whatever was not
+                        # recorded before the error is simply not recorded, so
+                        # the next run tries it again. Writing a failure row here
+                        # would claim to know something about comments this pass
+                        # never reached.
+                        why = str(e).splitlines()[0][:120]
+                        print(f"     error on this video: {why}")
+                        if "has been closed" in why or "Target page" in why:
+                            # The browser itself is gone. Every remaining video
+                            # would fail the same way.
+                            print("     browser is gone — stopping this profile")
+                            break
+                        time.sleep(random.uniform(lo, hi))
+                        continue
                 ctx.close()
                 f.close()
-                print(f"\n{ok} liked, {failed} failed. Log: {DONE}")
+                print(f"\n{ok} liked, {failed} failed{recovered_note()}. Log: {DONE}")
                 return 0 if failed == 0 else 1
 
             # ── api mode: kept for the day TikTok changes its mind ────────────
@@ -2250,7 +3329,7 @@ def main() -> int:
     finally:
         f.close()
 
-    print(f"\n{ok} liked, {failed} failed. Log: {DONE}")
+    print(f"\n{ok} liked, {failed} failed{recovered_note()}. Log: {DONE}")
     return 0 if failed == 0 else 1
 
 

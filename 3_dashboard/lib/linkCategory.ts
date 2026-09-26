@@ -51,7 +51,10 @@ const SYSTEM =
 //
 // Matched against a normalised form (lowercased, non-alphanumerics stripped) so
 // "Walter Writes", "walterwrites" and "#walterwrites" all hit the same key.
-const COMPETITOR_BRANDS = [
+// Exported because the LIKER needs the same list: it reads a video's comments
+// looking for one that recommends a rival, and a second copy of these names in
+// another project is a list that will disagree with this one within a month.
+export const COMPETITOR_BRANDS = [
   'grubbyai', 'naturalwrite', 'walterwrites', 'undetectableai', 'stealthwriter',
   'quillbot', 'hixbypass', 'humbot', 'phrasly', 'twixify', 'rephrasy',
 ]

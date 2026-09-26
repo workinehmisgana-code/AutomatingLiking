@@ -1,7 +1,13 @@
 import { headers } from 'next/headers'
 import { redirect } from 'next/navigation'
 import { auth } from '@/lib/auth'
-import { getUserProfile, isProfileComplete, getBlockForEmail } from '@/lib/db'
+import {
+  getUserProfile,
+  isProfileComplete,
+  needsContactOnly,
+  getBlockForEmail,
+  getReferralOf,
+} from '@/lib/db'
 import Onboarding from '@/components/Onboarding'
 import Login from '@/components/Login'
 import Blocked from '@/components/Blocked'
@@ -36,11 +42,21 @@ export default async function OnboardingPage() {
   // they work for all of them.
   if (isProfileComplete(profile)) redirect('/')
 
+  // The referral question is asked once. Somebody who already has a referrer
+  // recorded (a half-finished registration they are coming back to) is not
+  // asked again, because the answer could not be applied.
+  const referral = await getReferralOf(session.user.id).catch(() => null)
+
   return (
     <Onboarding
       initial={profile}
       email={session.user.email ?? ''}
       suggestedName={session.user.name ?? ''}
+      canEnterReferral={!referral}
+      // An existing worker sent here by the contact gate is looking at a form
+      // they filled in weeks ago. Without a word at the top it reads as being
+      // asked to register again.
+      contactOnly={needsContactOnly(profile)}
     />
   )
 }

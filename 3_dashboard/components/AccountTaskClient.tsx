@@ -20,6 +20,8 @@ interface Data {
   domain: string
   /** The password to set on the mailbox. '' = we are not telling them one. */
   password: string
+  /** The recovery address to put on it. '' = we are not asking for one. */
+  recovery: string
   rate: number
   submissions: Submission[]
 }
@@ -62,6 +64,7 @@ export default function AccountTaskClient() {
   const [email, setEmail] = useState('')
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [copiedRecovery, setCopiedRecovery] = useState(false)
   const [msg, setMsg] = useState('')
   const [formErr, setFormErr] = useState('')
 
@@ -191,6 +194,40 @@ export default function AccountTaskClient() {
               <p className="text-[11px] text-zinc-500 mt-1.5 leading-relaxed">
                 Exactly as written, including the capital letters and symbols. An
                 address we cannot sign in to is rejected and not paid.
+              </p>
+            </div>
+          )}
+          {/* The recovery address, beside the password, because both are
+              instructions for the step before this one — things to type while
+              creating the mailbox, not while telling us about it. */}
+          {data.recovery && (
+            <div className="mb-3 rounded-lg border border-sky-500/30 bg-sky-500/5 px-3 py-2">
+              <div className="text-xs text-sky-200/90 mb-1">
+                Set this as the recovery email on the mailbox:
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <code className="text-sm text-white bg-zinc-950 border border-zinc-700 rounded px-2 py-1 break-all select-all">
+                  {data.recovery}
+                </code>
+                <button
+                  type="button"
+                  onClick={() => {
+                    try {
+                      void navigator.clipboard?.writeText(data.recovery)
+                      setCopiedRecovery(true)
+                      setTimeout(() => setCopiedRecovery(false), 1500)
+                    } catch {
+                      /* clipboard blocked — the address is on screen to type */
+                    }
+                  }}
+                  className="text-xs text-zinc-300 border border-zinc-700 hover:bg-zinc-800 rounded px-2 py-1"
+                >
+                  {copiedRecovery ? 'Copied ✓' : 'Copy'}
+                </button>
+              </div>
+              <p className="text-[11px] text-zinc-500 mt-1.5 leading-relaxed">
+                Not your own address. It is where the reset link goes, and an address
+                without it is rejected and not paid.
               </p>
             </div>
           )}

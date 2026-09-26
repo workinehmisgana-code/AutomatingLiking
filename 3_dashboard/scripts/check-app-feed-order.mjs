@@ -129,9 +129,13 @@ for (const platform of ['tiktok', 'instagram']) {
   const pool = videos.filter((v) => String(v.platform) === platform && String(v.url ?? '').startsWith('http'))
   if (pool.length === 0) continue
   const seed = seedFrom(userId)
-  const feed = platform === 'instagram'
-    ? clusterAndOrder(pool, 'rank')
-    : mixOrderings(clusterAndOrder(pool, 'rank'), clusterAndOrder(pool, 'date'), dateShare, seed, 1000)
+  // Every platform is mixed. Instagram used to be forced to rank-only here,
+  // mirroring a rule in the route that has been removed: its links all arrive
+  // date_only now, and rank-only clustering drops those, which left the phone
+  // with nothing. See check-instagram-feed.mjs.
+  const build = () =>
+    mixOrderings(clusterAndOrder(pool, 'rank'), clusterAndOrder(pool, 'date'), dateShare, seed, 1000)
+  const feed = build()
   console.log(`\n${platform}: batch of ${feed.length.toLocaleString()} from ${pool.length.toLocaleString()} link(s)`)
 
   const pos = feed.map((_, i) => i)
@@ -156,9 +160,7 @@ for (const platform of ['tiktok', 'instagram']) {
   }
 
   // Rebuilding from scores and the seed alone must reproduce the batch exactly.
-  const again = platform === 'instagram'
-    ? clusterAndOrder(pool, 'rank')
-    : mixOrderings(clusterAndOrder(pool, 'rank'), clusterAndOrder(pool, 'date'), dateShare, seed, 1000)
+  const again = build()
   check('  the batch is reproducible from scores + seed alone', again.map((v) => v.url).join() === feed.map((v) => v.url).join(), true)
 }
 

@@ -17,7 +17,7 @@
 // and link_stat — so the button answers immediately.
 
 import { loadVideosJson } from './videos'
-import { getBlockedUrls, getLinkStats, type LinkStat } from './db'
+import { getBlockedUrls, getLinkStats, getExtraChannels, type LinkStat } from './db'
 import { overlayStats } from './linkStats'
 import { parsePostedDate } from './cluster'
 
@@ -40,6 +40,15 @@ export interface ChannelRow {
   /** Days since its most recent post we know of. */
   lastPostDays: number | null
   score: number
+  /**
+   * Somebody asked for this channel by hand; it is not (only) inferred from
+   * links we hold.
+   *
+   * Kept on the row because it changes where the row SORTS — see the ordering
+   * at the bottom of rankChannels — and because a row with no links and no
+   * history looks like a bug unless it says why it is there.
+   */
+  added: boolean
 }
 
 /**
@@ -112,6 +121,7 @@ interface Acc {
   active: number
   hearts: number[]
   times: number[]
+  added: boolean
 }
 
 /**
@@ -167,10 +177,14 @@ export interface UnattributedCount {
 }
 
 export async function rankChannels(): Promise<ChannelRow[]> {
-  const [videos, blockedUrls, stats] = await Promise.all([
+  const [videos, blockedUrls, stats, extras] = await Promise.all([
     loadVideosJson().catch(() => []),
     getBlockedUrls().catch(() => [] as string[]),
     getLinkStats().catch(() => ({}) as Record<string, LinkStat>),
+    // Channels somebody asked for that no link names. Without these the list is
+    // a closed loop: only channels we already have links from can ever be
+    // visited, so a channel we have never scraped can never be started.
+    getExtraChannels().catch(() => []),
   ])
   // Refreshed counts first, so a channel's average reflects the live numbers
   // rather than whatever the scrape happened to capture months ago.
@@ -193,7 +207,8 @@ export async function rankChannels(): Promise<ChannelRow[]> {
     }
     const s = siteOf(url)
     const key = channelKey(s, handle)
-    const a = acc.get(key) ?? { handle, site: s, links: 0, active: 0, hearts: [], times: [] }
+    const a =
+      acc.get(key) ?? { handle, site: s, links: 0, active: 0, hearts: [], times: [], added: false }
     a.links++
     if (!blocked.has(url)) a.active++
     const h = Number((v as { heart_count?: unknown }).heart_count ?? v.like_count)
@@ -203,6 +218,22 @@ export async function rankChannels(): Promise<ChannelRow[]> {
       v.scraped_at == null ? undefined : String(v.scraped_at)
     )
     if (t !== null) a.times.push(t)
+    acc.set(key, a)
+  }
+
+  // The hand-added channels, after the pool: one that HAS links keeps every
+  // number the pool gave it and is merely marked, while one we have never
+  // scraped joins with nothing — no links, no hearts, no dates — which is
+  // exactly what it is, and is why it sorts on the instruction rather than on
+  // its numbers.
+  for (const e of extras) {
+    const site = e.site as 'tiktok' | 'instagram' | 'youtube'
+    const handle = String(e.handle || '').toLowerCase()
+    if (!handle) continue
+    const key = channelKey(site, handle)
+    const a =
+      acc.get(key) ?? { handle, site, links: 0, active: 0, hearts: [], times: [], added: false }
+    a.added = true
     acc.set(key, a)
   }
 
@@ -261,6 +292,7 @@ export async function rankChannels(): Promise<ChannelRow[]> {
       perDay,
       lastPostDays,
       score: 0,
+      added: a.added,
     })
   })
 
@@ -287,6 +319,24 @@ export async function rankChannels(): Promise<ChannelRow[]> {
   }
   // Best first; handle breaks ties so the order is stable across requests, which
   // the extract pass relies on to resume at an offset.
-  rows.sort((a, b) => b.score - a.score || a.handle.localeCompare(b.handle))
+  //
+  // EXCEPT for a channel somebody added that we have no links from at all. It
+  // scores near the bottom by construction — no links, no hearts, no posting
+  // rate — and extraction walks this list in order, so left in score order it
+  // would sit behind five thousand channels and never actually be visited. That
+  // is the one case where an explicit instruction beats a computed score: a
+  // person typed this handle in and pressed add, and the next extraction should
+  // go and get it.
+  //
+  // Self-limiting: once its first links are merged it has links, so `links > 0`
+  // and it takes its place in the ranking like everything else. Nothing is
+  // permanently pinned.
+  const isNew = (r: ChannelRow) => r.added && r.links === 0
+  rows.sort(
+    (a, b) =>
+      Number(isNew(b)) - Number(isNew(a)) ||
+      b.score - a.score ||
+      a.handle.localeCompare(b.handle)
+  )
   return rows
 }

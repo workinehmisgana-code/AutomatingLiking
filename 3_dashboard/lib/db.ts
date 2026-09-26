@@ -3,11 +3,13 @@ import { del } from '@vercel/blob'
 import { randomBytes } from 'crypto'
 import {
   COMMENT_PAY_RATE,
+  REFERRAL_PAY_RATE,
   VIDEO_PAYMENT_BIRR,
   PROMO_PAY_BIRR,
   ACCOUNT_PAY_BIRR,
   ACCOUNT_TASK_DEFAULT_DOMAIN,
   ACCOUNT_TASK_DEFAULT_PASSWORD,
+  ACCOUNT_TASK_DEFAULT_RECOVERY,
   PROMO_DOWNLOAD_DAILY_LIMIT,
   CLICK_EXCLUDED_EMAILS,
   CLICK_PLATFORMS,
@@ -31,6 +33,7 @@ import {
   DEFAULT_COMMENT_STYLE,
 } from './config'
 import { isGenericTitle } from './titleFilter'
+import { normalizeReferralCode, referralCodeFrom, candidateCode } from './referrals'
 import { clampShare } from './clusterMix'
 
 const rawUrl = process.env.DATABASE_URL || ''
@@ -614,6 +617,26 @@ export function ensureVerifyLinkTable(): Promise<void> {
           added_at      TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         ALTER TABLE verify_link ADD COLUMN IF NOT EXISTS bio TEXT;
+
+        -- Channels somebody asked for by hand, which no link in the pool names.
+        --
+        -- Every other channel we know about is INFERRED from links we already
+        -- hold, so a channel we have never scraped cannot be reached: it is not
+        -- in the ranking, so the extract pass never visits it, so it never gets
+        -- links, so it is never in the ranking. This table is the way in.
+        --
+        -- Keyed by SITE AND HANDLE, the same key the ranking uses: 98 of our
+        -- handles exist on more than one site, and adding @x on Instagram must
+        -- not silently mean @x on TikTok.
+        CREATE TABLE IF NOT EXISTS extra_channel (
+          site     TEXT NOT NULL,
+          handle   TEXT NOT NULL,
+          -- Why it was added. Free text, shown in the table; a channel nobody
+          -- remembers adding is a channel nobody dares remove.
+          note     TEXT,
+          added_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (site, handle)
+        );
       `)
       .then(() => undefined)
       .catch((e) => {
@@ -622,6 +645,68 @@ export function ensureVerifyLinkTable(): Promise<void> {
       })
   }
   return ensuredVerifyLinks
+}
+
+// ── Channels added by hand ───────────────────────────────────────────────────
+//
+// See the extra_channel comment in the schema above for why this exists. In
+// short: every other channel is inferred from links we already hold, so there
+// was no way to start scraping one we had never seen.
+
+export interface ExtraChannel {
+  site: string
+  handle: string
+  note: string | null
+  addedAt: string
+}
+
+/** Add a channel by hand. Idempotent — adding one twice keeps the first note. */
+export async function addExtraChannel(
+  site: string,
+  handle: string,
+  note: string
+): Promise<boolean> {
+  await ensureVerifyLinkTable()
+  const { rowCount } = await pool.query(
+    `INSERT INTO extra_channel (site, handle, note) VALUES ($1, $2, $3)
+     ON CONFLICT (site, handle) DO NOTHING`,
+    [site, handle.replace(/^@/, '').trim().toLowerCase(), note.trim() || null]
+  )
+  return (rowCount ?? 0) > 0
+}
+
+/**
+ * Forget a hand-added channel.
+ *
+ * Only removes the ROW. Links already scraped from it stay in the pool and keep
+ * being served, and the channel keeps appearing in the ranking on their
+ * strength — which is right: removing it here says "stop treating this as one
+ * I asked for", not "throw away the work".
+ */
+export async function removeExtraChannel(site: string, handle: string): Promise<boolean> {
+  await ensureVerifyLinkTable()
+  const { rowCount } = await pool.query(
+    'DELETE FROM extra_channel WHERE site = $1 AND handle = $2',
+    [site, handle.replace(/^@/, '').trim().toLowerCase()]
+  )
+  return (rowCount ?? 0) > 0
+}
+
+/** Every hand-added channel, newest first. */
+export async function getExtraChannels(): Promise<ExtraChannel[]> {
+  await ensureVerifyLinkTable()
+  const { rows } = await pool.query<{
+    site: string
+    handle: string
+    note: string | null
+    added_at: Date
+  }>('SELECT site, handle, note, added_at FROM extra_channel ORDER BY added_at DESC')
+  return rows.map((r) => ({
+    site: r.site,
+    handle: r.handle,
+    note: r.note,
+    addedAt: new Date(r.added_at).toISOString(),
+  }))
 }
 
 export interface VerifyLinkRow {
@@ -999,6 +1084,186 @@ export async function getClickCountsByUrl(): Promise<Record<string, number>> {
   const out: Record<string, number> = {}
   for (const r of rows) out[r.url] = r.n
   return out
+}
+
+/** A clicked link, with whatever the comment extraction found on it. */
+export interface ClickScanRow {
+  url: string
+  /** Distinct users who opened it. */
+  clicks: number
+  /**
+   * When it was most recently opened, as epoch milliseconds — the instant a
+   * scan has to beat.
+   *
+   * A NUMBER, not a timestamp, because the whole point of this field is to be
+   * compared with `scannedAt`. node-postgres hands timestamptz back as a JS
+   * Date, and a Date stringifies to "Wed Sep 17 2025 12:00:00 GMT+0300 (…)" —
+   * which sorts by weekday. Comparing two of those would have quietly decided
+   * which scans were fresh by the first letter of the day of the week.
+   */
+  lastClick: number
+  /** Our product comments the last scan found, or null if nobody has scanned it. */
+  ourCount: number | null
+  /** When that scan ran, epoch milliseconds, or null. */
+  scannedAt: number | null
+  /**
+   * How many comments that scan could actually read, and whether it reached the
+   * end of the list.
+   *
+   * Both are here because a zero in `ourCount` means nothing without them. A
+   * scan that read NO comments — a deleted video, a private account, a throttled
+   * request — is not a video with none of our comments on it, and 1,539 of the
+   * 7,412 otherwise-countable links are in exactly that state. This is the same
+   * distinction lib/commentPresence draws with `judgeable`.
+   */
+  readCount: number | null
+  complete: boolean
+}
+
+/**
+ * Every clicked link, with its click count and its latest comment scan.
+ *
+ * `lastClick` is here for one reason, and it is the difference between a number
+ * that means something and one that does not: a scan taken BEFORE the last click
+ * could not have seen the comment that click was meant to produce, so counting
+ * it would report "nobody comments on this channel" about a channel nobody had
+ * looked at recently. The caller drops those; see lib/commentYield.
+ *
+ * Admin/debug accounts are excluded from the click count exactly as
+ * getClickCountsByUrl excludes them, or our own test clicks would be counted as
+ * work that produced no comment.
+ */
+export async function getClickScanByUrl(): Promise<ClickScanRow[]> {
+  await ensureClickedTable()
+  // The two instants come back as epoch milliseconds, computed by Postgres, so
+  // the comparison that decides freshness is arithmetic on two numbers from the
+  // same clock — no Date parsing, no timezone, no string ordering.
+  const { rows } = await pool.query<{
+    url: string
+    n: number
+    last_click: string
+    our_count: number | null
+    scanned_at: string | null
+    read_count: number | null
+    complete: boolean | null
+  }>(
+    `SELECT c.url,
+            c.n,
+            (EXTRACT(EPOCH FROM c.last_click) * 1000)::bigint   AS last_click,
+            s.our_count,
+            (EXTRACT(EPOCH FROM s.scanned_at) * 1000)::bigint   AS scanned_at,
+            s.read_count,
+            s.complete
+       FROM (
+         SELECT url, COUNT(*)::int AS n, MAX(clicked_at) AS last_click
+           FROM clicked_link
+          WHERE user_id NOT IN (
+                  SELECT id FROM "user" WHERE lower(email) = ANY($1::text[])
+                )
+          GROUP BY url
+       ) c
+       LEFT JOIN link_comment_scan s ON s.url = c.url`,
+    [CLICK_EXCLUDED_EMAILS]
+  )
+  return rows.map((r) => ({
+    url: r.url,
+    clicks: r.n,
+    lastClick: Number(r.last_click),
+    ourCount: r.our_count,
+    scannedAt: r.scanned_at === null ? null : Number(r.scanned_at),
+    readCount: r.read_count,
+    complete: r.complete === true,
+  }))
+}
+
+/**
+ * Which of our products were found on each scanned link, and how many of each.
+ *
+ * The scan's `our_count` says how many of our comments are on a video; this says
+ * WHICH, and a channel carrying only one product is a different problem from a
+ * channel carrying none.
+ */
+export async function getProductCommentCounts(): Promise<Record<string, Record<string, number>>> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ url: string; product: string; n: number }>(
+    `SELECT url, product, COUNT(*)::int AS n
+       FROM link_product_comment
+      GROUP BY url, product`
+  )
+  const out: Record<string, Record<string, number>> = {}
+  for (const r of rows) (out[r.url] ??= {})[r.product] = r.n
+  return out
+}
+
+/** One of our product comments, as the extraction read it off the video. */
+export interface OurComment {
+  product: string
+  /** 0-based position in the comment list — 0 is the very top. */
+  rank: number
+  likes: number
+  username: string | null
+  text: string | null
+}
+
+/**
+ * Our product comments on a set of links, verbatim.
+ *
+ * The counts say how many; this says what they actually are, which is the only
+ * way to tell a real recommendation from a bare product name posted by a bot.
+ * Fetched for a set of URLs rather than for the pool because the text is only
+ * ever wanted for one channel at a time.
+ */
+export async function getProductCommentsForUrls(
+  urls: string[]
+): Promise<Record<string, OurComment[]>> {
+  if (urls.length === 0) return {}
+  await ensureClickedTable()
+  const { rows } = await pool.query<{
+    url: string
+    product: string
+    rank: number
+    likes: number
+    username: string | null
+    text: string | null
+  }>(
+    `SELECT url, product, rank, likes, username, text
+       FROM link_product_comment
+      WHERE url = ANY($1::text[])
+      ORDER BY url, rank`,
+    [urls]
+  )
+  const out: Record<string, OurComment[]> = {}
+  for (const r of rows) {
+    ;(out[r.url] ??= []).push({
+      product: r.product,
+      rank: r.rank,
+      likes: r.likes,
+      username: r.username,
+      text: r.text,
+    })
+  }
+  return out
+}
+
+/**
+ * How many links each platform has had its comments read on.
+ *
+ * Reported beside the yield table because the answer is currently "TikTok only":
+ * the extraction reads TikTok's comment endpoint, so an Instagram or YouTube
+ * channel has no comment data at all and is absent from the table. A table that
+ * quietly contained one platform would be read as "the others are fine".
+ */
+export async function getScanCountsByPlatform(): Promise<Record<string, number>> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ tiktok: number; instagram: number; youtube: number }>(
+    `SELECT COUNT(*) FILTER (WHERE url ILIKE '%tiktok.com%')::int    AS tiktok,
+            COUNT(*) FILTER (WHERE url ILIKE '%instagram.com%')::int AS instagram,
+            COUNT(*) FILTER (WHERE url ILIKE '%youtube.com%'
+                                OR url ILIKE '%youtu.be%')::int      AS youtube
+       FROM link_comment_scan`
+  )
+  const r = rows[0] ?? { tiktok: 0, instagram: 0, youtube: 0 }
+  return { tiktok: r.tiktok, instagram: r.instagram, youtube: r.youtube }
 }
 
 // ── One-time backfill: stamp `product` on clicks recorded before the column ──
@@ -2158,7 +2423,18 @@ export async function saveJudgedLinks(
   links: { url: string; found: boolean; judgeable: boolean; text?: string | null; total?: number | null }[],
   /** When the current pass began. Given, the day's totals count only verdicts
    *  from this pass — see the comment on the recompute below. */
-  freshSince?: string | null
+  freshSince?: string | null,
+  /**
+   * Whether to recompute the day's score row from these verdicts.
+   *
+   * FALSE FOR A SAMPLE THAT IS NOT THE DAY. The per-user check reads a user's
+   * last 100 links, which spans days and takes a slice of each: recomputing a
+   * 400-link day from the nine of its links that fell inside that slice would
+   * replace a day's score with a fragment of itself. The verdicts are still
+   * written — they are real readings and the next sweep reuses them — but the
+   * day row stays the sweep's business.
+   */
+  refreshDay = true
 ): Promise<void> {
   if (links.length === 0) return
   await ensureClickedTable()
@@ -2196,6 +2472,7 @@ export async function saveJudgedLinks(
   //
   // (This used to say the day was capped at 100 links. It no longer is: every
   // link opened that day is read — see lib/commentPresence.)
+  if (!refreshDay) return
   await pool.query(
     freshSince
       ? `INSERT INTO comment_presence (user_id, day, checked, found, skipped)
@@ -2271,10 +2548,18 @@ export async function getRecentClickedLinks(
   return rows.map((r) => ({ url: r.url, day: r.day.toISOString().slice(0, 10) }))
 }
 
-/** Verdicts already in the ledger for these exact (day, url) pairs. */
+/**
+ * Verdicts already in the ledger for these exact (day, url) pairs.
+ *
+ * `freshSince` drops anything judged before that instant, so a caller can treat
+ * an older verdict as unjudged and read the video again. A comment can be
+ * deleted, hidden or posted late, and none of that shows in a stored boolean —
+ * so a check that says "as of now" has to ignore what an earlier pass concluded.
+ */
 export async function getJudgedVerdicts(
   userId: string,
-  pairs: { url: string; day: string }[]
+  pairs: { url: string; day: string }[],
+  freshSince?: string | null
 ): Promise<Map<string, { found: boolean; judgeable: boolean }>> {
   const out = new Map<string, { found: boolean; judgeable: boolean }>()
   if (pairs.length === 0) return out
@@ -2285,8 +2570,11 @@ export async function getJudgedVerdicts(
       WHERE user_id = $1
         AND (url, day) IN (
           SELECT u, d::date FROM unnest($2::text[], $3::text[]) AS x(u, d)
-        )`,
-    [userId, pairs.map((p) => p.url), pairs.map((p) => p.day)]
+        )
+        ${freshSince ? 'AND checked_at >= $4::timestamptz' : ''}`,
+    freshSince
+      ? [userId, pairs.map((p) => p.url), pairs.map((p) => p.day), freshSince]
+      : [userId, pairs.map((p) => p.url), pairs.map((p) => p.day)]
   )
   for (const r of rows) {
     out.set(`${r.day.toISOString().slice(0, 10)}|${r.url}`, {
@@ -3394,6 +3682,14 @@ export function ensureUserProfileTable(): Promise<void> {
         );
         -- Normalised copies of each profile link, used to enforce that no two
         -- users register the same account. NULL when the user left it blank.
+        -- How to reach the person. One of the two is required (see hasContact):
+        -- pay goes out by bank transfer, but every question about a payment, a
+        -- block or a rejected link is asked over Telegram or a phone call, and
+        -- an account with neither is one nobody can contact about their own
+        -- money. Added after the fact, so existing rows have NULL and the
+        -- dashboard asks them for it before they can work.
+        ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS phone    TEXT;
+        ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS telegram TEXT;
         ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS tiktok_url_norm    TEXT;
         ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS youtube_url_norm   TEXT;
         ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS instagram_url_norm TEXT;
@@ -3433,6 +3729,53 @@ export interface UserProfile {
   tiktok_url: string | null
   youtube_url: string | null
   instagram_url: string | null
+  /** Phone number, as typed but normalised. null when not given. */
+  phone: string | null
+  /** Telegram username without the @. null when not given. */
+  telegram: string | null
+}
+
+/**
+ * A phone number we could actually ring, or null.
+ *
+ * Kept deliberately loose: this is Ethiopia, where the same number is written
+ * 0912345678, +251912345678 and 251912345678, and a form that rejects two of
+ * those spellings is a form people give up on. Everything but the digits and a
+ * leading + is dropped; anything under nine digits is not a number.
+ */
+export function normalizePhone(raw: string | null | undefined): string | null {
+  const s = String(raw ?? '').trim()
+  if (!s) return null
+  const plus = s.startsWith('+')
+  const digits = s.replace(/\D/g, '')
+  if (digits.length < 9 || digits.length > 15) return null
+  return (plus ? '+' : '') + digits
+}
+
+/**
+ * A Telegram username without the @, or null.
+ *
+ * Telegram's own rule: 5–32 characters, letters, digits and underscores. People
+ * paste it as @name, as t.me/name and as a full https://t.me/name link, and all
+ * three mean the same person.
+ */
+export function normalizeTelegram(raw: string | null | undefined): string | null {
+  let s = String(raw ?? '').trim()
+  if (!s) return null
+  s = s.replace(/^https?:\/\//i, '').replace(/^(www\.)?t(elegram)?\.me\//i, '')
+  s = s.replace(/^@/, '').split(/[?#/]/)[0]
+  return /^[A-Za-z0-9_]{5,32}$/.test(s) ? s : null
+}
+
+/**
+ * Can this person be reached at all?
+ *
+ * EITHER is enough, which is what was asked for: some of these workers have a
+ * phone and no Telegram, some the other way round, and demanding both would
+ * lock out people who can be contacted perfectly well.
+ */
+export function hasContact(p: UserProfile | null): boolean {
+  return !!(p && ((p.phone ?? '').trim() || (p.telegram ?? '').trim()))
 }
 
 /**
@@ -3480,7 +3823,7 @@ export async function findProfileLinkConflicts(
 export async function getUserProfile(userId: string): Promise<UserProfile | null> {
   await ensureUserProfileTable()
   const { rows } = await pool.query<UserProfile>(
-    `SELECT name, bank_account, tiktok_url, youtube_url, instagram_url
+    `SELECT name, bank_account, tiktok_url, youtube_url, instagram_url, phone, telegram
      FROM user_profile WHERE user_id = $1`,
     [userId]
   )
@@ -3507,19 +3850,27 @@ export async function upsertUserProfile(userId: string, p: UserProfile): Promise
     await pool.query(
       `INSERT INTO user_profile
          (user_id, name, bank_account, tiktok_url, youtube_url, instagram_url,
+          phone, telegram,
           tiktok_url_norm, youtube_url_norm, instagram_url_norm, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
        ON CONFLICT (user_id) DO UPDATE SET
          name               = EXCLUDED.name,
          bank_account       = EXCLUDED.bank_account,
          tiktok_url         = EXCLUDED.tiktok_url,
          youtube_url        = EXCLUDED.youtube_url,
          instagram_url      = EXCLUDED.instagram_url,
+         -- COALESCE, not EXCLUDED: several callers write a profile without ever
+         -- asking for these — the admin editor, the block remediation form —
+         -- and a plain overwrite would silently wipe the contact details of
+         -- everyone whose link an admin corrected.
+         phone              = COALESCE(EXCLUDED.phone, user_profile.phone),
+         telegram           = COALESCE(EXCLUDED.telegram, user_profile.telegram),
          tiktok_url_norm    = EXCLUDED.tiktok_url_norm,
          youtube_url_norm   = EXCLUDED.youtube_url_norm,
          instagram_url_norm = EXCLUDED.instagram_url_norm,
          updated_at         = now()`,
       [userId, p.name, p.bank_account, p.tiktok_url, p.youtube_url, p.instagram_url,
+       normalizePhone(p.phone), normalizeTelegram(p.telegram),
        tkN, ytN, igN]
     )
   } catch (e) {
@@ -3540,12 +3891,33 @@ export async function upsertUserProfile(userId: string, p: UserProfile): Promise
 
 // A profile counts as "complete" once name + bank account are filled in.
 export function isProfileComplete(p: UserProfile | null): boolean {
-  // TikTok is required; YouTube and Instagram are optional.
+  // TikTok is required; YouTube and Instagram are optional. A phone number or a
+  // Telegram username is required — either one, not both.
   return (
     !!p &&
     p.name.trim().length > 0 &&
     p.bank_account.trim().length > 0 &&
-    !!p.tiktok_url?.trim()
+    !!p.tiktok_url?.trim() &&
+    hasContact(p)
+  )
+}
+
+/**
+ * Is this an EXISTING user who only lacks a way to be contacted?
+ *
+ * The difference matters on screen. Somebody who has never registered is sent
+ * to the form; somebody who registered months ago, has been working and is now
+ * missing one new field should be told what changed and given a button — not
+ * dropped into a form asking for their bank account again as though they were
+ * new.
+ */
+export function needsContactOnly(p: UserProfile | null): boolean {
+  return (
+    !!p &&
+    p.name.trim().length > 0 &&
+    p.bank_account.trim().length > 0 &&
+    !!p.tiktok_url?.trim() &&
+    !hasContact(p)
   )
 }
 
@@ -3948,6 +4320,17 @@ export function ensureAdminTables(): Promise<void> {
           user_id    TEXT NOT NULL,
           body       TEXT NOT NULL,
           created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
+        -- WHICH USER MESSAGES THE ADMIN HAS SEEN.
+        --
+        -- Per reply rather than one "last looked at" timestamp: a watermark
+        -- marks everything read the moment the admin glances at the page, so a
+        -- message they meant to come back to is gone. A row here is somebody
+        -- deciding they are finished with that one.
+        CREATE TABLE IF NOT EXISTS admin_reply_read (
+          reply_id BIGINT PRIMARY KEY,
+          read_at  TIMESTAMPTZ NOT NULL DEFAULT now()
         );
 
         CREATE TABLE IF NOT EXISTS commented_submission (
@@ -5157,6 +5540,408 @@ export async function releasePromoLock(product: string): Promise<void> {
   await pool.query('UPDATE generated_promo SET locked_at = NULL WHERE product = $1', [product])
 }
 
+// ── Referrals ────────────────────────────────────────────────────────────────
+//
+// Every user has a referral username. Somebody who enters it while registering
+// is attributed to them permanently, and 20% of that person's COMMENT pay is
+// then owed to the referrer ON TOP of what the worker earns -- nothing is taken
+// off the worker.
+//
+// Three facts are stored, and each answers a different question:
+//
+//   user_profile.referral_code   what to give out. One per user, unique.
+//   referral                     who introduced whom. Written once, never
+//                                updated: the whole arrangement is worthless if
+//                                it can be changed after the work is done.
+//   referral_pay_marker          when the REFERRER was last paid their
+//                                commission. Separate from comment_pay_marker
+//                                because paying the worker must not clear the
+//                                referrer's balance, and paying the referrer
+//                                must not clear the worker's.
+
+let ensuredReferral: Promise<void> | null = null
+
+export function ensureReferralTables(): Promise<void> {
+  if (!ensuredReferral) {
+    ensuredReferral = ensureUserProfileTable()
+      .then(() =>
+        pool.query(`
+        -- The shareable handle. On user_profile because it is an attribute of
+        -- the person, and because everything that displays a user already
+        -- reads this table.
+        ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS referral_code TEXT;
+
+        -- Who introduced whom. user_id is the PRIMARY KEY, so a user has AT
+        -- MOST ONE referrer, for ever: a second registration cannot re-point
+        -- somebody's earnings at a different person.
+        CREATE TABLE IF NOT EXISTS referral (
+          user_id     TEXT PRIMARY KEY,
+          referrer_id TEXT NOT NULL,
+          -- The code as it was typed, kept verbatim. If a code is ever
+          -- reassigned or a name is edited, this is the only record of what the
+          -- person actually entered.
+          code        TEXT NOT NULL,
+          created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+          -- Nobody refers themselves. Enforced here as well as in the route:
+          -- this is the cheapest fraud there is.
+          CHECK (user_id <> referrer_id)
+        );
+        CREATE INDEX IF NOT EXISTS referral_referrer_idx ON referral (referrer_id);
+
+        -- When each referrer was last paid their commission.
+        CREATE TABLE IF NOT EXISTS referral_pay_marker (
+          user_id TEXT PRIMARY KEY,
+          paid_at TIMESTAMPTZ NOT NULL
+        );
+      `)
+      )
+      .then(async () => {
+        // A separate step, like the profile link indexes above it: CREATE
+        // UNIQUE INDEX fails outright if existing rows already collide, and a
+        // collision here must not brick every referral read.
+        try {
+          await pool.query(
+            `CREATE UNIQUE INDEX IF NOT EXISTS uq_profile_referral_code
+               ON user_profile (referral_code) WHERE referral_code IS NOT NULL`
+          )
+        } catch {
+          /* pre-existing duplicates - assignReferralCode still checks */
+        }
+      })
+      .then(() => undefined)
+      .catch((e) => {
+        ensuredReferral = null
+        throw e
+      })
+  }
+  return ensuredReferral
+}
+
+/**
+ * Give this user a referral code if they have none, and return it.
+ *
+ * Idempotent: a user who already has one keeps it. That is the important half —
+ * a code that changed would break every referral already made with it, and
+ * people share these in screenshots and voice notes that are not recalled.
+ *
+ * Races are settled by the unique index rather than by checking first: two
+ * requests can both read "abebek is free". On a collision it tries the next
+ * candidate, and after enough tries falls back to a suffix nothing can collide
+ * with.
+ */
+export async function assignReferralCode(
+  userId: string,
+  name: string,
+  email: string
+): Promise<string | null> {
+  await ensureReferralTables()
+  const existing = await pool.query<{ referral_code: string | null }>(
+    'SELECT referral_code FROM user_profile WHERE user_id = $1',
+    [userId]
+  )
+  if (existing.rows.length === 0) return null // no profile row yet
+  if (existing.rows[0].referral_code) return existing.rows[0].referral_code
+
+  const base = referralCodeFrom(name, email)
+  for (let n = 1; n <= 50; n++) {
+    const code = candidateCode(base, n)
+    try {
+      const { rows } = await pool.query<{ referral_code: string }>(
+        `UPDATE user_profile SET referral_code = $2
+          WHERE user_id = $1 AND referral_code IS NULL
+          RETURNING referral_code`,
+        [userId, code]
+      )
+      // No row means somebody assigned one concurrently; read theirs.
+      if (rows.length === 0) {
+        const again = await pool.query<{ referral_code: string | null }>(
+          'SELECT referral_code FROM user_profile WHERE user_id = $1',
+          [userId]
+        )
+        return again.rows[0]?.referral_code ?? null
+      }
+      return rows[0].referral_code
+    } catch (e) {
+      if ((e as { code?: string })?.code === '23505') continue // taken, try next
+      throw e
+    }
+  }
+  // Fifty names collided. Fall back to something that cannot: the user id is
+  // unique by definition.
+  const last = candidateCode(base, 1).slice(0, 8) + userId.replace(/[^a-z0-9]/gi, '').slice(0, 8).toLowerCase()
+  const { rows } = await pool.query<{ referral_code: string }>(
+    `UPDATE user_profile SET referral_code = $2
+      WHERE user_id = $1 AND referral_code IS NULL
+      RETURNING referral_code`,
+    [userId, last]
+  )
+  return rows[0]?.referral_code ?? last
+}
+
+/** Backfill: every user who has a profile but no code yet gets one. */
+export async function assignMissingReferralCodes(): Promise<number> {
+  await ensureReferralTables()
+  const { rows } = await pool.query<{ user_id: string; name: string; email: string | null }>(
+    `SELECT p.user_id, p.name, u.email
+       FROM user_profile p LEFT JOIN "user" u ON u.id = p.user_id
+      WHERE p.referral_code IS NULL`
+  )
+  let n = 0
+  for (const r of rows) {
+    const code = await assignReferralCode(r.user_id, r.name, r.email ?? '').catch(() => null)
+    if (code) n++
+  }
+  return n
+}
+
+/** This user's own referral code, or null if they have no profile row yet. */
+export async function getUserReferralCode(userId: string): Promise<string | null> {
+  await ensureReferralTables()
+  const { rows } = await pool.query<{ referral_code: string | null }>(
+    'SELECT referral_code FROM user_profile WHERE user_id = $1',
+    [userId]
+  )
+  return rows[0]?.referral_code ?? null
+}
+
+/** The user who owns a referral code, or null. Case and punctuation-insensitive. */
+export async function findUserByReferralCode(raw: string): Promise<string | null> {
+  const code = normalizeReferralCode(raw)
+  if (!code) return null
+  await ensureReferralTables()
+  const { rows } = await pool.query<{ user_id: string }>(
+    'SELECT user_id FROM user_profile WHERE referral_code = $1',
+    [code]
+  )
+  return rows[0]?.user_id ?? null
+}
+
+export interface ReferralOf {
+  referrerId: string
+  code: string
+  referrerName: string | null
+  createdAt: string
+}
+
+/** Who referred this user, if anyone. */
+export async function getReferralOf(userId: string): Promise<ReferralOf | null> {
+  await ensureReferralTables()
+  const { rows } = await pool.query<{
+    referrer_id: string
+    code: string
+    created_at: Date
+    name: string | null
+  }>(
+    `SELECT r.referrer_id, r.code, r.created_at, p.name
+       FROM referral r LEFT JOIN user_profile p ON p.user_id = r.referrer_id
+      WHERE r.user_id = $1`,
+    [userId]
+  )
+  const r = rows[0]
+  return r
+    ? {
+        referrerId: r.referrer_id,
+        code: r.code,
+        referrerName: r.name,
+        createdAt: new Date(r.created_at).toISOString(),
+      }
+    : null
+}
+
+/**
+ * Attribute a new user to a referrer.
+ *
+ * ON CONFLICT DO NOTHING, not DO UPDATE: the row is written once. A user who
+ * already has a referrer keeps them, whatever a later request says.
+ */
+export async function recordReferral(
+  userId: string,
+  referrerId: string,
+  code: string
+): Promise<boolean> {
+  if (!userId || !referrerId || userId === referrerId) return false
+  await ensureReferralTables()
+  const { rowCount } = await pool.query(
+    `INSERT INTO referral (user_id, referrer_id, code) VALUES ($1, $2, $3)
+     ON CONFLICT (user_id) DO NOTHING`,
+    [userId, referrerId, normalizeReferralCode(code)]
+  )
+  return (rowCount ?? 0) > 0
+}
+
+export interface ReferredMember {
+  userId: string
+  name: string | null
+  joinedAt: string
+  /** Comments that count toward the referrer's CURRENT unpaid commission. */
+  comments: number
+  /** Every comment they have ever been credited for. */
+  lifetimeComments: number
+}
+
+export interface ReferralEarnings {
+  /** The referrer's own code, for sharing. */
+  code: string | null
+  /** People who registered with it. */
+  people: number
+  /** Comments those people made that this referrer has not been paid for. */
+  comments: number
+  birr: number
+  /** Everything ever earned from them, paid or not. */
+  lifetimeComments: number
+  lifetimeBirr: number
+  members: ReferredMember[]
+}
+
+/**
+ * What a referrer is owed, and from whom.
+ *
+ * THE TIME WINDOW IS THE WHOLE POINT, so it is worth being explicit. A comment
+ * counts toward the current commission when it was submitted after all of:
+ *
+ *   the global reset          everybody's counters start there;
+ *   the WORKER's own reset    an admin wiping a user's work wipes it for
+ *                             everyone, or a reset would leave the referrer
+ *                             being paid for work the worker no longer is;
+ *   the REFERRER's last
+ *   commission payout         which is what clears this balance.
+ *
+ * Note what is NOT in that list: the worker's own comment_pay_marker. Paying
+ * the worker must not clear the referrer's commission -- they are two separate
+ * debts for the same work, and the earlier draft of this had them sharing one
+ * marker, which silently zeroed a referrer's balance every time one of their
+ * people was paid.
+ */
+export async function getReferralEarnings(userId: string): Promise<ReferralEarnings> {
+  await Promise.all([ensureReferralTables(), ensureAdminTables()])
+  const resetAt = await getResetAt()
+  const [codeRes, membersRes] = await Promise.all([
+    pool.query<{ referral_code: string | null }>(
+      'SELECT referral_code FROM user_profile WHERE user_id = $1',
+      [userId]
+    ),
+    pool.query<{
+      user_id: string
+      name: string | null
+      created_at: Date
+      n: string | null
+      lifetime: string | null
+    }>(
+      `SELECT r.user_id,
+              p.name,
+              r.created_at,
+              COALESCE(SUM(cs.count) FILTER (
+                WHERE cs.submitted_at >= GREATEST(
+                        $2::timestamptz,
+                        COALESCE(ur.reset_at, $2::timestamptz),
+                        COALESCE(rpm.paid_at, $2::timestamptz))
+              ), 0) AS n,
+              COALESCE(SUM(cs.count) FILTER (
+                WHERE cs.submitted_at >= GREATEST(
+                        $2::timestamptz,
+                        COALESCE(ur.reset_at, $2::timestamptz))
+              ), 0) AS lifetime
+         FROM referral r
+         LEFT JOIN user_profile p          ON p.user_id  = r.user_id
+         LEFT JOIN commented_submission cs ON cs.user_id = r.user_id
+         LEFT JOIN user_reset ur           ON ur.user_id = r.user_id
+         LEFT JOIN referral_pay_marker rpm ON rpm.user_id = r.referrer_id
+        WHERE r.referrer_id = $1
+        GROUP BY r.user_id, p.name, r.created_at
+        ORDER BY r.created_at`,
+      [userId, resetAt]
+    ),
+  ])
+
+  const members: ReferredMember[] = membersRes.rows.map((r) => ({
+    userId: r.user_id,
+    name: r.name,
+    joinedAt: new Date(r.created_at).toISOString(),
+    comments: Number(r.n ?? 0),
+    lifetimeComments: Number(r.lifetime ?? 0),
+  }))
+  const comments = members.reduce((a, m) => a + m.comments, 0)
+  const lifetimeComments = members.reduce((a, m) => a + m.lifetimeComments, 0)
+  return {
+    code: codeRes.rows[0]?.referral_code ?? null,
+    people: members.length,
+    comments,
+    birr: comments * REFERRAL_PAY_RATE,
+    lifetimeComments,
+    lifetimeBirr: lifetimeComments * REFERRAL_PAY_RATE,
+    members,
+  }
+}
+
+/** The same, for every referrer at once — one pass, for the admin dashboard. */
+export async function getAllReferralEarnings(): Promise<Record<string, ReferralEarnings>> {
+  await Promise.all([ensureReferralTables(), ensureAdminTables()])
+  const resetAt = await getResetAt()
+  const { rows } = await pool.query<{
+    referrer_id: string
+    referrer_code: string | null
+    user_id: string
+    name: string | null
+    created_at: Date
+    n: string | null
+    lifetime: string | null
+  }>(
+    `SELECT r.referrer_id,
+            rp.referral_code AS referrer_code,
+            r.user_id,
+            p.name,
+            r.created_at,
+            COALESCE(SUM(cs.count) FILTER (
+              WHERE cs.submitted_at >= GREATEST(
+                      $1::timestamptz,
+                      COALESCE(ur.reset_at, $1::timestamptz),
+                      COALESCE(rpm.paid_at, $1::timestamptz))
+            ), 0) AS n,
+            COALESCE(SUM(cs.count) FILTER (
+              WHERE cs.submitted_at >= GREATEST(
+                      $1::timestamptz,
+                      COALESCE(ur.reset_at, $1::timestamptz))
+            ), 0) AS lifetime
+       FROM referral r
+       LEFT JOIN user_profile p          ON p.user_id  = r.user_id
+       LEFT JOIN user_profile rp         ON rp.user_id = r.referrer_id
+       LEFT JOIN commented_submission cs ON cs.user_id = r.user_id
+       LEFT JOIN user_reset ur           ON ur.user_id = r.user_id
+       LEFT JOIN referral_pay_marker rpm ON rpm.user_id = r.referrer_id
+      GROUP BY r.referrer_id, rp.referral_code, r.user_id, p.name, r.created_at
+      ORDER BY r.referrer_id, r.created_at`,
+    [resetAt]
+  )
+  const out: Record<string, ReferralEarnings> = {}
+  for (const r of rows) {
+    const e =
+      (out[r.referrer_id] ??= {
+        code: r.referrer_code,
+        people: 0,
+        comments: 0,
+        birr: 0,
+        lifetimeComments: 0,
+        lifetimeBirr: 0,
+        members: [],
+      })
+    e.members.push({
+      userId: r.user_id,
+      name: r.name,
+      joinedAt: new Date(r.created_at).toISOString(),
+      comments: Number(r.n ?? 0),
+      lifetimeComments: Number(r.lifetime ?? 0),
+    })
+    e.people++
+    e.comments += Number(r.n ?? 0)
+    e.lifetimeComments += Number(r.lifetime ?? 0)
+  }
+  for (const e of Object.values(out)) {
+    e.birr = e.comments * REFERRAL_PAY_RATE
+    e.lifetimeBirr = e.lifetimeComments * REFERRAL_PAY_RATE
+  }
+  return out
+}
+
 // ── A user's own pending (unpaid / unapproved) earnings, per task ─────────────
 export interface PendingTask {
   count: number
@@ -5168,6 +5953,14 @@ export interface PendingPayments {
   promo: PendingTask
   /** Mailboxes an admin has validated. Payable, and part of `total`. */
   accounts: PendingTask
+  /**
+   * 20% of the comment pay earned by people this user referred.
+   *
+   * `count` is those people's comments, not this user's own -- the two must
+   * never be added together, and the dashboard labels it accordingly. Paid ON
+   * TOP: nothing is deducted from the worker who made the comments.
+   */
+  referrals: PendingTask
   /**
    * Mailboxes submitted but NOT yet validated.
    *
@@ -5186,7 +5979,7 @@ export interface PendingPayments {
 export async function getUserPendingPayments(userId: string): Promise<PendingPayments> {
   await Promise.all([ensureAdminTables(), ensurePromoTables()])
   const resetAt = await getResetAt()
-  const [commentedRes, videoRes, promoRes, accountRes, statusRes] = await Promise.all([
+  const [commentedRes, videoRes, promoRes, accountRes, statusRes, referralRes] = await Promise.all([
     // Comment pay: counts comments after the effective reset AND after the last
     // time the admin marked this user's comment pay as paid.
     pool.query<{ n: number }>(
@@ -5223,6 +6016,10 @@ export async function getUserPendingPayments(userId: string): Promise<PendingPay
       `SELECT approved_at, approved_amount FROM user_pay_status WHERE user_id = $1`,
       [userId]
     ),
+    // Commission on the comments of everybody this user referred. Its own
+    // window -- see getReferralEarnings for why the worker's payout must not
+    // clear it.
+    getReferralEarnings(userId).catch(() => null),
   ])
   const commentsCount = commentedRes.rows[0]?.n ?? 0
   const videoCount = videoRes.rows[0]?.n ?? 0
@@ -5233,12 +6030,16 @@ export async function getUserPendingPayments(userId: string): Promise<PendingPay
   const video: PendingTask = { count: videoCount, birr: videoCount * VIDEO_PAYMENT_BIRR }
   const promo: PendingTask = { count: promoCount, birr: promoCount * PROMO_PAY_BIRR }
   const accounts: PendingTask = { count: accountCount, birr: accountCount * ACCOUNT_PAY_BIRR }
+  const referrals: PendingTask = {
+    count: referralRes?.comments ?? 0,
+    birr: referralRes?.birr ?? 0,
+  }
   const accountsAwaiting: PendingTask = {
     count: awaitingCount,
     birr: awaitingCount * ACCOUNT_PAY_BIRR,
   }
   // `accountsAwaiting` is NOT in the total — see the interface.
-  const total = comments.birr + video.birr + promo.birr + accounts.birr
+  const total = comments.birr + video.birr + promo.birr + accounts.birr + referrals.birr
 
   // The approved amount is frozen when the admin approves; anything earned after
   // that is unapproved. total only grows while approved (a paid-mark clears it).
@@ -5253,6 +6054,7 @@ export async function getUserPendingPayments(userId: string): Promise<PendingPay
     video,
     promo,
     accounts,
+    referrals,
     accountsAwaiting,
     total,
     approved,
@@ -5276,10 +6078,82 @@ export interface AccountSubmission {
   reviewedAt: string | null
 }
 
+/** A message a user sent, that the admin has not finished with. */
+export interface UnreadReply {
+  id: number
+  userId: string
+  userName: string
+  userEmail: string
+  /** What they wrote. */
+  body: string
+  createdAt: string
+  /** The admin message they were replying to, if it still exists. Without it a
+   *  reply reads as a statement out of nowhere. */
+  toMessage: string | null
+  /** So the admin can answer where the person actually reads things. */
+  phone: string | null
+  telegram: string | null
+}
+
+/**
+ * Messages from users that nobody has marked as dealt with.
+ *
+ * Newest first, and capped: an inbox nobody has opened for a month is still a
+ * popup somebody has to get past, and thirty is more than anyone will answer in
+ * one sitting.
+ */
+export async function getUnreadReplies(limit = 30): Promise<UnreadReply[]> {
+  await ensureAdminTables()
+  const { rows } = await pool.query(
+    `SELECT r.id, r.user_id, r.body, r.created_at::text AS created_at,
+            m.body AS to_message,
+            COALESCE(u.name, '')  AS user_name,
+            COALESCE(u.email, '') AS user_email,
+            p.phone, p.telegram
+       FROM message_reply r
+       LEFT JOIN admin_message m ON m.id = r.message_id
+       LEFT JOIN "user" u        ON u.id = r.user_id
+       LEFT JOIN user_profile p  ON p.user_id = r.user_id
+      WHERE NOT EXISTS (SELECT 1 FROM admin_reply_read x WHERE x.reply_id = r.id)
+      ORDER BY r.created_at DESC
+      LIMIT $1`,
+    [Math.min(200, Math.max(1, limit))]
+  )
+  return rows.map((r) => ({
+    id: Number(r.id),
+    userId: String(r.user_id),
+    userName: String(r.user_name ?? ''),
+    userEmail: String(r.user_email ?? ''),
+    body: String(r.body ?? ''),
+    createdAt: new Date(r.created_at as string).toISOString(),
+    toMessage: r.to_message == null ? null : String(r.to_message),
+    phone: r.phone ? String(r.phone) : null,
+    telegram: r.telegram ? String(r.telegram) : null,
+  }))
+}
+
+/** Mark messages as dealt with. Idempotent: pressing it twice is not an error. */
+export async function markRepliesRead(ids: number[]): Promise<number> {
+  await ensureAdminTables()
+  const clean = ids.map(Number).filter((n) => Number.isFinite(n) && n > 0)
+  if (!clean.length) return 0
+  const { rowCount } = await pool.query(
+    `INSERT INTO admin_reply_read (reply_id)
+     SELECT unnest($1::bigint[]) ON CONFLICT (reply_id) DO NOTHING`,
+    [clean]
+  )
+  return rowCount ?? 0
+}
+
 /** One submission plus who made it, for the admin queue. */
 export interface AccountSubmissionRow extends AccountSubmission {
   userName: string
   userEmail: string
+  /** How to reach them. Reviewing a mailbox means asking about it — the
+   *  password does not work, the address is a typo, it is already registered —
+   *  and the sign-in email is not something these workers read. */
+  phone: string | null
+  telegram: string | null
 }
 
 const accountRow = (r: Record<string, unknown>): AccountSubmission => ({
@@ -5351,7 +6225,11 @@ export async function getAccountSubmissions(opts: {
     args.push(`%${opts.q.trim().toLowerCase()}%`)
     where.push(
       `(lower(a.email) LIKE $${args.length} OR lower(u.name) LIKE $${args.length}` +
-        ` OR lower(u.email) LIKE $${args.length})`
+        ` OR lower(u.email) LIKE $${args.length}` +
+        // Searchable by contact as well: an admin holding a phone number is
+        // trying to find out whose submission it is.
+        ` OR lower(COALESCE(p.phone, '')) LIKE $${args.length}` +
+        ` OR lower(COALESCE(p.telegram, '')) LIKE $${args.length})`
     )
   }
   args.push(Math.min(1000, Math.max(1, opts.limit ?? 500)))
@@ -5359,9 +6237,11 @@ export async function getAccountSubmissions(opts: {
     `SELECT a.id, a.user_id, a.email, a.status, a.reject_reason, a.paid,
             a.submitted_at, a.reviewed_at,
             COALESCE(u.name, '')  AS user_name,
-            COALESCE(u.email, '') AS user_email
+            COALESCE(u.email, '') AS user_email,
+            p.phone, p.telegram
        FROM account_submission a
        LEFT JOIN "user" u ON u.id = a.user_id
+       LEFT JOIN user_profile p ON p.user_id = a.user_id
       ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
       ORDER BY (a.status = 'pending') DESC, a.submitted_at DESC
       LIMIT $${args.length}`,
@@ -5371,6 +6251,8 @@ export async function getAccountSubmissions(opts: {
     ...accountRow(r),
     userName: String(r.user_name ?? ''),
     userEmail: String(r.user_email ?? ''),
+    phone: r.phone ? String(r.phone) : null,
+    telegram: r.telegram ? String(r.telegram) : null,
   }))
 }
 
@@ -5433,6 +6315,22 @@ export async function setAccountTaskPassword(password: string): Promise<string> 
   // Trimmed, never lowercased: a password is not a domain.
   const clean = String(password ?? '').trim()
   await setAppState(ACCOUNT_PASSWORD_KEY, clean)
+  return clean
+}
+
+/** The recovery address workers put on the mailbox. Blank = do not ask for one. */
+const ACCOUNT_RECOVERY_KEY = 'account_task_recovery'
+
+export async function getAccountTaskRecovery(): Promise<string> {
+  const saved = await getAppState(ACCOUNT_RECOVERY_KEY).catch(() => null)
+  return (saved ?? '').trim() || ACCOUNT_TASK_DEFAULT_RECOVERY
+}
+
+export async function setAccountTaskRecovery(email: string): Promise<string> {
+  // Lowercased, like the domain: an address is not case-sensitive in practice,
+  // and two spellings of the same one would read as a change when it is not.
+  const clean = String(email ?? '').trim().toLowerCase()
+  await setAppState(ACCOUNT_RECOVERY_KEY, clean)
   return clean
 }
 
@@ -5570,6 +6468,15 @@ export async function deleteUser(userId: string): Promise<void> {
     'commented_submission', 'comment_screenshot', 'comment_pay_marker',
     'user_pay_status', 'app_token', 'promo_download', 'promo_link', 'promo_account',
   ]
+  // Keyed by reply, not by user, so it cannot ride along in the loop below —
+  // and left behind it would mark a future reply as already dealt with.
+  await pool
+    .query(
+      `DELETE FROM admin_reply_read WHERE reply_id IN
+         (SELECT id FROM message_reply WHERE user_id = $1)`,
+      [userId]
+    )
+    .catch(() => {})
   for (const t of userTables) {
     await pool.query(`DELETE FROM ${t} WHERE user_id = $1`, [userId]).catch(() => {})
   }
@@ -5595,6 +6502,10 @@ export interface MarkPaidUndo {
    *  it would be worse than never telling them. */
   messageId?: number
   prevMarkerPaidAt: string | null
+  /** The referral marker before this payment. Optional so an undo descriptor
+   *  recorded before commissions existed still reverses everything it knew
+   *  about, instead of failing on a field it has never heard of. */
+  prevReferralPaidAt?: string | null
   prevStatus: {
     approved_at: string | null
     approved_amount: number | null
@@ -5618,6 +6529,13 @@ export async function markUserPaid(userId: string): Promise<{ amount: number; un
     [userId]
   )
   const prevMarkerPaidAt = mk.rows[0]?.paid_at ? new Date(mk.rows[0].paid_at).toISOString() : null
+  const rmk = await pool.query<{ paid_at: Date }>(
+    'SELECT paid_at FROM referral_pay_marker WHERE user_id = $1',
+    [userId]
+  )
+  const prevReferralPaidAt = rmk.rows[0]?.paid_at
+    ? new Date(rmk.rows[0].paid_at).toISOString()
+    : null
   const st = await pool.query<{
     approved_at: Date | null
     approved_amount: string | null
@@ -5649,6 +6567,14 @@ export async function markUserPaid(userId: string): Promise<{ amount: number; un
      ON CONFLICT (user_id) DO UPDATE SET paid_at = now()`,
     [userId]
   )
+  // The commission was part of `amount`, so it has to be cleared by the same
+  // payment. Its own marker: clearing it through comment_pay_marker would mean
+  // paying a worker also wiped the commission owed to whoever referred them.
+  await pool.query(
+    `INSERT INTO referral_pay_marker (user_id, paid_at) VALUES ($1, now())
+     ON CONFLICT (user_id) DO UPDATE SET paid_at = now()`,
+    [userId]
+  )
   await pool.query(
     `INSERT INTO user_pay_status (user_id, last_paid_amount, last_paid_at, paid_ack, approved_at, approved_amount)
      VALUES ($1, $2, now(), false, NULL, NULL)
@@ -5662,6 +6588,7 @@ export async function markUserPaid(userId: string): Promise<{ amount: number; un
       videoIds: v.rows.map((r) => r.id),
       promoIds: p.rows.map((r) => r.id),
       prevMarkerPaidAt,
+      prevReferralPaidAt,
       prevStatus,
     },
   }
@@ -5684,6 +6611,21 @@ export async function undoMarkPaid(userId: string, u: MarkPaidUndo): Promise<voi
     )
   } else {
     await pool.query('DELETE FROM comment_pay_marker WHERE user_id = $1', [userId])
+  }
+  // Only touched when the descriptor carries the field. An undo recorded before
+  // commissions existed says nothing about the referral marker, and `undefined`
+  // must not be read as "there was none" — that would hand the referrer their
+  // whole history again.
+  if (u.prevReferralPaidAt !== undefined) {
+    if (u.prevReferralPaidAt) {
+      await pool.query(
+        `INSERT INTO referral_pay_marker (user_id, paid_at) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET paid_at = $2`,
+        [userId, u.prevReferralPaidAt]
+      )
+    } else {
+      await pool.query('DELETE FROM referral_pay_marker WHERE user_id = $1', [userId])
+    }
   }
   if (u.prevStatus) {
     await pool.query(
@@ -5716,7 +6658,7 @@ export async function consumePayNotice(userId: string): Promise<number | null> {
 export async function getAllPendingPay(): Promise<Record<string, PendingPayments>> {
   await Promise.all([ensureAdminTables(), ensurePromoTables()])
   const resetAt = await getResetAt()
-  const [commented, video, promo, accounts, status] = await Promise.all([
+  const [commented, video, promo, accounts, status, referrals] = await Promise.all([
     pool.query<{ user_id: string; n: number }>(
       `SELECT cs.user_id, COALESCE(SUM(cs.count), 0)::int AS n
          FROM commented_submission cs
@@ -5744,6 +6686,12 @@ export async function getAllPendingPay(): Promise<Record<string, PendingPayments
     pool.query<{ user_id: string; approved_at: Date | null; approved_amount: string | null }>(
       `SELECT user_id, approved_at, approved_amount FROM user_pay_status`
     ),
+    // Commission per REFERRER. Note which markers appear and which do not: the
+    // worker's own reset counts (their work is void for everyone), the
+    // referrer's payout counts (it is what clears this), and the worker's
+    // comment_pay_marker deliberately does NOT — paying a worker must not wipe
+    // the commission owed to whoever brought them in.
+    getAllReferralEarnings().catch(() => ({}) as Record<string, ReferralEarnings>),
   ])
   const out: Record<string, PendingPayments> = {}
   const ensure = (uid: string): PendingPayments =>
@@ -5752,6 +6700,7 @@ export async function getAllPendingPay(): Promise<Record<string, PendingPayments
       video: { count: 0, birr: 0 },
       promo: { count: 0, birr: 0 },
       accounts: { count: 0, birr: 0 },
+      referrals: { count: 0, birr: 0 },
       accountsAwaiting: { count: 0, birr: 0 },
       total: 0,
       approved: false,
@@ -5766,6 +6715,9 @@ export async function getAllPendingPay(): Promise<Record<string, PendingPayments
     p.accounts = { count: r.ok, birr: r.ok * ACCOUNT_PAY_BIRR }
     p.accountsAwaiting = { count: r.waiting, birr: r.waiting * ACCOUNT_PAY_BIRR }
   }
+  for (const [uid, e] of Object.entries(referrals)) {
+    ensure(uid).referrals = { count: e.comments, birr: e.birr }
+  }
   const snapshots: Record<string, number | null> = {}
   for (const r of status.rows) {
     if (r.approved_at) ensure(r.user_id).approved = true
@@ -5775,7 +6727,7 @@ export async function getAllPendingPay(): Promise<Record<string, PendingPayments
     const p = out[uid]
     // Same rule as getUserPendingPayments: awaiting-validation mailboxes are
     // shown as unapproved and are NOT payable.
-    p.total = p.comments.birr + p.video.birr + p.promo.birr + p.accounts.birr
+    p.total = p.comments.birr + p.video.birr + p.promo.birr + p.accounts.birr + p.referrals.birr
     p.approvedBirr = p.approved ? Math.min(snapshots[uid] ?? 0, p.total) : 0
     p.unapprovedBirr = Math.max(0, p.total - p.approvedBirr) + p.accountsAwaiting.birr
   }
@@ -6139,11 +7091,20 @@ export async function addMessageReply(
 export async function deleteMessageReply(replyId: number): Promise<void> {
   await ensureAdminTables()
   await pool.query('DELETE FROM message_reply WHERE id = $1', [replyId])
+  // Its read-mark goes with it. Leaving one behind is a row that outlives what
+  // it describes, and the only thing it can ever do is mark some future reply
+  // as already dealt with.
+  await pool.query('DELETE FROM admin_reply_read WHERE reply_id = $1', [replyId])
 }
 
 // Admin: delete a message and everything tied to it (replies + read receipts).
 export async function deleteAdminMessage(messageId: number): Promise<void> {
   await ensureAdminTables()
+  await pool.query(
+    `DELETE FROM admin_reply_read WHERE reply_id IN
+       (SELECT id FROM message_reply WHERE message_id = $1)`,
+    [messageId]
+  )
   await pool.query('DELETE FROM message_reply WHERE message_id = $1', [messageId])
   await pool.query('DELETE FROM message_read WHERE message_id = $1', [messageId])
   await pool.query('DELETE FROM admin_message WHERE id = $1', [messageId])
@@ -6186,6 +7147,16 @@ export interface AdminUserRow {
   loginDays: string[]
   dailyClicks: { day: string; count: number }[]
   dailyComments: { day: string; count: number }[]
+  /**
+   * The day this user's counting starts: the later of the global reset and
+   * their own, as an ISO date.
+   *
+   * Sent per user because the two differ. A worker reset individually last
+   * Tuesday has a fortnight's totals measured over three days, and dividing
+   * their work by the GLOBAL reset would make them look a third as productive
+   * as they are.
+   */
+  countingFrom: string
   screenshots: { platform: string; url: string; uploaded_at: string }[]
   videoStatus: VideoStatus | null
   videoSubmissions: VideoSubmission[]
@@ -6198,6 +7169,9 @@ export interface AdminUserRow {
   /** True when the nightly presence check blocked them, not a person. */
   blockAuto: boolean
   lastSnapshotDay: string | null // day of this user's most recent saved past-state
+  /** This user's own referral username, so an admin can look one up when a new
+   *  worker says who invited them. Null until they have a profile. */
+  referralCode: string | null
 }
 
 // How many days the admin dashboard's daily-clicks table covers.
@@ -6288,6 +7262,7 @@ export async function getAdminData(): Promise<AdminData> {
   const [
     users,
     clicks,
+    userResets,
     daily,
     logins,
     commented,
@@ -6310,6 +7285,10 @@ export async function getAdminData(): Promise<AdminData> {
          GROUP BY cl.user_id, cl.platform`,
         [resetAt]
       ),
+      // Who was reset on their own, and when. Every count above is measured
+      // from GREATEST(global, theirs), so a rate has to divide by the same
+      // thing or it is arithmetic on two different periods.
+      pool.query(`SELECT user_id, reset_at::date::text AS day FROM user_reset`),
       pool.query(
         `SELECT cl.user_id, cl.clicked_at::date::text AS day, COUNT(*)::int AS n
          FROM clicked_link cl LEFT JOIN user_reset ur ON ur.user_id = cl.user_id
@@ -6347,7 +7326,9 @@ export async function getAdminData(): Promise<AdminData> {
         [resetAt]
       ),
       pool.query(
-        `SELECT user_id, name, bank_account, tiktok_url, youtube_url, instagram_url FROM user_profile`
+        `SELECT user_id, name, bank_account, tiktok_url, youtube_url, instagram_url,
+                phone, telegram, referral_code
+           FROM user_profile`
       ),
       pool.query(
         `SELECT cs.user_id, cs.submitted_at::date::text AS day, COALESCE(SUM(cs.count), 0)::int AS n
@@ -6375,12 +7356,13 @@ export async function getAdminData(): Promise<AdminData> {
   ).map((r) => r.rows) as [
     { id: string; name: string | null; email: string; image: string | null; created_at: string }[],
     { user_id: string; platform: string; n: number }[],
+    { user_id: string; day: string }[],
     { user_id: string; day: string; n: number }[],
     { user_id: string; day: string }[],
     { user_id: string; platform: string; n: number }[],
     { user_id: string; platform: string; sample_url: string }[],
     { user_id: string; platform: string; blob_url: string; uploaded_at: string }[],
-    (UserProfile & { user_id: string })[],
+    (UserProfile & { user_id: string; referral_code: string | null })[],
     { user_id: string; day: string; n: number }[],
     { user_id: string; product: string }[],
     { user_id: string; status: string }[],
@@ -6398,6 +7380,10 @@ export async function getAdminData(): Promise<AdminData> {
     { id: string; user_id: string; message_id: string; body: string; created_at: string; to_message: string | null }[],
     { user_id: string; id: string; platform: string; url: string; paid: boolean; submitted_at: string }[],
   ]
+
+  // The global reset as a day, and each user's own override of it.
+  const resetDay = new Date(resetAt).toISOString().slice(0, 10)
+  const ownReset = new Map(userResets.map((r) => [r.user_id, r.day]))
 
   const byId = new Map<string, AdminUserRow>()
   for (const u of users) {
@@ -6417,6 +7403,12 @@ export async function getAdminData(): Promise<AdminData> {
       loginDays: [],
       dailyClicks: [],
       dailyComments: [],
+      // Whichever is later, and never before they existed: a rate over days
+      // that predate the account is a rate over days nobody could have worked.
+      countingFrom: [resetDay, ownReset.get(u.id) ?? '', (u.created_at ?? '').slice(0, 10)]
+        .filter(Boolean)
+        .sort()
+        .pop() as string,
       screenshots: [],
       videoStatus: null,
       videoSubmissions: [],
@@ -6428,6 +7420,7 @@ export async function getAdminData(): Promise<AdminData> {
       blockReason: null,
       blockAuto: false,
       lastSnapshotDay: null,
+      referralCode: null,
     })
   }
 
@@ -6472,14 +7465,18 @@ export async function getAdminData(): Promise<AdminData> {
 
   for (const p of profiles) {
     const u = byId.get(p.user_id)
-    if (u)
+    if (u) {
       u.profile = {
         name: p.name,
         bank_account: p.bank_account,
         tiktok_url: p.tiktok_url,
         youtube_url: p.youtube_url,
         instagram_url: p.instagram_url,
+        phone: p.phone ?? null,
+        telegram: p.telegram ?? null,
       }
+      u.referralCode = p.referral_code ?? null
+    }
   }
   for (const c of clicks) {
     const u = byId.get(c.user_id)

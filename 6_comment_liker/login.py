@@ -28,6 +28,12 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
+import busy
+import console
+import notify
+
+console.fix()
+
 HERE = Path(__file__).resolve().parent
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -114,6 +120,25 @@ def signed_in_youtube(page) -> tuple[bool, str]:
     return False, "the Sign in button is on screen"
 
 
+# A SITE REFUSING TO ANSWER IS NOT THE SITE SAYING "SIGNED OUT".
+#
+# The passport endpoint returns 403 to a machine it has decided to throttle.
+# Measured here after a seventeen-account run: three profiles answered 403 at
+# once, and a page-level probe of the same profiles showed no login button and
+# no other sign of being logged out — the sessions were fine. Reported as "not
+# signed in" that sends somebody to re-login seventeen healthy accounts, which
+# is worse than admitting the check did not get an answer.
+#
+# "probe failed" and "no JSON" are in here for the same reason: they are this
+# code failing to ask, not the site answering no.
+REFUSED = ("HTTP 4", "HTTP 5", "probe failed", "no JSON")
+
+
+def is_refusal(reason: str) -> bool:
+    """Did the site decline to answer, rather than answer "no"?"""
+    return any(m in str(reason or "") for m in REFUSED)
+
+
 def signed_in(page) -> tuple[bool, str]:
     """
     Is this profile logged in, and as whom?
@@ -167,13 +192,40 @@ def signed_in(page) -> tuple[bool, str]:
     return True, who
 
 
+def elapsed(seconds: int) -> str:
+    """How long we have been waiting, in something a person can read.
+
+    Bare seconds stop being legible at about the four-minute mark, which is
+    precisely when somebody is standing there wondering whether it has hung.
+    """
+    if seconds < 60:
+        return f"{seconds}s"
+    m, sec = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {sec:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Sign in to TikTok, Instagram or YouTube once for the liker.")
     ap.add_argument("--site", default="tiktok", choices=["tiktok", "instagram", "youtube"],
                     help="which site to sign in to (default: tiktok)")
     ap.add_argument("--profile", default="default", help="profile name (default: default)")
     ap.add_argument("--check", action="store_true", help="only check the stored session")
-    ap.add_argument("--timeout", type=int, default=300, help="seconds to wait for sign-in")
+    # NO TIMEOUT BY DEFAULT.
+    #
+    # Signing in is a person typing a password, reading a code off a phone, and
+    # sometimes solving a captcha. Five minutes was a guess at how long that
+    # takes, and when the guess was wrong the window closed mid-sign-in and the
+    # whole thing had to be started again — which is strictly worse than waiting.
+    # Nothing is consumed by waiting: the script sits on one page and probes it
+    # every three seconds.
+    #
+    # Ctrl+C, or closing the browser window, ends it. Both are noticed and both
+    # leave the profile as it was.
+    ap.add_argument("--timeout", type=int, default=0,
+                    help="seconds to wait for sign-in (0 = wait indefinitely, the default)")
     args = ap.parse_args()
 
     pdir = profile_dir(args.profile, args.site)
@@ -182,6 +234,15 @@ def main() -> int:
              "instagram": signed_in_instagram,
              "youtube": signed_in_youtube}[args.site]
 
+    # Asking about a profile a browser already has open gets a confident wrong
+    # answer: the cookie database is held by that browser, so this one sees no
+    # session. Said plainly instead — and only for --check, because opening a
+    # window to sign in is a different thing from reading one.
+    if args.check and busy.is_busy(pdir):
+        print(f"profile {pdir.name}: IN USE — cannot check")
+        print("  " + busy.note(pdir).split("\n", 1)[1].strip())
+        return 2
+
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             user_data_dir=str(pdir),
@@ -189,9 +250,14 @@ def main() -> int:
             user_agent=UA,
             locale="en-US",
             viewport={"width": 1280, "height": 900},
-            args=["--disable-blink-features=AutomationControlled"],
+            args=["--disable-blink-features=AutomationControlled"]
+            # Full size on the main screen, and only when there is a window at
+            # all: somebody is about to type a password into this.
+            + ([] if args.check else notify.screen_args()),
         )
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        if not args.check:
+            notify.show_window(page, f"sign in {pdir.name}")
         page.goto(SITE_HOME[args.site], wait_until="domcontentloaded")
         # Both of the newer sites hydrate after the document lands; probing the
         # instant it loads reports "signed out" for a session that is fine.
@@ -199,33 +265,71 @@ def main() -> int:
 
         ok, who = probe(page)
         if args.check:
-            print(f"profile {pdir.name}: {'signed in as ' + who if ok else 'NOT signed in (' + who + ')'}")
+            if ok:
+                print(f"profile {pdir.name}: signed in as {who}")
+            elif is_refusal(who):
+                # Exit 2, not 1. A caller that treats every non-zero as "log
+                # this account in again" would do exactly the wrong thing.
+                print(f"profile {pdir.name}: NO ANSWER ({who}) — {args.site} would not "
+                      f"answer the check")
+                print("  A 4xx/5xx here is the site throttling this machine, which many")
+                print("  browsers at once causes. It says nothing about the session.")
+                print("  Wait a while and check again rather than signing in again.")
+            else:
+                print(f"profile {pdir.name}: NOT signed in ({who})")
             ctx.close()
-            return 0 if ok else 1
+            return 0 if ok else (2 if is_refusal(who) else 1)
 
         if ok:
             print(f"Already signed in as {who}. Nothing to do.")
             ctx.close()
             return 0
 
-        print(f"Log in to {args.site} in the window that opened. Waiting...")
-        deadline = args.timeout
+        print(f"Log in to {args.site} in the window that opened.")
+        if args.timeout > 0:
+            print(f"Waiting up to {args.timeout}s. Ctrl+C to give up.")
+        else:
+            print("Waiting for as long as it takes. Ctrl+C, or close the window, to give up.")
         waited = 0
-        while waited < deadline:
-            page.wait_for_timeout(3000)
-            waited += 3
-            ok, who = probe(page)
-            if ok:
-                print(f"Signed in as {who}. Session saved to {pdir}")
-                # A moment on the page so TikTok finishes writing what it wants
-                # to storage; closing the instant the probe passes can leave the
-                # profile half-written.
-                page.wait_for_timeout(3000)
+        try:
+            while args.timeout <= 0 or waited < args.timeout:
+                try:
+                    page.wait_for_timeout(3000)
+                except Exception:  # noqa: BLE001
+                    # The window is gone. With no deadline this is the normal way
+                    # somebody abandons a sign-in, and it must not look like a
+                    # crash: nothing was written, and saying so is the whole
+                    # message.
+                    print("\nThe browser window was closed. Nothing was saved \u2014 run this again "
+                          "when you are ready.")
+                    return 1
+                waited += 3
+                try:
+                    ok, who = probe(page)
+                except Exception:  # noqa: BLE001
+                    print("\nThe browser window was closed. Nothing was saved \u2014 run this again "
+                          "when you are ready.")
+                    return 1
+                if ok:
+                    print(f"\nSigned in as {who}. Session saved to {pdir}")
+                    # A moment on the page so TikTok finishes writing what it wants
+                    # to storage; closing the instant the probe passes can leave the
+                    # profile half-written.
+                    page.wait_for_timeout(3000)
+                    ctx.close()
+                    return 0
+                print(f"  \u2026still waiting ({elapsed(waited)})", end="\r", flush=True)
+        except KeyboardInterrupt:
+            # Closed deliberately, so the profile directory is left as it was
+            # rather than half-written by a context torn down mid-flight.
+            print("\nGiven up on. Nothing was saved.")
+            try:
                 ctx.close()
-                return 0
-            print(f"  …still waiting ({waited}s)", end="\r", flush=True)
+            except Exception:  # noqa: BLE001
+                pass
+            return 1
 
-        print("\nTimed out waiting for sign-in.")
+        print(f"\nGave up after {args.timeout}s.")
         ctx.close()
         return 1
 

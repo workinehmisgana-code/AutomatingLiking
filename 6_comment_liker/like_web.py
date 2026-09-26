@@ -74,7 +74,13 @@ from like import (
     report_purge,
     wanted,
 )
-from login import SITE_PREFIX, profile_dir, signed_in_instagram, signed_in_youtube
+from login import (
+    SITE_PREFIX,
+    is_refusal,
+    profile_dir,
+    signed_in_instagram,
+    signed_in_youtube,
+)
 
 HERE = Path(__file__).resolve().parent
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -176,7 +182,20 @@ YT_STATE = """(i) => {
 # a control labelled Like/Unlike, and the nearest ancestor that also holds a
 # profile link. The label lives on an <svg> inside a div[role=button] as often
 # as on the button itself, so both are looked at.
-IG_COLLECT = """() => {
+IG_CONTROLS = """// The Like/Unlike controls that belong to COMMENTS, in page order.
+//
+// Shared verbatim by IG_COLLECT, IG_LIKE and IG_STATE because all three index
+// into this list by position: if they built it differently, index 3 would mean
+// a different control in each, and the one that CLICKS would be clicking
+// something the one that READ never saw.
+//
+// THE POST'S OWN LIKE IS EXCLUDED. Instagram labels it "Like" exactly as it
+// labels a comment's, and it sits in the action bar next to Comment / Share /
+// Save. Collected as a comment it would be liked publicly on the post itself —
+// the wrong action, on the wrong thing, visible to everyone. Measured on a
+// logged-out post page, it was the ONLY control found, presented as a comment
+// by @techtuberhardy whose text was the caption.
+const igCommentControls = () => {
   const norm = (s) => (s || '').trim();
   const labelOf = (el) => {
     const own = norm(el.getAttribute('aria-label'));
@@ -184,9 +203,31 @@ IG_COLLECT = """() => {
     const svg = el.querySelector('svg[aria-label]');
     return svg ? norm(svg.getAttribute('aria-label')) : '';
   };
-  const controls = [...document.querySelectorAll('[role="button"], button')]
-    .map((el) => ({el, label: labelOf(el)}))
-    .filter((c) => /^(like|unlike)$/i.test(c.label));
+  // A control is in the post's action bar if a near ancestor also holds one of
+  // the post-level actions. A comment's row holds none of them.
+  const POST_BAR = /^(comment|share|save|remove|unsave|share post)$/i;
+  const inPostBar = (el) => {
+    let node = el;
+    for (let hops = 0; hops < 4 && node; hops++) {
+      node = node.parentElement;
+      if (!node) return false;
+      const near = [...node.querySelectorAll('[role="button"], button, svg[aria-label]')];
+      if (near.some((n) => POST_BAR.test(labelOf(n)) || POST_BAR.test(norm(n.getAttribute('aria-label')))))
+        return true;
+    }
+    return false;
+  };
+  return [...document.querySelectorAll('[role="button"], button')]
+    .map((el) => ({ el, label: labelOf(el) }))
+    .filter((c) => /^(like|unlike)$/i.test(c.label))
+    .filter((c) => !inPostBar(c.el));
+};
+"""
+
+IG_COLLECT = """() => {
+  const norm = (s) => (s || '').trim();
+""" + IG_CONTROLS + """
+  const controls = igCommentControls();
 
   const out = [];
   const seen = new Set();
@@ -220,33 +261,20 @@ IG_COLLECT = """() => {
 }"""
 
 IG_LIKE = """(i) => {
-  const labelOf = (el) => {
-    const own = (el.getAttribute('aria-label') || '').trim();
-    if (own) return own;
-    const svg = el.querySelector('svg[aria-label]');
-    return svg ? (svg.getAttribute('aria-label') || '').trim() : '';
-  };
-  const controls = [...document.querySelectorAll('[role="button"], button')]
-    .filter((el) => /^(like|unlike)$/i.test(labelOf(el)));
-  const el = controls[i];
+""" + IG_CONTROLS + """
+  const controls = igCommentControls();
+  const el = controls[i]?.el;
   if (!el) return {ok: false, why: 'control vanished'};
-  if (/^unlike$/i.test(labelOf(el))) return {ok: true, already: true};
+  if (/^unlike$/i.test(controls[i].label)) return {ok: true, already: true};
   el.scrollIntoView({block: 'center'});
   el.click();
   return {ok: true, already: false};
 }"""
 
 IG_STATE = """(i) => {
-  const labelOf = (el) => {
-    const own = (el.getAttribute('aria-label') || '').trim();
-    if (own) return own;
-    const svg = el.querySelector('svg[aria-label]');
-    return svg ? (svg.getAttribute('aria-label') || '').trim() : '';
-  };
-  const controls = [...document.querySelectorAll('[role="button"], button')]
-    .filter((el) => /^(like|unlike)$/i.test(labelOf(el)));
-  const el = controls[i];
-  return el ? /^unlike$/i.test(labelOf(el)) : null;
+""" + IG_CONTROLS + """
+  const controls = igCommentControls();
+  return controls[i] ? /^unlike$/i.test(controls[i].label) : null;
 }"""
 
 SITES = {
@@ -429,10 +457,24 @@ def main() -> int:
 
     pdir = profile_dir(args.profile, site)
     if not (pdir / "Default").exists():
-        print(f"No {site} session at {pdir}.\n"
-              f"Run: python login.py --site {site}"
-              + ("" if args.profile == "default" else f" --profile {args.profile}"))
-        return 1
+        # A PROBE NEEDS NO SESSION. It reads the page and reports what the
+        # selectors found; it clicks nothing. Refusing it here meant the one
+        # tool for checking the selectors could not be used until after
+        # signing in — which is exactly backwards, because whether the
+        # selectors still work is what you want to know BEFORE committing an
+        # account to a run.
+        #
+        # YouTube shows its comments to anyone, so a logged-out probe is a real
+        # test of YT_COLLECT. Instagram shows a login wall, and the probe says
+        # so rather than reporting an empty page as "no comments".
+        if not args.probe:
+            print(f"No {site} session at {pdir}.\n"
+                  f"Run: python login.py --site {site}"
+                  + ("" if args.profile == "default" else f" --profile {args.profile}"))
+            return 1
+        pdir = HERE / f"probe-{site}"
+        print(f"No {site} session — probing signed OUT, in {pdir.name}/.")
+        print("  Anything a logged-out visitor cannot see will be missing here.")
 
     try:
         lo, hi = (float(x) for x in args.delay.split(","))
@@ -481,12 +523,34 @@ def main() -> int:
             page.wait_for_timeout(4000)
             live, who = S["signed_in"](page)
             if not live:
-                print(f"Not signed in to {site} ({who}).")
-                notify.toast(f"{site}: not signed in",
-                             f"Run: python login.py --site {site}")
-                notify.sound()
-                return 1
-            print(f"signed in as {who}")
+                # A PROBE CARRIES ON. It clicks nothing, so a login wall costs
+                # nothing but coverage — and seeing how much coverage is lost is
+                # itself the answer the probe exists to give. A real run still
+                # stops: every click would bounce off the wall and every comment
+                # would be recorded as a failure.
+                #
+                # And "no" is not the only way to fail. A 4xx/5xx is the site
+                # refusing to answer a machine it is throttling, and telling
+                # somebody to sign in again is then the wrong instruction.
+                refused = is_refusal(who)
+                said = (
+                    f"{site} would not answer the sign-in check ({who}). That is the\n"
+                    "  site throttling this machine, not a signed-out account — fewer\n"
+                    "  browsers at once, wait a while, and try again."
+                    if refused else f"Not signed in to {site} ({who})."
+                )
+                if not args.probe:
+                    print(said)
+                    notify.toast(
+                        f"{site}: check got no answer" if refused else f"{site}: not signed in",
+                        "Throttled — wait and retry" if refused
+                        else f"Run: python login.py --site {site}",
+                    )
+                    notify.sound()
+                    return 1
+                print(said)
+                print("  Probing anyway.")
+            print(f"signed in as {who}" if live else "carrying on without a session")
 
             for i, url in enumerate(links, 1):
                 if args.limit and ok >= args.limit:

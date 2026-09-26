@@ -7,6 +7,7 @@ import {
   getAccountTaskDomain,
   getAccountTaskOpen,
   getAccountTaskPassword,
+  getAccountTaskRecovery,
 } from '@/lib/db'
 import { submitAccountEmail, getUserAccountSubmissions } from '@/lib/db'
 import { ACCOUNT_PAY_BIRR, isCompanyEmail } from '@/lib/config'
@@ -38,10 +39,11 @@ export async function GET() {
     return NextResponse.json({ error: 'Account blocked', blocked: true }, { status: 403 })
   }
   try {
-    const [domain, open, password, mine] = await Promise.all([
+    const [domain, open, password, recovery, mine] = await Promise.all([
       getAccountTaskDomain().catch(() => ''),
       getAccountTaskOpen().catch(() => false),
       getAccountTaskPassword().catch(() => ''),
+      getAccountTaskRecovery().catch(() => ''),
       getUserAccountSubmissions(user.id).catch(() => []),
     ])
     return NextResponse.json({
@@ -53,6 +55,9 @@ export async function GET() {
       domain,
       // What to set as the mailbox password. Blank = nothing to tell them.
       password,
+      // Where the provider should send a reset link — ours, not theirs, or the
+      // address is one we can be locked out of. Blank = do not ask for one.
+      recovery,
       rate: ACCOUNT_PAY_BIRR,
       submissions: mine,
     })

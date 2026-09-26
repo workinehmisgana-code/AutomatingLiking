@@ -34,6 +34,8 @@ export interface GuideProps {
   accountDomain: string
   /** The password to set on the mailbox. Blank = not part of the instructions. */
   accountPassword: string
+  /** The recovery address to put on the mailbox. '' = we do not ask for one. */
+  accountRecovery: string
   /** Whether the task is being offered at all — a closed task is left out of
    *  the guide entirely rather than described and then not there. */
   accountOpen: boolean
@@ -182,6 +184,10 @@ export function en(p: GuideProps): GuideCopy {
                   (p.accountPassword
                     ? `Set the password to exactly ${p.accountPassword}, capitals and symbols ` +
                       `included — an address we cannot sign in to is rejected and not paid. `
+                    : '') +
+                  (p.accountRecovery
+                    ? `Put ${p.accountRecovery} as the recovery email — not your own address. ` +
+                      `One without it is rejected and not paid. `
                     : '') +
                   `${p.accountBirr} birr for each one. The pay shows as UNAPPROVED until we ` +
                   `open the mailbox and confirm it works; then it joins your approved pay. ` +
@@ -343,6 +349,10 @@ export function am(p: GuideProps): GuideCopy {
                   (p.accountPassword
                     ? `የይለፍ ቃሉን በትክክል ${p.accountPassword} ያድርጉት፤ ትላልቅ ፊደላትንና ምልክቶችን ጨምሮ — ` +
                       `ልንገባበት የማንችለው አድራሻ ውድቅ ይደረጋል፤ ክፍያም አይከፈልም። `
+                    : '') +
+                  (p.accountRecovery
+                    ? `የመልሶ ማግኛ (recovery) ኢሜይል ${p.accountRecovery} ያድርጉ — የራስዎን አድራሻ አይጠቀሙ። ` +
+                      `ይህ ያልተደረገበት አድራሻ ውድቅ ይደረጋል፤ ክፍያም አይከፈልም። `
                     : '') +
                   `ኢሜይሉን ከፍተን እስክናረጋግጥ ድረስ ክፍያው “ያልጸደቀ” ሆኖ ይታያል፤ ካረጋገጥን በኋላ ወደ ጸደቀው ` +
                   `ክፍያዎ ይጨመራል። ሌላ ሰው የላከውን አድራሻ እንደገና መላክ አይቻልም፤ ውድቅ የተደረገም ከሆነ ምክንያቱ ይነገርዎታል።`,

@@ -40,6 +40,12 @@ const blocks = [
   // 2,400 lines earlier, and the backtick after it belongs to someone else's
   // query entirely.
   ['ensureAdminTables', ddlOf('export function ensureAdminTables', 'product_comment_setting')],
+  // Referrals. Its own block because it depends on user_profile existing first
+  // (it ALTERs it), and because a failure there must not take the click and
+  // admin schemas with it.
+  ['ensureReferralTables', ddlOf('export function ensureReferralTables', 'referral_pay_marker')],
+  // verify_link and the hand-added channel list beside it.
+  ['ensureVerifyLinkTable', ddlOf('export function ensureVerifyLinkTable', 'extra_channel')],
 ]
 
 const pool = new pg.Pool({

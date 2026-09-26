@@ -36,8 +36,24 @@ export const dynamic = 'force-dynamic'
 // the next (the app switches when a platform's hourly quota is used up).
 const PLATFORM_ORDER = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram']
 
-// Instagram links have no posted date, so they always cluster by search rank.
-const RANK_ONLY_PLATFORMS = new Set(['instagram'])
+// There is deliberately no rank-only platform list here any more.
+//
+// There used to be one, holding 'instagram', on the grounds that Instagram links
+// carry no posted date. That was true when every Instagram link came off the
+// keyword-search grid. It has not been true for a long time: links now arrive
+// through scrape_channels.py and the verify list, which records the date — and
+// those links are marked date_only, meaning they have no search RANK.
+//
+// So the rule had inverted. clusterAndOrder('rank') drops every date_only link
+// by design, and measured on the live pool that left the Instagram tab with
+// EXACTLY ZERO links for every user: 11,947 usable Instagram links, all of them
+// date_only, all of them dropped — while the 3,647 genuinely ranked ones had
+// every last one retired at the 5-user Instagram cap. The phone said
+// "No links — reopen to reload" and it was right about what it had been sent.
+//
+// Every platform now goes through the same mix. Nothing special-cases a site:
+// a link with no date sorts last in the date ordering, and a link with no rank
+// sorts last in the rank ordering, which is what those orderings already do.
 
 // GET — the signed-in user's available links, same behavior as the web
 // dashboard: already-opened + retired links removed; the rest ordered by
@@ -159,12 +175,8 @@ export async function GET(req: NextRequest) {
       seed,
       APP_LINK_BATCH
     )
-  const forPlatform = (p: string) => {
-    const pool = available.filter((v) => String(v.platform ?? '') === p)
-    // Instagram links carry no posted date, so there is no date ordering to
-    // draw from — the share would silently do nothing there.
-    return RANK_ONLY_PLATFORMS.has(p) ? clusterAndOrder(pool, undefined, 'rank') : mixed(pool)
-  }
+  const forPlatform = (p: string) =>
+    mixed(available.filter((v) => String(v.platform ?? '') === p))
 
   // The feed is CAPPED (APP_LINK_BATCH). The app holds the batch on the device
   // and re-reads it on every tap, so handing it the whole pool is what makes the

@@ -14,6 +14,8 @@ interface Row {
   reviewedAt: string | null
   userName: string
   userEmail: string
+  phone: string | null
+  telegram: string | null
 }
 
 const FILTERS = [
@@ -44,6 +46,8 @@ export default function AdminAccountTasks() {
   const [domainBox, setDomainBox] = useState('')
   const [password, setPassword] = useState('')
   const [passwordBox, setPasswordBox] = useState('')
+  const [recovery, setRecovery] = useState('')
+  const [recoveryBox, setRecoveryBox] = useState('')
   const [open, setOpen] = useState(false)
   const [rate, setRate] = useState(0)
   const [status, setStatus] = useState<string>('pending')
@@ -70,6 +74,8 @@ export default function AdminAccountTasks() {
       setDomainBox(d.domain ?? '')
       setPassword(d.password ?? '')
       setPasswordBox(d.password ?? '')
+      setRecovery(d.recovery ?? '')
+      setRecoveryBox(d.recovery ?? '')
       setOpen(!!d.open)
       setRate(Number(d.rate) || 0)
     } catch {
@@ -163,6 +169,14 @@ export default function AdminAccountTasks() {
     if (ok) { setMsg('Password saved. Workers see it on the task page.'); await load() }
   }
 
+  async function saveRecovery() {
+    setSavingSetting(true)
+    setMsg('')
+    const ok = await post({ recovery: recoveryBox })
+    setSavingSetting(false)
+    if (ok) { setMsg('Recovery email saved. Workers see it on the task page.'); await load() }
+  }
+
   async function toggleOpen() {
     setSavingSetting(true)
     setMsg('')
@@ -231,6 +245,34 @@ export default function AdminAccountTasks() {
             {open ? 'Task is OPEN' : 'Task is CLOSED'}
           </button>
         </div>
+        <div className="flex flex-wrap items-end gap-3 mt-3">
+          <label className="flex-1 min-w-[220px]">
+            <span className="block text-[11px] uppercase tracking-wide text-zinc-500 mb-1">
+              Recovery email workers must put on the mailbox
+            </span>
+            <input
+              value={recoveryBox}
+              onChange={(e) => setRecoveryBox(e.target.value)}
+              placeholder="leave blank to not ask for one"
+              spellCheck={false}
+              autoComplete="off"
+              className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-emerald-500"
+            />
+          </label>
+          <button
+            onClick={saveRecovery}
+            disabled={savingSetting || recoveryBox.trim().toLowerCase() === recovery}
+            className="text-sm text-zinc-100 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-lg px-3 py-1.5 disabled:opacity-40"
+          >
+            Save
+          </button>
+        </div>
+        <p className="text-[11px] text-zinc-600 mt-2 leading-relaxed">
+          Where the provider sends a reset link. It has to be an address you control:
+          a mailbox whose recovery address belongs to the worker is one you can be
+          locked out of the day they change their mind, which is the opposite of what
+          this task is for.
+        </p>
         <div className="flex flex-wrap items-end gap-3 mt-3">
           <label className="flex-1 min-w-[220px]">
             <span className="block text-[11px] uppercase tracking-wide text-zinc-500 mb-1">
@@ -369,9 +411,39 @@ export default function AdminAccountTasks() {
                   </>
                 )}
               </div>
-              <div className="text-[11px] text-zinc-500 mt-1">
+              <div className="text-[11px] text-zinc-500 mt-1 break-words">
                 {r.userName || '(no name)'} · {r.userEmail} · sent {fmtWhen(r.submittedAt)}
                 {r.reviewedAt && ` · reviewed ${fmtWhen(r.reviewedAt)}`}
+              </div>
+              {/* HOW TO ASK THEM ABOUT IT. Reviewing a mailbox is mostly
+                  questions — the password does not work, the address is a typo,
+                  it is already registered — and the sign-in email is not
+                  something these workers read. Both are tap-to-open on a phone,
+                  which is where this page is now used. */}
+              <div className="text-[11px] mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+                {r.phone ? (
+                  <a
+                    href={`tel:${r.phone}`}
+                    className="inline-flex items-center min-h-[32px] text-sky-300 hover:text-sky-200 underline decoration-dotted"
+                  >
+                    📞 {r.phone}
+                  </a>
+                ) : null}
+                {r.telegram ? (
+                  <a
+                    href={`https://t.me/${r.telegram}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center min-h-[32px] text-sky-300 hover:text-sky-200 underline decoration-dotted"
+                  >
+                    ✈️ @{r.telegram}
+                  </a>
+                ) : null}
+                {!r.phone && !r.telegram && (
+                  <span className="text-zinc-600">
+                    no phone or Telegram on file — registered before we asked
+                  </span>
+                )}
               </div>
               {r.status === 'rejected' && r.rejectReason && (
                 <p className="text-xs text-rose-300/80 mt-1">Reason: {r.rejectReason}</p>

@@ -38,6 +38,10 @@ from like import (
     video_id,
 )
 
+import console
+
+console.fix()
+
 
 def profile_ok(pdir: Path) -> bool:
     return (pdir / "Default").exists()

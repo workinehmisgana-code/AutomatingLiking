@@ -12,11 +12,24 @@ import {
   PLATFORM_ROTATE_MS,
   REMINDER_CLICKS,
   FALLBACK_COMMENT_CATEGORY,
+  REFERRAL_SHARE,
+  REFERRAL_PAY_RATE,
 } from '@/lib/config'
+
+/** What a referrer gets, as the dashboard says it: a percentage and a rate. */
+const REFERRAL_PCT = Math.round(REFERRAL_SHARE * 100)
+const REFERRAL_RATE = REFERRAL_PAY_RATE
 import { pickDimension, seedFrom } from '@/lib/clusterMix'
 import FinishButton from '@/components/FinishButton'
 import EditAccountLinks from '@/components/EditAccountLinks'
-import type { UserMessage, PendingPayments, ApkInfo, UserProfile } from '@/lib/db'
+import type {
+  UserMessage,
+  PendingPayments,
+  ApkInfo,
+  UserProfile,
+  ReferralEarnings,
+  ReferralOf,
+} from '@/lib/db'
 
 // Birr formatting: no trailing ".00", up to 2 decimals otherwise.
 function fmtBirr(n: number): string {
@@ -75,9 +88,6 @@ const COMING_SOON_PLATFORMS: { label: string }[] = [
   { label: 'X' },
   { label: 'Blog Post' },
 ]
-
-// Platforms whose links have no posted_date, so only rank clustering makes sense.
-const RANK_ONLY_PLATFORMS = new Set<Platform>(['instagram'])
 
 function platformDot(p: string): string {
   const found = PLATFORMS.find((x) => x.key === p)
@@ -475,6 +485,8 @@ export default function Dashboard({
   firstLogin,
   messages,
   pendingPay,
+  referrals,
+  referredBy,
   paidNotice,
   apk,
   showClickedToday,
@@ -498,6 +510,11 @@ export default function Dashboard({
   firstLogin: boolean
   messages: UserMessage[]
   pendingPay: PendingPayments | null
+  /** This user's own referral code and what it has earned them. */
+  referrals: ReferralEarnings | null
+  /** Who invited this user, if anybody. Shown so the arrangement is visible
+   *  from both sides — somebody earning from you should not be invisible. */
+  referredBy: ReferralOf | null
   paidNotice: number | null
   apk: ApkInfo | null
   showClickedToday: boolean
@@ -531,12 +548,20 @@ export default function Dashboard({
     }).catch(() => {})
   }
 
-  // Instagram links have no date → force rank clustering (and hide the date tab).
-  const supportsDate = !RANK_ONLY_PLATFORMS.has(platform)
-  const effGroupBy: GroupBy = supportsDate ? groupBy : 'rank'
-  const clusterTabs: [GroupBy, string][] = supportsDate
-    ? [['rank', 'Search rank'], ['date', 'Posted date']]
-    : [['rank', 'Search rank']]
+  // Every platform offers both clusterings.
+  //
+  // Instagram used to be forced to rank-only, on the grounds that its links had
+  // no posted date. Measured on the live pool, all 11,947 usable Instagram links
+  // carry a posted_date, a scraped_at AND a composite date_score — they come
+  // from scrape_channels.py through the verify list, which records the date, and
+  // they carry no search RANK at all. Forcing them to rank clustering dropped
+  // every one of them into a single "Unranked" bucket, and did worse than that
+  // in the app, where it dropped them entirely.
+  const effGroupBy: GroupBy = groupBy
+  const clusterTabs: [GroupBy, string][] = [
+    ['rank', 'Search rank'],
+    ['date', 'Posted date'],
+  ]
 
   // URLs this user has opened — hidden from them from now on.
   const [clicked, setClicked] = useState<Set<string>>(() => new Set(clickedUrls))
@@ -664,6 +689,7 @@ export default function Dashboard({
   // Clicks made in this session; the first REMINDER_CLICKS show a confirm dialog.
   const [sessionClicks, setSessionClicks] = useState(0)
   const [pending, setPending] = useState<Video | null>(null)
+  const [copiedCode, setCopiedCode] = useState(false)
   // Transient banner shown when a platform hits its hourly limit.
   const [lockNotice, setLockNotice] = useState<string | null>(null)
   useEffect(() => {
@@ -1120,6 +1146,14 @@ export default function Dashboard({
               t: pendingPay.accounts,
               note: `${pendingPay.accounts.count} checked and owed`,
             },
+            {
+              label: 'Referrals',
+              t: pendingPay.referrals,
+              // The count is OTHER PEOPLE'S comments, so it says so. Read as
+              // this user's own it would look like their comment count had
+              // doubled.
+              note: `${pendingPay.referrals.count} comment(s) made by people you referred`,
+            },
           ] as const).map(({ label, t, note }) => (
             <span key={label} className="flex items-center gap-1.5 text-sm" title={note}>
               <span className="text-zinc-400">{label}</span>
@@ -1145,6 +1179,107 @@ export default function Dashboard({
             </Link>
           )}
         </div>
+      )}
+    </div>
+  )
+
+
+  // ── Referrals ─────────────────────────────────────────────────────────────
+  // The code is the whole feature: it is typed by somebody else, once, at a
+  // moment that cannot be corrected. So it is shown exactly as stored, in one
+  // piece, with a copy button — never reconstructed from the user's name, which
+  // is how two people called Abebe end up crediting the wrong one.
+  const referralBlock = referrals && (
+    <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 px-4 py-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p className="text-xs uppercase tracking-wide text-zinc-500">Your referral username</p>
+          <div className="flex items-center gap-2 mt-1">
+            <code className="text-lg font-semibold text-emerald-300 tracking-wide">
+              {referrals.code ?? '—'}
+            </code>
+            {referrals.code && (
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard?.writeText(referrals.code as string)
+                  setCopiedCode(true)
+                  setTimeout(() => setCopiedCode(false), 1500)
+                }}
+                className="text-xs rounded-lg px-2 py-1 border border-zinc-700 bg-zinc-800 text-zinc-200 hover:bg-zinc-700 transition-colors"
+              >
+                {copiedCode ? 'Copied ✓' : 'Copy'}
+              </button>
+            )}
+          </div>
+          <p className="text-xs text-zinc-500 mt-1 max-w-md">
+            Anyone who enters this when they register earns you {REFERRAL_PCT}% of their comment
+            pay — {fmtBirr(REFERRAL_RATE)} birr for every comment they make. We pay it; nothing is
+            taken off them. They can only enter it while registering.
+          </p>
+        </div>
+        <div className="flex items-center gap-5">
+          <div className="text-right">
+            <div className="text-xl font-semibold text-white tabular-nums">{referrals.people}</div>
+            <div className="text-[11px] text-zinc-500">joined with it</div>
+          </div>
+          <div className="text-right">
+            <div className="text-xl font-semibold text-emerald-300 tabular-nums">
+              {fmtBirr(referrals.birr)}
+            </div>
+            <div className="text-[11px] text-zinc-500">unpaid, from {referrals.comments} comment(s)</div>
+          </div>
+          <div className="text-right">
+            <div className="text-xl font-semibold text-zinc-300 tabular-nums">
+              {fmtBirr(referrals.lifetimeBirr)}
+            </div>
+            <div className="text-[11px] text-zinc-500">earned in total</div>
+          </div>
+        </div>
+      </div>
+
+      {referrals.members.length > 0 && (
+        <div className="mt-3 border-t border-zinc-800 pt-2">
+          <div className="flex items-center gap-3 px-1 pb-1 text-[11px] uppercase tracking-wide text-zinc-500">
+            <span className="flex-1">who joined with your username</span>
+            <span className="w-24 text-right">comments</span>
+            <span className="w-24 text-right">unpaid to you</span>
+            <span className="w-24 text-right">total to you</span>
+          </div>
+          {referrals.members.map((m) => (
+            <div key={m.userId} className="flex items-center gap-3 px-1 py-0.5 text-sm">
+              <span className="flex-1 truncate text-zinc-300">
+                {m.name || <span className="text-zinc-600">(no name yet)</span>}
+                <span className="ml-2 text-[11px] text-zinc-600">
+                  joined {new Date(m.joinedAt).toLocaleDateString()}
+                </span>
+              </span>
+              <span className="w-24 text-right tabular-nums text-zinc-400">{m.comments}</span>
+              <span className="w-24 text-right tabular-nums text-emerald-300">
+                {fmtBirr(m.comments * REFERRAL_RATE)}
+              </span>
+              <span className="w-24 text-right tabular-nums text-zinc-400">
+                {fmtBirr(m.lifetimeComments * REFERRAL_RATE)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {referrals.people === 0 && (
+        <p className="text-xs text-zinc-600 mt-2">
+          Nobody has registered with your username yet. Give it to people you invite — they type it
+          into the last box when they sign up.
+        </p>
+      )}
+
+      {referredBy && (
+        <p className="text-[11px] text-zinc-600 mt-3 border-t border-zinc-800 pt-2">
+          You registered with{' '}
+          <span className="text-zinc-400">{referredBy.referrerName || referredBy.code}</span>&apos;s
+          referral username. They earn {REFERRAL_PCT}% of your comment pay, paid by us — your own
+          pay is not reduced by it.
+        </p>
       )}
     </div>
   )
@@ -1178,6 +1313,7 @@ export default function Dashboard({
     <div className="max-w-3xl mx-auto px-4 py-6 sm:py-8">
       {header}
       {messagesBlock}
+      {referralBlock && <div className="mb-4">{referralBlock}</div>}
 
       {/* One-time payout confirmation — shown once after being marked paid */}
       {paidNotice != null && paidNotice > 0 && (
@@ -1278,12 +1414,10 @@ export default function Dashboard({
         )}
         <span className="text-xs text-zinc-600 tabular-nums">
           {effGroupBy === 'rank' ? RANK_CLUSTER_COUNT : DATE_CLUSTER_COUNT} clusters
-          {supportsDate && (
-            <span className="text-zinc-600">
-              {' '}
-              · {dateShare}% of workers on date, {100 - dateShare}% on rank
-            </span>
-          )}
+          <span className="text-zinc-600">
+            {' '}
+            · {dateShare}% of workers on date, {100 - dateShare}% on rank
+          </span>
         </span>
         {/* Get the app + Finish share one row: split on mobile, right-aligned on desktop */}
         <div className="flex gap-2 w-full sm:w-auto sm:ml-auto">

@@ -106,7 +106,13 @@ check('  a filter is needed to reach them', (counts.tiktok ?? 0) > (counts.insta
 
 const rank = read('lib/channelRank.ts')
 check('  ranking reads the author when the URL has no handle', /handleOf\(url\) \?\? \(String\(author/.test(rank), true)
-check('  and records which site each channel is on', /site\.set\(handle, siteOf\(url\)\)/.test(rank), true)
+// Stale since the site+handle rework: the ranking used to carry a separate
+// `site` Map keyed by handle alone, which is exactly what folded 98 same-named
+// channels into one row. It is now part of the accumulator KEY, which is a
+// stronger form of the same guarantee.
+check('  and records which site each channel is on',
+      /const channelKey = \(site: string, handle: string\) => `\$\{site\}:\$\{handle\}`/.test(rank), true)
+check('  by keying every channel on it', /const key = channelKey\(s, handle\)/.test(rank), true)
 
 // ── the ranked table can now show and pick them ───────────────────────────
 const ui = read('components/VerifyLinks.tsx')
@@ -130,7 +136,10 @@ const route = read('app/api/admin/verify-links/extract/route.ts')
 check('  the route drops non-TikTok channels', /skippedOtherSites = before - channels\.length/.test(route), true)
 check('  and reports the count', /skippedOtherSites,/.test(route), true)
 check('  the button offers only what it can check', /const extractable = visibleChannels\.filter\(\(c\) => c\.platform === 'tiktok'\)/.test(ui), true)
-check('  and extraction runs over exactly those', /const handles = extractable\.map\(\(c\) => c\.handle\)/.test(ui), true)
+// Still the default, now that extractNew can also be handed an explicit
+// subset (used by 'extract from the added channels only').
+check('  and extraction runs over exactly those', /const pick = subset \?\? extractable/.test(ui), true)
+check('  whichever set it is', /const handles = pick\.map\(\(c\) => c\.handle\)/.test(ui), true)
 check('  the confirm names the shortfall', /channel\(s\) on screen are not TikTok and cannot be/.test(ui), true)
 check('  and points somewhere useful', /1_tiktok_search_scraper/.test(ui), true)
 

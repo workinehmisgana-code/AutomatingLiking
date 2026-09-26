@@ -9,9 +9,19 @@ import {
   VIDEO_PAYMENT_BIRR,
   COMMENT_PAY_RATE,
   PROMO_PAY_BIRR,
+  REFERRAL_SHARE,
+  REFERRAL_PAY_RATE,
   CLICK_PLATFORM_LABELS,
 } from '@/lib/config'
-import type { AdminData, AdminUserRow, PendingPayments, ApkInfo, UserClick, GuideVideo } from '@/lib/db'
+import type {
+  AdminData,
+  AdminUserRow,
+  PendingPayments,
+  ApkInfo,
+  UserClick,
+  GuideVideo,
+  ReferralEarnings,
+} from '@/lib/db'
 import ApkAdmin from '@/components/ApkAdmin'
 import GuideVideosAdmin from '@/components/GuideVideosAdmin'
 import LlmModelPicker from '@/components/LlmModelPicker'
@@ -477,6 +487,7 @@ export default function AdminDashboard({
   data,
   adminEmail,
   pendingByUser,
+  referralByUser,
   apk,
   guideVideos,
   appVersions,
@@ -489,6 +500,9 @@ export default function AdminDashboard({
   data: AdminData
   adminEmail: string
   pendingByUser: Record<string, PendingPayments>
+  /** Per referrer: who they brought in and what they are owed for it. Keyed by
+   *  the REFERRER's user id, so a user with no entry has referred nobody. */
+  referralByUser: Record<string, ReferralEarnings>
   apk: ApkInfo | null
   guideVideos: GuideVideo[]
   appVersions: Record<string, { name: string | null; code: number | null }>
@@ -628,26 +642,32 @@ export default function AdminDashboard({
     } catch { /* ignore */ }
   }
 
-  // Verify that this user's @username appears among the commenters on the TikTok
-  // sample links they submitted. Reads TikTok's comment list over plain HTTP —
-  // no browser and no captcha, so it works on the deployed dashboard too.
+  // Verify that this user's @username is among the commenters on the last 100
+  // links they OPENED. Reads TikTok's comment list over plain HTTP — no browser
+  // and no captcha, so it works on the deployed dashboard too.
   const [verifyingUser, setVerifyingUser] = useState<string | null>(null)
   /** One judged link from the presence ledger. */
   interface JudgedLinkShape {
     url: string
     found: boolean
     judgeable: boolean
+    /** Which day it was opened. The sample spans days, so the row says which. */
+    day?: string
   }
   /** A finished single-user check. */
   interface VerifyReportShape {
     who: string
     username: string
-    day: string
     checked: number
     found: number
     skipped: number
     pct: number | null
-    opened: number
+    /** Links in the sample — 100, or everything they have opened if fewer. */
+    total: number
+    /** The oldest and newest day the sample reaches back over. */
+    from: string
+    to: string
+    days: number
     links: JudgedLinkShape[]
   }
   // Live progress for the per-user verification loop (null = idle).
@@ -933,11 +953,13 @@ export default function AdminDashboard({
       return
     }
     if (!confirm(
-      `Check ${who}'s comment presence?\n\n` +
-      'Reads the links they actually opened on their last active day (up to 100) and checks ' +
-      'which carry a comment from their own account — the same check the bulk sweep runs. ' +
-      'Every link is read again now, not taken from an earlier result. Progress is saved ' +
-      'as it goes; stopping and starting again re-reads the links.'
+      `Check ${who}'s last 100 links?\n\n` +
+      'Reads the last 100 links they actually opened — across however many days those ' +
+      'span — and checks which carry a comment from their own account. Same reads and ' +
+      'same judging as the bulk sweep; only the population differs, so one user\'s ' +
+      'number means the same as another\'s. Every link is read again now, not taken ' +
+      'from an earlier result. Progress is saved as it goes; stopping and starting ' +
+      'again re-reads what it had not finished.'
     )) return
 
     stopVerify.current = false
@@ -978,12 +1000,14 @@ export default function AdminDashboard({
         last = {
           who,
           username: String(d.username ?? ''),
-          day: String(d.day ?? ''),
           checked: Number(d.checked) || 0,
           found: Number(d.found) || 0,
           skipped: Number(d.skipped) || 0,
           pct: d.pct === null ? null : Number(d.pct),
-          opened: Number(d.opened) || 0,
+          total: Number(d.total) || 0,
+          from: String(d.from ?? ''),
+          to: String(d.to ?? ''),
+          days: Number(d.days) || 0,
           links: Array.isArray(d.links) ? (d.links as JudgedLinkShape[]) : [],
         }
         const total = Number(d.total) || 0
@@ -1171,6 +1195,23 @@ export default function AdminDashboard({
   const clickProducts = Array.from(
     new Set([...Object.keys(data.clicksByProduct), ...PRODUCTS])
   ).filter((p) => p !== '(none)').sort()
+  // The other direction. referralByUser is keyed by REFERRER; an admin looking
+  // at a worker wants to know who is being paid a commission on that worker's
+  // output, which is the same data read backwards.
+  const referredByUser = useMemo(() => {
+    const names = new Map(data.users.map((x) => [x.id, x.name || x.email]))
+    const out: Record<string, { referrerId: string; name: string | null; code: string }> = {}
+    for (const [referrerId, e] of Object.entries(referralByUser)) {
+      for (const m of e.members) {
+        out[m.userId] = {
+          referrerId,
+          name: names.get(referrerId) ?? null,
+          code: e.code ?? '',
+        }
+      }
+    }
+    return out
+  }, [referralByUser, data.users])
   const clicksAllProducts = Object.values(data.clicksByProduct).reduce((a, b) => a + b, 0)
   // Per-product totals come from the product stamped on each CLICK, so they don't
   // shift when a user is moved between products (unlike summing users' totals).
@@ -1185,12 +1226,13 @@ export default function AdminDashboard({
         acc.video += p.video.birr
         acc.promo += p.promo.birr
         acc.accounts += p.accounts.birr
+        acc.referrals += p.referrals.birr
         acc.waiting += p.accountsAwaiting.count
         acc.total += p.total
       }
       return acc
     },
-    { comments: 0, video: 0, promo: 0, accounts: 0, waiting: 0, total: 0 }
+    { comments: 0, video: 0, promo: 0, accounts: 0, referrals: 0, waiting: 0, total: 0 }
   )
   // Addresses nobody has checked yet. Shown on the Email task button, because
   // that number is the only thing standing between a worker and their pay.
@@ -1488,6 +1530,8 @@ export default function AdminDashboard({
               key={u.id}
               u={u}
               pending={pendingByUser[u.id] ?? null}
+              referral={referralByUser[u.id] ?? null}
+              referredBy={referredByUser[u.id] ?? null}
               appVersion={appVersions[u.id] ?? null}
               latestVersionName={apk?.version ?? null}
               paying={payingUser === u.id}
@@ -2231,14 +2275,21 @@ export default function AdminDashboard({
                     )}
                   </div>
                   <div className="text-[11px] text-zinc-600 mt-1">
-                    Last active {verifyReport.day} · opened {verifyReport.opened} link(s)
-                    {/* The day is read IN FULL now, so a shortfall here means the
-                        pass has not finished — not that a sample was taken. It
-                        works to a deadline and resumes, so a heavy day needs
-                        more than one run. */}
-                    {verifyReport.opened > verifyReport.links.length &&
+                    Their last {verifyReport.total} link(s)
+                    {verifyReport.days > 0 &&
+                      ` across ${verifyReport.days} day(s)`}
+                    {verifyReport.from &&
+                      ` · ${
+                        verifyReport.from === verifyReport.to
+                          ? verifyReport.from
+                          : `${verifyReport.from} → ${verifyReport.to}`
+                      }`}
+                    {/* A shortfall here means the pass has not finished — not that
+                        a sample was taken of the sample. It works to a deadline
+                        and resumes. */}
+                    {verifyReport.total > verifyReport.links.length &&
                       ` · ${verifyReport.links.length} read so far, ${(
-                        verifyReport.opened - verifyReport.links.length
+                        verifyReport.total - verifyReport.links.length
                       ).toLocaleString()} still to read`}
                     {verifyReport.skipped > 0 && ` · ${verifyReport.skipped} could not be judged`}
                   </div>
@@ -2284,6 +2335,11 @@ export default function AdminDashboard({
                       >
                         {l.url}
                       </a>
+                      {l.day && (
+                        <span className="shrink-0 text-[11px] text-zinc-600 tabular-nums">
+                          {l.day.slice(5)}
+                        </span>
+                      )}
                     </div>
                   ))
                 )}
@@ -2348,6 +2404,8 @@ export default function AdminDashboard({
 function UserCard({
   u,
   pending,
+  referral,
+  referredBy,
   appVersion,
   latestVersionName,
   paying,
@@ -2376,6 +2434,12 @@ function UserCard({
   tiktokAccount,
   onProfileSaved,
 }: {
+  /** What this user has earned by referring others, or null if they referred
+   *  nobody. */
+  referral: ReferralEarnings | null
+  /** Who referred THIS user — the other direction, so an admin looking at a
+   *  worker can see who is being paid a commission on their work. */
+  referredBy: { referrerId: string; name: string | null; code: string } | null
   u: AdminUserRow
   pending: PendingPayments | null
   appVersion: { name: string | null; code: number | null } | null
@@ -2587,6 +2651,36 @@ function UserCard({
           })()}
           <Chip label="clicked" value={u.totalClicks} />
           <Chip label="comments" value={u.totalCommented} />
+          {/* PER DAY, which is the number that compares two workers.
+              Totals do not: somebody reset last Tuesday and somebody counted
+              since the start of the month have the same column meaning
+              different things. Both rates divide by that user's OWN counting
+              period — their reset if they have one, the global one otherwise,
+              and never from before their account existed. */}
+          <Chip
+            label="clicks/day"
+            value={perDay(u.totalClicks, daysSince(u.countingFrom))}
+            title={
+              `${u.totalClicks.toLocaleString()} link(s) over ` +
+              `${daysSince(u.countingFrom)} day(s), counting from ${u.countingFrom}. ` +
+              (u.loginDays.length
+                ? `On the ${u.loginDays.length} day(s) they actually signed in it is ` +
+                  `${perDay(u.totalClicks, u.loginDays.length)} a day.`
+                : 'They have not signed in since then.')
+            }
+          />
+          <Chip
+            label="comments/day"
+            value={perDay(u.totalCommented, daysSince(u.countingFrom))}
+            title={
+              `${u.totalCommented.toLocaleString()} comment(s) over ` +
+              `${daysSince(u.countingFrom)} day(s), counting from ${u.countingFrom}. ` +
+              (u.loginDays.length
+                ? `On the ${u.loginDays.length} day(s) they actually signed in it is ` +
+                  `${perDay(u.totalCommented, u.loginDays.length)} a day.`
+                : 'They have not signed in since then.')
+            }
+          />
           <Chip label="reposts" value={u.promoLinks.length} accent={unapprovedReposts ? 'amber' : undefined} />
           {/* videos + logins counts are shown only in the expanded details, not the row */}
           {unapprovedReposts + unapprovedVideos > 0 && (
@@ -3236,6 +3330,16 @@ function UserCard({
                 <span>Video {fmtBirr(pending.video.birr)} ({pending.video.count})</span>
                 <span>Repost {fmtBirr(pending.promo.birr)} ({pending.promo.count})</span>
                 <span>Emails {fmtBirr(pending.accounts.birr)} ({pending.accounts.count})</span>
+                <span
+                  title={
+                    `${Math.round(REFERRAL_SHARE * 100)}% of the comment pay of the ` +
+                    `${referral?.people ?? 0} user(s) this person referred. The count is THEIR ` +
+                    'comments, not this user\u2019s. Paid on top \u2014 nothing is deducted from them.'
+                  }
+                  className={pending.referrals.birr > 0 ? 'text-sky-300' : undefined}
+                >
+                  Referrals {fmtBirr(pending.referrals.birr)} ({pending.referrals.count})
+                </span>
                 {pending.accountsAwaiting.count > 0 && (
                   <span
                     className="text-amber-400/90"
@@ -3244,6 +3348,57 @@ function UserCard({
                     + {fmtBirr(pending.accountsAwaiting.birr)} awaiting check (
                     {pending.accountsAwaiting.count})
                   </span>
+                )}
+              </div>
+            )}
+            {/* The referral arrangement, both directions. An admin approving a
+                payment should be able to see who else is being paid because of
+                this user's work, and on whose work this user is being paid. */}
+            {(referral?.people || referredBy) && (
+              <div className="mb-2 rounded-lg border border-sky-500/20 bg-sky-500/5 px-2.5 py-1.5 text-xs">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <span className="text-zinc-500">
+                    Referral username{' '}
+                    <code className="text-sky-300">{referral?.code || u.referralCode || '—'}</code>
+                  </span>
+                  {referredBy && (
+                    <span className="text-zinc-500">
+                      registered with{' '}
+                      <span className="text-zinc-300">{referredBy.name || referredBy.code}</span>
+                      &apos;s username
+                    </span>
+                  )}
+                </div>
+                {referral && referral.people > 0 && (
+                  <div className="mt-1 border-t border-sky-500/15 pt-1">
+                    <div className="text-[11px] text-zinc-500 mb-0.5">
+                      {referral.people} user(s) registered with this username &mdash;{' '}
+                      {Math.round(REFERRAL_SHARE * 100)}% of their comment pay, {fmtBirr(referral.birr)} birr
+                      unpaid, {fmtBirr(referral.lifetimeBirr)} birr in total
+                    </div>
+                    {referral.members.map((m) => (
+                      <div key={m.userId} className="flex items-center gap-3 text-[11px]">
+                        <span className="flex-1 truncate text-zinc-400">
+                          {m.name || <span className="text-zinc-600">(no name)</span>}
+                        </span>
+                        <span
+                          className="w-28 text-right tabular-nums text-zinc-500"
+                          title="Comments this person made that are not yet paid to the referrer"
+                        >
+                          {m.comments} unpaid
+                        </span>
+                        <span className="w-20 text-right tabular-nums text-sky-300">
+                          {fmtBirr(m.comments * REFERRAL_PAY_RATE)}
+                        </span>
+                        <span
+                          className="w-24 text-right tabular-nums text-zinc-600"
+                          title="Everything this person has ever earned the referrer"
+                        >
+                          {fmtBirr(m.lifetimeComments * REFERRAL_PAY_RATE)} total
+                        </span>
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
             )}
@@ -3522,14 +3677,43 @@ function Stat({
 }
 
 // A small inline stat pill used in each user's compact bar.
+/**
+ * Days from the start of counting to today, inclusive.
+ *
+ * INCLUSIVE, and never less than one. A user reset this morning has worked for
+ * one day, not zero — and dividing by zero puts Infinity on screen next to
+ * somebody's name.
+ */
+function daysSince(fromISO: string): number {
+  const from = new Date(`${fromISO}T00:00:00`)
+  if (isNaN(from.getTime())) return 1
+  const today = new Date()
+  const days = Math.floor(
+    (Date.UTC(today.getFullYear(), today.getMonth(), today.getDate()) -
+      Date.UTC(from.getFullYear(), from.getMonth(), from.getDate())) / 86400000
+  ) + 1
+  return Math.max(1, days)
+}
+
+/** A rate with one decimal, or a whole number when it is one. 12.0 reads as
+ *  false precision; 12 is what somebody would say out loud. */
+function perDay(total: number, days: number): string {
+  const v = total / Math.max(1, days)
+  return v >= 10 || Number.isInteger(v) ? Math.round(v).toLocaleString() : v.toFixed(1)
+}
+
 function Chip({
   label,
   value,
   accent,
+  title,
 }: {
   label: string
   value: string | number
   accent?: 'emerald' | 'amber'
+  /** Hovered explanation. A rate needs one: the number on its own does not say
+   *  what it was divided by, and two admins would read it two ways. */
+  title?: string
 }) {
   const cls =
     accent === 'emerald'
@@ -3538,7 +3722,10 @@ function Chip({
         ? 'text-amber-300 border-amber-500/30'
         : 'text-zinc-300 border-zinc-700'
   return (
-    <span className={`text-[11px] border rounded px-1.5 py-0.5 whitespace-nowrap tabular-nums ${cls}`}>
+    <span
+      title={title}
+      className={`text-[11px] border rounded px-1.5 py-0.5 whitespace-nowrap tabular-nums ${cls}`}
+    >
       <span className="font-semibold">{value}</span> <span className="text-zinc-500">{label}</span>
     </span>
   )

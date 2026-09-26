@@ -72,6 +72,9 @@ interface ChannelRank {
   perDay: number | null
   lastPostDays: number | null
   score: number
+  /** Somebody asked for this channel by hand rather than it being worked out
+   *  from links we already hold. */
+  added: boolean
 }
 
 export default function VerifyLinks() {
@@ -131,6 +134,13 @@ export default function VerifyLinks() {
   // 2,756 to 535, so without this the Instagram channels are real, ranked and
   // effectively unreachable — they sit below two thousand rows.
   const [rankSite, setRankSite] = useState('')
+  // Show only the channels somebody added by hand.
+  //
+  // A filter rather than a separate mode, because extraction already runs over
+  // exactly what the filters leave on screen — so narrowing to the added ones
+  // IS "extract from the added ones only", using the mechanism that was already
+  // there rather than a second one beside it.
+  const [onlyAdded, setOnlyAdded] = useState(false)
   const [extracting, setExtracting] = useState(false)
   const [exDone, setExDone] = useState(0)
   const [exTotal, setExTotal] = useState(0)
@@ -554,19 +564,179 @@ export default function VerifyLinks() {
     }
   }
 
+  // ── Channels added by hand ─────────────────────────────────────────────────
+  //
+  // Every other channel on this page is INFERRED from links already in the pool,
+  // which is a closed loop: a channel with no links is not in the ranking, so
+  // the extract pass never visits it, so it never gets links. This is the way
+  // in for a channel nobody has scraped yet.
+  interface ExtraChannel {
+    site: string
+    handle: string
+    note: string | null
+    addedAt: string
+  }
+  const [addOpen, setAddOpen] = useState(false)
+  const [addInput, setAddInput] = useState('')
+  const [addSite, setAddSite] = useState('')
+  const [addNote, setAddNote] = useState('')
+  const [addBusy, setAddBusy] = useState(false)
+  const [addMsg, setAddMsg] = useState('')
+  const [addErr, setAddErr] = useState('')
+  const [extras, setExtras] = useState<ExtraChannel[] | null>(null)
+  // Set when the channel just added is real and ranked but filtered off the
+  // screen — which is the one case where the add succeeded and the extract
+  // button still will not touch it.
+  const [addHidden, setAddHidden] = useState<{ site: string; handle: string } | null>(null)
+
+  /**
+   * The site a pasted link names, read in the browser as well as on the server.
+   *
+   * Only so the dropdown can lock itself and stop asking a question the link has
+   * already answered. The server parses it again and its answer is the one that
+   * counts — this is a convenience, not a validation.
+   */
+  const siteFromInput = (raw: string): string => {
+    const u = raw.trim().replace(/^https?:\/\//i, '').replace(/^www\./i, '')
+    if (/^(?:m\.|vm\.)?tiktok\.com\/@/i.test(u)) return 'tiktok'
+    if (/^(?:m\.)?youtube\.com\/@/i.test(u)) return 'youtube'
+    if (/^instagram\.com\/(?!p\/|reel|explore|stories|tv\/|accounts|direct)/i.test(u)) return 'instagram'
+    return ''
+  }
+  const detectedSite = siteFromInput(addInput)
+
+  async function loadExtras() {
+    try {
+      const res = await fetch('/api/admin/verify-links/channels')
+      const d = await res.json().catch(() => ({}))
+      if (res.ok) setExtras(Array.isArray(d.channels) ? d.channels : [])
+    } catch {
+      /* the panel simply shows nothing rather than an error nobody can act on */
+    }
+  }
+
+  async function addChannel() {
+    if (!addInput.trim()) return
+    setAddBusy(true)
+    setAddMsg('')
+    setAddErr('')
+    try {
+      const res = await fetch('/api/admin/verify-links/channels', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input: addInput, site: detectedSite || addSite, note: addNote }),
+      })
+      const d = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setAddErr(d?.error || 'Could not add that channel.')
+        return
+      }
+      // What actually happened, in the words that distinguish the cases: added,
+      // already there, and added-but-nothing-listed are three different things
+      // and only the first is a success.
+      const where = `@${d.handle} on ${d.site}`
+      setAddMsg(
+        !d.added
+          ? `${where} was already on the list.`
+          : d.listed === null
+            ? `${where} added. Its posts cannot be listed from here — export the handles and scrape it locally.`
+            : d.listed > 0
+              ? `${where} added — TikTok lists ${d.listed} video(s). It is now first in the ranked list; press ⬇ Extract new videos to stage them.`
+              : `${where} added, but TikTok listed nothing for it. Check the spelling, or the account may be private or new.`
+      )
+      setAddInput('')
+      setAddNote('')
+      setAddHidden(null)
+      await loadExtras()
+      // ALWAYS re-rank, not only when a ranking is already on screen.
+      //
+      // ⬇ Extract new videos is disabled until the channels have been ranked —
+      // it walks that list, in that order — so adding a channel without ranking
+      // left the button dead next to a message telling you to press it. Adding
+      // a channel IS a reason to rank: the list has just changed.
+      const list = await rankChannels()
+      if (list) {
+        // And it has to be VISIBLE. Extraction runs over exactly the rows the
+        // filters leave on screen, so a "min links" filter — which a channel we
+        // hold no links from can never pass — hides the very channel that was
+        // just added and takes it out of the run without saying so.
+        const row = list.find((c) => c.platform === d.site && c.handle === d.handle)
+        if (!row) {
+          setAddErr(
+            `@${d.handle} was saved but is not in the ranked list. Press 📊 Rank channels again; ` +
+              'if it still does not appear, something is wrong with the ranking rather than the add.'
+          )
+        } else if (!passesChannelFilters(row)) {
+          setAddHidden({ site: d.site, handle: d.handle })
+        }
+      }
+    } catch {
+      setAddErr('Network error.')
+    } finally {
+      setAddBusy(false)
+    }
+  }
+
+  /**
+   * Extract from the hand-added channels and nothing else.
+   *
+   * Ranks first and reads the returned list, rather than trusting what is on
+   * screen: this is usually pressed seconds after an add, when the table may
+   * not have caught up. The filter is set to match so the table shows what is
+   * actually being worked on — a run over a set the screen disagrees with is
+   * how you end up unable to say what was extracted.
+   */
+  async function extractAdded() {
+    const list = (await rankChannels()) ?? ranked
+    if (!list) return
+    setOnlyAdded(true)
+    setRankSite('')
+    setRankQuery('')
+    setFLinks(['', '']); setFHearts(['', '']); setFRate(['', ''])
+    setFActive(['', '']); setFLast(['', '']); setFScore(['', ''])
+    const mine = list.filter((c) => c.added)
+    if (mine.length === 0) {
+      setExNote('No channels have been added by hand, so there is nothing to extract from.')
+      return
+    }
+    await extractNew(mine.filter((c) => c.platform === 'tiktok'))
+  }
+
+  async function removeChannel(site: string, handle: string) {
+    try {
+      await fetch(
+        `/api/admin/verify-links/channels?site=${encodeURIComponent(site)}&handle=${encodeURIComponent(handle)}`,
+        { method: 'DELETE' }
+      )
+      await loadExtras()
+      if (ranked) await rankChannels()
+    } catch {
+      /* leave the row; the next load will show the truth */
+    }
+  }
+
   // ── Merge the current page's remaining links into the main pool ─────────────
   // Rank every channel from data we already hold — no network, so it returns at
   // once. Nothing is fetched from TikTok until the extract button is pressed.
-  async function rankChannels() {
+  /**
+   * Rank every channel from data we already hold, and RETURN the list.
+   *
+   * Returned as well as stored because a caller that has just changed the set
+   * of channels needs to look at the result now: setRanked schedules a render,
+   * so reading `ranked` on the next line still gives the old list.
+   */
+  async function rankChannels(): Promise<ChannelRank[] | null> {
     setRanking(true)
     setExNote('')
     try {
       const res = await fetch('/api/admin/verify-links/extract')
       const d = await res.json().catch(() => ({}))
-      if (!res.ok) { alert(d?.error || 'Could not rank channels.'); return }
-      setRanked(Array.isArray(d.channels) ? d.channels : [])
+      if (!res.ok) { alert(d?.error || 'Could not rank channels.'); return null }
+      const list: ChannelRank[] = Array.isArray(d.channels) ? d.channels : []
+      setRanked(list)
       setUnattributed(d.unattributed ?? null)
       setShowRanked(true)
+      return list
     } finally {
       setRanking(false)
     }
@@ -584,6 +754,7 @@ export default function VerifyLinks() {
   const [fScore, setFScore] = useState<[string, string]>(['', ''])
 
   function clearChannelFilters() {
+    setOnlyAdded(false)
     setRankQuery('')
     setFLinks(['', '']); setFHearts(['', '']); setFRate(['', ''])
     setFActive(['', '']); setFLast(['', '']); setFScore(['', ''])
@@ -608,19 +779,27 @@ export default function VerifyLinks() {
   }
 
   const needle = rankQuery.trim().replace(/^@/, '').toLowerCase()
+  /**
+   * Does this channel survive the filters currently on screen?
+   *
+   * One definition, used by the table AND by the add form, because extraction
+   * runs over exactly what the table leaves: a channel that fails this is a
+   * channel the ⬇ button will not visit, whatever else the page says.
+   */
+  const passesChannelFilters = (c: ChannelRank): boolean =>
+    (!onlyAdded || c.added) &&
+    (rankSite === '' || c.platform === rankSite) &&
+    (needle === '' || c.handle.includes(needle)) &&
+    inRange(c.links, fLinks) &&
+    inRange(c.avgHearts, fHearts) &&
+    inRange(c.perDay, fRate) &&
+    inRange(c.activePct, fActive) &&
+    inRange(c.lastPostDays, fLast) &&
+    inRange(c.score, fScore)
+
   const visibleChannels = (ranked ?? [])
     .map((c, i) => ({ ...c, rank: i + 1 }))
-    .filter(
-      (c) =>
-        (rankSite === '' || c.platform === rankSite) &&
-        (needle === '' || c.handle.includes(needle)) &&
-        inRange(c.links, fLinks) &&
-        inRange(c.avgHearts, fHearts) &&
-        inRange(c.perDay, fRate) &&
-        inRange(c.activePct, fActive) &&
-        inRange(c.lastPostDays, fLast) &&
-        inRange(c.score, fScore)
-    )
+    .filter(passesChannelFilters)
   const channelsFiltered = (ranked?.length ?? 0) !== visibleChannels.length
   // Channels that match the handle search but were removed by the SITE chip.
   //
@@ -642,6 +821,7 @@ export default function VerifyLinks() {
 
   // How many ranked channels each site has, so the chips can say so and an
   // empty one is visibly empty rather than a filter that returns nothing.
+  const addedCount = (ranked ?? []).filter((c) => c.added).length
   const siteCounts = (ranked ?? []).reduce<Record<string, number>>((acc, c) => {
     acc[c.platform] = (acc[c.platform] ?? 0) + 1
     return acc
@@ -691,18 +871,44 @@ export default function VerifyLinks() {
 
   // Walk the ranked channels in order, staging each one's new videos. Each POST
   // works ~40s and says where to resume; this loop drives the progress bar.
-  async function extractNew() {
+  /**
+   * Check channels for videos we do not hold yet and stage them in this list.
+   *
+   * With no argument it uses exactly the channels left on screen — filtering the
+   * table IS how a subset is chosen, so extraction follows it rather than the
+   * full list.
+   *
+   * `subset` is for a caller that already knows which channels it means and
+   * cannot wait for the table to agree: setRanked only schedules a render, so
+   * "add a channel, then extract from it" would otherwise read the list as it
+   * was before the add.
+   */
+  async function extractNew(subset?: ChannelRank[]) {
     if (extracting) { stopExtract.current = true; return }
-    if (!ranked || ranked.length === 0) return
-    // Exactly the channels left on screen. Filtering the table IS the way to
-    // choose a subset, so extraction must follow it rather than the full list.
-    const handles = extractable.map((c) => c.handle)
-    if (handles.length === 0) return
+    if (!subset && (!ranked || ranked.length === 0)) return
+    const pick = subset ?? extractable
+    const handles = pick.map((c) => c.handle)
+    const narrowed = subset ? true : channelsFiltered
+    const cannotList = subset ? subset.filter((c) => c.platform !== 'tiktok').length : unlistable
+    // Never a silent return. A button press that produces nothing at all is
+    // indistinguishable from a broken button, and this is the one path where
+    // the set can legitimately be empty.
+    if (handles.length === 0) {
+      setExNote(
+        cannotList
+          ? `Nothing to check: all ${cannotList.toLocaleString()} channel(s) in this selection are ` +
+            'Instagram or YouTube, whose posts cannot be listed from here. Use 📄 Export handles ' +
+            'and the local scraper.'
+          : 'Nothing to check: no TikTok channel is in this selection. Clear the filters above the ' +
+            'ranked table, or press 📊 Rank channels first.'
+      )
+      return
+    }
     if (!confirm(
       `Check ${handles.length.toLocaleString()}` +
-      `${channelsFiltered ? ' filtered' : ''} TikTok channel(s) for new videos?\n\n` +
-      (unlistable
-        ? `${unlistable.toLocaleString()} channel(s) on screen are not TikTok and cannot be ` +
+      `${narrowed ? ' filtered' : ''} TikTok channel(s) for new videos?\n\n` +
+      (cannotList
+        ? `${cannotList.toLocaleString()} channel(s) on screen are not TikTok and cannot be ` +
           'checked: Instagram exposes no way to list a profile\u2019s posts without a login, ' +
           'and a YouTube Shorts link carries no handle. Scrape those with ' +
           '1_tiktok_search_scraper and upload the CSV here.\n\n'
@@ -718,6 +924,9 @@ export default function VerifyLinks() {
     setExTotal(handles.length)
     setExNote('Starting…')
     let offset = 0, found = 0, failed = 0
+    // Which channels answered with nothing, so a small hand-picked run can say
+    // which one rather than how many.
+    const emptyHandles: string[] = []
     // Listed videos the channel had posted BEFORE the newest one we already
     // hold. Shown because a big number here is the back catalogue that used
     // to be staged as if it were new.
@@ -736,6 +945,9 @@ export default function VerifyLinks() {
         found += Number(d.newLinks) || 0
         failed += Number(d.failed) || 0
         older += Number(d.olderSkipped) || 0
+        for (const h of (Array.isArray(d.failedHandles) ? d.failedHandles : []) as string[]) {
+          if (!emptyHandles.includes(h) && emptyHandles.length < 40) emptyHandles.push(h)
+        }
         setExDone(offset); setExNew(found); setExFailed(failed)
         setExTotal(Number(d.total) || handles.length)
         setExNote(
@@ -753,6 +965,17 @@ export default function VerifyLinks() {
               ? ` ${skipped.toLocaleString()} channel(s) were not checked: fetching new videos ` +
                 'works for TikTok only — scrape Instagram and YouTube channels with ' +
                 '1_tiktok_search_scraper and upload the CSV here.'
+              : '') +
+            // Named, not counted. Over a handful of hand-picked channels
+            // "1 returned nothing" is useless and "@ace_the_page returned
+            // nothing" is the whole answer.
+            (emptyHandles.length
+              ? ` ${emptyHandles.length === failed ? '' : `${failed.toLocaleString()} `}` +
+                `channel(s) answered with no videos: ` +
+                emptyHandles.slice(0, 8).map((h) => `@${h}`).join(', ') +
+                (emptyHandles.length > 8 ? `, and ${emptyHandles.length - 8} more` : '') +
+                '. Either the handle is wrong, the account is gone or private, or TikTok is ' +
+                'throttling the listing — open the profile to tell which.'
               : '')
           )
           break
@@ -872,6 +1095,26 @@ export default function VerifyLinks() {
         </button>
         <button
           type="button"
+          onClick={() => {
+            setAddOpen((v) => !v)
+            if (extras === null) void loadExtras()
+          }}
+          title={
+            'Add a channel that no link in the list belongs to.\n\n' +
+            'Every channel here is otherwise worked out from links already held, so a channel ' +
+            'nobody has scraped can never be reached: no links means no place in the ranking, ' +
+            'which means the extract pass never visits it. This is the way in.'
+          }
+          className={`text-sm rounded-lg px-3 py-1.5 border transition-colors ${
+            addOpen
+              ? 'text-white bg-teal-700 border-teal-600'
+              : 'text-zinc-200 bg-zinc-800 hover:bg-zinc-700 border-zinc-700'
+          }`}
+        >
+          ➕ Add channel{extras && extras.length ? ` (${extras.length})` : ''}
+        </button>
+        <button
+          type="button"
           onClick={rankChannels}
           disabled={ranking || extracting}
           title="Order every channel by links, average hearts, posting frequency and active/blocked ratio (25% each). Uses data we already hold — nothing is fetched from TikTok."
@@ -881,7 +1124,7 @@ export default function VerifyLinks() {
         </button>
         <button
           type="button"
-          onClick={extractNew}
+          onClick={() => void extractNew()}
           disabled={!ranked || extractable.length === 0}
           title={
             !ranked
@@ -1074,6 +1317,152 @@ export default function VerifyLinks() {
       </div>
       </div>
 
+
+      {/* Add a channel nothing in the list names. */}
+      {addOpen && (
+        <div className="rounded-xl border border-teal-800/60 bg-teal-950/20 p-3 mb-3">
+          <p className="text-sm text-zinc-200 mb-1">Scrape a channel that is not in the list</p>
+          <p className="text-[11px] text-zinc-500 mb-2 max-w-3xl">
+            Paste the channel&apos;s profile link — that names its site, so there is nothing to
+            choose. A bare handle needs the site picked, because the same name exists on more than
+            one and guessing would send the scraper to a stranger.
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              value={addInput}
+              onChange={(e) => { setAddInput(e.target.value); setAddErr(''); setAddMsg('') }}
+              onKeyDown={(e) => { if (e.key === 'Enter' && !addBusy) void addChannel() }}
+              placeholder="https://www.tiktok.com/@studyexpert6   or   studyexpert6"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              className="flex-1 min-w-[18rem] bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-emerald-500"
+            />
+            <select
+              value={detectedSite || addSite}
+              onChange={(e) => setAddSite(e.target.value)}
+              disabled={!!detectedSite}
+              title={detectedSite ? 'The link says which site this is' : 'Which site is this handle on?'}
+              className="bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-sm text-zinc-200 disabled:opacity-60 focus:outline-none focus:border-emerald-500"
+            >
+              <option value="">Site…</option>
+              <option value="tiktok">TikTok</option>
+              <option value="instagram">Instagram</option>
+              <option value="youtube">YouTube</option>
+            </select>
+            <input
+              value={addNote}
+              onChange={(e) => setAddNote(e.target.value)}
+              placeholder="Why? (optional)"
+              className="w-56 bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-emerald-500"
+            />
+            <button
+              type="button"
+              onClick={() => void addChannel()}
+              disabled={addBusy || !addInput.trim()}
+              className="text-sm text-white bg-teal-700 hover:bg-teal-600 border border-teal-600 disabled:opacity-40 rounded-lg px-3 py-1.5 transition-colors"
+            >
+              {addBusy ? 'Checking…' : 'Add'}
+            </button>
+            {/* The usual next step, without having to find the filter first:
+                rank, narrow to the added channels, and extract from those
+                alone. */}
+            <button
+              type="button"
+              onClick={() => void extractAdded()}
+              disabled={extracting || ranking || (extras !== null && extras.length === 0)}
+              title={
+                'Check ONLY the channels added by hand for videos we do not hold, and stage ' +
+                'them in this list.\n\n' +
+                'The ranked table is narrowed to the same set, so what is on screen is what ' +
+                'is being worked on.'
+              }
+              className="text-sm text-white bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 disabled:opacity-40 rounded-lg px-3 py-1.5 transition-colors"
+            >
+              {extracting
+                ? '■ Stop extracting'
+                : ranking
+                  ? 'Ranking…'
+                  : `⬇ Extract from the added channel(s)${extras && extras.length ? ` (${extras.length})` : ''}`}
+            </button>
+          </div>
+          {addErr && <p className="text-xs text-rose-400 mt-2">{addErr}</p>}
+          {addMsg && <p className="text-xs text-emerald-300 mt-2">{addMsg}</p>}
+          {/* The add worked, the channel is ranked, and the filters on the table
+              are hiding it — so ⬇ Extract would walk straight past it. Said
+              here, next to the message that promised extraction, rather than
+              left to be worked out from a button that looks broken. */}
+          {addHidden && (
+            <p className="text-xs text-amber-300 mt-2 flex flex-wrap items-center gap-2">
+              <span>
+                …but the ranked table&apos;s filters are hiding @{addHidden.handle}, and
+                extraction only visits what is on screen.
+                {fLinks[0] ? ' A minimum-links filter is set, and a channel we hold no links from cannot pass it.' : ''}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  clearChannelFilters()
+                  setRankSite('')
+                  setAddHidden(null)
+                }}
+                className="text-[11px] text-white bg-amber-700 hover:bg-amber-600 border border-amber-600 rounded px-2 py-0.5"
+              >
+                Clear the filters and show it
+              </button>
+            </p>
+          )}
+          <p className="text-[11px] text-zinc-500 mt-2">
+            <span className="text-zinc-400">⬇ Extract from the added channel(s)</span> checks these
+            and nothing else — it narrows the ranked table to them first, so what is on screen is
+            what is being worked on. (The same thing by hand: the{' '}
+            <span className="text-zinc-400">Added by hand</span> chip above the table, then{' '}
+            <span className="text-zinc-400">⬇ Extract new videos</span>.) A channel added here also
+            goes to the TOP of the full ranked list until it has links of its own, so an ordinary
+            extraction reaches it first rather than behind four thousand others. Instagram and
+            YouTube cannot be listed from here at all —{' '}
+            <span className="text-zinc-400">📄 Export handles</span> and the local scraper.
+          </p>
+
+          {extras && extras.length > 0 && (
+            <div className="mt-3 border-t border-teal-800/40 pt-2">
+              <p className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1">
+                {extras.length} channel(s) added by hand
+              </p>
+              {extras.map((c) => (
+                <div key={`${c.site}:${c.handle}`} className="flex items-center gap-3 text-xs py-0.5">
+                  <a
+                    href={channelUrl(c.handle, c.site) as string}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-56 truncate text-zinc-300 hover:text-emerald-400"
+                  >
+                    @{c.handle}
+                    <span className="ml-1.5 text-[10px] text-zinc-600">{c.site}</span>
+                  </a>
+                  <span className="flex-1 truncate text-zinc-500">{c.note || ''}</span>
+                  <span className="text-[10px] text-zinc-600 tabular-nums">
+                    {new Date(c.addedAt).toLocaleDateString()}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void removeChannel(c.site, c.handle)}
+                    title={
+                      'Stop treating this as a channel you asked for.\n\n' +
+                      'Links already scraped from it stay in the pool and it keeps its place in ' +
+                      'the ranking on their strength \u2014 this removes the request, not the work.'
+                    }
+                    className="text-zinc-600 hover:text-rose-400 px-1"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Ranked channels — the order extraction follows. Filters below each
           column narrow it, and extraction uses exactly what survives them. */}
       {ranked && showRanked && (
@@ -1130,6 +1519,27 @@ export default function VerifyLinks() {
                   channels reachable. Extraction is a separate question, marked
                   on each chip. */}
               <div className="flex flex-wrap items-center gap-1.5 px-3 pt-2">
+                {/* Extraction runs over exactly what these filters leave, so
+                    this IS "extract from the added channels only" — the same
+                    mechanism as every other narrowing, rather than a second
+                    one beside it. */}
+                {addedCount > 0 && (
+                  <button
+                    onClick={() => setOnlyAdded((v) => !v)}
+                    title={
+                      'Show only the channels you added by hand.\n\n' +
+                      'Extraction visits exactly the channels on screen, so with this on ' +
+                      '↓ Extract new videos checks those and nothing else.'
+                    }
+                    className={`text-[11px] rounded px-2 py-0.5 border transition-colors ${
+                      onlyAdded
+                        ? 'bg-teal-600 border-teal-500 text-white'
+                        : 'bg-zinc-900 border-zinc-700 text-zinc-400 hover:bg-zinc-800'
+                    }`}
+                  >
+                    Added by hand ({addedCount})
+                  </button>
+                )}
                 {([
                   ['', 'All'],
                   ['tiktok', 'TikTok'],
@@ -1255,6 +1665,20 @@ export default function VerifyLinks() {
                     >
                       {c.platform}
                     </span>
+                    {/* A row with no links and no history looks like a fault
+                        unless it says why it is there. */}
+                    {c.added && (
+                      <span
+                        className="ml-1.5 text-[10px] text-teal-300"
+                        title={
+                          c.links === 0
+                            ? 'Added by hand, and we hold no links from it yet \u2014 so it is first in line for the next extraction.'
+                            : 'Added by hand. It has links of its own now, so it ranks on them like every other channel.'
+                        }
+                      >
+                        added
+                      </span>
+                    )}
                   </a>
                   <span className="w-16 shrink-0 text-right text-zinc-400 tabular-nums">
                     {c.links.toLocaleString()}

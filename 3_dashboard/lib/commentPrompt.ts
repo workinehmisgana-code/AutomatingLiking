@@ -17,7 +17,13 @@
 // write; instructions in the middle of a long prompt are the ones it drops. Say
 // each thing once, in the fewest words that are still exact.
 
-import { productWords, type CommentStyle, type LinkCategory, type Product } from './config'
+import {
+  productForms,
+  productWords,
+  type CommentStyle,
+  type LinkCategory,
+  type Product,
+} from './config'
 
 /** Blank line between the prompt's sections, so they read as separate rules. */
 const SEP = '\n\n'
@@ -79,7 +85,7 @@ export function voiceShapeRule(style: CommentStyle, mention: string): string {
         `Shapes to vary across the batch: "have you compared it with ${mention}?", "when ` +
         `will you show us trying ${mention}?", "how does this compare to ${mention}?", ` +
         `"does it give better results than ${mention}?", "would you run the same test on ` +
-        `${mention}?". ` +
+        `${mention}?", "is it better than ${mention}?". ` +
         `What is in question is THEIRS, never ours. Never ask whether ${mention} is any ` +
         `good, works, or is worth it. `
       )
@@ -132,16 +138,39 @@ function rewriteRule(style: CommentStyle, mention: string): string {
 }
 
 /** The rules every comment obeys, whichever prompt asked for it. */
-export function outputRules(band: PromptBand, style: CommentStyle, mention: string): string {
+export function outputRules(
+  band: PromptBand,
+  style: CommentStyle,
+  mention: string,
+  // Every phrasing the comment may use, canonical first — "purify text",
+  // "purify texted", "purify texting". Given to the model so the name can be
+  // conjugated into the sentence instead of dropped into a gap in it. Defaults
+  // to the mention alone, which is what a caller that has no product to hand
+  // can honestly offer.
+  forms: readonly string[] = [],
+  // False when the request does NOT give each line its own word count — the
+  // mimic prompt does not. Left true there, the model was being told to hit "the
+  // number of words its line asks for" by a request that asked for no such
+  // thing, and it mangled sentences trying to obey: "prohumanly saved my a
+  // midnight" is five words and not English.
+  perLineLength = true
+): string {
   const q = style.voice === 'question' || style.voice === 'curious'
   return (
     `EVERY comment: ${q ? 'ends in "?", ' : ''}` +
     // Each input names its own exact length. Asking for a range produces a
     // clump — the model settles on one comfortable length and repeats it.
-    `is exactly the number of words its line asks for (${band.min}-${band.max}), ` +
-    `spells the product "${mention}" exactly, lowercase and casual, no hashtags, no quotes ` +
-    `around it, and is not a tagline — no "#1", "secret weapon", "goat", "never fails", no ` +
-    `crowning it, no wordplay on the name. ` +
+    (perLineLength
+      ? `is exactly the number of words its line asks for (${band.min}-${band.max}), `
+      : `is ${band.min}-${band.max} words and reads as a real sentence, `) +
+    `writes the product as ORDINARY WORDS inside the sentence — ` +
+    `${(forms.length ? forms : [mention]).map((f) => `"${f}"`).join(', ')}` +
+    `${forms.length > 1 ? ', whichever fits the grammar' : ''} — ` +
+    `all lowercase, spelled with the space, never joined into one word, never capitalised, ` +
+    `no quotation marks around it, no hashtag, and never at the very start of the sentence. ` +
+    `It is something you are talking about, not a name you are announcing. ` +
+    `Not a tagline — no "#1", "secret weapon", "goat", "never fails", no crowning it, no ` +
+    `wordplay on the name. ` +
     // Diversity has to be in the SUBJECT, or every comment is one sentence with
     // a different adjective in it.
     `Vary the batch by changing what each one is ABOUT, not by using bigger words. ` +
@@ -150,6 +179,51 @@ export function outputRules(band: PromptBand, style: CommentStyle, mention: stri
         `count as words. `
       : `No emoji. `) +
     `Return strict JSON: {"comments": ["...", ...]}, one per input, same order.`
+  )
+}
+
+/**
+ * Write like the comment already under this video.
+ *
+ * Used when the liker finds a comment recommending a RIVAL tool and wants ours
+ * said the same way. Everything the ordinary prompt says about voice, length,
+ * spelling and banned words still applies — this only replaces the part that
+ * decides WHAT the comment is about, which here is "whatever that one was
+ * about".
+ *
+ * THE ONE RULE THIS ADDS is against copying. A model given one comment and
+ * asked for another will hand back the same sentence with the brand swapped,
+ * and the same sentence under fifty videos is a pattern somebody can search
+ * for. It is told, in as many words, to write a different sentence that makes
+ * the same point.
+ */
+export function buildMimicPrompt(
+  product: Product,
+  band: PromptBand,
+  style: CommentStyle
+): string {
+  const mention = productWords(product, style.splitBrand)
+  const forms = productForms(product)
+  return (
+    productBackground(product) +
+    SEP +
+    NAIVE_VOICE +
+    SEP +
+    voiceShapeRule(style, mention) +
+    SEP +
+    `You are given ONE real comment from under the video, which recommends some ` +
+    `other tool. Write comments that would sit naturally beside it: the same kind ` +
+    `of person, the same register, the same sort of claim, about "${mention}" ` +
+    `instead. ` +
+    // Matching the shape is the point; matching the words is the failure.
+    `Do NOT rewrite it or swap the name in it — write your own sentence that makes ` +
+    `the same kind of point. Different words, same vibe. ` +
+    // Slang in, slang out. A comment that reads as an advert beside a thread of
+    // "fr this saved me" is the thing being avoided.
+    `Match how it is written: if it is lowercase and slangy, so are yours; if it ` +
+    `is a full sentence, so are yours. Never name the other tool. ` +
+    SEP +
+    outputRules(band, style, mention, forms, false)
   )
 }
 
@@ -222,6 +296,7 @@ export function buildAudiencePrompt(
   style: CommentStyle
 ): string {
   const mention = productWords(product, style.splitBrand)
+  const forms = productForms(product)
   return (
     productBackground(product) +
     SEP +
@@ -238,7 +313,7 @@ export function buildAudiencePrompt(
     `MESSAGE from the audience above. Say something that only makes sense to that ` +
     `audience. ` +
     SEP +
-    outputRules(band, style, mention)
+    outputRules(band, style, mention, forms)
   )
 }
 
@@ -255,6 +330,7 @@ export function buildSystemPrompt(
   style: CommentStyle
 ): string {
   const mention = productWords(product, style.splitBrand)
+  const forms = productForms(product)
   return (
     productBackground(product) +
     SEP +
@@ -267,6 +343,6 @@ export function buildSystemPrompt(
     // question mark, so no filter catches it.
     `Write a NEW sentence, not the original reworded. It must read correctly on its own. ` +
     SEP +
-    outputRules(band, style, mention)
+    outputRules(band, style, mention, forms)
   )
 }

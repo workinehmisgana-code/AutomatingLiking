@@ -6,7 +6,7 @@ import {
   type LinkQuery,
   type ClusterBy,
 } from '@/lib/adminLinks'
-import { getActiveCommentProducts } from '@/lib/db'
+import { getActiveCommentProducts, getUrlsWithProductComments } from '@/lib/db'
 import { PRODUCTS } from '@/lib/config'
 
 export const dynamic = 'force-dynamic'
@@ -74,7 +74,28 @@ export async function GET(req: NextRequest) {
 
   try {
     const built = await buildAdminLinks(qy.product ?? '')
-    const matched = sortAdminLinks(filterAdminLinks(built.rows, qy, built.retirePlatforms), qy)
+    let matched = sortAdminLinks(filterAdminLinks(built.rows, qy, built.retirePlatforms), qy)
+
+    // withoutOurs=1 — only links that carry NONE of our comments.
+    //
+    // For a run whose job is to comment on those. Without it the liker pulls
+    // the whole list and opens every video to find out, which is one page load
+    // each to discard the ~80% that already have one of ours.
+    //
+    // It drops links KNOWN to carry one — a link nobody has scanned is not
+    // known to be clean, and stays in. That is the honest direction to be wrong
+    // in: the liker re-reads each video's own comments before writing anything,
+    // so a link that slips through is skipped there rather than commented on
+    // twice. This only saves the page loads it can prove are wasted.
+    let droppedWithOurs = 0
+    if (sp.get('withoutOurs') === '1') {
+      const withOurs = new Set(
+        (await getUrlsWithProductComments().catch(() => [] as string[])).map((u) => u)
+      )
+      const before = matched.length
+      matched = matched.filter((l) => !withOurs.has(l.url))
+      droppedWithOurs = before - matched.length
+    }
     const limit = Math.max(1, Math.min(20_000, Number(sp.get('limit')) || 5_000))
     // Active by default. `allProducts=1` returns every product including the
     // deactivated ones, for a caller that wants to like comments naming a
@@ -87,6 +108,9 @@ export async function GET(req: NextRequest) {
       clusterBy,
       clusters,
       matched: matched.length,
+      // How many the filter removed, so a caller can say why its list is
+      // shorter than the cluster it asked for.
+      droppedWithOurs,
       returned: Math.min(matched.length, limit),
       products,
       // Always both, so a caller can choose without asking twice.

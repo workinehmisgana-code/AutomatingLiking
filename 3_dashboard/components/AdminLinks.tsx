@@ -628,6 +628,229 @@ export default function AdminLinks({
     }
   }
 
+  async function loadYield(min?: string) {
+    const raw = (min ?? yieldMin).trim()
+    // An empty or unreadable box means "the default", never 0 — see yieldMin.
+    const n = raw === '' || !Number.isFinite(Number(raw)) ? 25 : Math.max(1, Math.round(Number(raw)))
+    setYieldOpen(true)
+    setYieldBusy(true)
+    setYieldData(null)
+    setYieldExpanded(null)
+    try {
+      const res = await fetch(`/api/admin/links/comment-yield?minClicks=${n}`)
+      const d = await res.json()
+      if (!res.ok) { setLoadErr(d?.error || 'Could not measure the comment yield.'); return }
+      setYieldData(d)
+      // Only sites that actually have rows are offered, so the filter cannot be
+      // set to something that shows nothing.
+      setYieldPlatform((p) => (d.rows?.some((r: YieldRow) => r.platform === p) ? p : ''))
+    } catch {
+      setLoadErr('Network error while measuring the comment yield.')
+    } finally {
+      setYieldBusy(false)
+    }
+  }
+
+  // ── Comment yield: channels that swallow clicks without showing a comment ──
+  // The question is "which channels are we spending clicks on for nothing", and
+  // the answer is a ratio: our product comments found on a channel's videos
+  // divided by the clicks workers have spent opening them. Lowest first.
+  interface YieldLink {
+    url: string
+    title: string
+    clicks: number
+    ours: number
+    rankCluster: number | null
+    dateCluster: number | null
+  }
+  interface YieldRow {
+    channel: string
+    platform: string
+    handle: string
+    profileUrl: string
+    links: number
+    clicks: number
+    ours: number
+    per100: number
+    byProduct: Record<string, number>
+    clickedLinks: number
+    stale: number
+    unscanned: number
+    unreadable: number
+    avgRankCluster: number | null
+    avgDateCluster: number | null
+    rankClusterLinks: number
+    dateClusterLinks: number
+    withOurs: YieldLink[]
+    withoutOurs: YieldLink[]
+  }
+  /** What a link actually carries, fetched when its channel is opened. */
+  interface YieldComments {
+    ours: { product: string; rank: number; likes: number; username: string | null; text: string | null }[]
+    top: { text: string; user: string | null; likes: number | null } | null
+    read: number | null
+    total: number | null
+    complete: boolean
+    scannedAt: string | null
+    /** Every comment on the video, read from the platform on demand. Absent
+     *  until somebody asks for it — see "Read every comment". */
+    live?: {
+      comments: { rank: number; username: string; text: string; likes: number; products: string[] }[]
+      total: number | null
+      complete: boolean
+      unresolved: boolean
+    }
+  }
+  interface YieldBasis {
+    clickedLinks: number
+    counted: number
+    stale: number
+    unscanned: number
+    unreadable: number
+    unattributed: Record<string, number>
+    scansByPlatform: Record<string, number>
+    channels: number
+    channelsBelowFloor: number
+    minClicks: number
+  }
+  const [yieldOpen, setYieldOpen] = useState(false)
+  const [yieldBusy, setYieldBusy] = useState(false)
+  const [yieldData, setYieldData] = useState<{ rows: YieldRow[]; basis: YieldBasis } | null>(null)
+  // Held as text so the box can be emptied mid-edit. An empty box reloads at the
+  // default rather than at zero — a floor of zero fills the table with channels
+  // on one click, which is not a ratio at all.
+  const [yieldMin, setYieldMin] = useState('25')
+  const [yieldPlatform, setYieldPlatform] = useState('')
+  const [yieldExpanded, setYieldExpanded] = useState<string | null>(null)
+  // Comment text for the opened channel's links, by URL. Kept across openings so
+  // going back to a row already read costs nothing.
+  const [yieldComments, setYieldComments] = useState<Record<string, YieldComments>>({})
+  const [yieldCommentsBusy, setYieldCommentsBusy] = useState<string | null>(null)
+  // The live read of EVERY comment is opt-in: it is one request per page per
+  // link against TikTok, so a 40-link channel is ~40-160 of them. Per channel:
+  // whether it is running, and how many links a deadline-bounded pass left over.
+  const [yieldFullBusy, setYieldFullBusy] = useState<string | null>(null)
+  const [yieldFullLeft, setYieldFullLeft] = useState<Record<string, number>>({})
+  const [yieldFullErr, setYieldFullErr] = useState<Record<string, string>>({})
+  // Which column orders the table. The panel opens on the yield, worst first —
+  // that is the question it exists to answer — and every other column sorts in
+  // the direction that puts its most interesting end at the top: fewest comments
+  // first, most clicks first, best (lowest) cluster first.
+  type YieldCol = 'per100' | 'ours' | 'clicks' | 'links' | 'rankCluster' | 'dateCluster'
+  const [yieldSort, setYieldSort] = useState<{ col: YieldCol; dir: 'asc' | 'desc' }>({
+    col: 'per100',
+    dir: 'asc',
+  })
+  const YIELD_DEFAULT_DIR: Record<YieldCol, 'asc' | 'desc'> = {
+    per100: 'asc',
+    ours: 'asc',
+    clicks: 'desc',
+    links: 'desc',
+    rankCluster: 'asc',
+    dateCluster: 'asc',
+  }
+  const sortYield = (col: YieldCol) =>
+    setYieldSort((s) =>
+      s.col === col
+        ? { col, dir: s.dir === 'asc' ? 'desc' : 'asc' }
+        : { col, dir: YIELD_DEFAULT_DIR[col] }
+    )
+  const yieldSites = useMemo(() => {
+    const n: Record<string, number> = {}
+    for (const r of yieldData?.rows ?? []) n[r.platform] = (n[r.platform] ?? 0) + 1
+    return Object.entries(n).sort((a, b) => b[1] - a[1])
+  }, [yieldData])
+  const yieldShown = useMemo(() => {
+    const rows = (yieldData?.rows ?? []).filter((r) => !yieldPlatform || r.platform === yieldPlatform)
+    // A channel with no place in a cluster dimension has null there. Null sorts
+    // LAST in both directions — it is an absence, and parking it at one end or
+    // the other would read as "the best" or "the worst" depending on which way
+    // the arrow happened to point.
+    const val = (r: YieldRow): number | null => {
+      switch (yieldSort.col) {
+        case 'per100': return r.clicks > 0 ? r.ours / r.clicks : null
+        case 'ours': return r.ours
+        case 'clicks': return r.clicks
+        case 'links': return r.links
+        case 'rankCluster': return r.avgRankCluster
+        case 'dateCluster': return r.avgDateCluster
+      }
+    }
+    const sign = yieldSort.dir === 'asc' ? 1 : -1
+    return [...rows].sort((a, b) => {
+      const x = val(a)
+      const y = val(b)
+      if (x === null && y === null) return a.channel.localeCompare(b.channel)
+      if (x === null) return 1
+      if (y === null) return -1
+      // Clicks break ties everywhere: two channels at the same number are not
+      // equally worth acting on when one has cost five times as much.
+      return sign * (x - y) || b.clicks - a.clicks || a.channel.localeCompare(b.channel)
+    })
+  }, [yieldData, yieldPlatform, yieldSort])
+
+  /**
+   * Read EVERY comment on a channel's links, live.
+   *
+   * Resumable, because the route is deadline-bounded: links it did not reach
+   * come back absent, and pressing again asks only for those. So a big channel
+   * takes two or three presses rather than one request that times out.
+   */
+  async function readAllComments(row: YieldRow) {
+    const urls = [...row.withOurs, ...row.withoutOurs]
+      .map((l) => l.url)
+      .filter((u) => !yieldComments[u]?.live)
+    if (urls.length === 0) return
+    setYieldFullBusy(row.channel)
+    setYieldFullErr((e) => ({ ...e, [row.channel]: '' }))
+    try {
+      const res = await fetch('/api/admin/links/comment-yield/comments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ urls, full: true }),
+      })
+      const d = await res.json()
+      if (!res.ok) {
+        setYieldFullErr((e) => ({ ...e, [row.channel]: d?.error || 'Could not read the comments.' }))
+        return
+      }
+      setYieldComments((prev) => ({ ...prev, ...(d.links ?? {}) }))
+      setYieldFullLeft((l) => ({ ...l, [row.channel]: Number(d.remaining) || 0 }))
+    } catch {
+      setYieldFullErr((e) => ({
+        ...e,
+        [row.channel]: 'Network error. Press again to carry on from where it stopped.',
+      }))
+    } finally {
+      setYieldFullBusy(null)
+    }
+  }
+
+  /** Read what is written under a channel's links, once per channel. */
+  async function openYieldChannel(row: YieldRow) {
+    if (yieldExpanded === row.channel) { setYieldExpanded(null); return }
+    setYieldExpanded(row.channel)
+    const urls = [...row.withOurs, ...row.withoutOurs]
+      .map((l) => l.url)
+      .filter((u) => !(u in yieldComments))
+    if (urls.length === 0) return
+    setYieldCommentsBusy(row.channel)
+    try {
+      const res = await fetch('/api/admin/links/comment-yield/comments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ urls }),
+      })
+      const d = await res.json()
+      if (res.ok && d?.links) setYieldComments((prev) => ({ ...prev, ...d.links }))
+    } catch {
+      // Left unread rather than reported: the row still shows every number it
+      // showed before, and the comment panel says it could not be read.
+    } finally {
+      setYieldCommentsBusy(null)
+    }
+  }
+
   const [weights, setWeights] = useState<Weights>(DEFAULT_WEIGHTS)
   const [weightsLoading, setWeightsLoading] = useState(false)
   // How the two clusterings are mixed when links are served: the percentage of
@@ -2605,7 +2828,15 @@ export default function AdminLinks({
               >
                 Rank-only channels
               </button>
-        <a
+              <button
+                type="button"
+                onClick={() => void loadYield()}
+                title="Channels ranked by how few of our product comments survive on them per click spent. Only links that have actually been scanned - and scanned since their last click - are counted."
+                className="text-sm rounded-lg px-3 py-1.5 border border-zinc-700 bg-zinc-800 text-white hover:bg-zinc-700 transition-colors"
+              >
+                📉 Comment yield by channel
+              </button>
+              <a
                 href="/admin/pipeline"
                 title="What the automatic six-hourly cycle has done, turn by turn"
                 className="text-sm rounded-lg px-3 py-1.5 border border-zinc-700 bg-zinc-800 text-white hover:bg-zinc-700 transition-colors"
@@ -4356,6 +4587,511 @@ export default function AdminLinks({
                       </div>
                     </div>
                   )}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Channels that take clicks and give nothing back */}
+      {yieldOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center p-4 overflow-y-auto"
+          onClick={() => setYieldOpen(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-[80rem] mt-6 rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-4 px-4 py-3 border-b border-zinc-800">
+              <div>
+                <h2 className="text-sm font-semibold text-white">
+                  Comment yield by channel — fewest of our comments per click
+                </h2>
+                <p className="text-[11px] text-zinc-500 mt-0.5">
+                  Our product comments found on a channel&apos;s videos, against the clicks
+                  workers spent opening them. Worst first.
+                </p>
+              </div>
+              <button
+                onClick={() => setYieldOpen(false)}
+                className="text-zinc-500 hover:text-white text-lg leading-none"
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-4">
+              {yieldBusy && <p className="text-sm text-zinc-500 py-8 text-center">Measuring…</p>}
+
+              {!yieldBusy && yieldData && (
+                <>
+                  {/* What the ratio was taken FROM. A link with no scan and a
+                      link scanned and found empty are different facts, and the
+                      whole number is worthless if they are confused — so the
+                      split is shown before the table, not buried under it. */}
+                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-3">
+                    {([
+                      ['counted', yieldData.basis.counted, 'text-emerald-300',
+                        'Clicked links whose comments were read AFTER the last click, and readably — the only ones a ratio can be built on'],
+                      ['scan is older than the last click', yieldData.basis.stale, 'text-amber-300',
+                        'Scanned, but before somebody last opened it, so the scan could not have seen the comment that click was meant to produce. Left out.'],
+                      ['nothing readable on the page', yieldData.basis.unreadable, 'text-amber-300',
+                        'The scan ran but could judge nothing: a deleted video, a private account, or a read that was throttled or cut short with none of ours found. Left out — a video we could not read is not a video with no comment on it.'],
+                      ['never scanned', yieldData.basis.unscanned, 'text-zinc-400',
+                        'Nobody has read these videos’ comments. Left out — "nobody looked" is not "nothing found".'],
+                      ['clicked links in all', yieldData.basis.clickedLinks, 'text-zinc-300',
+                        'Every link a worker has opened'],
+                    ] as const).map(([label, n, tone, tip]) => (
+                      <div
+                        key={label}
+                        title={tip}
+                        className="rounded-lg border border-zinc-800 bg-zinc-900/50 px-3 py-2"
+                      >
+                        <div className={`text-lg tabular-nums ${tone}`}>{n.toLocaleString()}</div>
+                        <div className="text-[11px] text-zinc-500">{label}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Comment extraction reads TikTok's comment endpoint and
+                      nothing else, so an Instagram or YouTube channel has no
+                      comment data at all and cannot appear here. Said plainly:
+                      a table that quietly held one platform would be read as
+                      "the other two are fine". */}
+                  {(yieldData.basis.scansByPlatform.instagram ?? 0) === 0 &&
+                    (yieldData.basis.scansByPlatform.youtube ?? 0) === 0 && (
+                      <p className="text-[11px] text-amber-300/90 mb-3">
+                        TikTok only. Comment extraction has read{' '}
+                        {(yieldData.basis.scansByPlatform.tiktok ?? 0).toLocaleString()} TikTok
+                        video(s) and no Instagram or YouTube ones, so channels on those two sites
+                        have no comment data and are absent from this table — not scoring zero
+                        on it.
+                      </p>
+                    )}
+
+                  <div className="flex flex-wrap items-center gap-3 mb-3">
+                    <label className="flex items-center gap-1.5 text-xs text-zinc-400">
+                      At least
+                      <input
+                        value={yieldMin}
+                        onChange={(e) => setYieldMin(e.target.value.replace(/[^\d]/g, ''))}
+                        onKeyDown={(e) => { if (e.key === 'Enter') void loadYield() }}
+                        inputMode="numeric"
+                        title="A channel needs this many counted clicks before its ratio is worth reading. One click and no comment is a ratio of zero and means nothing."
+                        className="w-16 bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-200 focus:outline-none focus:border-emerald-500"
+                      />
+                      clicks
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => void loadYield()}
+                      className="text-xs rounded-lg px-2.5 py-1.5 border border-zinc-700 bg-zinc-800 text-white hover:bg-zinc-700 transition-colors"
+                    >
+                      ↻ Apply
+                    </button>
+                    {yieldSites.length > 1 && (
+                      <select
+                        value={yieldPlatform}
+                        onChange={(e) => setYieldPlatform(e.target.value)}
+                        className={`bg-zinc-900 border rounded px-2 py-1 text-xs focus:outline-none focus:border-emerald-500 ${
+                          yieldPlatform ? 'border-teal-500 text-teal-200' : 'border-zinc-700 text-zinc-300'
+                        }`}
+                      >
+                        <option value="">All sites</option>
+                        {yieldSites.map(([p, n]) => (
+                          <option key={p} value={p}>
+                            {p} ({n})
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                    <span className="text-xs text-zinc-500">
+                      {yieldShown.length.toLocaleString()} channel(s) shown ·{' '}
+                      {yieldData.basis.channelsBelowFloor.toLocaleString()} below the floor
+                      {Object.keys(yieldData.basis.unattributed).length > 0 && (
+                        <>
+                          {' '}·{' '}
+                          {Object.entries(yieldData.basis.unattributed)
+                            .map(([p, n]) => `${n.toLocaleString()} ${p} link(s) name no channel`)
+                            .join(', ')}
+                        </>
+                      )}
+                    </span>
+                  </div>
+
+                  {yieldShown.length === 0 ? (
+                    <p className="text-sm text-zinc-500 py-8 text-center">
+                      {yieldData.basis.channels === 0
+                        ? 'No clicked link has been readably scanned since it was last opened, so there is nothing to build a ratio from. Run “Extract comments” over the links workers have been sent to.'
+                        : `Every one of the ${yieldData.basis.channels.toLocaleString()} channel(s) with comment data is below ${yieldData.basis.minClicks} counted click(s). Lower the floor to see them.`}
+                    </p>
+                  ) : (
+                    <div className="overflow-x-auto max-h-[60vh] overflow-y-auto rounded-lg border border-zinc-800">
+                      <div className="min-w-max">
+                        <div className="flex items-center gap-3 px-3 py-1.5 text-[11px] uppercase tracking-wide text-zinc-500 border-b border-zinc-800 sticky top-0 bg-zinc-900">
+                          <span className="w-20 shrink-0">site</span>
+                          <span className="w-56 shrink-0">channel</span>
+                          {/* Every number in this table is sortable. Which end
+                              of a column is the interesting one differs per
+                              column, so each opens in its own direction — see
+                              YIELD_DEFAULT_DIR — and clicking again reverses it. */}
+                          {([
+                            ['per100', 'per 100', 'w-28',
+                              "Our product comments per 100 clicks spent. Lower is worse — the clicks went in and nothing came out."],
+                            ['ours', 'ours', 'w-20',
+                              "Our product comments found on this channel's counted links"],
+                            ['clicks', 'clicks', 'w-20',
+                              "Distinct users who opened this channel's counted links"],
+                            ['links', 'links counted', 'w-40',
+                              'Counted links / every clicked link of this channel'],
+                            ['rankCluster', 'avg rank cluster', 'w-36',
+                              'Where this channel’s links sit in the SEARCH-RANK clustering, averaged over every one of its links still in the pool. Cluster 1 is the best, so LOWER IS BETTER — the opposite direction from the yield.'],
+                            ['dateCluster', 'avg date cluster', 'w-36',
+                              'The same for the POSTED-DATE clustering. Cluster 1 is the best, so lower is better.'],
+                          ] as const).map(([col, label, width, tip]) => (
+                            <button
+                              key={col}
+                              type="button"
+                              onClick={() => sortYield(col)}
+                              title={`${tip}\n\nClick to sort by this column.`}
+                              className={`${width} shrink-0 text-right uppercase tracking-wide transition-colors ${
+                                yieldSort.col === col ? 'text-emerald-400' : 'hover:text-zinc-300'
+                              }`}
+                            >
+                              {label}{' '}
+                              <span className={yieldSort.col === col ? '' : 'text-zinc-700'}>
+                                {yieldSort.col === col ? (yieldSort.dir === 'asc' ? '▲' : '▼') : '↕'}
+                              </span>
+                            </button>
+                          ))}
+                          <span className="w-64 shrink-0" title="Which of our products actually appear on this channel">
+                            products found
+                          </span>
+                        </div>
+                        {yieldShown.map((r) => {
+                          const open = yieldExpanded === r.channel
+                          return (
+                            <div key={r.channel} className="border-b border-zinc-800/60">
+                              <div
+                                onClick={() => void openYieldChannel(r)}
+                                className={`flex items-center gap-3 px-3 py-1.5 text-xs cursor-pointer ${
+                                  open ? 'bg-zinc-900/80' : 'hover:bg-zinc-900/60'
+                                }`}
+                              >
+                                <span className="w-20 shrink-0 text-[10px] text-zinc-500">
+                                  {r.platform}
+                                </span>
+                                <a
+                                  href={r.profileUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
+                                  title={`Open @${r.handle} on ${r.platform} in a new tab`}
+                                  className="w-56 shrink-0 truncate text-zinc-200 hover:text-emerald-400 hover:underline"
+                                >
+                                  @{r.handle}
+                                </a>
+                                <span
+                                  className={`w-28 shrink-0 text-right tabular-nums ${
+                                    r.ours === 0
+                                      ? 'text-rose-400'
+                                      : r.per100 < 20
+                                        ? 'text-amber-300'
+                                        : 'text-zinc-300'
+                                  }`}
+                                >
+                                  {r.per100.toFixed(1)}
+                                </span>
+                                <span className="w-20 shrink-0 text-right tabular-nums text-zinc-400">
+                                  {r.ours.toLocaleString()}
+                                </span>
+                                <span className="w-20 shrink-0 text-right tabular-nums text-zinc-400">
+                                  {r.clicks.toLocaleString()}
+                                </span>
+                                <span
+                                  className="w-40 shrink-0 text-right tabular-nums text-zinc-400"
+                                  title={`${r.links} counted, ${r.unscanned} never scanned, ${r.stale} scanned before the last click, ${r.unreadable} unreadable`}
+                                >
+                                  {r.links.toLocaleString()} / {r.clickedLinks.toLocaleString()}
+                                </span>
+                                {/* An average over no links is not zero, and a
+                                    dash says so. Printing 0.0 would put a
+                                    channel with no place in the ladder at the
+                                    very best end of a sort by it. */}
+                                <span
+                                  className="w-36 shrink-0 text-right tabular-nums text-zinc-400"
+                                  title={
+                                    r.avgRankCluster === null
+                                      ? 'None of this channel’s pool links has a search rank, so it has no place in the rank clustering.'
+                                      : `Averaged over ${r.rankClusterLinks} pool link(s) of this channel. Cluster 1 is the best.`
+                                  }
+                                >
+                                  {r.avgRankCluster === null ? '—' : r.avgRankCluster.toFixed(1)}
+                                </span>
+                                <span
+                                  className="w-36 shrink-0 text-right tabular-nums text-zinc-400"
+                                  title={
+                                    r.avgDateCluster === null
+                                      ? 'None of this channel’s links is in the pool any more, so it has no posted-date cluster.'
+                                      : `Averaged over ${r.dateClusterLinks} pool link(s) of this channel. Cluster 1 is the best.`
+                                  }
+                                >
+                                  {r.avgDateCluster === null ? '—' : r.avgDateCluster.toFixed(1)}
+                                </span>
+                                <span className="w-64 shrink-0 truncate">
+                                  {Object.keys(r.byProduct).length === 0 ? (
+                                    <span className="text-rose-400/80">none</span>
+                                  ) : (
+                                    Object.entries(r.byProduct)
+                                      .sort((a, b) => b[1] - a[1])
+                                      .map(([p, n]) => (
+                                        <span
+                                          key={p}
+                                          className="inline-block rounded bg-zinc-800 border border-zinc-700 px-1.5 py-0.5 text-[10px] text-zinc-300 mr-1"
+                                        >
+                                          {p} {n}
+                                        </span>
+                                      ))
+                                  )}
+                                </span>
+                              </div>
+                              {/* Both sides of the channel, with what is written
+                                  under each link — so a ratio can be checked
+                                  rather than believed. The links carrying our
+                                  comments show what ours SAY (a real
+                                  recommendation reads nothing like a bare
+                                  product name dropped by a bot); the links
+                                  carrying none show the video's own top comment,
+                                  which is what is there instead. */}
+                              {open && (
+                                <div className="px-3 pb-3 pt-2 bg-zinc-900/40 space-y-3">
+                                  {yieldCommentsBusy === r.channel && (
+                                    <p className="text-[11px] text-zinc-500">Reading the comments…</p>
+                                  )}
+                                  {/* Everything above is what we WROTE DOWN.
+                                      This reads the videos as they are now, in
+                                      full — one request per page per link, so it
+                                      is a button and never automatic. */}
+                                  {(() => {
+                                    const urls = [...r.withOurs, ...r.withoutOurs].map((l) => l.url)
+                                    const done = urls.filter((u) => yieldComments[u]?.live).length
+                                    const left = urls.length - done
+                                    const busy = yieldFullBusy === r.channel
+                                    return (
+                                      <div className="flex flex-wrap items-center gap-2">
+                                        <button
+                                          type="button"
+                                          onClick={(e) => { e.stopPropagation(); void readAllComments(r) }}
+                                          disabled={busy || left === 0}
+                                          title={
+                                            'Read every comment on this channel’s counted links, straight from the platform. ' +
+                                            'Roughly four requests per link, so it takes a moment and is never done on its own. ' +
+                                            'Nothing is written back — the stored scan is left as it is.'
+                                          }
+                                          className="text-[11px] rounded-lg px-2 py-1 border border-zinc-700 bg-zinc-800 text-white hover:bg-zinc-700 disabled:opacity-40 transition-colors"
+                                        >
+                                          {busy
+                                            ? '⏳ Reading…'
+                                            : left === 0
+                                              ? `✓ All ${urls.length} link(s) read`
+                                              : done === 0
+                                                ? `💬 Read every comment (${urls.length} link${urls.length === 1 ? '' : 's'})`
+                                                : `↻ Continue — ${left} link${left === 1 ? '' : 's'} left`}
+                                        </button>
+                                        {done > 0 && left > 0 && !busy && (
+                                          <span className="text-[11px] text-amber-300/90">
+                                            {done} of {urls.length} read so far. The rest did not fit in one
+                                            request; press again to carry on.
+                                          </span>
+                                        )}
+                                        {yieldFullErr[r.channel] && (
+                                          <span className="text-[11px] text-rose-400">
+                                            {yieldFullErr[r.channel]}
+                                          </span>
+                                        )}
+                                      </div>
+                                    )
+                                  })()}
+                                  {([
+                                    ['carrying our comments', r.withOurs, true],
+                                    ['carrying none of ours', r.withoutOurs, false],
+                                  ] as const).map(([label, list, has]) => (
+                                    <div key={label}>
+                                      <p className={`text-[11px] mb-1 ${has ? 'text-emerald-400/80' : 'text-rose-400/80'}`}>
+                                        {list.length.toLocaleString()} counted link
+                                        {list.length === 1 ? '' : 's'} {label}
+                                        {list.length > 0 && ', most-clicked first'}
+                                      </p>
+                                      {list.length === 0 ? (
+                                        <p className="text-[11px] text-zinc-600 pl-3">
+                                          {has
+                                            ? 'Not one of this channel’s scanned links carries a product comment.'
+                                            : 'Every scanned link of this channel carries at least one.'}
+                                        </p>
+                                      ) : (
+                                        list.map((l) => {
+                                          const c = yieldComments[l.url]
+                                          return (
+                                            <div
+                                              key={l.url}
+                                              className="border-l-2 pl-2 py-1 mb-1"
+                                              style={{ borderColor: has ? 'rgb(16 185 129 / 0.4)' : 'rgb(244 63 94 / 0.35)' }}
+                                            >
+                                              <div className="flex items-baseline gap-3 text-[11px]">
+                                                <span className="w-16 shrink-0 text-right tabular-nums text-zinc-400">
+                                                  {l.clicks} click{l.clicks === 1 ? '' : 's'}
+                                                </span>
+                                                <span
+                                                  className="w-24 shrink-0 text-right tabular-nums text-zinc-600"
+                                                  title="This link's search-rank cluster / posted-date cluster"
+                                                >
+                                                  r{l.rankCluster ?? '—'} · d{l.dateCluster ?? '—'}
+                                                </span>
+                                                <a
+                                                  href={l.url}
+                                                  target="_blank"
+                                                  rel="noopener noreferrer"
+                                                  onClick={(e) => e.stopPropagation()}
+                                                  title={l.url}
+                                                  className="truncate text-zinc-400 hover:text-emerald-400"
+                                                >
+                                                  {l.title || l.url}
+                                                </a>
+                                              </div>
+                                              {/* Our comments, verbatim. */}
+                                              {(c?.ours ?? []).map((o, i) => (
+                                                <div
+                                                  key={`${o.product}-${o.rank}-${i}`}
+                                                  className="flex items-baseline gap-2 text-[11px] pl-[7.5rem] text-zinc-300"
+                                                >
+                                                  <span className="shrink-0 rounded bg-emerald-900/40 border border-emerald-700/50 px-1 text-[10px] text-emerald-300">
+                                                    {o.product}
+                                                  </span>
+                                                  <span className="shrink-0 text-zinc-600 tabular-nums" title="Position in the comment list — 0 is the very top">
+                                                    #{o.rank}
+                                                  </span>
+                                                  <span className="shrink-0 text-zinc-600 tabular-nums">
+                                                    ♥{o.likes}
+                                                  </span>
+                                                  <span className="shrink-0 text-zinc-500">
+                                                    @{o.username || '?'}
+                                                  </span>
+                                                  <span className="truncate">{o.text || <span className="text-zinc-600">(no text)</span>}</span>
+                                                </div>
+                                              ))}
+                                              {/* On a link with none of ours, the
+                                                  video's own top comment is what
+                                                  IS there. */}
+                                              {!has && c && (
+                                                <div className="flex items-baseline gap-2 text-[11px] pl-[7.5rem] text-zinc-500">
+                                                  {c.top ? (
+                                                    <>
+                                                      <span className="shrink-0 rounded bg-zinc-800 border border-zinc-700 px-1 text-[10px] text-zinc-400">
+                                                        their top
+                                                      </span>
+                                                      <span className="shrink-0 text-zinc-600 tabular-nums">
+                                                        ♥{c.top.likes ?? 0}
+                                                      </span>
+                                                      <span className="shrink-0 text-zinc-600">@{c.top.user || '?'}</span>
+                                                      <span className="truncate">{c.top.text}</span>
+                                                    </>
+                                                  ) : (
+                                                    <span className="text-zinc-600">
+                                                      No comment was readable on this video.
+                                                    </span>
+                                                  )}
+                                                </div>
+                                              )}
+                                              {/* How much of the video was read.
+                                                  A read cut off halfway is not
+                                                  evidence that our comment is
+                                                  absent — it is evidence that we
+                                                  stopped looking. */}
+                                              {c && c.read !== null && (
+                                                <div
+                                                  className="text-[10px] pl-[7.5rem] text-zinc-600"
+                                                  title={c.scannedAt ? `Scanned ${new Date(c.scannedAt).toLocaleString()}` : undefined}
+                                                >
+                                                  {c.read} of {c.total ?? '?'} comment(s) read
+                                                  {c.complete ? '' : ' — the read was cut short, so an absence here is not proof'}
+                                                </div>
+                                              )}
+                                              {/* Every comment on the video, as
+                                                  it reads right now. Ours are
+                                                  marked by the same rule the
+                                                  scan counts them by, so what is
+                                                  highlighted here is what the
+                                                  `ours` column counted. */}
+                                              {c?.live && (
+                                                <div className="ml-[7.5rem] mt-1 rounded border border-zinc-800 bg-zinc-950/60">
+                                                  <div className="px-2 py-1 text-[10px] text-zinc-500 border-b border-zinc-800">
+                                                    {c.live.unresolved
+                                                      ? 'This video could not be opened at all — deleted, private, or the link no longer resolves.'
+                                                      : `${c.live.comments.length} comment(s) read of ${c.live.total ?? '?'} on the video` +
+                                                        (c.live.complete ? ' — the whole list' : ' — the list goes deeper than this read')}
+                                                  </div>
+                                                  {c.live.comments.length > 0 && (
+                                                    <div className="max-h-56 overflow-y-auto divide-y divide-zinc-800/60">
+                                                      {c.live.comments.map((m) => (
+                                                        <div
+                                                          key={`${m.rank}-${m.username}`}
+                                                          className={`flex items-baseline gap-2 px-2 py-0.5 text-[11px] ${
+                                                            m.products.length
+                                                              ? 'bg-emerald-950/40 text-emerald-100'
+                                                              : 'text-zinc-400'
+                                                          }`}
+                                                        >
+                                                          <span className="w-8 shrink-0 text-right tabular-nums text-zinc-600">
+                                                            #{m.rank}
+                                                          </span>
+                                                          <span className="w-12 shrink-0 text-right tabular-nums text-zinc-600">
+                                                            ♥{m.likes}
+                                                          </span>
+                                                          <span className="w-32 shrink-0 truncate text-zinc-500">
+                                                            @{m.username}
+                                                          </span>
+                                                          {m.products.map((p) => (
+                                                            <span
+                                                              key={p}
+                                                              className="shrink-0 rounded bg-emerald-900/50 border border-emerald-700/50 px-1 text-[10px] text-emerald-300"
+                                                            >
+                                                              {p}
+                                                            </span>
+                                                          ))}
+                                                          <span className="whitespace-pre-wrap break-words">{m.text}</span>
+                                                        </div>
+                                                      ))}
+                                                    </div>
+                                                  )}
+                                                </div>
+                                              )}
+                                            </div>
+                                          )
+                                        })
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* What the number does NOT say. A zero here is a place to
+                      look, not a verdict: the channel may delete comments, its
+                      videos may be too busy for ours to survive, or the workers
+                      sent there may simply not have posted. */}
+                  <p className="text-[11px] text-zinc-500 mt-2">
+                    A low ratio says the clicks are not turning into visible comments. It does not
+                    say why — the channel may delete them, the video may be too busy for ours to
+                    survive, or the workers sent there may not have posted at all.
+                  </p>
                 </>
               )}
             </div>

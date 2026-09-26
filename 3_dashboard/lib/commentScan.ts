@@ -51,8 +51,15 @@ function norm(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]/g, '')
 }
 
-/** Which of our products a comment mentions. Usually none, sometimes several. */
-function productsIn(text: string): Product[] {
+/**
+ * Which of our products a comment mentions. Usually none, sometimes several.
+ *
+ * Exported so that anything showing a comment list marks OUR comments by the
+ * same rule the scan counted them by. Two rules would mean a comment counted in
+ * `our_count` but not highlighted where an admin reads it, which reads as a bug
+ * in whichever one they happen to be looking at.
+ */
+export function productsIn(text: string): Product[] {
   const hay = norm(text)
   if (!hay) return []
   return PRODUCTS.filter((p) => hay.includes(norm(p)))

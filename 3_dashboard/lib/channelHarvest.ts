@@ -142,8 +142,16 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
   //
   // A null ratio means the channel has neither an active nor a blocked link —
   // nothing to judge it on — and it is excluded rather than assumed good.
+  //
+  // WITH ONE EXCEPTION: a channel somebody added by hand that we hold no links
+  // from. It has no ratio for the same reason it has no anything — we have
+  // never scraped it — so the rule above would leave it out for ever, which is
+  // the opposite of what adding it meant. A person typing a handle in is a
+  // better reason to visit a channel than 50% of its links surviving. It stops
+  // being an exception the moment its first links land, because then it has a
+  // ratio like everyone else.
   const qualified = ranked.filter(
-    (c) => c.activePct !== null && c.activePct >= HARVEST_MIN_ACTIVE_PCT
+    (c) => (c.added && c.links === 0) || (c.activePct !== null && c.activePct >= HARVEST_MIN_ACTIVE_PCT)
   )
   const eligible = qualified.filter((c) => siteIsOn(c.platform))
   const platforms = Array.from(on).sort()

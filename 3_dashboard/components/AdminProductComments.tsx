@@ -5,6 +5,8 @@ import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import {
   isCommentVoice,
+  productForms,
+  productWords,
   type CommentStyle,
   type CommentVoice,
   type LinkCategory,
@@ -73,20 +75,14 @@ const AUDIENCE: Record<string, { label: string; hint: string; tone: string }> = 
 }
 
 /**
- * The two-word spelling used for the preview.
+ * The two-word spelling used for the preview — the generator's own table.
  *
- * A copy of PRODUCT_WORDS rather than an import: this runs in the browser and
- * only needs to render an example, while the real mention is applied by the
- * generator on the server, where the mapping actually lives.
+ * It used to be a copy, on the grounds that the browser only needs an example.
+ * The copy drifted: it held three products of seven, so the preview for the
+ * other four showed the one-word spelling that is never actually sent.
  */
-const SPLIT_PREVIEW: Record<string, string> = {
-  purifytext: 'purify text',
-  acoustictext: 'acoustic text',
-  prohumanly: 'pro humanly',
-}
-
 function splitPreview(product: string): string {
-  return SPLIT_PREVIEW[product] ?? product
+  return productWords(product)
 }
 
 export default function AdminProductComments({
@@ -118,7 +114,9 @@ export default function AdminProductComments({
   // stored comments are not rewritten in place.
   const [emoji, setEmoji] = useState(style.emoji)
   const [splitBrand, setSplitBrand] = useState(style.splitBrand)
-  const [quoteBrand, setQuoteBrand] = useState(style.quoteBrand)
+  // Still sent and still stored, so an older row round-trips unchanged; no
+  // longer shown, because productMention() stopped honouring it.
+  const [quoteBrand] = useState(style.quoteBrand)
   // Which of the three pitches the comments make.
   const [voice, setVoice] = useState<CommentVoice>(style.voice)
   // What the server currently holds, so an edited-but-unsaved box is visible.
@@ -151,7 +149,7 @@ export default function AdminProductComments({
       setSavedBand({ min: Number(d.min), max: Number(d.max) })
       if (typeof d.emoji === 'boolean') setEmoji(d.emoji)
       if (typeof d.splitBrand === 'boolean') setSplitBrand(d.splitBrand)
-      if (typeof d.quoteBrand === 'boolean') setQuoteBrand(d.quoteBrand)
+      // quoteBrand is no longer honoured, so there is nothing to put it into.
       if (isCommentVoice(d.voice)) setVoice(d.voice)
       return true
     } catch {
@@ -246,7 +244,10 @@ export default function AdminProductComments({
   // What a mention will look like under the current switches, so the effect is
   // visible before spending a regeneration to find out.
   const words = splitBrand ? splitPreview(product) : product
-  const brand = quoteBrand ? `“${words}”` : words
+  // NO QUOTES, whatever the stored setting says — see productMention(). A name
+  // in quotation marks is a name being announced, and the preview has to show
+  // what will really be sent.
+  const brand = words
   // Show the VOICE as well as the mention: the two switches together are what
   // a comment will actually read like, and the mention alone hid the bigger of
   // the two changes.
@@ -545,7 +546,8 @@ export default function AdminProductComments({
               setSplitBrand,
               `Write compound names as two words: ${product} becomes ${splitPreview(product)}.`,
             ],
-            ['Quote the brand', quoteBrand, setQuoteBrand, 'Wrap the name in double quotes.'],
+            // 'Quote the brand' used to be here and is gone: quoting is no longer
+            // applied, so the switch could only lie about what would be sent.
           ] as const).map(([label, value, set, hint]) => (
             <label key={label} className="flex items-center gap-1.5 text-xs text-zinc-300" title={hint}>
               <input

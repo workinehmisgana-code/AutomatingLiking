@@ -10,7 +10,9 @@ import {
   getAccountTaskOpen,
   setAccountTaskOpen,
   getAccountTaskPassword,
+  getAccountTaskRecovery,
   setAccountTaskPassword,
+  setAccountTaskRecovery,
 } from '@/lib/db'
 
 export const dynamic = 'force-dynamic'
@@ -21,6 +23,7 @@ export const dynamic = 'force-dynamic'
 //   POST { id, approve, reason }                          validate one address
 //   POST { domain }                                       set the domain
 //   POST { password }                                     set the mailbox password
+//   POST { recovery }                                     set the recovery address
 //   POST { open }                                         open/close the task
 //
 // APPROVING IS THE PAYMENT. A submission sits outside the payable total until
@@ -38,7 +41,7 @@ export async function GET(req: NextRequest) {
   if (!(await requireAdmin())) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   const sp = req.nextUrl.searchParams
   try {
-    const [rows, domain, open, password] = await Promise.all([
+    const [rows, domain, open, password, recovery] = await Promise.all([
       getAccountSubmissions({
         status: sp.get('status') ?? 'pending',
         q: sp.get('q') ?? '',
@@ -47,8 +50,11 @@ export async function GET(req: NextRequest) {
       getAccountTaskDomain().catch(() => ''),
       getAccountTaskOpen().catch(() => false),
       getAccountTaskPassword().catch(() => ''),
+      getAccountTaskRecovery().catch(() => ''),
     ])
-    return NextResponse.json({ ok: true, rows, domain, open, password, rate: ACCOUNT_PAY_BIRR })
+    return NextResponse.json({
+      ok: true, rows, domain, open, password, recovery, rate: ACCOUNT_PAY_BIRR,
+    })
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 })
   }
@@ -63,6 +69,7 @@ export async function POST(req: NextRequest) {
     reason?: unknown
     domain?: unknown
     password?: unknown
+    recovery?: unknown
     open?: unknown
   }
 
@@ -71,6 +78,11 @@ export async function POST(req: NextRequest) {
       const saved = await setAccountTaskDomain(b.domain)
       return NextResponse.json({ ok: true, domain: saved })
     }
+    if (typeof b.recovery === 'string') {
+      const saved = await setAccountTaskRecovery(b.recovery)
+      return NextResponse.json({ ok: true, recovery: saved })
+    }
+
     if (typeof b.password === 'string') {
       const saved = await setAccountTaskPassword(b.password)
       return NextResponse.json({ ok: true, password: saved })

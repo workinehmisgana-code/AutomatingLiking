@@ -17,6 +17,10 @@ from pathlib import Path
 
 import like
 
+import console
+
+console.fix()
+
 HERE = Path(__file__).resolve().parent
 
 

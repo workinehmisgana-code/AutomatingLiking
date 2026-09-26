@@ -18,6 +18,9 @@ profile/
 profile-*/
 browser_profile/
 captcha-dump/
+# A throwaway one, made by check_focus.py and left behind. Same contents, same
+# reason not to commit it.
+.focus-test-profile/
 
 # ── Never commit: the accounts file ──────────────────────────────────────────
 accounts.json
@@ -64,6 +67,20 @@ app/build/
 done*.csv
 done*.csv.bak
 done*.csv.tmp
+
+# The liker dashboard's settings. Per-machine: link queries, delays, and which
+# profiles are switched on.
+6_comment_liker/dashboard.json
+6_comment_liker/dashboard.json.tmp
+
+# The signed-in-profile list from sessions.py. Per-machine, and it names the
+# TikTok/Instagram/YouTube accounts each profile is logged in as.
+6_comment_liker/sessions-*.txt
+
+# Per-run debugging output from run_parallel.py: one log per account plus
+# exits.csv. Local, per-machine, and it names accounts. *.log below already
+# covers the logs themselves; this covers the CSV beside them.
+6_comment_liker/logs/
 
 # Scratch output from the probes
 inspect*.json

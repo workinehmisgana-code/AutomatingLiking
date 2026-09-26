@@ -6,6 +6,7 @@ import Login from '@/components/Login'
 import Blocked from '@/components/Blocked'
 import BlockedRemediation from '@/components/BlockedRemediation'
 import VerifyGate from '@/components/VerifyGate'
+import ContactGate from '@/components/ContactGate'
 import type { Video } from '@/components/Dashboard'
 import { auth } from '@/lib/auth'
 import {
@@ -15,6 +16,7 @@ import {
   getHourlyClickTimes,
   getUserProfile,
   isProfileComplete,
+  needsContactOnly,
   recordLoginDay,
   hasAnyLoginDay,
   getUnreadMessages,
@@ -32,6 +34,9 @@ import {
   getUrlsWithProductComments,
   getCleanSessionClicks,
   getLinkCategoriesFor,
+  assignReferralCode,
+  getReferralEarnings,
+  getReferralOf,
 } from '@/lib/db'
 import { retiredUrlSet } from '@/lib/videos'
 import { buildUserFeed, FEED_PER_PLATFORM } from '@/lib/userFeed'
@@ -115,6 +120,15 @@ export default async function Home() {
   // First login (incomplete profile) → onboarding. There is no product to choose:
   // users aren't assigned to one, they work for every product.
   const profile = await getUserProfile(session.user.id).catch(() => null)
+  // SOMEBODY WHO ALREADY REGISTERED IS NOT A NEW USER. The phone number and
+  // Telegram username were added after these accounts existed, so a worker of
+  // several weeks is suddenly "incomplete" — and dropping them into a form
+  // asking for their bank account again reads as having been reset. They get
+  // the reason and a button instead; a first-time visitor still goes straight
+  // to the form, because there is nothing to explain yet.
+  if (needsContactOnly(profile)) {
+    return <ContactGate name={profile?.name ?? session.user.name ?? null} />
+  }
   if (!isProfileComplete(profile)) redirect('/onboarding')
 
   // Comment-verification gate: until a check finds this user's comment on the
@@ -172,6 +186,18 @@ export default async function Home() {
     : []
   // What share of workers the admin has put on the posted-date clustering.
   const dateShare = await getClusterDateShare().catch(() => DEFAULT_DATE_SHARE)
+
+  // Referrals. assignReferralCode is idempotent and returns the existing code
+  // untouched, so calling it here is what gives EVERY user a code — including
+  // the ones who registered before referrals existed and will never open the
+  // onboarding form again.
+  await assignReferralCode(session.user.id, profile?.name ?? '', session.user.email ?? '').catch(
+    () => null
+  )
+  const [referrals, referredBy] = await Promise.all([
+    getReferralEarnings(session.user.id).catch(() => null),
+    getReferralOf(session.user.id).catch(() => null),
+  ])
   // Permanently-blocked links never appear, even if a new videos.json re-adds them.
   // Blocked (a judgement we made) and broken (the platform no longer serves it)
   // are different facts with the same effect here: neither is worth anyone's
@@ -234,6 +260,8 @@ export default async function Home() {
       firstLogin={firstLogin}
       messages={messages}
       pendingPay={pending}
+      referrals={referrals}
+      referredBy={referredBy}
       paidNotice={paidNotice}
       apk={apk}
       showClickedToday={SHOW_CLICKED_TODAY}
