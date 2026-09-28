@@ -1648,6 +1648,177 @@ export async function saveLinkScan(scan: {
   }
 }
 
+/**
+ * Our product comments, grouped by what they SAY, most-carried first.
+ *
+ * NOTHING NEW IS RECORDED FOR THIS. Every press of "Extract comments" already
+ * writes each of our comments it finds to link_product_comment — the product, the
+ * position, the likes, the account and the text — so this counts rows that are
+ * already there. A tally that is derived cannot disagree with the links it came
+ * from, and it is right the moment a scan finishes.
+ *
+ * GROUPED CASE- AND SPACE-BLIND: "Purifytext has zero competition" and
+ * "purifytext has zero competition" are one comment posted twice. The spelling
+ * shown is the first recorded.
+ *
+ * WHY FREQUENCY IS THE INTERESTING COLUMN. One comment on a hundred links is a
+ * line somebody can search for and find our whole operation with — measured on
+ * the real table, the top one sits on 103 links. Forty comments on forty links is
+ * the bank being used as intended. The count is what tells those apart, and it is
+ * invisible on any per-link view.
+ *
+ * AND WHAT IT COST. Every comment handed to a worker is recorded on the click
+ * that served it (clicked_link.served_comment), so the same grouping gives the
+ * other half of the story: served 633 times, found on 15 links, 2%. That ratio is
+ * the yield of a comment, and it is the number nothing else in the dashboard
+ * shows — measured across the whole table, 82,181 comments have been served and
+ * 20,047 of ours are on links, and the per-comment spread runs from 0% to 14%.
+ *
+ * A comment found but never served was not posted by a worker: 2,410 of the
+ * distinct texts are in that group, which is the liker's own work. Their ratio is
+ * null rather than zero — dividing by nothing is not a failure.
+ *
+ * `urls` narrows it to a set of links (the page's current filter). Empty or
+ * omitted means every scanned link. BOTH HALVES ARE SCOPED THE SAME WAY, or a
+ * cluster-scoped found count against a pool-wide served count would read as a
+ * collapse in yield that is really just a smaller numerator.
+ */
+export async function getProductCommentTally(
+  opts: { urls?: string[]; limit?: number } = {}
+): Promise<{
+  rows: {
+    text: string
+    /** How many DISTINCT links carry it. */
+    links: number
+    /** Rows in the table — the same link can hold it under two products. */
+    hits: number
+    products: string[]
+    /** Best (lowest) position it reached in any comment list. */
+    bestRank: number | null
+    likes: number
+    accounts: number
+    lastSeen: string | null
+    /** How many times this comment was handed to a worker. */
+    served: number
+    /** links / served, as a percentage. null when it was never served. */
+    ratio: number | null
+  }[]
+  distinct: number
+  hits: number
+  links: number
+  /** Comments served for these links in total. */
+  served: number
+}> {
+  await ensureClickedTable()
+  const urls = (opts.urls ?? []).filter((u) => typeof u === 'string' && u)
+  const limit = Math.max(1, Math.min(2000, opts.limit ?? 500))
+  const where = urls.length ? 'WHERE c.url = ANY($1::text[])' : ''
+  const args: unknown[] = urls.length ? [urls, limit] : [limit]
+  const lim = urls.length ? '$2' : '$1'
+  // Served counts, grouped the same way and scoped the same way, so the two
+  // halves of the ratio are about the same links.
+  const servedWhere = urls.length ? 'AND k.url = ANY($1::text[])' : ''
+  const { rows } = await pool.query<{
+    text: string
+    links: string
+    hits: string
+    products: string[]
+    best_rank: number | null
+    likes: string
+    accounts: string
+    last_seen: Date | null
+    served: string
+  }>(
+    `WITH served AS (
+       SELECT lower(btrim(k.served_comment)) AS key, count(*) AS n
+         FROM clicked_link k
+        WHERE k.served_comment IS NOT NULL AND btrim(k.served_comment) <> ''
+          ${servedWhere}
+        GROUP BY lower(btrim(k.served_comment))
+     )
+     SELECT min(c.text) AS text,
+            count(DISTINCT c.url) AS links,
+            count(*) AS hits,
+            array_agg(DISTINCT c.product) AS products,
+            min(c.rank) AS best_rank,
+            sum(c.likes) AS likes,
+            count(DISTINCT lower(c.username)) AS accounts,
+            max(s.scanned_at) AS last_seen,
+            coalesce(max(v.n), 0) AS served
+       FROM link_product_comment c
+       LEFT JOIN link_comment_scan s ON s.url = c.url
+       LEFT JOIN served v ON v.key = lower(btrim(c.text))
+       ${where}
+      GROUP BY lower(btrim(c.text))
+      ORDER BY count(DISTINCT c.url) DESC, count(*) DESC, min(c.text)
+      LIMIT ${lim}`,
+    args
+  )
+  // The totals are over the whole set, not the page of rows returned, or a
+  // truncated list would report a truncated total.
+  const { rows: tot } = await pool.query<{ distinct: string; hits: string; links: string }>(
+    `SELECT count(DISTINCT lower(btrim(c.text))) AS distinct,
+            count(*) AS hits,
+            count(DISTINCT c.url) AS links
+       FROM link_product_comment c
+       ${urls.length ? 'WHERE c.url = ANY($1::text[])' : ''}`,
+    urls.length ? [urls] : []
+  )
+  const { rows: srv } = await pool.query<{ served: string }>(
+    `SELECT count(*) AS served FROM clicked_link k
+      WHERE k.served_comment IS NOT NULL AND btrim(k.served_comment) <> ''
+        ${urls.length ? 'AND k.url = ANY($1::text[])' : ''}`,
+    urls.length ? [urls] : []
+  )
+  return {
+    rows: rows.map((r) => {
+      const links = Number(r.links)
+      const served = Number(r.served ?? 0)
+      return {
+        text: r.text,
+        links,
+        hits: Number(r.hits),
+        products: r.products ?? [],
+        bestRank: r.best_rank,
+        likes: Number(r.likes ?? 0),
+        accounts: Number(r.accounts ?? 0),
+        lastSeen: r.last_seen ? r.last_seen.toISOString() : null,
+        served,
+        // NULL, NOT ZERO, when it was never handed out: the liker posts comments
+        // of its own, and "no yield" is a different statement from "never tried".
+        ratio: served > 0 ? Math.round((100 * links) / served) : null,
+      }
+    }),
+    distinct: Number(tot[0]?.distinct ?? 0),
+    hits: Number(tot[0]?.hits ?? 0),
+    links: Number(tot[0]?.links ?? 0),
+    served: Number(srv[0]?.served ?? 0),
+  }
+}
+
+/** Which links carry one exact comment, newest scan first. */
+export async function getLinksForComment(
+  text: string,
+  limit = 200
+): Promise<{ url: string; product: string; rank: number; likes: number; username: string }[]> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{
+    url: string
+    product: string
+    rank: number
+    likes: number
+    username: string
+  }>(
+    `SELECT c.url, c.product, c.rank, c.likes, c.username
+       FROM link_product_comment c
+      WHERE lower(btrim(c.text)) = lower(btrim($1))
+      ORDER BY c.rank, c.url
+      LIMIT $2`,
+    [text, Math.max(1, Math.min(500, limit))]
+  )
+  return rows
+}
+
 /** Scan rows for a set of URLs, with the products present on each. */
 export async function getLinkScans(urls: string[]): Promise<Record<string, LinkScanRow>> {
   if (urls.length === 0) return {}
@@ -2549,6 +2720,54 @@ export async function getRecentClickedLinks(
 }
 
 /**
+ * How often the user's comment was found, over their newest N JUDGED links.
+ *
+ * FROM THE LEDGER ONLY. It reads verdicts already recorded and reads nothing from
+ * TikTok, which is what makes it affordable: the rate rule needs a denominator of
+ * 200, and judging 200 links on demand is ten minutes of requests per user. The
+ * sweeps have already judged these links; this counts what they found.
+ *
+ * The consequence is that the rule applies only once 200 of somebody's recent
+ * links have actually been judged, which on the real data is 31 users of 80. That
+ * is the right way round: no verdict until there is evidence.
+ *
+ * NEWEST N JUDGED, not "judged among the newest N". A user opens links faster than
+ * a sweep can read them, so the two differ by hundreds — and "their last 200
+ * comments" means the last 200 that were actually looked at.
+ *
+ * Unjudgeable links are excluded from both halves of the fraction, exactly as they
+ * are in the day scores: a video that would not load is not a missing comment.
+ */
+export async function getRecentJudgedRate(
+  userId: string,
+  sample: number,
+  pool_ = 500
+): Promise<{ judged: number; found: number; pct: number }> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ judged: string; found: string }>(
+    `WITH r AS (
+       SELECT c.url, c.clicked_at::date AS day, c.clicked_at,
+              row_number() OVER (ORDER BY c.clicked_at DESC) AS rn
+         FROM clicked_link c
+        WHERE c.user_id = $1 AND c.url ILIKE '%tiktok.com%'
+     ),
+     j AS (
+       SELECT l.found, row_number() OVER (ORDER BY r.clicked_at DESC) AS jn
+         FROM r
+         JOIN comment_presence_link l
+           ON l.user_id = $1 AND l.url = r.url AND l.day = r.day
+        WHERE r.rn <= $3 AND l.judgeable
+     )
+     SELECT count(*) AS judged, count(*) FILTER (WHERE found) AS found
+       FROM j WHERE jn <= $2`,
+    [userId, Math.max(1, sample), Math.max(1, Math.min(2000, pool_))]
+  )
+  const judged = Number(rows[0]?.judged ?? 0)
+  const found = Number(rows[0]?.found ?? 0)
+  return { judged, found, pct: judged > 0 ? Math.round((100 * found) / judged) : 0 }
+}
+
+/**
  * Verdicts already in the ledger for these exact (day, url) pairs.
  *
  * `freshSince` drops anything judged before that instant, so a caller can treat
@@ -2560,12 +2779,22 @@ export async function getJudgedVerdicts(
   userId: string,
   pairs: { url: string; day: string }[],
   freshSince?: string | null
-): Promise<Map<string, { found: boolean; judgeable: boolean }>> {
-  const out = new Map<string, { found: boolean; judgeable: boolean }>()
+): Promise<Map<string, { found: boolean; judgeable: boolean; text?: string | null }>> {
+  const out = new Map<string, { found: boolean; judgeable: boolean; text?: string | null }>()
   if (pairs.length === 0) return out
   await ensureClickedTable()
-  const { rows } = await pool.query<{ url: string; day: Date; found: boolean; judgeable: boolean }>(
-    `SELECT url, day, found, judgeable
+  // THE TEXT COMES BACK TOO. It was captured when the link was judged, and a
+  // report that can only say "commented" is a boolean the admin has to take on
+  // trust — with the words, they can see what was actually posted, and the same
+  // rows give the tally of which comments are being used and how often.
+  const { rows } = await pool.query<{
+    url: string
+    day: Date
+    found: boolean
+    judgeable: boolean
+    comment_text: string | null
+  }>(
+    `SELECT url, day, found, judgeable, comment_text
        FROM comment_presence_link
       WHERE user_id = $1
         AND (url, day) IN (
@@ -2580,9 +2809,62 @@ export async function getJudgedVerdicts(
     out.set(`${r.day.toISOString().slice(0, 10)}|${r.url}`, {
       found: r.found,
       judgeable: r.judgeable,
+      text: r.comment_text,
     })
   }
   return out
+}
+
+/**
+ * Which comments were found on these links, and on how many of them each one was.
+ *
+ * NOTHING NEW IS STORED. Every found comment's text has been written to
+ * comment_presence_link since the day the check started capturing it, so this
+ * counts what is already there — which means the tally cannot drift from the
+ * links it came from, and it is right the moment a check finishes.
+ *
+ * GROUPED CASE- AND SPACE-BLIND, because the same comment posted twice is the
+ * same comment: "Purify text passed mine" and "purify text passed mine  " are one
+ * row with a count of two. The spelling shown is the first one recorded.
+ *
+ * The frequency is the point. One comment on forty links is a person pasting the
+ * same line all day, which reads as automation to anybody looking; forty comments
+ * on forty links is somebody working through the bank as intended.
+ */
+export async function getFoundComments(
+  userId: string,
+  pairs: { url: string; day: string }[]
+): Promise<{ text: string; count: number; days: number; firstDay: string; lastDay: string }[]> {
+  if (pairs.length === 0) return []
+  await ensureClickedTable()
+  const { rows } = await pool.query<{
+    text: string
+    count: string
+    days: string
+    first_day: Date
+    last_day: Date
+  }>(
+    `SELECT min(comment_text) AS text, count(*) AS count,
+            count(DISTINCT day) AS days, min(day) AS first_day, max(day) AS last_day
+       FROM comment_presence_link
+      WHERE user_id = $1
+        AND found
+        AND comment_text IS NOT NULL
+        AND btrim(comment_text) <> ''
+        AND (url, day) IN (
+          SELECT u, d::date FROM unnest($2::text[], $3::text[]) AS x(u, d)
+        )
+      GROUP BY lower(btrim(comment_text))
+      ORDER BY count(*) DESC, min(comment_text)`,
+    [userId, pairs.map((p) => p.url), pairs.map((p) => p.day)]
+  )
+  return rows.map((r) => ({
+    text: r.text,
+    count: Number(r.count),
+    days: Number(r.days),
+    firstDay: r.first_day.toISOString().slice(0, 10),
+    lastDay: r.last_day.toISOString().slice(0, 10),
+  }))
 }
 
 export async function saveCommentPresence(
@@ -3979,10 +4261,23 @@ export function ensureBlockedUserTable(): Promise<void> {
         CREATE INDEX IF NOT EXISTS idx_blocked_email  ON blocked_user (email)       WHERE email       IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_blocked_bank   ON blocked_user (bank_norm)   WHERE bank_norm   IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_blocked_tiktok ON blocked_user (tiktok_norm) WHERE tiktok_norm IS NOT NULL;
-        -- Users an admin has unblocked by hand. The presence check may block
-        -- automatically, but it must never overturn a person's decision: without
-        -- this, unblocking someone the check still disagrees with just means they
-        -- are blocked again on the next sweep, and the admin cannot win.
+        -- Users the automatic check may never block.
+        --
+        -- IT USED TO FILL ITSELF. Every unblock added a row, on the reasoning that
+        -- a machine must not overturn a person's decision — otherwise unblocking
+        -- somebody the nightly check still disagrees with lasts until 17:10 and
+        -- undoes itself.
+        --
+        -- That is no longer wanted, and the reasoning cut the wrong way in
+        -- practice: it made an unblock permanent immunity. Six real workers ended
+        -- up outside the rule for good, invisibly, and the only record of it was a
+        -- check quietly returning false. An unblock now RE-ARMS the check — see
+        -- unblockUser — so the next sweep or button press judges them again on
+        -- what their links actually show.
+        --
+        -- Nothing writes to this table any more. It is read, and kept, so that a
+        -- row inserted by hand still protects somebody permanently if that is ever
+        -- wanted.
         CREATE TABLE IF NOT EXISTS auto_block_exempt (
           user_id     TEXT PRIMARY KEY,
           exempted_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -4042,25 +4337,47 @@ export async function unblockUser(userId: string): Promise<void> {
     'DELETE FROM blocked_user WHERE user_id = $1 OR (email IS NOT NULL AND email = $2)',
     [userId, email]
   )
-  // An admin has looked at this person and decided. The automatic check does not
-  // get to reverse that on its next run.
-  await pool
-    .query(
-      'INSERT INTO auto_block_exempt (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING',
-      [userId]
-    )
-    .catch(() => {})
+  // AND THE CHECK IS RE-ARMED. An unblock used to add an auto_block_exempt row,
+  // which put the person outside the automatic rule for the rest of time. It now
+  // removes one instead: unblocking says "let them work", not "never judge them
+  // again", so the next check — nightly or pressed by hand — reaches its own
+  // verdict on the links they have opened since.
+  //
+  // The consequence is deliberate and worth knowing: unblock somebody whose
+  // comments still cannot be found and tonight's sweep will block them again.
+  // That is the answer being asked for — the block message tells them to
+  // register a different TikTok account, and until that changes nothing about
+  // their situation has.
+  await pool.query('DELETE FROM auto_block_exempt WHERE user_id = $1', [userId]).catch(() => {})
 }
 
 /**
  * May the presence check block this user by itself?
  *
  * False when they are already blocked (re-blocking would only resend the same
- * message) or when an admin has unblocked them at least once. Errs to FALSE on
+ * message), or when a row has been put in auto_block_exempt by hand — which an
+ * unblock no longer does. Errs to FALSE on
  * a database failure: not blocking someone who deserved it is a smaller mistake
  * than blocking someone who did not.
  */
 export async function canAutoBlock(userId: string): Promise<boolean> {
+  const r = await autoBlockStatus(userId)
+  return !r.blocked && !r.exempt
+}
+
+/**
+ * The two reasons an auto-block can be refused, told apart.
+ *
+ * canAutoBlock answers yes or no, which is all a sweep needs. An admin pressing
+ * the button on one person needs to know WHICH — "already blocked" and "on the
+ * exempt list" call for completely different next steps, and a message that
+ * offers both leaves them no wiser. This came up on a real user: Faiz Seid abdu
+ * has been exempt since September, and "already blocked, or exempt" read as
+ * though the check had blocked him.
+ */
+export async function autoBlockStatus(
+  userId: string
+): Promise<{ blocked: boolean; exempt: boolean }> {
   await ensureBlockedUserTable()
   const { rows } = await pool.query<{ blocked: boolean; exempt: boolean }>(
     `SELECT EXISTS (SELECT 1 FROM blocked_user WHERE user_id = $1) AS blocked,
@@ -4068,7 +4385,7 @@ export async function canAutoBlock(userId: string): Promise<boolean> {
     [userId]
   )
   const r = rows[0]
-  return !!r && !r.blocked && !r.exempt
+  return { blocked: !!r?.blocked, exempt: !!r?.exempt }
 }
 
 // Remove the block row(s) for this email (used after successful self-remediation).

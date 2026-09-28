@@ -91,6 +91,23 @@ check('  saying over how many days', /day\(s\), counting from/.test(ui), true)
 check('  and what it is on the days they worked',
       /they actually signed in it is/.test(ui), true)
 
+console.log('\nand each day table ends with its total')
+// The total was computed here already — the Comments table needed it for the pay
+// column — and was never shown, so "how much since their reset" meant adding up a
+// row of numbers by eye.
+check('  the header has a Total column', />\s*Total\s*</.test(ui), true)
+check('  carrying the sum of the days', /\{total\.toLocaleString\(\)\}/.test(ui), true)
+check('  set apart from the days', /border-l-2 border-t border-zinc-700 text-center tabular-nums font-semibold/.test(ui), true)
+// Both tables, since DayTable renders both.
+check('  on the clicks table', /<DayTable title="Clicks"/.test(ui), true)
+check('  and the comments one', /<DayTable title="Comments"/.test(ui), true)
+// Pay is derived from the total, so it stays after it.
+check('  pay still comes last', ui.indexOf('Total') < ui.indexOf('Pay (birr)'), true)
+// The tooltip carries the rate over the days that have a row, which is a
+// different question from the chip's rate over every day since the reset.
+check('  the total explains its rate', /a day on the days they worked/.test(ui), true)
+check('  over the days with any activity', /over \$\{rows\.length\} day\(s\) with any/.test(ui), true)
+
 console.log('\nthe copies used above are still the real ones')
 const bodyOf = (src, name) => {
   const at = src.indexOf(`function ${name}(`)

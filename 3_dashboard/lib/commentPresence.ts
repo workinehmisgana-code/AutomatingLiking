@@ -18,6 +18,7 @@ import {
   saveJudgedLinks,
   getRecentClickedLinks,
   getJudgedVerdicts,
+  getRecentJudgedRate,
   recordTiktokAccount,
 } from './db'
 
@@ -206,11 +207,23 @@ export async function scoreUserDay(
  * on eleven links, and a heavy one needed a dozen resumed passes to get through
  * 1,373. Neither is "is this person doing the work".
  *
- * The last hundred links, across however many days they span, is the same
+ * Their most recent links, across however many days they span, is the same
  * question asked the same way for everybody, and it is the population the
- * auto-block rule already samples from.
+ * auto-block rules already sample from.
+ *
+ * THREE HUNDRED, TO FEED A TWO HUNDRED DENOMINATOR. The rate rule below needs
+ * RATIO_SAMPLE judged links before it may say anything, and a read is not a
+ * judgement: a dead video, a restricted account or a throttled page is skipped,
+ * and measured across real days about 15% are — 250 links read gave 210 judged,
+ * 276 gave 244, 345 gave 305. At that rate 300 reads yield roughly 255 judged,
+ * comfortably past 200, while 200 reads would land near 170 and leave the rule
+ * permanently unable to speak.
+ *
+ * It costs what it costs: 300 videos at a few seconds each is minutes of reading,
+ * spread over several resumed requests. That is the price of a number that can
+ * block somebody.
  */
-export const RECENT_SAMPLE = 100
+export const RECENT_SAMPLE = 300
 
 /**
  * Judge a user's most recent links, newest first, spanning days.
@@ -274,7 +287,9 @@ export async function scoreUserRecent(
   await rememberAccount(userId, username, judged)
 
   // The report is over the SAMPLE, in the order the user opened it: this pass's
-  // verdicts plus the ones it made on an earlier request.
+  // verdicts plus the ones it made on an earlier request. Both carry the comment
+  // they found — a report that can only say "commented" asks the admin to take a
+  // boolean on trust.
   const fresh = new Map(judged.map((l) => [l.url, l]))
   const links: (JudgedLink & { day: string })[] = []
   for (const r of recent) {
@@ -313,6 +328,33 @@ export async function scoreUserRecent(
 
 /** Judged links required before a no-comments verdict may block anyone. */
 export const BLOCK_SAMPLE = 50
+
+/**
+ * THE SECOND RULE: a rate, not an absence.
+ *
+ * Nothing found on fifty links catches somebody who posts nothing. It does not
+ * catch somebody who posts occasionally and claims to have worked all day — one
+ * comment in two hundred clears the first rule completely, and on the real data
+ * five people sat in exactly that gap: 1, 2, 7, 10 and 15 comments found across
+ * 200 judged links.
+ *
+ * So: fewer than a tenth of their last two hundred judged links carrying their
+ * comment is also a block.
+ *
+ * TEN PERCENT IS NOT A GUESS. Measured across every user with 200 judged links,
+ * the distribution has a hole in it — eight users sit at 0–8% and everybody else
+ * starts at 11%, running up to 36%. The threshold sits in that gap, so it
+ * separates two groups that were already separate rather than cutting through a
+ * crowd.
+ *
+ * THE DENOMINATOR IS JUDGED LINKS, and it must be reached before the rule may
+ * speak: a user with 170 judged links is not judged on 170, they are not judged at
+ * all. Unreadable links are in neither half of the fraction.
+ */
+export const RATIO_SAMPLE = 200
+export const RATIO_MIN_PCT = 10
+/** Recent links to look back over to find RATIO_SAMPLE judged ones. */
+const RATIO_POOL = 500
 
 /**
  * Bounds on a sample the admin chooses for a sweep.
@@ -365,6 +407,15 @@ export interface BlockVerdict {
   /** Links looked at but not judgeable — reported so a near-miss is explicable. */
   skipped: number
   block: boolean
+  /**
+   * Which rule decided it, so a report can say why rather than just "blocked".
+   *
+   *   empty  nothing found on BLOCK_SAMPLE judged links
+   *   ratio  under RATIO_MIN_PCT% of RATIO_SAMPLE judged links
+   */
+  rule?: 'empty' | 'ratio'
+  /** The rate over their last RATIO_SAMPLE judged links, when it could be read. */
+  ratio?: { judged: number; found: number; pct: number } | null
 }
 
 /**
@@ -445,5 +496,19 @@ export async function noCommentVerdict(
     if (verdicts.length < slice.length) break
   }
 
-  return { judged, found, skipped, block: judged >= sample && found === 0 }
+  // ── rule one: nothing at all on a sample of links ──────────────────────
+  if (judged >= sample && found === 0) {
+    return { judged, found, skipped, block: true, rule: 'empty' }
+  }
+
+  // ── rule two: something, but almost nothing ────────────────────────────
+  //
+  // Read from the ledger, so it costs no requests and cannot blow the deadline.
+  // It applies only once RATIO_SAMPLE of their recent links have been judged —
+  // before that there is no denominator and therefore no verdict.
+  const ratio = await getRecentJudgedRate(userId, RATIO_SAMPLE, RATIO_POOL).catch(() => null)
+  if (ratio && ratio.judged >= RATIO_SAMPLE && ratio.pct < RATIO_MIN_PCT) {
+    return { judged, found, skipped, block: true, rule: 'ratio', ratio }
+  }
+  return { judged, found, skipped, block: false, ratio }
 }

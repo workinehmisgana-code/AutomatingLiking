@@ -72,7 +72,7 @@ export async function GET(req: NextRequest) {
 
     const deadline = Date.now() + BUDGET_MS
     const scored: { userId: string; judged: number; remaining: number; total: number }[] = []
-    const blocked: { userId: string; judged: number }[] = []
+    const blocked: { userId: string; judged: number; rule?: string; pct?: number | null }[] = []
     for (const c of pending) {
       if (scored.length > 0 && Date.now() >= deadline) break
       const r = await scoreUserDay(c.userId, c.tiktokUrl, day, deadline, freshSince)
@@ -97,7 +97,12 @@ export async function GET(req: NextRequest) {
             c.userId,
             'Your account has been paused. Please contact the admin.'
           ).catch(() => {})
-          blocked.push({ userId: c.userId, judged: v.judged })
+          blocked.push({
+            userId: c.userId,
+            judged: v.rule === 'ratio' ? (v.ratio?.judged ?? 0) : v.judged,
+            rule: v.rule,
+            pct: v.ratio?.pct ?? null,
+          })
         }
       }
 

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ScrollX from '@/components/ScrollX'
 import { clampShare } from '@/lib/clusterMix'
 import ScanHistory from '@/components/ScanHistory'
+import CommentFrequency from '@/components/CommentFrequency'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import {
@@ -1252,6 +1253,9 @@ export default function AdminLinks({
   const [scanTotal, setScanTotal] = useState(0)
   const [scanWithOurs, setScanWithOurs] = useState(0)
   const [historyOpen, setHistoryOpen] = useState(false)
+  // Our comments grouped by what they say, counted across links. Reads what the
+  // last extract saved, so it opens instantly and never scans anything.
+  const [freqOpen, setFreqOpen] = useState(false)
   // The hourly channel harvest. Vercel fires a cron at its next scheduled time
   // and not at deploy, so without a way to start one by hand the first run after
   // a deploy is up to an hour away.
@@ -2803,6 +2807,20 @@ export default function AdminLinks({
         </button>
         <button
           type="button"
+          onClick={() => setFreqOpen(true)}
+          title={
+            'The comments that extract has already found, grouped by what they SAY and ' +
+            'ordered by how many links carry each one.\n\n' +
+            'Nothing is read from TikTok: this counts what the last extract saved, so it ' +
+            'is instant. A comment sitting on a hundred links is one search away from ' +
+            'being found — that is the number this exists to show.'
+          }
+          className="text-sm rounded-lg px-3 py-1.5 border border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800 transition-colors"
+        >
+          📊 Comments by frequency
+        </button>
+        <button
+          type="button"
           onClick={() => setToolsOpen((v) => !v)}
           title="Exports, title tools, the block list, the pipeline controls and the rank/date mix"
           className={`text-sm rounded-lg px-3 py-1.5 border transition-colors ${
@@ -3800,6 +3818,12 @@ export default function AdminLinks({
       )}
 
       {historyOpen && <ScanHistory onClose={() => setHistoryOpen(false)} />}
+      {/* Scoped to the page's current filter, since "how often does this comment
+          appear" means something different across one cluster than across the
+          whole pool. A tick inside widens it to everything scanned. */}
+      {freqOpen && (
+        <CommentFrequency query={queryFor(0)} onClose={() => setFreqOpen(false)} />
+      )}
 
       {(scanning || scanNote || catRunning || catNote || refreshing || refreshNote) && (
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[70] flex flex-col items-center gap-2 pointer-events-none">

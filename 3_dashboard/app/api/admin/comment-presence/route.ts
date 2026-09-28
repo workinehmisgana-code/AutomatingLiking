@@ -133,7 +133,7 @@ export async function POST(req: NextRequest) {
       // once this user's day is fully judged — a partial day says nothing —
       // and never twice, since re-blocking would overwrite an admin's own
       // unblock with a machine verdict.
-      let blocked: { judged: number } | undefined
+      let blocked: { judged: number; rule?: string; pct?: number | null } | undefined
       if (r.remaining === 0 && (await canAutoBlock(u.userId).catch(() => false))) {
         const v = await noCommentVerdict(u.userId, u.tiktokUrl, deadline, blockSample).catch(
           () => null
@@ -147,7 +147,14 @@ export async function POST(req: NextRequest) {
             u.userId,
             'Your account has been paused. Please contact the admin.'
           ).catch(() => {})
-          blocked = { judged: v.judged }
+          // WHICH RULE. 'empty' is nothing on 50 judged links; 'ratio' is under
+          // 10% of 200, which catches the person the first rule cannot — one
+          // comment anywhere clears it.
+          blocked = {
+            judged: v.rule === 'ratio' ? (v.ratio?.judged ?? 0) : v.judged,
+            rule: v.rule,
+            pct: v.ratio?.pct ?? null,
+          }
         }
       }
       results.push({

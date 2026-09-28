@@ -98,8 +98,8 @@ interface SweepRow {
   pct: number | null
   /** Links of that day still unjudged; > 0 means this user is mid-read. */
   remaining: number
-  /** Present when the sweep auto-blocked them, with the sample it acted on. */
-  blocked?: { judged: number }
+  /** Present when the sweep auto-blocked them, with the sample and rule it acted on. */
+  blocked?: { judged: number; rule?: string; pct?: number | null }
 }
 
 /** One judged link in the per-user presence breakdown. */
@@ -642,9 +642,13 @@ export default function AdminDashboard({
     } catch { /* ignore */ }
   }
 
-  // Verify that this user's @username is among the commenters on the last 100
+  // Verify that this user's @username is among the commenters on the last 300
   // links they OPENED. Reads TikTok's comment list over plain HTTP — no browser
   // and no captcha, so it works on the deployed dashboard too.
+  //
+  // Three hundred is chosen to feed the rate rule's 200-JUDGED denominator rather
+  // than for its own sake: about 15% of reads cannot be judged, so 300 read is
+  // roughly 255 judged. See RECENT_SAMPLE in lib/commentPresence.
   const [verifyingUser, setVerifyingUser] = useState<string | null>(null)
   /** One judged link from the presence ledger. */
   interface JudgedLinkShape {
@@ -653,6 +657,16 @@ export default function AdminDashboard({
     judgeable: boolean
     /** Which day it was opened. The sample spans days, so the row says which. */
     day?: string
+    /** The comment that was found, as it was read off the video. */
+    text?: string | null
+  }
+  /** One distinct comment found, and how many links carried it. */
+  interface FoundCommentShape {
+    text: string
+    count: number
+    days: number
+    firstDay: string
+    lastDay: string
   }
   /** A finished single-user check. */
   interface VerifyReportShape {
@@ -669,6 +683,23 @@ export default function AdminDashboard({
     to: string
     days: number
     links: JudgedLinkShape[]
+    /** The distinct comments found, most-used first. */
+    comments: FoundCommentShape[]
+    /** How many judged links the block rule needs. */
+    blockSample: number
+    /** Set when this check blocked them. */
+    blocked?: {
+      judged: number
+      skipped: number
+      /** 'empty' — nothing on 50; 'ratio' — under 10% of 200. */
+      rule?: string
+      pct?: number | null
+    }
+    /** The rate rule's size and threshold, so the panel can name them. */
+    ratioSample: number
+    ratioMinPct: number
+    /** Why it did not, when it did not. Empty while the check is unfinished. */
+    blockNote: string
   }
   // Live progress for the per-user verification loop (null = idle).
   const [verifyProgress, setVerifyProgress] = useState<
@@ -718,7 +749,18 @@ export default function AdminDashboard({
 
   async function unblockUserAction(u: AdminUserRow) {
     const label = u.profile?.name || u.name || u.email
-    if (!confirm(`Unblock ${label}?\n\nThey'll be able to sign in and register again.`)) return
+    // WHAT UNBLOCKING NOW MEANS. It used to make the person permanently immune
+    // to the automatic check; it now re-arms it, so this dialog has to say so —
+    // pressing it on somebody whose comments still cannot be found buys them
+    // until the next sweep and no longer.
+    if (!confirm(
+      `Unblock ${label}?\n\n` +
+      "They'll be able to sign in and register again.\n\n" +
+      'This also RE-ARMS the automatic comment check on them: if their comment still ' +
+      'cannot be found on their recent links, the next nightly sweep — or the next ' +
+      'verify you run — will block them again. Unblocking used to make somebody ' +
+      'immune to it for good.'
+    )) return
     setBlockingUser(u.id)
     try {
       const res = await fetch('/api/admin/user', {
@@ -953,13 +995,18 @@ export default function AdminDashboard({
       return
     }
     if (!confirm(
-      `Check ${who}'s last 100 links?\n\n` +
-      'Reads the last 100 links they actually opened — across however many days those ' +
+      `Check ${who}'s last 300 links?\n\n` +
+      'Reads the last 300 links they actually opened — across however many days those ' +
       'span — and checks which carry a comment from their own account. Same reads and ' +
       'same judging as the bulk sweep; only the population differs, so one user\'s ' +
       'number means the same as another\'s. Every link is read again now, not taken ' +
       'from an earlier result. Progress is saved as it goes; stopping and starting ' +
-      'again re-reads what it had not finished.'
+      'again re-reads what it had not finished. Three hundred videos is a few minutes, ' +
+      'in several batches — the bar shows where it is.\n\n' +
+      'They will be BLOCKED automatically if EITHER holds: none of their last 50 judged ' +
+      'links carry their comment, or under 10% of their last 200 judged links do. Same ' +
+      'rules as the nightly check. A sample too small to judge blocks nobody. You can ' +
+      'unblock them again.'
     )) return
 
     stopVerify.current = false
@@ -1009,6 +1056,21 @@ export default function AdminDashboard({
           to: String(d.to ?? ''),
           days: Number(d.days) || 0,
           links: Array.isArray(d.links) ? (d.links as JudgedLinkShape[]) : [],
+          comments: Array.isArray(d.comments) ? (d.comments as FoundCommentShape[]) : [],
+          blockSample: Number(d.blockSample) || 50,
+          blocked: d.blocked
+            ? {
+                judged: Number(d.blocked.judged) || 0,
+                skipped: Number(d.blocked.skipped) || 0,
+                rule: String(d.blocked.rule ?? ''),
+                pct: d.blocked.pct === null || d.blocked.pct === undefined
+                  ? null
+                  : Number(d.blocked.pct),
+              }
+            : undefined,
+          ratioSample: Number(d.ratioSample) || 200,
+          ratioMinPct: Number(d.ratioMinPct) || 10,
+          blockNote: String(d.blockNote ?? ''),
         }
         const total = Number(d.total) || 0
         const done = total - (Number(d.remaining) || 0)
@@ -1962,7 +2024,11 @@ export default function AdminDashboard({
                             </button>
                             {r.blocked && (
                               <span
-                                title={`Auto-blocked by this sweep: no comment found on ${r.blocked.judged} judged links`}
+                                title={
+                                  r.blocked.rule === 'ratio'
+                                    ? `Auto-blocked by this sweep: only ${r.blocked.pct ?? 0}% of ${r.blocked.judged} judged links carry their comment`
+                                    : `Auto-blocked by this sweep: no comment found on ${r.blocked.judged} judged links`
+                                }
                                 className="shrink-0 text-[10px] rounded px-1 py-0.5 border border-rose-500/50 bg-rose-500/15 text-rose-300 whitespace-nowrap"
                               >
                                 auto-blocked
@@ -2297,6 +2363,90 @@ export default function AdminDashboard({
               </div>
             </div>
 
+            {/* THE COMMENTS THEMSELVES, and how often each one turned up.
+                The per-link list below says WHERE their comment was; this says
+                WHAT it was, which is the part that shows whether somebody is
+                working through the bank or pasting one line all day. */}
+            {verifyReport.comments.length > 0 && (
+              <div className="mx-4 mt-3 rounded-lg border border-zinc-700 bg-zinc-800/30">
+                <div className="px-3 py-2 border-b border-zinc-700/60 flex items-baseline gap-2">
+                  <span className="text-xs font-semibold text-zinc-200">
+                    {verifyReport.comments.length} comment(s) found
+                  </span>
+                  <span className="text-[11px] text-zinc-500">
+                    on {verifyReport.found} link(s) — most used first
+                  </span>
+                  {/* The one number that tells the two apart at a glance. */}
+                  {verifyReport.comments[0].count > 1 && (
+                    <span className="text-[11px] text-amber-300/90">
+                      most-repeated: ×{verifyReport.comments[0].count}
+                    </span>
+                  )}
+                </div>
+                <div className="max-h-56 overflow-y-auto divide-y divide-zinc-800/60">
+                  {verifyReport.comments.map((c) => (
+                    <div key={c.text} className="flex items-baseline gap-2 px-3 py-1.5">
+                      <span
+                        className={`shrink-0 text-[11px] tabular-nums rounded px-1.5 py-0.5 border ${
+                          c.count > 1
+                            ? 'text-amber-200 bg-amber-600/15 border-amber-500/40'
+                            : 'text-zinc-400 bg-zinc-800 border-zinc-700'
+                        }`}
+                        title={
+                          c.count > 1
+                            ? `On ${c.count} of their links, across ${c.days} day(s)`
+                            : 'On one link'
+                        }
+                      >
+                        ×{c.count}
+                      </span>
+                      <span className="flex-1 min-w-0 text-xs text-zinc-300 break-words">
+                        {c.text}
+                      </span>
+                      <span className="shrink-0 text-[11px] text-zinc-600 tabular-nums">
+                        {c.firstDay === c.lastDay
+                          ? c.firstDay.slice(5)
+                          : `${c.firstDay.slice(5)}–${c.lastDay.slice(5)}`}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* WHAT THIS DID TO THEM. A check that can block somebody has to say
+                so where the admin is already looking, not in a toast that has
+                gone by the time they read the numbers. */}
+            {verifyReport.blocked ? (
+              <div className="mx-4 mt-3 rounded-lg border border-rose-500/50 bg-rose-950/40 px-3 py-2">
+                <div className="text-xs font-semibold text-rose-200">
+                  Blocked automatically — signed out now
+                </div>
+                <div className="text-[11px] text-rose-300/80 mt-0.5">
+                  {/* WHICH RULE, because they describe different behaviour: one is
+                      somebody who posts nothing, the other somebody who posts a
+                      little and claims a full day. */}
+                  {verifyReport.blocked.rule === 'ratio'
+                    ? `Only ${verifyReport.blocked.pct ?? 0}% of their last ${verifyReport.blocked.judged} judged links carry their comment — under the ${verifyReport.ratioMinPct}% the rule allows.`
+                    : `Their comment was on none of ${verifyReport.blocked.judged} judged link(s)`}
+                  {verifyReport.blocked.rule !== 'ratio' &&
+                    verifyReport.blocked.skipped > 0 &&
+                    `, with ${verifyReport.blocked.skipped} that could not be read and were not counted against them`}
+                  . Reason shown to them: register a different TikTok account. They have been
+                  sent “Your account has been paused. Please contact the admin.” — unblock from
+                  their row if this is wrong.
+                </div>
+              </div>
+            ) : verifyReport.blockNote ? (
+              <div className="mx-4 mt-3 rounded-lg border border-zinc-700 bg-zinc-800/40 px-3 py-2">
+                <div className="text-[11px] text-zinc-400">
+                  Auto-block rules (nothing on {verifyReport.blockSample} judged links, or under{' '}
+                  {verifyReport.ratioMinPct}% of {verifyReport.ratioSample}):{' '}
+                  {verifyReport.blockNote}.
+                </div>
+              </div>
+            ) : null}
+
             {/* Horizontal scroller: these rows carry fixed-width columns that
                 overflow rather than squash on a narrow screen. */}
             <ScrollX min={720}>
@@ -2335,6 +2485,14 @@ export default function AdminDashboard({
                       >
                         {l.url}
                       </a>
+                      {l.found && l.text && (
+                        <span
+                          className="shrink-0 max-w-[16rem] truncate text-[11px] text-emerald-300/80"
+                          title={l.text}
+                        >
+                          {l.text}
+                        </span>
+                      )}
                       {l.day && (
                         <span className="shrink-0 text-[11px] text-zinc-600 tabular-nums">
                           {l.day.slice(5)}
@@ -3589,6 +3747,14 @@ function DailyClicksTable({
 // Two-row table: top row is the title + each date; bottom row is the values.
 // When `payRate` is given, a trailing "Pay (birr)" column shows the total count
 // across all days × payRate — the amount owed for those comments.
+/**
+ * One line per day, days across the columns, with the TOTAL at the end.
+ *
+ * The total was computed here already — the Comments table needed it to work out
+ * the pay — but it was never shown, so reading "how much has this person done
+ * since their reset" meant adding up a row of numbers by eye. It is the column
+ * the table is actually consulted for.
+ */
 function DayTable({
   title,
   rows,
@@ -3601,6 +3767,10 @@ function DayTable({
   if (rows.length === 0) return <div className="text-xs text-zinc-600">None</div>
   const total = rows.reduce((s, r) => s + r.count, 0)
   const pay = payRate != null ? total * payRate : null
+  // Over the days that HAVE a row, which is what the table shows. Days with
+  // nothing on them are not in `rows`, so this is the rate on the days they
+  // worked — the row chips carry the other rate, over every day since the reset.
+  const perActiveDay = total / Math.max(1, rows.length)
   return (
     <div className="overflow-x-auto">
       <table className="text-xs border-collapse min-w-[420px]">
@@ -3616,6 +3786,9 @@ function DayTable({
                 {r.day.slice(5)}
               </td>
             ))}
+            <td className="text-zinc-200 px-2 py-1 border-l-2 border-zinc-700 text-center whitespace-nowrap font-medium">
+              Total
+            </td>
             {pay != null && (
               <td className="text-emerald-300 px-2 py-1 border-l-2 border-zinc-700 text-center whitespace-nowrap font-medium">
                 Pay (birr)
@@ -3632,6 +3805,15 @@ function DayTable({
                 {r.count}
               </td>
             ))}
+            <td
+              className="text-white px-2 py-1 border-l-2 border-t border-zinc-700 text-center tabular-nums font-semibold"
+              title={
+                `${total.toLocaleString()} over ${rows.length} day(s) with any — ` +
+                `${perActiveDay.toFixed(1)} a day on the days they worked`
+              }
+            >
+              {total.toLocaleString()}
+            </td>
             {pay != null && (
               <td
                 className="text-emerald-300 px-2 py-1 border-l-2 border-t border-zinc-700 text-center tabular-nums font-semibold"
