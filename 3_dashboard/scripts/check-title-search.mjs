@@ -92,18 +92,23 @@ try {
 // ── the wiring ─────────────────────────────────────────────────────────────
 const lib = read('lib/adminLinks.ts')
 const ui = read('components/AdminLinks.tsx')
+// These four used to look for `l.title.toLowerCase().includes(needle)` and a
+// placeholder reading "Filter by URL, keyword or title". Neither exists now:
+// the fields became a list the user ticks (SEARCH_FIELDS), the placeholder says
+// what is ticked, and case folding moved out of searchText so that the
+// case-sensitive switch can mean something. Asserting the current shape.
 console.log('\nthe filter and the box agree about what is searched:')
-check('  the predicate includes the title', /l\.title\.toLowerCase\(\)\.includes\(needle\)/.test(lib), true)
-check('  the box says so', /Filter by URL, keyword or title/.test(ui), true)
+check('  title is one of the fields searched', /case 'title':\s*\n\s*return l\.title\b/.test(lib), true)
+check('  the box names what it is searching', /placeholder=\{`Search \$\{searchLabel\}/.test(ui), true)
 check(
-  '  and warns that untitled links cannot match',
-  /cannot match on it/.test(ui),
+  '  and warns that a field we hold nothing for cannot match',
+  /A field we hold nothing for never matches/.test(ui),
   true
 )
 // One predicate, so every endpoint that filters links searches the same way.
 check(
   '  there is only one such predicate',
-  (lib.match(/l\.title\.toLowerCase\(\)\.includes\(needle\)/g) ?? []).length,
+  (lib.match(/fields\.some\(\(f\) => matches\(searchText\(l, f\)\)\)/g) ?? []).length,
   1
 )
 

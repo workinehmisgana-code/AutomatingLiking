@@ -28,7 +28,7 @@ export async function GET() {
 
   // Task switched off by the admin: return early rather than serving videos the
   // user could download but never submit (every mutating promo route is blocked).
-  if (!(await getPromoTaskEnabled().catch(() => true))) {
+  if (!(await getPromoTaskEnabled().catch(() => false))) {
     return NextResponse.json({ taskEnabled: false })
   }
 

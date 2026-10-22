@@ -39,6 +39,14 @@ export interface GuideProps {
   /** Whether the task is being offered at all — a closed task is left out of
    *  the guide entirely rather than described and then not there. */
   accountOpen: boolean
+  /** The minimum TikTok account age, in days (admin setting). */
+  minAgeDays: number
+  /** The video new accounts comment on to be verified. */
+  verifyVideoUrl: string
+  /** Referral commission, as a whole percent (e.g. 20). */
+  referralPct: number
+  /** Automatic pauses allowed before the next one is permanent. */
+  autoPausesAllowed: number
 }
 
 export interface Section {
@@ -97,14 +105,26 @@ export function en(p: GuideProps): GuideCopy {
         intro: 'Do this once, on the website.',
         steps: [
           'Sign in with your Google account.',
-          'Enter your full name and the bank account number you want to be paid into.',
-          'Add your TikTok, YouTube and Instagram profile links. These are the accounts you will comment from, so they must be real accounts you control.',
-          'Save. You land on the Links page, which is your dashboard.',
+          'Enter your full name and the bank account number you want to be paid into, then choose your bank from the list. If your bank is not in the list, choose "Other" and type its name.',
+          'Enter a phone number or a Telegram username — one of the two is enough. This is how you are contacted about a payment or a problem with your account.',
+          'Add your TikTok profile link — it is required, and it must show your @username, like tiktok.com/@yourusername (a video link or a short vm.tiktok.com link will not work). YouTube and Instagram are optional. Each account can be registered by one person only.',
+          'If somebody invited you, type their referral username. It is asked only once, when you register, and cannot be added later.',
+          'Save. Next you verify your TikTok account (step 2) — then your links appear.',
         ],
-        note: 'Type your bank account number carefully. You are paid every Monday, and the money goes to exactly the account number you enter here — a wrong digit means a failed or misdirected payment.',
+        note: 'Type your bank account number carefully and choose the right bank. You are paid every Monday, and the money goes to exactly that account at that bank — a wrong digit or the wrong bank means a failed or misdirected payment.',
       },
       {
-        heading: '2. Install the Comment Helper app',
+        heading: '2. Verify your TikTok account',
+        intro: `Before you get any links, we check that the TikTok account is really yours and that it is at least ${p.minAgeDays} days old. Brand-new accounts are not accepted.`,
+        steps: [
+          `From the TikTok account you registered, comment anything on this video: ${p.verifyVideoUrl}`,
+          'Back on the dashboard, press Check. We find your comment and read how old the account is.',
+          `If the account is at least ${p.minAgeDays} days old, you are verified and your links appear. If it is younger, you are told so — use an older account, or wait until it is old enough.`,
+        ],
+        note: `This applies to everyone, including people who joined earlier. If you change your TikTok account later, the new account has to be verified the same way, and it must also be at least ${p.minAgeDays} days old.`,
+      },
+      {
+        heading: '3. Install the Comment Helper app',
         intro: 'The app is what makes commenting fast. You do the work in the app, not on the website.',
         steps: [
           'On the dashboard, find the Android app section and download the APK.',
@@ -116,21 +136,20 @@ export function en(p: GuideProps): GuideCopy {
         note: 'If the app says "Update the app first to get links", download the newest APK from the dashboard. Old versions stop receiving links.',
       },
       {
-        heading: '3. The floating bubble',
+        heading: '4. The floating bubble',
         intro: 'This is the bubble you use all day. Drag it anywhere on screen.',
         rows: [
           { k: 'Next ▶', v: 'The main button. Copies a comment for you and opens the next video.' },
           { k: '🚫 Unrelated', v: 'Use it when the video has nothing to do with what we advertise. It flags the link and takes you straight to the next one. It does not count against you.' },
           { k: '☰ All ▾', v: 'Work on one platform only (TikTok, Instagram, and so on) or leave it on All.' },
           { k: '💬', v: 'Shows the comment that was copied, in case you need to see it again.' },
-          { k: '⛶', v: 'Opens the full dashboard inside the app.' },
           { k: '… Details', v: 'Your totals, how many links are left, and any hourly countdown.' },
           { k: 'Counter', v: 'How many links you have opened out of the batch loaded on your phone.' },
           { k: '✕', v: 'Hides the bubble. Reopen it from the app.' },
         ],
       },
       {
-        heading: '4. How to comment — the loop you repeat',
+        heading: '5. How to comment — the loop you repeat',
         intro: 'This is the part you repeat all session. It takes a few seconds per video once you are used to it.',
         steps: [
           'Tap Next ▶. The app copies a comment to your clipboard and opens the video.',
@@ -142,7 +161,7 @@ export function en(p: GuideProps): GuideCopy {
         note: 'Never edit the comment and never post your own words. The comment you are given is the one that must go up, and never comment twice on the same video.',
       },
       {
-        heading: '5. When a video is not related',
+        heading: '6. When a video is not related',
         intro: 'Some links are wrong: a random cooking video, a language you cannot comment in, or something unrelated to what we advertise.',
         steps: [
           'Tap 🚫 Unrelated while you are on that video.',
@@ -152,7 +171,7 @@ export function en(p: GuideProps): GuideCopy {
         note: 'Do not use Unrelated just to skip a video you do not feel like doing. It is for genuinely wrong links.',
       },
       {
-        heading: '6. Report your work and get paid',
+        heading: '7. Report your work and get paid',
         intro: 'Your commenting is only counted once you report it. Do this at the end of every session.',
         steps: [
           'Tap Finish in the app, or open the Finish page on the website.',
@@ -164,7 +183,7 @@ export function en(p: GuideProps): GuideCopy {
         note: 'Report honestly. Your number is checked against the links you actually opened and against your screenshots. Inflated numbers are removed and can get your account blocked.',
       },
       {
-        heading: '7. The other ways to earn',
+        heading: '8. The other ways to earn',
         intro: 'All optional, and all on the dashboard.',
         rows: [
           {
@@ -174,6 +193,10 @@ export function en(p: GuideProps): GuideCopy {
           {
             k: '📢 Repost & earn',
             v: `Create a dedicated account on each platform, download a ready-made video and caption from the dashboard, post it, then paste the link back. ${p.promoBirr} birr per link. You may download ${p.promoDownloads} video per day and post ${p.promoPerPlatform} per platform per day.`,
+          },
+          {
+            k: '🤝 Referrals',
+            v: `Share your referral username (on your dashboard). When someone registers with it, you earn ${p.referralPct}% of their comment pay, on top — nothing is taken from what they earn. You earn only on the people who used YOUR username, not on the people they invite.`,
           },
           ...(p.accountOpen
             ? [{
@@ -198,10 +221,10 @@ export function en(p: GuideProps): GuideCopy {
         ],
       },
       {
-        heading: '8. The website (dashboard)',
+        heading: '9. The website (dashboard)',
         intro: 'The website is for setup, reporting and payment. Day-to-day commenting happens in the app.',
         rows: [
-          { k: 'Links', v: 'Your remaining links, grouped, plus your totals for today.' },
+          { k: 'Links', v: 'Your remaining links, grouped, plus your totals for today. There is a tab per platform: TikTok, YT Shorts, YT Videos, Instagram and Reddit.' },
           { k: 'Pages', v: `Links come a page at a time, best group first — ${p.linksPerPage} on a page, which is about an hour's work. Use Next at the bottom for the following page.` },
           { k: 'Comments', v: 'The comment pool. Tap any comment to copy it manually if you need to.' },
           { k: 'Video task', v: 'Upload your own video and see whether it was approved.' },
@@ -217,8 +240,19 @@ export function en(p: GuideProps): GuideCopy {
         ],
       },
       {
-        heading: '9. Rules that protect your pay',
+        heading: '10. Comment checks and pauses',
+        intro: 'We regularly check that your comments are actually visible on the videos you opened. Comments that cannot be found are not counted, so post every comment you are given, from your registered account.',
+        steps: [
+          'If your comments cannot be found on enough of the links you opened, your account is paused automatically and you see a "Your account has been paused" message.',
+          `To continue, switch to a different TikTok account: comment on the verification video (${p.verifyVideoUrl}) from the NEW account, then enter its profile link on the paused screen and press Check. The new account must be at least ${p.minAgeDays} days old.`,
+          'After you switch, only the links you open with the new account are checked.',
+        ],
+        note: `You can be paused automatically ${p.autoPausesAllowed} times. The next automatic pause after that is permanent: the account cannot be restored, and the same Google account, bank account and TikTok account cannot be used to register again.`,
+      },
+      {
+        heading: '11. Rules that protect your pay',
         rows: [
+          { k: 'Account age', v: `Your TikTok account must be at least ${p.minAgeDays} days old — checked when you verify, and again whenever the minimum changes.` },
           { k: 'Real accounts', v: 'Comment from real accounts with a normal history. Brand new empty accounts get their comments hidden by the platform, and hidden comments do not count.' },
           { k: 'One per video', v: 'Never comment twice on the same video.' },
           { k: 'Respect the limits', v: 'The hourly limits exist so your accounts are not flagged as spam. Wait for the countdown instead of switching accounts.' },
@@ -262,14 +296,26 @@ export function am(p: GuideProps): GuideCopy {
         intro: 'ይህን አንድ ጊዜ ብቻ በድረ-ገጹ ላይ ያድርጉ።',
         steps: [
           'በGoogle አካውንትዎ ይግቡ።',
-          'ሙሉ ስምዎን እና ክፍያ እንዲላክልዎ የሚፈልጉትን የባንክ ሒሳብ ቁጥር ያስገቡ።',
-          'የTikTok፣ የYouTube እና የInstagram አካውንት ሊንኮችዎን ያስገቡ። አስተያየት የሚሰጡት ከእነዚህ አካውንቶች ስለሆነ፣ በእርስዎ ቁጥጥር ሥር ያሉ እውነተኛ አካውንቶች መሆን አለባቸው።',
-          'ያስቀምጡ። ወደ ሊንኮች ገጽ ይደርሳሉ፤ ይህም ዳሽቦርድዎ ነው።',
+          'ሙሉ ስምዎን እና ክፍያ እንዲላክልዎ የሚፈልጉትን የባንክ ሒሳብ ቁጥር ያስገቡ፣ ከዚያም ባንክዎን ከዝርዝሩ ይምረጡ። ባንክዎ በዝርዝሩ ውስጥ ከሌለ "Other" የሚለውን መርጠው ስሙን ይጻፉ።',
+          'የስልክ ቁጥር ወይም የTelegram መለያ ስም (username) ያስገቡ — ከሁለቱ አንዱ በቂ ነው። ስለ ክፍያ ወይም ስለ አካውንትዎ ችግር የምናገኝዎት በዚህ ነው።',
+          'የTikTok አካውንት ሊንክዎን ያስገቡ — ግዴታ ነው፤ እንደ tiktok.com/@yourusername ያለ @username የሚያሳይ መሆን አለበት (የቪዲዮ ሊንክ ወይም አጭር vm.tiktok.com ሊንክ አይሠራም)። YouTube እና Instagram በፈቃደኝነት ናቸው። አንድ አካውንት በአንድ ሰው ብቻ ነው መመዝገብ የሚችለው።',
+          'የጋበዘዎት ሰው ካለ የሪፈራል መለያ ስሙን ይጻፉ። የሚጠየቀው በምዝገባ ጊዜ አንድ ጊዜ ብቻ ሲሆን በኋላ መጨመር አይቻልም።',
+          'ያስቀምጡ። ቀጥሎ የTikTok አካውንትዎን ያረጋግጣሉ (ደረጃ 2) — ከዚያ ሊንኮችዎ ይታያሉ።',
         ],
-        note: 'የባንክ ሒሳብ ቁጥርዎን በጥንቃቄ ይጻፉ። ክፍያ የሚፈጸመው በየሰኞው ሲሆን፣ ገንዘቡ የሚላከው እዚህ ላይ በጻፉት የሒሳብ ቁጥር በትክክል ነው፤ አንድ የተሳሳተ ቁጥር ክፍያው እንዲቋረጥ ወይም ወደ ሌላ ሰው እንዲሄድ ያደርጋል።',
+        note: 'የባንክ ሒሳብ ቁጥርዎን በጥንቃቄ ይጻፉ፤ ትክክለኛውን ባንክም ይምረጡ። ክፍያ የሚፈጸመው በየሰኞው ሲሆን፣ ገንዘቡ የሚላከው በዚያ ባንክ ወዳለው ወደዚያው ሒሳብ በትክክል ነው፤ አንድ የተሳሳተ ቁጥር ወይም የተሳሳተ ባንክ ክፍያው እንዲቋረጥ ወይም ወደ ሌላ ሰው እንዲሄድ ያደርጋል።',
       },
       {
-        heading: '2. የComment Helper አፑን ይጫኑ',
+        heading: '2. የTikTok አካውንትዎን ያረጋግጡ',
+        intro: `ምንም ሊንክ ከማግኘትዎ በፊት የTikTok አካውንቱ በእርግጥ የእርስዎ መሆኑን እና ቢያንስ ${p.minAgeDays} ቀን የሆነው መሆኑን እናረጋግጣለን። አዲስ የተከፈቱ አካውንቶች ተቀባይነት የላቸውም።`,
+        steps: [
+          `ከመዘገቡት የTikTok አካውንት በዚህ ቪዲዮ ላይ ማንኛውንም አስተያየት ይስጡ፦ ${p.verifyVideoUrl}`,
+          'ወደ ዳሽቦርዱ ተመልሰው Check የሚለውን ይጫኑ። አስተያየትዎን አግኝተን አካውንቱ ስንት ጊዜ እንደሆነው እናነባለን።',
+          `አካውንቱ ቢያንስ ${p.minAgeDays} ቀን ከሆነው ይረጋገጣሉ፤ ሊንኮችዎም ይታያሉ። ካልሆነ ይነገርዎታል — የቆየ አካውንት ይጠቀሙ፣ ወይም በቂ ጊዜ እስኪሆነው ይጠብቁ።`,
+        ],
+        note: `ይህ ቀደም ብለው የተቀላቀሉትንም ጨምሮ ሁሉንም ይመለከታል። በኋላ የTikTok አካውንትዎን ከቀየሩ፣ አዲሱ አካውንት በተመሳሳይ መንገድ መረጋገጥ አለበት፤ እሱም ቢያንስ ${p.minAgeDays} ቀን የሆነው መሆን አለበት።`,
+      },
+      {
+        heading: '3. የComment Helper አፑን ይጫኑ',
         intro: 'አስተያየት መስጠትን ፈጣን የሚያደርገው አፑ ነው። ሥራውን የሚሠሩት በአፑ ላይ እንጂ በድረ-ገጹ ላይ አይደለም።',
         steps: [
           'በዳሽቦርዱ ላይ የAndroid አፕ ክፍሉን አግኝተው APK ፋይሉን ያውርዱ።',
@@ -281,21 +327,20 @@ export function am(p: GuideProps): GuideCopy {
         note: 'አፑ "Update the app first to get links" ካለ፣ ከዳሽቦርዱ አዲሱን APK ያውርዱ። አሮጌ ስሪቶች ሊንክ መቀበል ያቆማሉ።',
       },
       {
-        heading: '3. ተንሳፋፊው ቁልፍ (bubble)',
+        heading: '4. ተንሳፋፊው ቁልፍ (bubble)',
         intro: 'ቀኑን ሙሉ የሚጠቀሙበት ይህ ነው። በስክሪኑ ላይ ወደፈለጉት ቦታ መጎተት ይችላሉ።',
         rows: [
           { k: 'Next ▶', v: 'ዋናው ቁልፍ። አስተያየቱን ኮፒ አድርጎ ቀጣዩን ቪዲዮ ይከፍታል።' },
           { k: '🚫 Unrelated', v: 'ቪዲዮው እኛ ከምናስተዋውቀው ጋር ምንም ግንኙነት ከሌለው ይጠቀሙበት። ሊንኩን ምልክት አድርጎ በቀጥታ ወደ ቀጣዩ ያሸጋግርዎታል። በእርስዎ ላይ አይቆጠርም።' },
           { k: '☰ All ▾', v: 'በአንድ መድረክ ብቻ ለመሥራት (TikTok ብቻ፣ Instagram ብቻ ወዘተ) ወይም All ላይ ይተውት።' },
           { k: '💬', v: 'ኮፒ የተደረገውን አስተያየት እንደገና ማየት ከፈለጉ ያሳያል።' },
-          { k: '⛶', v: 'ሙሉውን ዳሽቦርድ በአፑ ውስጥ ይከፍታል።' },
           { k: '… Details', v: 'ጠቅላላ ውጤትዎን፣ የቀሩትን ሊንኮች ብዛት እና የሰዓት ቆጠራን ያሳያል።' },
           { k: 'ቆጣሪ', v: 'በስልክዎ ላይ ከተጫኑት ሊንኮች ውስጥ ስንቱን እንደከፈቱ ያሳያል።' },
           { k: '✕', v: 'ቁልፉን ይሰውራል። ከአፑ እንደገና ይክፈቱት።' },
         ],
       },
       {
-        heading: '4. አስተያየት እንዴት እንደሚሰጡ — ተደጋጋሚው ሂደት',
+        heading: '5. አስተያየት እንዴት እንደሚሰጡ — ተደጋጋሚው ሂደት',
         intro: 'ይህ በሥራ ጊዜዎ ሁሉ የሚደጋገም ነው። ከለመዱት በኋላ ለአንድ ቪዲዮ ጥቂት ሰከንዶች ብቻ ይወስዳል።',
         steps: [
           'Next ▶ ን ይንኩ። አፑ አስተያየቱን ኮፒ አድርጎ ቪዲዮውን ይከፍታል።',
@@ -307,7 +352,7 @@ export function am(p: GuideProps): GuideCopy {
         note: 'አስተያየቱን በጭራሽ አያስተካክሉ፤ የራስዎን ቃላትም አይለጥፉ። የተሰጠዎት አስተያየት እንዳለ መለጠፍ አለበት። እንዲሁም በአንድ ቪዲዮ ላይ ሁለት ጊዜ አስተያየት አይስጡ።',
       },
       {
-        heading: '5. ቪዲዮው ተዛማጅ ካልሆነ',
+        heading: '6. ቪዲዮው ተዛማጅ ካልሆነ',
         intro: 'አንዳንድ ሊንኮች ትክክል አይደሉም፤ ለምሳሌ የምግብ ማብሰያ ቪዲዮ፣ አስተያየት መስጠት በማይችሉበት ቋንቋ የተሠራ፣ ወይም እኛ ከምናስተዋውቀው ጋር ግንኙነት የሌለው።',
         steps: [
           'በዚያ ቪዲዮ ላይ እያሉ 🚫 Unrelated ን ይንኩ።',
@@ -317,7 +362,7 @@ export function am(p: GuideProps): GuideCopy {
         note: 'መሥራት ስላልፈለጉ ብቻ ቪዲዮ ለመዝለል Unrelated ን አይጠቀሙ። ይህ በእውነት ለተሳሳቱ ሊንኮች ብቻ ነው።',
       },
       {
-        heading: '6. ሥራዎን ሪፖርት አድርገው ክፍያ ያግኙ',
+        heading: '7. ሥራዎን ሪፖርት አድርገው ክፍያ ያግኙ',
         intro: 'የሰጡት አስተያየት የሚቆጠረው ሪፖርት ካደረጉ በኋላ ብቻ ነው። ይህን በእያንዳንዱ የሥራ ጊዜ መጨረሻ ላይ ያድርጉ።',
         steps: [
           'በአፑ ላይ Finish ን ይንኩ፣ ወይም በድረ-ገጹ ላይ የFinish ገጹን ይክፈቱ።',
@@ -329,7 +374,7 @@ export function am(p: GuideProps): GuideCopy {
         note: 'በሐቀኝነት ሪፖርት ያድርጉ። ያስገቡት ቁጥር በእውነት ከከፈቷቸው ሊንኮች እና ከስክሪንሾቶችዎ ጋር ይመሳከራል። የተጋነኑ ቁጥሮች ይሰረዛሉ፤ አካውንትዎም ሊታገድ ይችላል።',
       },
       {
-        heading: '7. ሌሎቹ የገቢ መንገዶች',
+        heading: '8. ሌሎቹ የገቢ መንገዶች',
         intro: 'ሁሉም በፈቃደኝነት ላይ የተመሠረቱ ሲሆኑ በዳሽቦርዱ ላይ ይገኛሉ።',
         rows: [
           {
@@ -339,6 +384,10 @@ export function am(p: GuideProps): GuideCopy {
           {
             k: '📢 ሪፖስት አድርገው ያግኙ',
             v: `በእያንዳንዱ መድረክ ላይ የተለየ አካውንት ይክፈቱ፣ ከዳሽቦርዱ ዝግጁ የሆነ ቪዲዮና ጽሑፍ አውርደው ይለጥፉ፣ ከዚያም ሊንኩን መልሰው ይለጥፉ። ለአንድ ሊንክ ${p.promoBirr} ብር። በቀን ${p.promoDownloads} ቪዲዮ ማውረድ እና በአንድ መድረክ በቀን ${p.promoPerPlatform} መለጠፍ ይችላሉ።`,
+          },
+          {
+            k: '🤝 ሪፈራል',
+            v: `የሪፈራል መለያ ስምዎን (በዳሽቦርድዎ ላይ ያለውን) ያጋሩ። አንድ ሰው በእሱ ሲመዘገብ፣ ከአስተያየት ክፍያው ${p.referralPct}% ተጨማሪ ያገኛሉ — ከእሱ ገቢ ምንም አይቀነስም። የሚያገኙት የእርስዎን መለያ ስም ከተጠቀሙት ሰዎች ብቻ ነው፤ እነሱ ከሚጋብዟቸው ሰዎች አይደለም።`,
           },
           ...(p.accountOpen
             ? [{
@@ -361,10 +410,10 @@ export function am(p: GuideProps): GuideCopy {
         ],
       },
       {
-        heading: '8. ድረ-ገጹ (ዳሽቦርድ)',
+        heading: '9. ድረ-ገጹ (ዳሽቦርድ)',
         intro: 'ድረ-ገጹ ለዝግጅት፣ ለሪፖርት እና ለክፍያ ነው። የዕለት ተዕለት አስተያየት መስጠት የሚከናወነው በአፑ ላይ ነው።',
         rows: [
-          { k: 'ሊንኮች', v: 'የቀሩት ሊንኮችዎ በቡድን ተከፋፍለው፣ እንዲሁም የዛሬው ጠቅላላ ውጤትዎ።' },
+          { k: 'ሊንኮች', v: 'የቀሩት ሊንኮችዎ በቡድን ተከፋፍለው፣ እንዲሁም የዛሬው ጠቅላላ ውጤትዎ። ለእያንዳንዱ መድረክ የተለየ ትር አለ፦ TikTok፣ YT Shorts፣ YT Videos፣ Instagram እና Reddit።' },
           { k: 'ገጾች', v: `ሊንኮች በገጽ በገጽ ይቀርባሉ፤ ምርጡ ቡድን መጀመሪያ። በአንድ ገጽ ${p.linksPerPage} ሊንኮች ሲሆኑ ይህም የአንድ ሰዓት ያህል ሥራ ነው። ቀጣዩን ገጽ ለማየት ከታች ያለውን Next ይጠቀሙ።` },
           { k: 'አስተያየቶች', v: 'የአስተያየት ስብስቡ። ካስፈለገዎት ማንኛውንም አስተያየት ነክተው በእጅ ኮፒ ማድረግ ይችላሉ።' },
           { k: 'የቪዲዮ ሥራ', v: 'የራስዎን ቪዲዮ ይላኩ እና መጽደቁን ይከታተሉ።' },
@@ -374,8 +423,19 @@ export function am(p: GuideProps): GuideCopy {
         ],
       },
       {
-        heading: '9. ክፍያዎን የሚጠብቁ ደንቦች',
+        heading: '10. የአስተያየት ፍተሻ እና እገዳ',
+        intro: 'የሰጧቸው አስተያየቶች በከፈቷቸው ቪዲዮዎች ላይ በእርግጥ መታየታቸውን በየጊዜው እናረጋግጣለን። ሊገኙ ያልቻሉ አስተያየቶች አይቆጠሩም፤ ስለዚህ የተሰጠዎትን እያንዳንዱን አስተያየት ከመዘገቡት አካውንት ይለጥፉ።',
+        steps: [
+          'በከፈቷቸው ሊንኮች ውስጥ በበቂ ብዛት ላይ አስተያየትዎ ካልተገኘ አካውንትዎ በራስ-ሰር ይታገዳል፤ "Your account has been paused" የሚል መልእክትም ያያሉ።',
+          `ለመቀጠል ወደ ሌላ የTikTok አካውንት ይቀይሩ፦ ከአዲሱ አካውንት በማረጋገጫ ቪዲዮው (${p.verifyVideoUrl}) ላይ አስተያየት ይስጡ፣ ከዚያም በእገዳ ገጹ ላይ የአካውንቱን ሊንክ አስገብተው Check ይጫኑ። አዲሱ አካውንት ቢያንስ ${p.minAgeDays} ቀን የሆነው መሆን አለበት።`,
+          'ከቀየሩ በኋላ የሚፈተሹት በአዲሱ አካውንት የከፈቷቸው ሊንኮች ብቻ ናቸው።',
+        ],
+        note: `በራስ-ሰር መታገድ የሚችሉት ${p.autoPausesAllowed} ጊዜ ነው። ከዚያ በኋላ የሚመጣው ራስ-ሰር እገዳ ቋሚ ነው፦ አካውንቱ አይመለስም፤ ያው የGoogle አካውንት፣ የባንክ ሒሳብ እና የTikTok አካውንት ዳግመኛ ለምዝገባ መጠቀም አይቻልም።`,
+      },
+      {
+        heading: '11. ክፍያዎን የሚጠብቁ ደንቦች',
         rows: [
+          { k: 'የአካውንት ዕድሜ', v: `የTikTok አካውንትዎ ቢያንስ ${p.minAgeDays} ቀን የሆነው መሆን አለበት — ሲያረጋግጡ ይፈተሻል፤ ዝቅተኛው ገደብ በተቀየረ ቁጥርም እንደገና ይፈተሻል።` },
           { k: 'እውነተኛ አካውንቶች', v: 'መደበኛ ታሪክ ካላቸው እውነተኛ አካውንቶች አስተያየት ይስጡ። አዲስ እና ባዶ አካውንቶች የሚሰጡት አስተያየት በመድረኩ ይሰወራል፤ የተሰወረ አስተያየት ደግሞ አይቆጠርም።' },
           { k: 'በአንድ ቪዲዮ አንድ', v: 'በአንድ ቪዲዮ ላይ ሁለት ጊዜ አስተያየት በጭራሽ አይስጡ።' },
           { k: 'ገደቦቹን ያክብሩ', v: 'የሰዓት ገደቦቹ የተቀመጡት አካውንቶችዎ እንደ ስፓም እንዳይቆጠሩ ነው። አካውንት ከመቀያየር ይልቅ ቆጠራው እስኪያልቅ ይጠብቁ።' },

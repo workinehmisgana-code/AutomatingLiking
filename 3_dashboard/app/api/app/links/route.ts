@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { isTiktokVerified } from '@/lib/profileGate'
 import { userIdFromApp } from '@/lib/appAuth'
 import {
   getClickedUrls,
   getClickCountsByUrl,
-  getBlockedUrls,
+  getBlockedPoolUrls,
   getConfirmedBrokenUrls,
   getServeOnlyClean,
   getUrlsWithProductComments,
@@ -11,7 +12,10 @@ import {
   getApk,
   getEffectivePlatformLimits,
   getUnrelatedUrls,
-  isUserVerified,
+
+  getGenreMix,
+  getUserProfile,
+  needsTiktokProfileFix,
   getLinkCategories,
   getLinkScans,
   getClusterDateShare,
@@ -21,8 +25,12 @@ import { loadVideosJson, retiredUrlSet, type RawVideo } from '@/lib/videos'
 import { missingProducts } from '@/lib/commentScan'
 import { clusterAndOrder } from '@/lib/cluster'
 import { BROKEN_AFTER_MISSES } from '@/lib/linkStats'
+import { interleaveByWeight } from '@/lib/userFeed'
 import { mixOrderings, seedFrom, DEFAULT_DATE_SHARE } from '@/lib/clusterMix'
 import {
+  GENRES,
+  genreOfRow,
+  genreWeights,
   isAppOutdated,
   VERIFY_VIDEO_URL,
   VERIFY_GATE_ENABLED,
@@ -34,7 +42,7 @@ export const dynamic = 'force-dynamic'
 
 // Platform processing order when no filter is set: drain one platform before
 // the next (the app switches when a platform's hourly quota is used up).
-const PLATFORM_ORDER = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram']
+const PLATFORM_ORDER = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram', 'reddit']
 
 // There is deliberately no rank-only platform list here any more.
 //
@@ -64,9 +72,32 @@ export async function GET(req: NextRequest) {
   const userId = await userIdFromApp(req)
   if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
+  // A TIKTOK LINK WITH NO @USERNAME IN IT IS CHECKED FIRST, because the
+  // verification gate below cannot answer for such a user: it reads the handle
+  // out of tiktok_url and looks for it among a video's commenters, and there is
+  // no handle to read. Left to the gate, the app told these people to go and
+  // comment on the verification video — which they could do all day without
+  // ever passing. The real reason is a link only they can replace.
+  const profile = await getUserProfile(userId).catch(() => null)
+  if (needsTiktokProfileFix(profile)) {
+    return NextResponse.json({
+      profileFixRequired: true,
+      message:
+        'Your saved TikTok link does not show your @username, so your comments cannot be ' +
+        'checked. Open the dashboard and send your profile link again ' +
+        '(tiktok.com/@yourusername).',
+      count: 0,
+      links: [],
+    })
+  }
+
   // Comment-verification gate — the app gets no links until the user has proved
   // they can comment from their registered account (see VerifyGate on the web).
-  if (VERIFY_GATE_ENABLED && !(await isUserVerified(userId).catch(() => false))) {
+  // THE ACCOUNT-AGE VERIFICATION (tiktok_verification), the same check the web
+  // dashboard and userIdFromApp use. This read the OLD comment-validity table
+  // (user_validity), which nobody is written to any more, so once the gate was
+  // switched on it refused every worker — verified or not — links and clicks.
+  if (VERIFY_GATE_ENABLED && !(await isTiktokVerified(userId).catch(() => false))) {
     return NextResponse.json({
       verifyRequired: true,
       verifyUrl: VERIFY_VIDEO_URL,
@@ -103,7 +134,7 @@ export async function GET(req: NextRequest) {
       getClickedUrls(userId).catch(() => [] as string[]),
       getClickCountsByUrl().catch(() => ({}) as Record<string, number>),
       loadVideosJson(),
-      getBlockedUrls().catch(() => [] as string[]),
+      getBlockedPoolUrls().catch(() => [] as string[]),
       getEffectivePlatformLimits(),
       getUnrelatedUrls(userId).catch(() => [] as string[]),
       // Links the platform no longer serves. Confirmed ones only — a single
@@ -115,7 +146,10 @@ export async function GET(req: NextRequest) {
     ])
   // Read only when the setting is on: it is a full scan of link_product_comment
   // and pointless on every request when the answer is not used.
-  const alreadyOurs = onlyClean
+  // ?clean=1 — the Comment Tester app asks for clean links only, whatever the
+  // setting says: it exists to test comments on videos that carry none of ours.
+  const testerClean = req.nextUrl.searchParams.get('clean') === '1'
+  const alreadyOurs = onlyClean || testerClean
     ? await getUrlsWithProductComments().catch(() => [] as string[])
     : []
   // What this user has opened since the setting was switched on. It takes the
@@ -155,6 +189,9 @@ export async function GET(req: NextRequest) {
   // a per-link draw, seeded by the user so two people working at the same second
   // get different blends while one person's own feed stays stable.
   const dateShare = await getClusterDateShare().catch(() => DEFAULT_DATE_SHARE)
+  // The genre shares, normalised. Nothing set reads as all-humanizer, which is
+  // what every link in the pool was before genres existed.
+  const genreMix = genreWeights(await getGenreMix().catch(() => null))
   const seed = seedFrom(userId)
 
   const available = videos.filter((v) => v.url && v.url.startsWith('http') && !hidden.has(v.url))
@@ -175,8 +212,29 @@ export async function GET(req: NextRequest) {
       seed,
       APP_LINK_BATCH
     )
-  const forPlatform = (p: string) =>
-    mixed(available.filter((v) => String(v.platform ?? '') === p))
+  // ── ONE ORDERING PER GENRE, THEN MIXED ─────────────────────────
+  //
+  // Same reasoning as the web feed: clusterAndOrder is relative to the pool it
+  // is given, so the genres are ordered separately and only the finished
+  // orderings are interleaved. Clustering them together would rank cocodly's
+  // handful of links against three hundred humanizer ones.
+  //
+  // mixOrderings above blends the two CLUSTERINGS of one pool; this blends three
+  // POOLS. Different axes, both proportional, composed in that order.
+  const forPlatform = (p: string) => {
+    const ofPlatform = available.filter((v) => String(v.platform ?? '') === p)
+    const byGenre = new Map<string, RawVideo[]>()
+    for (const g of GENRES) byGenre.set(g, [])
+    for (const v of ofPlatform) {
+      const bucket = byGenre.get(genreOfRow(v))
+      if (bucket) bucket.push(v)
+    }
+    const ordered = new Map<string, RawVideo[]>()
+    for (const [g, rows] of Array.from(byGenre.entries())) {
+      if (rows.length > 0) ordered.set(g, mixed(rows))
+    }
+    return interleaveByWeight(ordered, genreMix, APP_LINK_BATCH)
+  }
 
   // The feed is CAPPED (APP_LINK_BATCH). The app holds the batch on the device
   // and re-reads it on every tap, so handing it the whole pool is what makes the

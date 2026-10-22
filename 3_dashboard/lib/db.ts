@@ -1,7 +1,26 @@
 import { Pool } from 'pg'
+import { cached, invalidate, TTL } from './poolCache'
 import { del } from '@vercel/blob'
 import { randomBytes } from 'crypto'
 import {
+  clampRule,
+  clampGenreShare,
+  DEFAULT_GENRE,
+  DEFAULT_GENRE_MIX,
+  isGenre,
+  isTestEmail,
+  GENRES,
+  PRODUCT_GENRE,
+  productsInGenre,
+  VERIFY_VIDEO_URL,
+  VERIFY_MIN_AGE_DAYS,
+  type GenreMix,
+  isTiktokProfileMisformatted,
+  type BlockRules,
+  clampTopList,
+  isTopListRank,
+  DEFAULT_TOP_LIST,
+  type TopListSetting,
   COMMENT_PAY_RATE,
   REFERRAL_PAY_RATE,
   VIDEO_PAYMENT_BIRR,
@@ -35,6 +54,7 @@ import {
 import { isGenericTitle } from './titleFilter'
 import { normalizeReferralCode, referralCodeFrom, candidateCode } from './referrals'
 import { clampShare } from './clusterMix'
+import { getPoolGenreIndex } from './videos'
 
 const rawUrl = process.env.DATABASE_URL || ''
 // Neon / most hosted Postgres require SSL; local dev usually doesn't.
@@ -134,6 +154,23 @@ export function ensureClickedTable(): Promise<void> {
           url        TEXT PRIMARY KEY,
           blocked_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+        -- BLOCKS ARE PER GENRE. A video judged unrelated to humanizers can be
+        -- exactly what the website-builder pool wants, so a block says which
+        -- genre it was decided for and only that genre's pool honours it.
+        -- Every block made before this column existed was a humanizer
+        -- judgement, which is what the default records.
+        ALTER TABLE blocked_link ADD COLUMN IF NOT EXISTS genre TEXT NOT NULL DEFAULT 'humanizer';
+        DO $$ BEGIN
+          IF EXISTS (
+            SELECT 1 FROM pg_constraint
+             WHERE conrelid = 'blocked_link'::regclass AND contype = 'p'
+               AND array_length(conkey, 1) = 1
+          ) THEN
+            ALTER TABLE blocked_link DROP CONSTRAINT blocked_link_pkey;
+            ALTER TABLE blocked_link ADD PRIMARY KEY (url, genre);
+          END IF;
+        END $$;
+        CREATE INDEX IF NOT EXISTS blocked_link_genre_idx ON blocked_link (genre);
 
         -- Links the platform no longer serves: deleted, made private, or taken
         -- down. Held apart from blocked_link because they are a different fact
@@ -341,6 +378,16 @@ export function ensureClickedTable(): Promise<void> {
           PRIMARY KEY (url, product, rank)
         );
         CREATE INDEX IF NOT EXISTS link_product_comment_url ON link_product_comment (url);
+        -- WHEN THE COMMENT WAS POSTED, from TikTok's own create_time rather than
+        -- from our clock. Every other date on this data is when a scan happened
+        -- to run, so "comments from the last 30 days" could only ever mean "links
+        -- we looked at in the last 30 days" — a different question, and the wrong
+        -- one. Null on every row written before this existed; a re-extract fills
+        -- it with the real date, because the date comes from TikTok and not from
+        -- the moment we asked.
+        ALTER TABLE link_product_comment ADD COLUMN IF NOT EXISTS posted_at TIMESTAMPTZ;
+        CREATE INDEX IF NOT EXISTS link_product_comment_posted
+          ON link_product_comment (posted_at);
         -- A reply we generated for a video's top comment, recommending one of
         -- our products in the context of what that comment actually says.
         CREATE TABLE IF NOT EXISTS comment_reply_draft (
@@ -560,7 +607,11 @@ export async function getTiktokVerifyList(): Promise<
 }
 
 // Every link a user has clicked (opened), newest first — for the admin viewer.
-export async function getUserClicks(userId: string): Promise<UserClick[]> {
+export async function getUserClicks(
+  userId: string,
+  /** One genre's products (the admin's switch); every click when omitted. */
+  products?: string[]
+): Promise<UserClick[]> {
   await ensureClickedTable()
   const { rows } = await pool.query<{
     url: string
@@ -570,9 +621,9 @@ export async function getUserClicks(userId: string): Promise<UserClick[]> {
   }>(
     `SELECT url, platform, search_query, clicked_at
        FROM clicked_link
-      WHERE user_id = $1
+      WHERE user_id = $1 AND ($2::text[] IS NULL OR product = ANY($2::text[]))
       ORDER BY clicked_at DESC`,
-    [userId]
+    [userId, products?.length ? products : null]
   )
   return rows.map((r) => ({
     url: r.url,
@@ -617,6 +668,21 @@ export function ensureVerifyLinkTable(): Promise<void> {
           added_at      TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         ALTER TABLE verify_link ADD COLUMN IF NOT EXISTS bio TEXT;
+        -- WHICH GENRE'S POOL A STAGED LINK IS FOR.
+        --
+        -- Staging used to be humanizer-only by assumption, and the merge stamped
+        -- DEFAULT_GENRE on everything it wrote. That is wrong the moment a
+        -- channel is added for cocodly: its videos would be verified, merged,
+        -- and then filed in the humanizer pool where only humanizer comments are
+        -- ever served on them.
+        --
+        -- NULL reads as DEFAULT_GENRE, the same convention the pool uses, so
+        -- every row staged before this stays correct without being rewritten.
+        ALTER TABLE verify_link ADD COLUMN IF NOT EXISTS genre TEXT;
+        -- A hand-added channel belongs to a genre, and its videos inherit it.
+        -- This is where the genre of a staged link actually comes from: nobody
+        -- types it per link, they type it once per channel.
+        ALTER TABLE extra_channel ADD COLUMN IF NOT EXISTS genre TEXT;
 
         -- Channels somebody asked for by hand, which no link in the pool names.
         --
@@ -657,20 +723,33 @@ export interface ExtraChannel {
   site: string
   handle: string
   note: string | null
+  /** Which genre its videos join when merged. Never '' - see the column. */
+  genre: string
   addedAt: string
 }
 
-/** Add a channel by hand. Idempotent — adding one twice keeps the first note. */
+/**
+ * Add a channel by hand.
+ *
+ * Adding one twice keeps the first note and UPDATES the genre: re-adding is how
+ * somebody corrects a channel filed under the wrong one, and the old DO NOTHING
+ * made that impossible from the page.
+ */
 export async function addExtraChannel(
   site: string,
   handle: string,
-  note: string
+  note: string,
+  genre: string = DEFAULT_GENRE
 ): Promise<boolean> {
   await ensureVerifyLinkTable()
+  const g = isGenre(genre) ? genre : DEFAULT_GENRE
   const { rowCount } = await pool.query(
-    `INSERT INTO extra_channel (site, handle, note) VALUES ($1, $2, $3)
-     ON CONFLICT (site, handle) DO NOTHING`,
-    [site, handle.replace(/^@/, '').trim().toLowerCase(), note.trim() || null]
+    `INSERT INTO extra_channel (site, handle, note, genre) VALUES ($1, $2, $3, $4)
+     -- DO UPDATE on the genre, not DO NOTHING. Re-adding a channel is how
+     -- somebody corrects a mistake, and refusing silently would leave it filed
+     -- under the wrong genre with no way to say so from the page.
+     ON CONFLICT (site, handle) DO UPDATE SET genre = EXCLUDED.genre`,
+    [site, handle.replace(/^@/, '').trim().toLowerCase(), note.trim() || null, g]
   )
   return (rowCount ?? 0) > 0
 }
@@ -699,12 +778,14 @@ export async function getExtraChannels(): Promise<ExtraChannel[]> {
     site: string
     handle: string
     note: string | null
+    genre: string | null
     added_at: Date
-  }>('SELECT site, handle, note, added_at FROM extra_channel ORDER BY added_at DESC')
+  }>('SELECT site, handle, note, genre, added_at FROM extra_channel ORDER BY added_at DESC')
   return rows.map((r) => ({
     site: r.site,
     handle: r.handle,
     note: r.note,
+    genre: isGenre(r.genre) ? r.genre : DEFAULT_GENRE,
     addedAt: new Date(r.added_at).toISOString(),
   }))
 }
@@ -713,6 +794,8 @@ export interface VerifyLinkRow {
   url: string
   account: string | null
   platform: string
+  /** Which genre's pool this will join when merged. Never ''. */
+  genre: string
   view_count: number
   heart_count: number
   comment_count: number
@@ -725,7 +808,7 @@ export interface VerifyLinkRow {
 type RawVerifyRow = {
   url?: unknown; account?: unknown; view_count?: unknown; heart_count?: unknown
   comment_count?: unknown; share_count?: unknown; posted_date?: unknown; title?: unknown
-  bio?: unknown
+  bio?: unknown; genre?: unknown
 }
 
 // Bulk upsert uploaded rows (the client sends chunks). Returns rows written.
@@ -746,13 +829,14 @@ export async function saveVerifyLinks(rows: RawVerifyRow[]): Promise<number> {
       posted_date: r?.posted_date != null ? String(r.posted_date).slice(0, 60) : null,
       title: r?.title != null ? String(r.title).slice(0, 500) : null,
       bio: r?.bio != null ? String(r.bio).slice(0, 500) : null,
+      genre: isGenre(r?.genre) ? r.genre : DEFAULT_GENRE,
     }))
     .filter((r) => r.url.startsWith('http'))
   if (clean.length === 0) return 0
   await ensureVerifyLinkTable()
   const { rowCount } = await pool.query(
-    `INSERT INTO verify_link (url, account, platform, view_count, heart_count, comment_count, share_count, posted_date, title, bio)
-     SELECT * FROM unnest($1::text[], $2::text[], $10::text[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[], $7::text[], $8::text[], $9::text[])
+    `INSERT INTO verify_link (url, account, platform, view_count, heart_count, comment_count, share_count, posted_date, title, bio, genre)
+     SELECT * FROM unnest($1::text[], $2::text[], $10::text[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[], $7::text[], $8::text[], $9::text[], $11::text[])
      ON CONFLICT (url) DO UPDATE SET
        account       = COALESCE(NULLIF(EXCLUDED.account, ''), verify_link.account),
        platform      = EXCLUDED.platform,
@@ -762,7 +846,10 @@ export async function saveVerifyLinks(rows: RawVerifyRow[]): Promise<number> {
        share_count   = CASE WHEN EXCLUDED.share_count   > 0 THEN EXCLUDED.share_count   ELSE verify_link.share_count   END,
        posted_date   = COALESCE(NULLIF(EXCLUDED.posted_date, ''), verify_link.posted_date),
        title         = COALESCE(NULLIF(EXCLUDED.title, ''), verify_link.title),
-       bio           = COALESCE(NULLIF(EXCLUDED.bio, ''), verify_link.bio)`,
+       bio           = COALESCE(NULLIF(EXCLUDED.bio, ''), verify_link.bio),
+       -- Set, never cleared: a re-stage that did not say which genre must not
+       -- blank one that is already right.
+       genre         = COALESCE(NULLIF(EXCLUDED.genre, ''), verify_link.genre)`,
     [
       clean.map((r) => r.url), clean.map((r) => r.account),
       clean.map((r) => r.view_count), clean.map((r) => r.heart_count),
@@ -770,6 +857,7 @@ export async function saveVerifyLinks(rows: RawVerifyRow[]): Promise<number> {
       clean.map((r) => r.posted_date), clean.map((r) => r.title),
       clean.map((r) => r.bio),
       clean.map((r) => platformFromUrl(r.url)),
+      clean.map((r) => r.genre),
     ]
   )
   return rowCount ?? 0
@@ -780,6 +868,7 @@ function mapVerifyRow(r: Record<string, unknown>): VerifyLinkRow {
     url: String(r.url),
     account: r.account != null ? String(r.account) : null,
     platform: String(r.platform ?? 'tiktok'),
+    genre: isGenre(r.genre) ? r.genre : DEFAULT_GENRE,
     view_count: Number(r.view_count) || 0,
     heart_count: Number(r.heart_count) || 0,
     comment_count: Number(r.comment_count) || 0,
@@ -823,13 +912,15 @@ const VERIFY_PLATFORM_SQL = `
     WHEN lower(url) LIKE '%youtube.com%' OR lower(url) LIKE '%youtu.be%'
       THEN CASE WHEN lower(url) LIKE '%/shorts/%' THEN 'youtube_shorts'
                 ELSE 'youtube_videos' END
+    WHEN lower(url) LIKE '%reddit.com%' THEN 'reddit'
     ELSE 'tiktok'
   END`
 
 function verifyWhere(
   filter: TitleFilter,
   accounts: string[],
-  platform = ''
+  platform = '',
+  genre = ''
 ): { predicate: string; params: unknown[] } {
   const conds: string[] = []
   const params: unknown[] = []
@@ -840,6 +931,16 @@ function verifyWhere(
   if (plat) {
     params.push(plat)
     conds.push(`${VERIFY_PLATFORM_SQL} = $${params.length}`)
+  }
+
+  // COALESCED, not compared raw. Links staged before the column existed hold
+  // NULL and belong to the default genre — the same reading mapVerifyRow
+  // gives them — so filtering on 'humanizer' has to find them or the filter
+  // hides most of the list.
+  const gen = String(genre ?? '').trim()
+  if (gen) {
+    params.push(gen)
+    conds.push(`COALESCE(NULLIF(genre, ''), '${DEFAULT_GENRE}') = $${params.length}`)
   }
 
   const accs = Array.from(
@@ -857,10 +958,11 @@ export async function getVerifyLinks(
   offset: number,
   filter: TitleFilter = 'all',
   accounts: string[] = [],
-  platform = ''
+  platform = '',
+  genre = ''
 ): Promise<{ rows: VerifyLinkRow[]; total: number; totalAll: number }> {
   await ensureVerifyLinkTable()
-  const { predicate, params } = verifyWhere(filter, accounts, platform)
+  const { predicate, params } = verifyWhere(filter, accounts, platform, genre)
   const [pageRes, cntRes] = await Promise.all([
     pool.query(
       // GROUPED BY CHANNEL. A channel is judged as a whole — from its bio and
@@ -872,7 +974,7 @@ export async function getVerifyLinks(
       // which is the order the admin is working through, while still putting
       // each channel's links in one run. A channel wider than a page continues
       // onto the next one under the same heading.
-      `SELECT url, account, platform, view_count, heart_count, comment_count, share_count, posted_date, title, bio
+      `SELECT url, account, platform, genre, view_count, heart_count, comment_count, share_count, posted_date, title, bio
          FROM (
            SELECT *, min(added_at) OVER (PARTITION BY lower(coalesce(account, ''))) AS chan_first
              FROM verify_link WHERE ${predicate}
@@ -898,7 +1000,7 @@ export async function getVerifyLinksByUrls(urls: string[]): Promise<VerifyLinkRo
   if (urls.length === 0) return []
   await ensureVerifyLinkTable()
   const { rows } = await pool.query(
-    `SELECT url, account, platform, view_count, heart_count, comment_count, share_count, posted_date, title, bio
+    `SELECT url, account, platform, genre, view_count, heart_count, comment_count, share_count, posted_date, title, bio
        FROM verify_link WHERE url = ANY($1::text[])`,
     [urls]
   )
@@ -922,15 +1024,41 @@ export async function getVerifyPlatformCounts(): Promise<Record<string, number>>
   return out
 }
 
-/** Distinct channels in the verify list, with how many links each still has. */
-export async function getVerifyAccounts(): Promise<{ account: string; platform: string; n: number }[]> {
+/**
+ * How many verify links each genre holds.
+ *
+ * Same reason as the platform counts: the dropdown shows the numbers, so an
+ * option that would empty the page says so before it is picked. NULL counts as
+ * the default genre, matching both mapVerifyRow and the filter predicate — a
+ * link staged before the column existed is a humanizer link, not a link with no
+ * genre.
+ */
+export async function getVerifyGenreCounts(): Promise<Record<string, number>> {
   await ensureVerifyLinkTable()
+  const { rows } = await pool.query<{ g: string; n: number }>(
+    `SELECT COALESCE(NULLIF(genre, ''), '${DEFAULT_GENRE}') AS g, COUNT(*)::int AS n
+       FROM verify_link GROUP BY 1`
+  )
+  const out: Record<string, number> = {}
+  for (const r of rows) out[r.g] = r.n
+  return out
+}
+
+/** Distinct channels in the verify list, with how many links each still has. */
+export async function getVerifyAccounts(
+  /** Only links staged in this genre; every genre when omitted. */
+  genre?: string
+): Promise<{ account: string; platform: string; n: number }[]> {
+  await ensureVerifyLinkTable()
+  const g = genre && isGenre(genre) ? genre : null
   const { rows } = await pool.query<{ account: string; platform: string; n: number }>(
     `SELECT account, MIN(platform) AS platform, COUNT(*)::int AS n
        FROM verify_link
       WHERE account IS NOT NULL AND btrim(account) <> ''
+        AND ($1::text IS NULL OR COALESCE(NULLIF(genre, ''), '${DEFAULT_GENRE}') = $1::text)
       GROUP BY account
-      ORDER BY n DESC, account`
+      ORDER BY n DESC, account`,
+    [g]
   )
   return rows.map((r) => ({ account: r.account, platform: r.platform || 'tiktok', n: r.n }))
 }
@@ -954,7 +1082,7 @@ export async function getVerifyLinksByAccounts(accounts: string[]): Promise<Veri
   if (clean.length === 0) return []
   await ensureVerifyLinkTable()
   const { rows } = await pool.query(
-    `SELECT url, account, platform, view_count, heart_count, comment_count, share_count, posted_date, title, bio
+    `SELECT url, account, platform, genre, view_count, heart_count, comment_count, share_count, posted_date, title, bio
        FROM verify_link WHERE lower(account) = ANY($1::text[])`,
     [clean]
   )
@@ -975,11 +1103,204 @@ export async function getAllVerifyLinkUrls(): Promise<string[]> {
   return rows.map((r) => r.url)
 }
 
+/** Staged url → the genre it was staged under (its channel's). */
+export async function getVerifyLinkGenres(): Promise<Map<string, string>> {
+  await ensureVerifyLinkTable()
+  const { rows } = await pool.query<{ url: string; genre: string | null }>(
+    'SELECT url, genre FROM verify_link'
+  )
+  return new Map(rows.map((r) => [r.url, isGenre(r.genre) ? r.genre : DEFAULT_GENRE]))
+}
+
 // Wipe the entire verify-links staging list. Returns how many rows were removed.
 export async function clearVerifyLinks(): Promise<number> {
   await ensureVerifyLinkTable()
   const { rowCount } = await pool.query('DELETE FROM verify_link')
   return rowCount ?? 0
+}
+
+// ── Proving a worker owns their TikTok account ──────────────────────────
+//
+// One row per worker, written when the check runs. It stores the ANSWER and
+// the evidence behind it: which account, how old, what they actually
+// commented, and on which video — so a decision can be re-read months later
+// without re-running anything, and so rotating the video does not invalidate
+// the people already through.
+//
+// See lib/tiktokVerify.ts for what the statuses mean.
+let ensuredTiktokVerify: Promise<void> | null = null
+
+export function ensureTiktokVerifyTable(): Promise<void> {
+  if (!ensuredTiktokVerify) {
+    ensuredTiktokVerify = pool
+      .query(`
+        CREATE TABLE IF NOT EXISTS tiktok_verification (
+          user_id      TEXT PRIMARY KEY,
+          handle       TEXT NOT NULL,
+          status       TEXT NOT NULL,
+          uid          TEXT,
+          account_at   TIMESTAMPTZ,
+          age_days     INT,
+          comment_text TEXT,
+          video_url    TEXT,
+          checked_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        -- The admin list shows who is still waiting, which is a scan of the
+        -- ones that are NOT ok.
+        CREATE INDEX IF NOT EXISTS tiktok_verification_status_idx
+          ON tiktok_verification (status);
+      `)
+      .then(() => undefined)
+      .catch((e) => {
+        ensuredTiktokVerify = null
+        throw e
+      })
+  }
+  return ensuredTiktokVerify
+}
+
+export interface TiktokVerification {
+  handle: string
+  status: string
+  uid: string | null
+  accountAt: string | null
+  ageDays: number | null
+  commentText: string | null
+  videoUrl: string | null
+  checkedAt: string
+}
+
+export async function getTiktokVerification(userId: string): Promise<TiktokVerification | null> {
+  await ensureTiktokVerifyTable()
+  const { rows } = await pool.query(
+    `SELECT handle, status, uid, account_at::text AS account_at, age_days,
+            comment_text, video_url, checked_at::text AS checked_at
+       FROM tiktok_verification WHERE user_id = $1`,
+    [userId]
+  )
+  const r = rows[0]
+  if (!r) return null
+  return {
+    handle: String(r.handle ?? ''),
+    status: String(r.status ?? ''),
+    uid: r.uid ?? null,
+    accountAt: r.account_at ?? null,
+    ageDays: r.age_days ?? null,
+    commentText: r.comment_text ?? null,
+    videoUrl: r.video_url ?? null,
+    checkedAt: String(r.checked_at ?? ''),
+  }
+}
+
+/** Write the outcome, replacing whatever was there. */
+export async function saveTiktokVerification(
+  userId: string,
+  v: {
+    handle: string
+    status: string
+    uid: string | null
+    accountAt: Date | null
+    ageDays: number | null
+    commentText: string
+    videoUrl: string
+  }
+): Promise<void> {
+  await ensureTiktokVerifyTable()
+  await pool.query(
+    `INSERT INTO tiktok_verification
+       (user_id, handle, status, uid, account_at, age_days, comment_text, video_url, checked_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+     ON CONFLICT (user_id) DO UPDATE SET
+       handle = EXCLUDED.handle, status = EXCLUDED.status, uid = EXCLUDED.uid,
+       account_at = EXCLUDED.account_at, age_days = EXCLUDED.age_days,
+       comment_text = EXCLUDED.comment_text, video_url = EXCLUDED.video_url,
+       checked_at = now()`,
+    [userId, v.handle, v.status, v.uid, v.accountAt, v.ageDays, v.commentText, v.videoUrl]
+  )
+}
+
+/** Everyone's verification, for the admin list. */
+export async function getTiktokVerifications(): Promise<Record<string, TiktokVerification>> {
+  await ensureTiktokVerifyTable()
+  const { rows } = await pool.query(
+    `SELECT user_id, handle, status, uid, account_at::text AS account_at, age_days,
+            comment_text, video_url, checked_at::text AS checked_at
+       FROM tiktok_verification`
+  )
+  const out: Record<string, TiktokVerification> = {}
+  for (const r of rows) {
+    out[String(r.user_id)] = {
+      handle: String(r.handle ?? ''),
+      status: String(r.status ?? ''),
+      uid: r.uid ?? null,
+      accountAt: r.account_at ?? null,
+      ageDays: r.age_days ?? null,
+      commentText: r.comment_text ?? null,
+      videoUrl: r.video_url ?? null,
+      checkedAt: String(r.checked_at ?? ''),
+    }
+  }
+  return out
+}
+
+/**
+ * The video workers must comment on, and where it is set.
+ *
+ * A SETTING, not a constant, because one video cannot serve forever: the
+ * comment list is ranked and only a few hundred deep, so once it is busy a new
+ * worker's comment stops being findable. Rotating to a fresh video fixes that,
+ * and the rows above remember which video each worker was checked against.
+ */
+const VERIFY_VIDEO_KEY = 'verify_video_url'
+
+export async function getVerifyVideoUrl(): Promise<string> {
+  const v = await getAppState(VERIFY_VIDEO_KEY).catch(() => null)
+  return (v ?? '').trim() || VERIFY_VIDEO_URL
+}
+
+/**
+ * How old a TikTok account must be, in days, before it may be used.
+ *
+ * A SETTING, because the right number is a judgement about the market rather
+ * than a fact about the code: three months is where it starts, and the person
+ * watching how many new accounts turn up is the one who should be able to move
+ * it without a deploy.
+ *
+ * Clamped to something sane. Zero would switch the rule off while leaving the
+ * page claiming to enforce it, and a number in the thousands would refuse
+ * everybody — both are easier to type than to notice.
+ */
+const MIN_AGE_KEY = 'verify_min_account_age_days'
+export const MIN_AGE_FLOOR = 0
+export const MIN_AGE_CEILING = 3650
+
+export async function getMinAccountAgeDays(): Promise<number> {
+  const raw = await getAppState(MIN_AGE_KEY).catch(() => null)
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < MIN_AGE_FLOOR || n > MIN_AGE_CEILING) {
+    return VERIFY_MIN_AGE_DAYS
+  }
+  return Math.floor(n)
+}
+
+export async function setMinAccountAgeDays(days: number): Promise<number> {
+  const n = Math.floor(Number(days))
+  if (!Number.isFinite(n) || n < MIN_AGE_FLOOR || n > MIN_AGE_CEILING) {
+    throw new Error(
+      `The minimum age must be between ${MIN_AGE_FLOOR} and ${MIN_AGE_CEILING} days.`
+    )
+  }
+  await setAppState(MIN_AGE_KEY, String(n))
+  return n
+}
+
+export async function setVerifyVideoUrl(url: string): Promise<string> {
+  const clean = String(url ?? '').trim()
+  if (!/^https:\/\/(www\.)?tiktok\.com\/@[^/]+\/(video|photo)\/\d+/.test(clean)) {
+    throw new Error('That is not a TikTok video link.')
+  }
+  await setAppState(VERIFY_VIDEO_KEY, clean)
+  return clean
 }
 
 // ── Per-user state snapshots (taken when marking a user paid, before reset) ───
@@ -1068,7 +1389,13 @@ export async function getRetiredUrls(threshold: number): Promise<string[]> {
 // Distinct-user click count per URL (one clicked_link row per user, so COUNT(*)
 // == distinct users). Used by the admin links page to show each link's progress
 // toward the retire-after-N-users quota and to list "finished" (retired) links.
-export async function getClickCountsByUrl(): Promise<Record<string, number>> {
+export function getClickCountsByUrl(): Promise<Record<string, number>> {
+  // Cached: see lib/poolCache. This is a whole-table read and it used to
+  // run on every request that touched the link pool.
+  return cached('clickCounts', TTL.clicks, getClickCountsByUrlUncached)
+}
+
+async function getClickCountsByUrlUncached(): Promise<Record<string, number>> {
   await ensureClickedTable()
   // Exclude debug/admin accounts so their test clicks don't count toward the
   // retire quota (or the admin "clicked by" count).
@@ -1326,7 +1653,13 @@ export async function getClickCountsByUrlForProduct(
 
 // Distinct-user click counts per URL, grouped by product — { product: { url: n } }.
 // Used by the admin links page so retirement can be inspected per product.
-export async function getClickCountsByProductAndUrl(): Promise<Record<string, Record<string, number>>> {
+export function getClickCountsByProductAndUrl(): Promise<Record<string, Record<string, number>>> {
+  // Cached: see lib/poolCache. This is a whole-table read and it used to
+  // run on every request that touched the link pool.
+  return cached('clickCountsByProduct', TTL.clicks, getClickCountsByProductAndUrlUncached)
+}
+
+async function getClickCountsByProductAndUrlUncached(): Promise<Record<string, Record<string, number>>> {
   await Promise.all([ensureClickedTable(), ensureAdminTables()])
   await backfillClickProducts().catch(() => {})
   const { rows } = await pool.query<{ product: string; url: string; n: number }>(
@@ -1375,6 +1708,9 @@ export async function getUnrelatedUrls(userId: string): Promise<string[]> {
 // Admin: clear every "unrelated" flag on a URL (the link is actually fine).
 // Returns how many flags were removed.
 export async function clearUnrelatedLink(url: string): Promise<number> {
+  // The table behind these cached reads is about to change; the next
+  // reader rebuilds rather than being served last minute's answer.
+  invalidate('unrelatedCounts')
   await ensureClickedTable()
   const { rowCount } = await pool.query('DELETE FROM unrelated_link WHERE url = $1', [url])
   return rowCount ?? 0
@@ -1383,33 +1719,49 @@ export async function clearUnrelatedLink(url: string): Promise<number> {
 // ── Permanent block list ─────────────────────────────────────────────────────
 // Admin: block a URL forever. It's filtered out of every user's list at serve
 // time, so re-uploading videos.json can never bring it back. Not a delete.
-export async function blockLink(url: string): Promise<void> {
-  await ensureClickedTable()
-  await pool.query(
-    `INSERT INTO blocked_link (url) VALUES ($1) ON CONFLICT (url) DO NOTHING`,
-    [url]
-  )
+//
+// PER GENRE. Every write says which genre's pool the block is for; nothing here
+// can block a link for every genre at once. `genre` is either one genre for all
+// the URLs, or a lookup per URL. Omitted, each URL takes the genre the pool
+// files it under — which is what "block this link" means on the Links page.
+type GenreFor = string | ((url: string) => string | undefined)
+
+async function resolveGenres(urls: string[], genre?: GenreFor): Promise<string[]> {
+  if (typeof genre === 'string') return urls.map(() => (isGenre(genre) ? genre : DEFAULT_GENRE))
+  const index = genre ? null : await getPoolGenreIndex()
+  return urls.map((u) => {
+    const g = genre ? genre(u) : index!.get(u)
+    return isGenre(g) ? g : DEFAULT_GENRE
+  })
+}
+
+export async function blockLink(url: string, genre?: GenreFor): Promise<void> {
+  await blockLinks([url], genre)
 }
 
 // Admin: block many URLs at once (bulk "block all filtered"). Also clears any
 // unrelated flags on them. Returns how many new blocks were added.
-export async function blockLinks(urls: string[]): Promise<number> {
+export async function blockLinks(urls: string[], genre?: GenreFor): Promise<number> {
+  // The table behind these cached reads is about to change; the next
+  // reader rebuilds rather than being served last minute's answer.
+  invalidate('blockedUrls')
   const clean = urls.map((u) => String(u).trim()).filter(Boolean)
   if (clean.length === 0) return 0
   await ensureClickedTable()
+  const genres = await resolveGenres(clean, genre)
   const { rowCount } = await pool.query(
-    `INSERT INTO blocked_link (url) SELECT unnest($1::text[]) ON CONFLICT (url) DO NOTHING`,
-    [clean]
+    `INSERT INTO blocked_link (url, genre) SELECT * FROM unnest($1::text[], $2::text[])
+     ON CONFLICT (url, genre) DO NOTHING`,
+    [clean, genres]
   )
   await pool.query('DELETE FROM unrelated_link WHERE url = ANY($1::text[])', [clean]).catch(() => {})
   return rowCount ?? 0
 }
 
 // Admin: lift a permanent block (the link may appear again if it's in the pool).
-export async function unblockLink(url: string): Promise<number> {
-  await ensureClickedTable()
-  const { rowCount } = await pool.query('DELETE FROM blocked_link WHERE url = $1', [url])
-  return rowCount ?? 0
+// The block for the genre the pool files it under, unless one is named.
+export async function unblockLink(url: string, genre?: GenreFor): Promise<number> {
+  return unblockLinks([url], genre ?? ((await resolveGenres([url]))[0]))
 }
 
 // ── Link comment scans ───────────────────────────────────────────────────────
@@ -1447,7 +1799,13 @@ export interface ScanCoverage {
   complete: boolean
 }
 
-export async function getScanCoverage(): Promise<Record<string, ScanCoverage>> {
+export function getScanCoverage(): Promise<Record<string, ScanCoverage>> {
+  // Cached: see lib/poolCache. This is a whole-table read and it used to
+  // run on every request that touched the link pool.
+  return cached('scanCoverage', TTL.scan, getScanCoverageUncached)
+}
+
+async function getScanCoverageUncached(): Promise<Record<string, ScanCoverage>> {
   await ensureClickedTable()
   const { rows } = await pool.query<{
     url: string
@@ -1613,8 +1971,20 @@ export async function saveLinkScan(scan: {
   topText: string | null
   topUser: string | null
   topLikes: number | null
-  hits: { product: string; rank: number; likes: number; username: string; text: string }[]
+  hits: {
+    product: string
+    rank: number
+    likes: number
+    username: string
+    text: string
+    postedAt?: string | null
+  }[]
 }): Promise<void> {
+  // The table behind these cached reads is about to change; the next
+  // reader rebuilds rather than being served last minute's answer.
+  invalidate('scanCoverage')
+  invalidate('ourCountsByUrl')
+  invalidate('urlsWithOurs')
   await ensureClickedTable()
   await pool.query(
     `INSERT INTO link_comment_scan
@@ -1635,15 +2005,20 @@ export async function saveLinkScan(scan: {
   await pool.query('DELETE FROM link_product_comment WHERE url = $1', [scan.url])
   if (scan.hits.length > 0) {
     await pool.query(
-      `INSERT INTO link_product_comment (url, product, rank, likes, username, text)
-       SELECT $1, p, r, l, u, t
-         FROM unnest($2::text[], $3::int[], $4::int[], $5::text[], $6::text[])
-              AS x(p, r, l, u, t)
+      `INSERT INTO link_product_comment (url, product, rank, likes, username, text, posted_at)
+       SELECT $1, p, r, l, u, t, d::timestamptz
+         FROM unnest($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[])
+              AS x(p, r, l, u, t, d)
        ON CONFLICT (url, product, rank) DO UPDATE SET
-         likes = EXCLUDED.likes, username = EXCLUDED.username, text = EXCLUDED.text`,
+         likes = EXCLUDED.likes, username = EXCLUDED.username, text = EXCLUDED.text,
+         -- COALESCE, so a read that came back without a date does not erase one
+         -- an earlier read captured. The date is a fact about the comment; our
+         -- failure to see it this time is a fact about the request.
+         posted_at = COALESCE(EXCLUDED.posted_at, link_product_comment.posted_at)`,
       [scan.url, scan.hits.map((h) => h.product), scan.hits.map((h) => h.rank),
        scan.hits.map((h) => h.likes), scan.hits.map((h) => h.username),
-       scan.hits.map((h) => h.text.slice(0, 300))]
+       scan.hits.map((h) => h.text.slice(0, 300)),
+       scan.hits.map((h) => h.postedAt ?? null)]
     )
   }
 }
@@ -1682,9 +2057,22 @@ export async function saveLinkScan(scan: {
  * omitted means every scanned link. BOTH HALVES ARE SCOPED THE SAME WAY, or a
  * cluster-scoped found count against a pool-wide served count would read as a
  * collapse in yield that is really just a smaller numerator.
+ *
+ * `days` narrows it in TIME, and the same rule applies to both halves: served
+ * counts only clicks inside the window, found counts only links whose last scan
+ * falls inside it.
+ *
+ * WHAT "FOUND IN THE LAST 30 DAYS" MEANS. The comment's own posting date, from
+ * TikTok's create_time, which the scan now stores. Rows written before that
+ * existed have no posted_at, and those fall back to the date their link was last
+ * scanned — the best available answer, and the only one there used to be.
+ *
+ * The served side is filtered on the click that served it, so the two halves are
+ * about the same period even though they are measured on different clocks: one is
+ * when the comment went up, the other when we handed it out.
  */
 export async function getProductCommentTally(
-  opts: { urls?: string[]; limit?: number } = {}
+  opts: { urls?: string[]; limit?: number; days?: number; product?: string; products?: string[] } = {}
 ): Promise<{
   rows: {
     text: string
@@ -1697,9 +2085,23 @@ export async function getProductCommentTally(
     bestRank: number | null
     likes: number
     accounts: number
+    /** How many of those accounts are our own workers. */
+    ourAccounts: number
+    /** Rows posted by one of our workers, out of `hits`. */
+    byWorkers: number
     lastSeen: string | null
-    /** How many times this comment was handed to a worker. */
+    /**
+     * When the newest copy of this comment was POSTED, from TikTok's own
+     * create_time. Null on rows written before the scan stored it.
+     */
+    lastPosted: string | null
+    /** How many times this comment was handed to a worker, inside the window. */
     served: number
+    /** The same with no time limit, so "none in this window" is distinguishable
+     *  from "never". Equal to `served` when there is no window. */
+    servedEver: number
+    /** When it was last handed out, at any time. */
+    servedLast: string | null
     /** links / served, as a percentage. null when it was never served. */
     ratio: number | null
   }[]
@@ -1708,16 +2110,58 @@ export async function getProductCommentTally(
   links: number
   /** Comments served for these links in total. */
   served: number
+  /** Of `hits`, how many were posted by one of our own workers. */
+  byWorkers: number
+  /**
+   * Rows a window had to leave out because nothing records when they were
+   * posted. Zero when no window is on, since then nothing is excluded.
+   */
+  undated: number
 }> {
   await ensureClickedTable()
   const urls = (opts.urls ?? []).filter((u) => typeof u === 'string' && u)
   const limit = Math.max(1, Math.min(2000, opts.limit ?? 500))
-  const where = urls.length ? 'WHERE c.url = ANY($1::text[])' : ''
+  // 0 or absent means all time. Clamped so a hand-edited query cannot ask for a
+  // window the planner has to think about.
+  const days = Math.max(0, Math.min(3650, Math.round(opts.days ?? 0)))
+  const since = days > 0 ? `now() - interval '${days} days'` : ''
+  const conds: string[] = []
+  if (urls.length) conds.push('c.url = ANY($1::text[])')
+  // ONE PRODUCT, when asked. The rows are per (url, product, rank), so this is a
+  // plain filter — and it has to be a filter rather than a post-hoc pick, or a
+  // comment naming two products would be counted under both and ranked twice.
+  const product = String(opts.product ?? '').trim()
+  if (product) conds.push(`c.product = ${quoteLiteral(product)}`)
+  // ONE GENRE'S PRODUCTS — the admin's master switch. On the comment rows and
+  // on the served half alike, so the ratio compares like with like.
+  const inProducts = opts.products?.length
+    ? `IN (${opts.products.map((p) => quoteLiteral(p)).join(', ')})`
+    : ''
+  if (inProducts) conds.push(`c.product ${inProducts}`)
+  const servedProducts = inProducts ? ` AND k.product ${inProducts}` : ''
+  // THE COMMENT'S OWN DATE, AND ONLY THAT. This used to fall back to the link's
+  // last scan where posted_at was missing, which quietly broke the promise the
+  // dropdown makes: a comment posted on 18 August sat in a 7-day window because
+  // its link had been scanned yesterday. A date we do not have is not evidence of
+  // recency, so an undated row is simply out of a windowed view — and back in it
+  // the moment an extract fills its date, which is self-healing.
+  if (since) conds.push(`c.posted_at >= ${since}`)
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
   const args: unknown[] = urls.length ? [urls, limit] : [limit]
   const lim = urls.length ? '$2' : '$1'
   // Served counts, grouped the same way and scoped the same way, so the two
   // halves of the ratio are about the same links.
-  const servedWhere = urls.length ? 'AND k.url = ANY($1::text[])' : ''
+  //
+  // TWO OF THEM WHEN A WINDOW IS ON. "Served 0 times" inside a 7-day window is
+  // not the same statement as "never handed to anybody", and the page cannot tell
+  // them apart from one number. On the real table a 7-day window holds 2,825
+  // comments, 2,146 of which have no serving inside it — but 722 of those were
+  // served before it, some of them hundreds of times. Calling those "not served"
+  // is simply false.
+  const servedWhere =
+    (urls.length ? 'AND k.url = ANY($1::text[])' : '') +
+    servedProducts +
+    (since ? ` AND k.clicked_at >= ${since}` : '')
   const { rows } = await pool.query<{
     text: string
     links: string
@@ -1726,14 +2170,38 @@ export async function getProductCommentTally(
     best_rank: number | null
     likes: string
     accounts: string
+    our_accounts: string
+    by_workers: string
     last_seen: Date | null
+    last_posted: Date | null
     served: string
+    served_ever: string
+    served_last: Date | null
   }>(
-    `WITH served AS (
+    `WITH workers AS (
+       -- The @handles of our own workers, from their profiles. A comment is
+       -- "ours" in this table because its TEXT names a product, which says
+       -- nothing about who typed it — and the difference is the whole answer to
+       -- "why does this say never served". Measured on the real table: of 19,809
+       -- rows, 6,886 were posted by our workers and 12,923 by other accounts
+       -- entirely, and 2,370 of the workers' own were text the app never served
+       -- them.
+       SELECT DISTINCT lower(substring(p.tiktok_url from '@([^/?#]+)')) AS handle
+         FROM user_profile p WHERE p.tiktok_url IS NOT NULL
+     ), served AS (
        SELECT lower(btrim(k.served_comment)) AS key, count(*) AS n
          FROM clicked_link k
         WHERE k.served_comment IS NOT NULL AND btrim(k.served_comment) <> ''
           ${servedWhere}
+        GROUP BY lower(btrim(k.served_comment))
+     ), served_ever AS (
+       -- The same count with the DATE filter off, so a row can say "served
+       -- earlier" instead of "never served".
+       SELECT lower(btrim(k.served_comment)) AS key, count(*) AS n,
+              max(k.clicked_at) AS last_at
+         FROM clicked_link k
+        WHERE k.served_comment IS NOT NULL AND btrim(k.served_comment) <> ''
+          ${urls.length ? 'AND k.url = ANY($1::text[])' : ''}${servedProducts}
         GROUP BY lower(btrim(k.served_comment))
      )
      SELECT min(c.text) AS text,
@@ -1743,11 +2211,19 @@ export async function getProductCommentTally(
             min(c.rank) AS best_rank,
             sum(c.likes) AS likes,
             count(DISTINCT lower(c.username)) AS accounts,
+            count(DISTINCT lower(c.username)) FILTER (WHERE w.handle IS NOT NULL)
+              AS our_accounts,
+            count(*) FILTER (WHERE w.handle IS NOT NULL) AS by_workers,
             max(s.scanned_at) AS last_seen,
-            coalesce(max(v.n), 0) AS served
+            max(c.posted_at) AS last_posted,
+            coalesce(max(v.n), 0) AS served,
+            coalesce(max(e.n), 0) AS served_ever,
+            max(e.last_at) AS served_last
        FROM link_product_comment c
        LEFT JOIN link_comment_scan s ON s.url = c.url
        LEFT JOIN served v ON v.key = lower(btrim(c.text))
+       LEFT JOIN served_ever e ON e.key = lower(btrim(c.text))
+       LEFT JOIN workers w ON w.handle = lower(c.username)
        ${where}
       GROUP BY lower(btrim(c.text))
       ORDER BY count(DISTINCT c.url) DESC, count(*) DESC, min(c.text)
@@ -1756,24 +2232,49 @@ export async function getProductCommentTally(
   )
   // The totals are over the whole set, not the page of rows returned, or a
   // truncated list would report a truncated total.
-  const { rows: tot } = await pool.query<{ distinct: string; hits: string; links: string }>(
-    `SELECT count(DISTINCT lower(btrim(c.text))) AS distinct,
+  const { rows: tot } = await pool.query<{
+    distinct: string
+    hits: string
+    links: string
+    by_workers: string
+  }>(
+    `WITH workers AS (
+       SELECT DISTINCT lower(substring(p.tiktok_url from '@([^/?#]+)')) AS handle
+         FROM user_profile p WHERE p.tiktok_url IS NOT NULL
+     )
+     SELECT count(DISTINCT lower(btrim(c.text))) AS distinct,
             count(*) AS hits,
-            count(DISTINCT c.url) AS links
+            count(DISTINCT c.url) AS links,
+            count(*) FILTER (WHERE w.handle IS NOT NULL) AS by_workers
        FROM link_product_comment c
-       ${urls.length ? 'WHERE c.url = ANY($1::text[])' : ''}`,
+       ${since ? 'LEFT JOIN link_comment_scan s ON s.url = c.url' : ''}
+       LEFT JOIN workers w ON w.handle = lower(c.username)
+       ${where}`,
     urls.length ? [urls] : []
   )
+  // How many rows the window had to hold back for want of a date. Reported, not
+  // hidden: a count that silently shrinks is a count nobody can trust.
+  const { rows: und } = since
+    ? await pool.query<{ n: string }>(
+        `SELECT count(*) AS n FROM link_product_comment c
+          WHERE c.posted_at IS NULL
+            ${urls.length ? 'AND c.url = ANY($1::text[])' : ''}
+            ${inProducts ? `AND c.product ${inProducts}` : ''}`,
+        urls.length ? [urls] : []
+      )
+    : { rows: [{ n: '0' }] }
   const { rows: srv } = await pool.query<{ served: string }>(
     `SELECT count(*) AS served FROM clicked_link k
       WHERE k.served_comment IS NOT NULL AND btrim(k.served_comment) <> ''
-        ${urls.length ? 'AND k.url = ANY($1::text[])' : ''}`,
+        ${urls.length ? 'AND k.url = ANY($1::text[])' : ''}${servedProducts}
+        ${since ? `AND k.clicked_at >= ${since}` : ''}`,
     urls.length ? [urls] : []
   )
   return {
     rows: rows.map((r) => {
       const links = Number(r.links)
       const served = Number(r.served ?? 0)
+      const servedEver = Number(r.served_ever ?? 0)
       return {
         text: r.text,
         links,
@@ -1782,8 +2283,13 @@ export async function getProductCommentTally(
         bestRank: r.best_rank,
         likes: Number(r.likes ?? 0),
         accounts: Number(r.accounts ?? 0),
+        ourAccounts: Number(r.our_accounts ?? 0),
+        byWorkers: Number(r.by_workers ?? 0),
         lastSeen: r.last_seen ? r.last_seen.toISOString() : null,
+        lastPosted: r.last_posted ? r.last_posted.toISOString() : null,
         served,
+        servedEver,
+        servedLast: r.served_last ? r.served_last.toISOString() : null,
         // NULL, NOT ZERO, when it was never handed out: the liker posts comments
         // of its own, and "no yield" is a different statement from "never tried".
         ratio: served > 0 ? Math.round((100 * links) / served) : null,
@@ -1793,30 +2299,383 @@ export async function getProductCommentTally(
     hits: Number(tot[0]?.hits ?? 0),
     links: Number(tot[0]?.links ?? 0),
     served: Number(srv[0]?.served ?? 0),
+    byWorkers: Number(tot[0]?.by_workers ?? 0),
+    undated: Number(und[0]?.n ?? 0),
   }
 }
 
+// ── SOLVING A CAPTCHA FROM A PHONE, ANYWHERE ────────────────────────────────
+//
+// The liker runs headless on one machine at home. When TikTok puts a rotation
+// puzzle in front of an account the run stops dead: the comment list renders as
+// grey placeholders, the account stays signed in, and every symptom points at
+// the DOM while none of them is the cause. Somebody has to drag a slider, and
+// the wait gives up after a few minutes whether anyone noticed or not.
+//
+// Until now the only answer was to be at that machine. This table is the relay
+// that removes that: the worker posts the puzzle here and polls for a verdict,
+// and /admin/captcha — this app, already on the internet, already behind the
+// admin login — shows it on a phone and sends the answer back.
+//
+// WHY THROUGH HERE rather than opening the liker's own control panel to the
+// internet. That panel can start browsers signed in to real accounts and post
+// public comments, and it binds to localhost for exactly that reason. This app
+// is already deployed, already HTTPS, and already refuses anyone who is not the
+// admin, so the phone needs no tunnel, no port forwarding and no new door into
+// the house.
+//
+// THE PAYLOADS ARE SMALL AND SHORT-LIVED. Two base64 images of a hundred-odd
+// pixels square, or one screenshot of the widget; tens of kilobytes, deleted as
+// soon as the worker has read the answer, and pruned after an hour regardless.
+// Nothing here is history worth keeping — an unanswered puzzle is stale within
+// minutes, because the run it was blocking has long since moved on.
+let captchaReady: Promise<void> | null = null
+
+export function ensureCaptchaTable(): Promise<void> {
+  if (!captchaReady) {
+    captchaReady = pool
+      .query(`
+        CREATE TABLE IF NOT EXISTS captcha_request (
+          id          TEXT PRIMARY KEY,
+          -- Which account is stuck. Nine can be running at once and the answer
+          -- has to go back to the right browser.
+          profile     TEXT NOT NULL,
+          -- 'rotate' is the disc-and-annulus puzzle, which one number solves.
+          -- Anything else needs taps on a picture, so the payload differs.
+          kind        TEXT NOT NULL,
+          instruction TEXT NOT NULL DEFAULT '',
+          -- rotate: the two images TikTok sent, base64, as the widget got them.
+          outer_b64   TEXT,
+          inner_b64   TEXT,
+          -- other kinds: a screenshot of the widget, and its size in CSS pixels
+          -- so a tap at a fraction of the picture maps back to a real click.
+          shot_b64    TEXT,
+          box_w       DOUBLE PRECISION,
+          box_h       DOUBLE PRECISION,
+          -- {"angle":n} | {"points":[[x,y]…]} | {"refresh":true} | {"give_up":true}
+          answer      JSONB,
+          created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+          answered_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS captcha_request_open
+          ON captcha_request (created_at DESC);
+      `)
+      .then(() => undefined)
+  }
+  return captchaReady
+}
+
+export interface CaptchaRequest {
+  id: string
+  profile: string
+  kind: string
+  instruction: string
+  outer: string | null
+  inner: string | null
+  shot: string | null
+  boxW: number | null
+  boxH: number | null
+  answer: unknown | null
+  createdAt: string
+  answeredAt: string | null
+}
+
+function captchaRow(r: {
+  id: string
+  profile: string
+  kind: string
+  instruction: string
+  outer_b64: string | null
+  inner_b64: string | null
+  shot_b64: string | null
+  box_w: string | number | null
+  box_h: string | number | null
+  answer: unknown
+  created_at: Date
+  answered_at: Date | null
+}): CaptchaRequest {
+  return {
+    id: r.id,
+    profile: r.profile,
+    kind: r.kind,
+    instruction: r.instruction ?? '',
+    outer: r.outer_b64,
+    inner: r.inner_b64,
+    shot: r.shot_b64,
+    boxW: r.box_w === null ? null : Number(r.box_w),
+    boxH: r.box_h === null ? null : Number(r.box_h),
+    answer: r.answer ?? null,
+    createdAt: r.created_at.toISOString(),
+    answeredAt: r.answered_at ? r.answered_at.toISOString() : null,
+  }
+}
+
+/**
+ * An hour is generous and still finite.
+ *
+ * Called from the write paths rather than on a schedule: there is no cron here
+ * that runs often enough to matter, and the table is only ever touched while a
+ * run is actually blocked.
+ */
+export async function pruneCaptchaRequests(): Promise<number> {
+  await ensureCaptchaTable()
+  const { rowCount } = await pool.query(
+    `DELETE FROM captcha_request WHERE created_at < now() - interval '1 hour'`
+  )
+  return rowCount ?? 0
+}
+
+/** Put one puzzle up for a person to look at. Returns its id. */
+export async function createCaptchaRequest(v: {
+  profile: string
+  kind: string
+  instruction?: string
+  outer?: string | null
+  inner?: string | null
+  shot?: string | null
+  boxW?: number | null
+  boxH?: number | null
+}): Promise<string> {
+  await ensureCaptchaTable()
+  await pruneCaptchaRequests().catch(() => 0)
+  // The id carries the profile and the minute, which makes a stuck row readable
+  // in the table without a join, and the random tail keeps two puzzles on one
+  // account in one minute apart.
+  const id =
+    `${v.profile}-${Date.now().toString(36)}-` +
+    Math.random().toString(36).slice(2, 8)
+  // ONE OPEN PUZZLE PER ACCOUNT. A profile that met a captcha, timed out and met
+  // another would otherwise leave the first on the page, and answering the wrong
+  // one sends a drag to a browser that has moved on.
+  await pool.query(`DELETE FROM captcha_request WHERE profile = $1 AND answer IS NULL`, [
+    v.profile,
+  ])
+  await pool.query(
+    `INSERT INTO captcha_request
+       (id, profile, kind, instruction, outer_b64, inner_b64, shot_b64, box_w, box_h)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    [
+      id,
+      v.profile,
+      v.kind,
+      v.instruction ?? '',
+      v.outer ?? null,
+      v.inner ?? null,
+      v.shot ?? null,
+      v.boxW ?? null,
+      v.boxH ?? null,
+    ]
+  )
+  return id
+}
+
+/** One puzzle, for the worker polling its own or the page rendering it. */
+export async function getCaptchaRequest(id: string): Promise<CaptchaRequest | null> {
+  await ensureCaptchaTable()
+  const { rows } = await pool.query(
+    `SELECT * FROM captcha_request WHERE id = $1`,
+    [id]
+  )
+  return rows[0] ? captchaRow(rows[0]) : null
+}
+
+/**
+ * Everything waiting on a person, newest first.
+ *
+ * Answered rows come too, briefly: the page has to be able to say "sent" rather
+ * than have the card vanish the instant Submit is pressed, which reads as the
+ * answer having been lost.
+ */
+export async function listCaptchaRequests(): Promise<CaptchaRequest[]> {
+  await ensureCaptchaTable()
+  await pruneCaptchaRequests().catch(() => 0)
+  const { rows } = await pool.query(
+    `SELECT * FROM captcha_request
+      WHERE created_at > now() - interval '15 minutes'
+      ORDER BY created_at DESC LIMIT 12`
+  )
+  return rows.map(captchaRow)
+}
+
+/** Save what the person decided. False when that puzzle is already gone. */
+export async function answerCaptchaRequest(id: string, answer: unknown): Promise<boolean> {
+  await ensureCaptchaTable()
+  const { rowCount } = await pool.query(
+    `UPDATE captcha_request
+        SET answer = $2::jsonb, answered_at = now()
+      WHERE id = $1 AND answer IS NULL`,
+    [id, JSON.stringify(answer)]
+  )
+  return (rowCount ?? 0) > 0
+}
+
+/**
+ * The worker has read the answer and acted on it, so the row is finished.
+ *
+ * Deleted rather than flagged: the only reader is gone, the images are the
+ * biggest thing in the table, and a "done" row on the page is one more thing to
+ * scroll past while another account is stuck.
+ */
+export async function closeCaptchaRequest(id: string): Promise<void> {
+  await ensureCaptchaTable()
+  await pool.query(`DELETE FROM captcha_request WHERE id = $1`, [id])
+}
+
 /** Which links carry one exact comment, newest scan first. */
+/**
+ * Links carrying a comment of ours with no posting date, oldest scan first.
+ *
+ * A row has no date only because it was written before the scan learned to keep
+ * one; re-reading the link fills it, since the date comes from TikTok rather than
+ * from our clock. So this is not a repair of bad data — it is the same extract,
+ * aimed at exactly the links that would benefit.
+ *
+ * OLDEST SCAN FIRST, because those are also the links whose comment list is most
+ * out of date: the pass that fills the dates re-reads the comments as it goes,
+ * so the least-recently-checked link gets the most out of it.
+ *
+ * `urls` scopes it to the page's current filter; empty means everywhere.
+ */
+/**
+ * The best comments this product has, by whichever measure the admin chose.
+ *
+ * SAME NUMBERS AS THE FREQUENCY MODAL, deliberately: this is that list, filtered
+ * to one product and cut to the top N. If serving is going to be driven by a
+ * ranking, the ranking has to be the one the admin can see and argue with.
+ *
+ *   links     how many videos carry it — reach
+ *   ratio     how often a serving ends up on the link — yield
+ *   balanced  half of each, normalised against the best in the list, because a
+ *             count that runs to 200 and a percentage under 30 do not add
+ *
+ * Cached, because it is two grouped scans and a click cannot wait for them.
+ */
+export async function getTopCommentsForProduct(
+  product: string,
+  opt: TopListSetting
+): Promise<{ text: string; links: number; ratio: number | null; served: number }[]> {
+  const key = `topComments:${product}:${opt.rank}:${opt.days}:${opt.count}`
+  return cached(key, TTL.scan, async () => {
+    const t = await getProductCommentTally({
+      product,
+      days: opt.days,
+      limit: 1000,
+    }).catch(() => null)
+    const rows = t?.rows ?? []
+    // A ratio needs enough servings to mean anything; below that a comment is
+    // ranked on reach alone rather than on a coin toss.
+    const RATED = 20
+    const rated = rows.filter((r) => r.served >= RATED && r.ratio !== null)
+    const maxLinks = Math.max(1, ...rated.map((r) => r.links))
+    const maxPct = Math.max(1, ...rated.map((r) => r.ratio ?? 0))
+    const pool =
+      opt.rank === 'links'
+        ? rows.slice().sort((a, b) => b.links - a.links)
+        : rated
+            .slice()
+            .sort((a, b) =>
+              opt.rank === 'ratio'
+                ? (b.ratio ?? 0) - (a.ratio ?? 0) || b.links - a.links
+                : 0.5 * (b.links / maxLinks) +
+                  0.5 * ((b.ratio ?? 0) / maxPct) -
+                  (0.5 * (a.links / maxLinks) + 0.5 * ((a.ratio ?? 0) / maxPct))
+            )
+    // A ranking with nothing in it must not silently serve nothing: the caller
+    // falls back to the written bank, which is what an empty list means.
+    return pool.slice(0, opt.count).map((r) => ({
+      text: r.text,
+      links: r.links,
+      ratio: r.ratio,
+      served: r.served,
+    }))
+  })
+}
+
+export async function getUrlsMissingCommentDates(
+  opts: { urls?: string[]; limit?: number } = {}
+): Promise<string[]> {
+  await ensureClickedTable()
+  const urls = (opts.urls ?? []).filter((u) => typeof u === 'string' && u)
+  const limit = Math.max(1, Math.min(500, opts.limit ?? 60))
+  const { rows } = await pool.query<{ url: string }>(
+    `SELECT c.url
+       FROM link_product_comment c
+       LEFT JOIN link_comment_scan s ON s.url = c.url
+      WHERE c.posted_at IS NULL
+        ${urls.length ? 'AND c.url = ANY($1::text[])' : ''}
+      GROUP BY c.url, s.scanned_at
+      ORDER BY s.scanned_at NULLS FIRST
+      LIMIT ${urls.length ? '$2' : '$1'}`,
+    urls.length ? [urls, limit] : [limit]
+  )
+  return rows.map((r) => r.url)
+}
+
+/** How many comment rows still have no posting date, and on how many links. */
+export async function countMissingCommentDates(
+  urls: string[] = []
+): Promise<{ rows: number; links: number }> {
+  await ensureClickedTable()
+  const scoped = urls.filter((u) => typeof u === 'string' && u)
+  const { rows } = await pool.query<{ n: string; links: string }>(
+    `SELECT count(*) AS n, count(DISTINCT url) AS links
+       FROM link_product_comment
+      WHERE posted_at IS NULL
+        ${scoped.length ? 'AND url = ANY($1::text[])' : ''}`,
+    scoped.length ? [scoped] : []
+  )
+  return { rows: Number(rows[0]?.n ?? 0), links: Number(rows[0]?.links ?? 0) }
+}
+
 export async function getLinksForComment(
   text: string,
-  limit = 200
-): Promise<{ url: string; product: string; rank: number; likes: number; username: string }[]> {
+  limit = 200,
+  days = 0,
+  /** Only rows of these products (the admin's genre); all when omitted. */
+  products?: string[]
+): Promise<
+  {
+    url: string
+    product: string
+    rank: number
+    likes: number
+    username: string
+    postedAt: string | null
+  }[]
+> {
   await ensureClickedTable()
+  // THE SAME WINDOW AS THE LIST IT OPENS FROM. It used to ignore the window
+  // entirely, so a row that qualified on one recent link expanded into every link
+  // that ever carried the text — which is how a comment dated 18 August appeared
+  // under "last 7 days". The rows are the evidence for the count above them; they
+  // have to be the same rows.
+  const n = Math.max(0, Math.min(3650, Math.round(days)))
+  const since = n > 0 ? `AND c.posted_at >= now() - interval '${n} days'` : ''
   const { rows } = await pool.query<{
     url: string
     product: string
     rank: number
     likes: number
     username: string
+    posted_at: Date | null
   }>(
-    `SELECT c.url, c.product, c.rank, c.likes, c.username
+    `SELECT c.url, c.product, c.rank, c.likes, c.username, c.posted_at
        FROM link_product_comment c
       WHERE lower(btrim(c.text)) = lower(btrim($1))
-      ORDER BY c.rank, c.url
+        ${since}
+        ${products?.length ? `AND c.product IN (${products.map((p) => quoteLiteral(p)).join(', ')})` : ''}
+      ORDER BY c.posted_at DESC NULLS LAST, c.rank, c.url
       LIMIT $2`,
     [text, Math.max(1, Math.min(500, limit))]
   )
-  return rows
+  return rows.map((r) => ({
+    url: r.url,
+    product: r.product,
+    rank: r.rank,
+    likes: r.likes,
+    username: r.username,
+    postedAt: r.posted_at ? r.posted_at.toISOString() : null,
+  }))
 }
 
 /** Scan rows for a set of URLs, with the products present on each. */
@@ -1945,11 +2804,18 @@ export async function getReplyDrafts(opts: {
   offset: number
   limit: number
   q?: string
+  /** Only drafts for these products (the admin's genre); all when omitted. */
+  products?: string[]
 }): Promise<{ rows: ReplyDraftRow[]; matched: number }> {
   await ensureClickedTable()
   const q = (opts.q ?? '').trim()
-  const where = q ? `WHERE d.top_text ILIKE $1 OR d.reply ILIKE $1 OR d.url ILIKE $1` : ''
   const params: unknown[] = q ? [`%${q}%`] : []
+  const conds: string[] = q ? [`(d.top_text ILIKE $1 OR d.reply ILIKE $1 OR d.url ILIKE $1)`] : []
+  if (opts.products?.length) {
+    params.push(opts.products)
+    conds.push(`d.product = ANY($${params.length}::text[])`)
+  }
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
   const { rows: cnt } = await pool.query<{ n: string }>(
     `SELECT count(*)::text AS n FROM comment_reply_draft d ${where}`,
     params
@@ -2290,7 +3156,7 @@ export async function getAppState(key: string): Promise<string | null> {
 
 // ── Which LLM every generation uses ──────────────────────────────────────────
 // One setting for the whole app: comments, replies, title classification and
-// audience analysis all run through groqChat, so choosing here changes all of
+// audience analysis all run through llmChat, so choosing here changes all of
 // them. Stored rather than compiled in so it can be switched without a deploy —
 // which is the point when one model starts refusing or drifting.
 
@@ -2335,6 +3201,39 @@ export async function setClusterDateShare(pct: number): Promise<number> {
   return v
 }
 
+// ── How much of a worker's list each product genre gets ────────────────
+//
+// Three numbers, one per genre, stored as three keys rather than one JSON blob
+// so a half-written save cannot lose the others.
+//
+// Read by BOTH feeds — the web dashboard and the app — so a change here changes
+// what every worker is shown next, which is the whole point of it being a
+// setting and not a constant.
+const GENRE_MIX_KEY = (genre: string) => `genre_mix_${genre}`
+
+export async function getGenreMix(): Promise<GenreMix> {
+  const entries = await Promise.all(
+    GENRES.map(async (g) => [g, clampGenreShare(await getAppState(GENRE_MIX_KEY(g)).catch(() => null))] as const)
+  )
+  const stored = Object.fromEntries(entries) as GenreMix
+  // Nothing set at all is the default, not three zeros: genreWeights would fall
+  // back anyway, and returning the default here means the admin form shows what
+  // is actually in force.
+  const total = GENRES.reduce((a, g) => a + stored[g], 0)
+  return total > 0 ? stored : { ...DEFAULT_GENRE_MIX }
+}
+
+/** Save the shares, clamped, and return what was stored. */
+export async function saveGenreMix(v: Partial<GenreMix>): Promise<GenreMix> {
+  const current = await getGenreMix()
+  const next = { ...current } as GenreMix
+  for (const g of GENRES) {
+    if (v[g] !== undefined) next[g] = clampGenreShare(v[g])
+  }
+  await Promise.all(GENRES.map((g) => setAppState(GENRE_MIX_KEY(g), String(next[g]))))
+  return next
+}
+
 // ── Serve only links that carry none of our comments ────────────────────────
 // Off by default. On, the app and the web dashboard withhold every link already
 // known to carry one of our product comments, so a session is spent on videos
@@ -2364,7 +3263,13 @@ export async function setServeOnlyClean(on: boolean): Promise<boolean> {
  * Just the URLs — the serving paths only need to know WHETHER, and the full
  * per-product counts are a much larger read for a set membership test.
  */
-export async function getUrlsWithProductComments(): Promise<string[]> {
+export function getUrlsWithProductComments(): Promise<string[]> {
+  // Cached: see lib/poolCache. This is a whole-table read and it used to
+  // run on every request that touched the link pool.
+  return cached('urlsWithOurs', TTL.scan, getUrlsWithProductCommentsUncached)
+}
+
+async function getUrlsWithProductCommentsUncached(): Promise<string[]> {
   await ensureClickedTable()
   const { rows } = await pool.query<{ url: string }>(
     "SELECT DISTINCT url FROM link_product_comment WHERE product IS NOT NULL"
@@ -2448,7 +3353,9 @@ export interface PresenceLinkRow {
 export async function getPresenceLinks(
   userId: string,
   days = 7,
-  limit = 400
+  limit = 400,
+  /** One genre's products (the admin's switch); every genre when omitted. */
+  products?: string[]
 ): Promise<PresenceLinkRow[]> {
   await ensureClickedTable()
   const { rows } = await pool.query<{
@@ -2485,9 +3392,12 @@ export async function getPresenceLinks(
           LIMIT 1
        ) c ON true
       WHERE l.user_id = $1 AND l.day >= (now() - ($2::int || ' days')::interval)::date
+        AND ($4::text[] IS NULL OR EXISTS (
+              SELECT 1 FROM clicked_link k
+               WHERE k.user_id = l.user_id AND k.url = l.url AND k.product = ANY($4::text[])))
       ORDER BY l.day DESC, l.found DESC, l.url
       LIMIT $3`,
-    [userId, days, Math.max(1, Math.min(1000, limit))]
+    [userId, days, Math.max(1, Math.min(1000, limit)), products?.length ? products : null]
   )
   return rows.map((r) => ({
     url: r.url,
@@ -2551,16 +3461,76 @@ export async function recordTiktokAccount(
 export interface TiktokAccountRow {
   handle: string
   uid: string
+  /**
+   * Where the id came from, because the two are not equally trustworthy.
+   *
+   *   'verified'  the account commented on the verification video at
+   *               registration. We watched it happen, against a handle the
+   *               worker had already registered.
+   *   'seen'      the id turned up beside a comment during a presence scan.
+   *               Good enough to date an account, but opportunistic: it is
+   *               whatever was captured while judging something else.
+   */
+  source: 'verified' | 'seen'
 }
 
-/** Every known TikTok id, by user id. */
+/**
+ * Every known TikTok id, by user id.
+ *
+ * VERIFICATION WINS. Both tables hold a (handle, uid) pair, and when they
+ * disagree the registration one is the one that was watched: the worker
+ * commented from the account they had registered, and the id came off that
+ * comment. The scan-captured one is a by-product of judging something else and
+ * can be stale — a worker who changed accounts has an old row in
+ * tiktok_account until the next scan happens to notice.
+ *
+ * Callers still compare the handle against the profile before trusting either,
+ * so a row describing an account the worker no longer uses is discarded there
+ * rather than quietly dating the wrong account.
+ */
 export async function getTiktokAccounts(): Promise<Record<string, TiktokAccountRow>> {
-  await ensureClickedTable()
-  const { rows } = await pool.query<{ user_id: string; handle: string; uid: string }>(
-    'SELECT user_id, handle, uid FROM tiktok_account'
+  await Promise.all([ensureClickedTable(), ensureTiktokVerifyTable()])
+  const [seen, verified] = await Promise.all([
+    pool.query<{ user_id: string; handle: string; uid: string }>(
+      'SELECT user_id, handle, uid FROM tiktok_account'
+    ),
+    pool.query<{ user_id: string; handle: string; uid: string }>(
+      // Only rows that actually carry an id: a 'too_new' verdict has one, but a
+      // row written before the id could be read does not, and an empty uid
+      // would overwrite a perfectly good scanned one with nothing.
+      `SELECT user_id, handle, uid FROM tiktok_verification
+        WHERE uid IS NOT NULL AND uid <> ''`
+    ),
+  ])
+  // THE ACCOUNT THEY USE NOW. The row only shows an age for the handle on their
+  // profile, so when someone switches accounts (the paused screen, a profile
+  // edit) the id that matches the NEW handle has to win — a verified id for the
+  // old account would otherwise hide a scanned one for the new account, and the
+  // row would read "—" for an account we do know the age of.
+  const current = new Map(
+    (
+      await pool
+        .query<{ user_id: string; tiktok_url: string | null }>(
+          'SELECT user_id, tiktok_url FROM user_profile WHERE tiktok_url IS NOT NULL'
+        )
+        .catch(() => ({ rows: [] as { user_id: string; tiktok_url: string | null }[] }))
+    ).rows.map((r) => [
+      r.user_id,
+      (String(r.tiktok_url ?? '').match(/@([^/?#\s]+)/)?.[1] ?? '').toLowerCase(),
+    ])
   )
   const out: Record<string, TiktokAccountRow> = {}
-  for (const r of rows) out[r.user_id] = { handle: r.handle, uid: r.uid }
+  const put = (userId: string, row: TiktokAccountRow) => {
+    const now = current.get(userId)
+    const have = out[userId]
+    // Replace what is there unless it matches the current handle and this does not.
+    if (have && now && have.handle === now && row.handle !== now) return
+    out[userId] = row
+  }
+  for (const r of seen.rows) put(r.user_id, { handle: String(r.handle).toLowerCase(), uid: r.uid, source: 'seen' })
+  for (const r of verified.rows) {
+    put(r.user_id, { handle: String(r.handle).toLowerCase(), uid: r.uid, source: 'verified' })
+  }
   return out
 }
 
@@ -2705,16 +3675,43 @@ export async function getJudgedLinkRows(
  */
 export async function getRecentClickedLinks(
   userId: string,
-  limit: number
+  limit: number,
+  /**
+   * Only links opened BEFORE this instant, which pins the window still.
+   *
+   * WITHOUT IT THE WINDOW RUNS AWAY FROM THE CHECK. "Their newest 300" is
+   * measured from whenever you ask, and these users open 150-400 TikTok links a
+   * day: a night's work judging 150 of them is undone by the next day's
+   * clicking, which pushes every judged link out of the newest 300. Measured on
+   * the real ledger, three users had judged exactly 150 links and had opened
+   * exactly 150 since, so their windows were back to 300 unjudged. The nightly
+   * check could therefore never finish anybody who was still working, and it
+   * only ever blocks on a finished window.
+   *
+   * Pinned to the moment a check began, every run of that check reads the same
+   * 300 links and the work accumulates until it is done.
+   */
+  before?: string | null
 ): Promise<{ url: string; day: string }[]> {
-  await ensureClickedTable()
+  await Promise.all([ensureClickedTable(), ensureUserProfileTable()])
+  // ONLY LINKS OPENED WITH THE ACCOUNT ON THEIR PROFILE NOW. Somebody who
+  // switched TikTok accounts left every earlier link's comment under the old
+  // one, so judging those against the new @username finds nothing and blocks
+  // them for links they did comment on. Every comment check — Verify, Verify
+  // all, the nightly sweep and the block verdict — reads its window from here.
   const { rows } = await pool.query<{ url: string; day: Date }>(
     `SELECT url, clicked_at::date AS day
        FROM clicked_link
       WHERE user_id = $1 AND url ILIKE '%tiktok.com%'
+        AND clicked_at >= COALESCE(
+              (SELECT tiktok_changed_at FROM user_profile WHERE user_id = $1),
+              '-infinity'::timestamptz)
+        ${before ? 'AND clicked_at < $3::timestamptz' : ''}
       ORDER BY clicked_at DESC, url
       LIMIT $2`,
-    [userId, Math.max(1, Math.min(500, limit))]
+    before
+      ? [userId, Math.max(1, Math.min(500, limit)), before]
+      : [userId, Math.max(1, Math.min(500, limit))]
   )
   return rows.map((r) => ({ url: r.url, day: r.day.toISOString().slice(0, 10) }))
 }
@@ -2775,6 +3772,75 @@ export async function getRecentJudgedRate(
  * deleted, hidden or posted late, and none of that shows in a stored boolean —
  * so a check that says "as of now" has to ignore what an earlier pass concluded.
  */
+/**
+ * A single-quoted SQL literal for an identifier-ish value.
+ *
+ * Used only for the product name, which is matched against PRODUCTS before it
+ * ever reaches here — but a literal built by hand still gets escaped, because the
+ * next caller may not check.
+ */
+function quoteLiteral(v: string): string {
+  return `'${v.replace(/'/g, "''")}'`
+}
+
+/**
+ * The auto-block rules as the admin has set them, clamped into range.
+ *
+ * Stored in app_kv, one key each, because they are four small values that come
+ * and go with a feature — which is what that table is for. Anything missing or
+ * unreadable falls back to the default, so a half-written setting cannot leave
+ * the check running on a nonsense threshold.
+ */
+export async function getBlockRules(): Promise<BlockRules> {
+  await ensureClickedTable()
+  const { rows } = await pool
+    .query<{ key: string; value: string }>(
+      `SELECT key, value FROM app_kv
+        WHERE key IN ('block_on', 'block_sample', 'block_ratio_sample', 'block_ratio_pct')`
+    )
+    .catch(() => ({ rows: [] as { key: string; value: string }[] }))
+  const kv = new Map(rows.map((r) => [r.key, r.value]))
+  return {
+    // Explicit '0' is off; anything else, including no row at all, is on. A
+    // switch that defaulted to OFF would quietly stop blocking after a wipe.
+    on: (kv.get('block_on') ?? '1') !== '0',
+    sample: clampRule(kv.get('block_sample'), 'sample'),
+    ratioSample: clampRule(kv.get('block_ratio_sample'), 'ratioSample'),
+    ratioMinPct: clampRule(kv.get('block_ratio_pct'), 'ratioMinPct'),
+  }
+}
+
+/** Save the rules, clamped, and return what was actually stored. */
+export async function saveBlockRules(v: Partial<BlockRules>): Promise<BlockRules> {
+  await ensureClickedTable()
+  const current = await getBlockRules()
+  const next: BlockRules = {
+    on: typeof v.on === 'boolean' ? v.on : current.on,
+    sample: v.sample === undefined ? current.sample : clampRule(v.sample, 'sample'),
+    ratioSample:
+      v.ratioSample === undefined
+        ? current.ratioSample
+        : clampRule(v.ratioSample, 'ratioSample'),
+    ratioMinPct:
+      v.ratioMinPct === undefined
+        ? current.ratioMinPct
+        : clampRule(v.ratioMinPct, 'ratioMinPct'),
+  }
+  const pairs: [string, string][] = [
+    ['block_on', next.on ? '1' : '0'],
+    ['block_sample', String(next.sample)],
+    ['block_ratio_sample', String(next.ratioSample)],
+    ['block_ratio_pct', String(next.ratioMinPct)],
+  ]
+  await pool.query(
+    `INSERT INTO app_kv (key, value, updated_at)
+     SELECT k, v, now() FROM unnest($1::text[], $2::text[]) AS x(k, v)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    [pairs.map((x) => x[0]), pairs.map((x) => x[1])]
+  )
+  return next
+}
+
 export async function getJudgedVerdicts(
   userId: string,
   pairs: { url: string; day: string }[],
@@ -2885,19 +3951,68 @@ export async function saveCommentPresence(
 
 /** The last `days` days of scores for every user, newest day first. */
 /** One user's day rows, oldest first — the shape a trend line wants. */
+
+/**
+ * Presence per (user, day) for ONE GENRE, rebuilt from the per-link rows.
+ *
+ * comment_presence holds one total per user-day across every genre, so it
+ * cannot be cut. comment_presence_link can: each row is one clicked link, and
+ * the click it came from is stamped with the product it was for. Counted
+ * exactly as the totals are (judgeable / found / not judgeable).
+ */
+async function presenceDaysForProducts(
+  products: string[],
+  opts: { userId?: string; days?: number }
+): Promise<{ user_id: string; day: Date; checked: number; found: number; skipped: number }[]> {
+  await ensureClickedTable()
+  const params: unknown[] = [products]
+  const conds = [
+    `EXISTS (SELECT 1 FROM clicked_link ck
+              WHERE ck.user_id = l.user_id AND ck.url = l.url AND ck.product = ANY($1::text[]))`,
+  ]
+  if (opts.userId) {
+    params.push(opts.userId)
+    conds.push(`l.user_id = $${params.length}`)
+  }
+  if (opts.days) {
+    params.push(opts.days)
+    conds.push(`l.day >= (now() - ($${params.length}::int || ' days')::interval)::date`)
+  }
+  const { rows } = await pool.query<{
+    user_id: string; day: Date; checked: number; found: number; skipped: number
+  }>(
+    `SELECT l.user_id, l.day,
+            count(*) FILTER (WHERE l.judgeable)::int AS checked,
+            count(*) FILTER (WHERE l.found)::int AS found,
+            count(*) FILTER (WHERE NOT l.judgeable)::int AS skipped
+       FROM comment_presence_link l
+      WHERE ${conds.join(' AND ')}
+      GROUP BY l.user_id, l.day
+      ORDER BY l.day DESC`,
+    params
+  )
+  return rows
+}
+
 export async function getPresenceHistoryForUser(
   userId: string,
-  days: number
+  days: number,
+  /** One genre's products (the admin's switch); every genre when omitted. */
+  products?: string[]
 ): Promise<PresenceDay[]> {
   await ensureClickedTable()
-  const { rows } = await pool.query<{
-    day: Date; checked: number; found: number; skipped: number
-  }>(
-    `SELECT day, checked, found, skipped FROM comment_presence
-      WHERE user_id = $1 AND day >= (now() - ($2::int || ' days')::interval)::date
-      ORDER BY day`,
-    [userId, days]
-  )
+  const rows = products?.length
+    ? (await presenceDaysForProducts(products, { userId, days })).reverse()
+    : (
+        await pool.query<{
+          day: Date; checked: number; found: number; skipped: number
+        }>(
+          `SELECT day, checked, found, skipped FROM comment_presence
+            WHERE user_id = $1 AND day >= (now() - ($2::int || ' days')::interval)::date
+            ORDER BY day`,
+          [userId, days]
+        )
+      ).rows
   return rows.map((r) => ({
     day: r.day.toISOString().slice(0, 10),
     checked: r.checked,
@@ -2909,16 +4024,24 @@ export async function getPresenceHistoryForUser(
   }))
 }
 
-export async function getPresenceHistory(days: number): Promise<Record<string, PresenceDay[]>> {
+export async function getPresenceHistory(
+  days: number,
+  /** One genre's products (the admin's switch); every genre when omitted. */
+  products?: string[]
+): Promise<Record<string, PresenceDay[]>> {
   await ensureClickedTable()
-  const { rows } = await pool.query<{
-    user_id: string; day: Date; checked: number; found: number; skipped: number
-  }>(
-    `SELECT user_id, day, checked, found, skipped FROM comment_presence
-      WHERE day >= (now() - ($1::int || ' days')::interval)::date
-      ORDER BY day DESC`,
-    [days]
-  )
+  const rows = products?.length
+    ? await presenceDaysForProducts(products, { days })
+    : (
+        await pool.query<{
+          user_id: string; day: Date; checked: number; found: number; skipped: number
+        }>(
+          `SELECT user_id, day, checked, found, skipped FROM comment_presence
+            WHERE day >= (now() - ($1::int || ' days')::interval)::date
+            ORDER BY day DESC`,
+          [days]
+        )
+      ).rows
   const out: Record<string, PresenceDay[]> = {}
   for (const r of rows) {
     ;(out[r.user_id] = out[r.user_id] ?? []).push({
@@ -2940,8 +4063,24 @@ export async function getPresenceHistory(days: number): Promise<Record<string, P
  * Averaging the days weights every working day equally, so one heavy day cannot
  * drown out a week of light ones. Days with nothing judgeable are left out.
  */
-export async function getPresenceAverages(): Promise<Record<string, { pct: number; days: number }>> {
+export async function getPresenceAverages(
+  /** One genre's products (the admin's switch); every genre when omitted. */
+  products?: string[]
+): Promise<Record<string, { pct: number; days: number }>> {
   await ensureClickedTable()
+  if (products?.length) {
+    // The same average of per-day percentages, over this genre's days.
+    const acc: Record<string, { sum: number; n: number }> = {}
+    for (const r of await presenceDaysForProducts(products, {})) {
+      if (r.checked <= 0) continue
+      const a = (acc[r.user_id] ??= { sum: 0, n: 0 })
+      a.sum += (100 * r.found) / r.checked
+      a.n++
+    }
+    const out: Record<string, { pct: number; days: number }> = {}
+    for (const [u, a] of Object.entries(acc)) out[u] = { pct: Math.round(a.sum / a.n), days: a.n }
+    return out
+  }
   const { rows } = await pool.query<{ user_id: string; pct: string; days: string }>(
     `SELECT user_id,
             avg(100.0 * found / NULLIF(checked, 0))::text AS pct,
@@ -2989,7 +4128,13 @@ export async function getLinkCategoriesFor(urls: string[]): Promise<Record<strin
 }
 
 /** Every categorised URL -> its category. */
-export async function getLinkCategories(): Promise<Record<string, string>> {
+export function getLinkCategories(): Promise<Record<string, string>> {
+  // Cached: see lib/poolCache. This is a whole-table read and it used to
+  // run on every request that touched the link pool.
+  return cached('linkCategories', TTL.pool, getLinkCategoriesUncached)
+}
+
+async function getLinkCategoriesUncached(): Promise<Record<string, string>> {
   await ensureClickedTable()
   const { rows } = await pool.query<{ url: string; category: string }>(
     'SELECT url, category FROM link_category'
@@ -3012,6 +4157,9 @@ export async function countLinkCategories(): Promise<Record<string, number>> {
 export async function saveLinkCategories(
   rows: { url: string; category: string }[]
 ): Promise<number> {
+  // The table behind these cached reads is about to change; the next
+  // reader rebuilds rather than being served last minute's answer.
+  invalidate('linkCategories')
   const clean = rows.filter((r) => r.url && r.category)
   if (clean.length === 0) return 0
   await ensureClickedTable()
@@ -3033,7 +4181,13 @@ export async function clearLinkCategories(): Promise<number> {
 
 // ── Channel bios ─────────────────────────────────────────────────────────────
 
-export async function getChannelBios(): Promise<Record<string, string>> {
+export function getChannelBios(): Promise<Record<string, string>> {
+  // Cached: see lib/poolCache. This is a whole-table read and it used to
+  // run on every request that touched the link pool.
+  return cached('channelBios', TTL.pool, getChannelBiosUncached)
+}
+
+async function getChannelBiosUncached(): Promise<Record<string, string>> {
   await ensureClickedTable()
   const { rows } = await pool.query<{ handle: string; bio: string }>(
     'SELECT handle, bio FROM channel_bio'
@@ -3044,6 +4198,9 @@ export async function getChannelBios(): Promise<Record<string, string>> {
 }
 
 export async function saveChannelBios(rows: { handle: string; bio: string }[]): Promise<number> {
+  // The table behind these cached reads is about to change; the next
+  // reader rebuilds rather than being served last minute's answer.
+  invalidate('channelBios')
   const clean = rows.filter((r) => r.handle && r.bio)
   if (clean.length === 0) return 0
   await ensureClickedTable()
@@ -3085,6 +4242,15 @@ export interface BlockedLinkRow {
   url: string
   blockedAt: string
   title: string
+  /** Which genre's pool this block applies to. */
+  genre: string
+}
+
+/** `AND b.genre = $n` when a genre is given, else nothing. */
+function genreClause(genre: string | undefined, params: unknown[], lead: 'WHERE' | 'AND'): string {
+  if (!genre || !isGenre(genre)) return ''
+  params.push(genre)
+  return ` ${lead} b.genre = $${params.length}`
 }
 
 export type BlockedSort = 'recent' | 'oldest' | 'url'
@@ -3095,13 +4261,16 @@ export async function getBlockedLinksPage(opts: {
   limit: number
   q?: string
   sort?: BlockedSort
+  genre?: string
 }): Promise<{ rows: BlockedLinkRow[]; matched: number }> {
   await ensureClickedTable()
   const q = (opts.q ?? '').trim()
   // ILIKE on url OR title; the pattern is parameterised, so a % or _ typed into
   // the search box is a literal wildcard rather than an injection risk.
-  const where = q ? `WHERE b.url ILIKE $1 OR COALESCE(t.title, '') ILIKE $1` : ''
   const params: unknown[] = q ? [`%${q}%`] : []
+  const where =
+    (q ? `WHERE (b.url ILIKE $1 OR COALESCE(t.title, '') ILIKE $1)` : '') +
+    genreClause(opts.genre, params, q ? 'AND' : 'WHERE')
   const order =
     opts.sort === 'oldest' ? 'b.blocked_at ASC' : opts.sort === 'url' ? 'b.url ASC' : 'b.blocked_at DESC'
 
@@ -3109,13 +4278,13 @@ export async function getBlockedLinksPage(opts: {
                     LEFT JOIN link_title t ON t.url = b.url ${where}`
   const { rows: cnt } = await pool.query<{ n: string }>(countSql, params)
 
-  const sql = `SELECT b.url, b.blocked_at, COALESCE(t.title, '') AS title
+  const sql = `SELECT b.url, b.blocked_at, COALESCE(t.title, '') AS title, b.genre
                FROM blocked_link b
                LEFT JOIN link_title t ON t.url = b.url
                ${where}
                ORDER BY ${order}
                LIMIT $${params.length + 1} OFFSET $${params.length + 2}`
-  const { rows } = await pool.query<{ url: string; blocked_at: Date; title: string }>(
+  const { rows } = await pool.query<{ url: string; blocked_at: Date; title: string; genre: string }>(
     sql,
     [...params, Math.max(1, Math.min(500, opts.limit)), Math.max(0, opts.offset)]
   )
@@ -3125,6 +4294,7 @@ export async function getBlockedLinksPage(opts: {
       url: r.url,
       blockedAt: r.blocked_at.toISOString(),
       title: r.title ?? '',
+      genre: r.genre,
     })),
   }
 }
@@ -3153,16 +4323,18 @@ export async function getBlockedChannels(opts: {
   limit: number
   q?: string
   sort?: BlockedSort
+  genre?: string
 }): Promise<{ rows: BlockedChannelRow[]; matched: number; links: number }> {
   await ensureClickedTable()
   const q = (opts.q ?? '').trim()
   // The handle, pulled straight out of the URL. Kept in one expression so the
   // count, the ordering and the rows can never disagree about what a channel is.
   const HANDLE = `substring(b.url from 'tiktok\\.com/@([A-Za-z0-9._]+)/')`
-  const where = q
-    ? `WHERE ${HANDLE} IS NOT NULL AND (b.url ILIKE $1 OR ${HANDLE} ILIKE $1)`
-    : `WHERE ${HANDLE} IS NOT NULL`
   const params: unknown[] = q ? [`%${q}%`] : []
+  const where =
+    (q
+      ? `WHERE ${HANDLE} IS NOT NULL AND (b.url ILIKE $1 OR ${HANDLE} ILIKE $1)`
+      : `WHERE ${HANDLE} IS NOT NULL`) + genreClause(opts.genre, params, 'AND')
 
   const { rows: cnt } = await pool.query<{ n: string; links: string }>(
     `SELECT count(*)::text AS n, COALESCE(sum(c), 0)::text AS links
@@ -3210,44 +4382,111 @@ export async function getBlockedChannels(opts: {
 }
 
 /** Every blocked URL belonging to these channels — backs a whole-channel unblock. */
-export async function getBlockedUrlsForChannels(handles: string[]): Promise<string[]> {
+export async function getBlockedUrlsForChannels(handles: string[], genre?: string): Promise<string[]> {
   const clean = handles.map((h) => h.replace(/^@/, '').trim()).filter(Boolean)
   if (clean.length === 0) return []
   await ensureClickedTable()
+  const params: unknown[] = [clean.map((h) => h.toLowerCase())]
   const { rows } = await pool.query<{ url: string }>(
-    `SELECT url FROM blocked_link
-      WHERE lower(substring(url from 'tiktok\\.com/@([A-Za-z0-9._]+)/')) = ANY($1::text[])`,
-    [clean.map((h) => h.toLowerCase())]
+    `SELECT DISTINCT b.url FROM blocked_link b
+      WHERE lower(substring(b.url from 'tiktok\\.com/@([A-Za-z0-9._]+)/')) = ANY($1::text[])` +
+      genreClause(genre, params, 'AND'),
+    params
   )
   return rows.map((r) => r.url)
 }
 
 /** Every URL matching the search — backs "select all matching". */
-export async function getBlockedLinkUrls(q?: string): Promise<string[]> {
+export async function getBlockedLinkUrls(q?: string, genre?: string): Promise<string[]> {
   await ensureClickedTable()
   const term = (q ?? '').trim()
-  const sql = term
-    ? `SELECT b.url FROM blocked_link b LEFT JOIN link_title t ON t.url = b.url
-       WHERE b.url ILIKE $1 OR COALESCE(t.title, '') ILIKE $1`
-    : 'SELECT url FROM blocked_link b'
-  const { rows } = await pool.query<{ url: string }>(sql, term ? [`%${term}%`] : [])
+  const params: unknown[] = term ? [`%${term}%`] : []
+  const sql =
+    (term
+      ? `SELECT DISTINCT b.url FROM blocked_link b LEFT JOIN link_title t ON t.url = b.url
+         WHERE (b.url ILIKE $1 OR COALESCE(t.title, '') ILIKE $1)`
+      : 'SELECT DISTINCT b.url FROM blocked_link b') +
+    genreClause(genre, params, term ? 'AND' : 'WHERE')
+  const { rows } = await pool.query<{ url: string }>(sql, params)
   return rows.map((r) => r.url)
 }
 
-/** Lift the block on many URLs at once. Returns how many were actually blocked. */
-export async function unblockLinks(urls: string[]): Promise<number> {
+/**
+ * Lift the block on many URLs at once. Returns how many blocks were removed.
+ *
+ * Only the named genre's blocks (one genre, or a lookup per URL); a block the
+ * same link carries for another genre stays. With no genre at all, every
+ * genre's block on these URLs goes — kept for callers that mean exactly that.
+ */
+export async function unblockLinks(urls: string[], genre?: GenreFor): Promise<number> {
+  // The table behind these cached reads is about to change; the next
+  // reader rebuilds rather than being served last minute's answer.
+  invalidate('blockedUrls')
   const clean = urls.map((u) => String(u).trim()).filter(Boolean)
   if (clean.length === 0) return 0
   await ensureClickedTable()
-  const { rowCount } = await pool.query('DELETE FROM blocked_link WHERE url = ANY($1::text[])', [clean])
+  if (genre === undefined) {
+    const { rowCount } = await pool.query('DELETE FROM blocked_link WHERE url = ANY($1::text[])', [clean])
+    return rowCount ?? 0
+  }
+  const genres = await resolveGenres(clean, genre)
+  const { rowCount } = await pool.query(
+    `DELETE FROM blocked_link b USING unnest($1::text[], $2::text[]) AS x(url, genre)
+      WHERE b.url = x.url AND b.genre = x.genre`,
+    [clean, genres]
+  )
   return rowCount ?? 0
 }
 
-// Every permanently-blocked URL (for filtering the served link lists).
+/** Every block, as (url, genre). Cached: a whole-table read on every pool request. */
+export function getBlockedPairs(): Promise<{ url: string; genre: string }[]> {
+  // Cached: see lib/poolCache. This is a whole-table read and it used to
+  // run on every request that touched the link pool.
+  return cached('blockedUrls', TTL.blocked, async () => {
+    await ensureClickedTable()
+    const { rows } = await pool.query<{ url: string; genre: string }>('SELECT url, genre FROM blocked_link')
+    return rows
+  })
+}
+
+/**
+ * Every URL blocked in ANY genre.
+ *
+ * For the questions that are about having SEEN a video rather than serving it:
+ * the extractor's "already past this one" mark, the per-channel blocked counts.
+ * NOT for filtering what is served — use getBlockedPoolUrls for that, or a
+ * link blocked as unrelated to humanizers disappears from the website pool too.
+ */
 export async function getBlockedUrls(): Promise<string[]> {
-  await ensureClickedTable()
-  const { rows } = await pool.query<{ url: string }>('SELECT url FROM blocked_link')
-  return rows.map((r) => r.url)
+  return Array.from(new Set((await getBlockedPairs()).map((p) => p.url)))
+}
+
+/**
+ * The URLs blocked FOR THE GENRE THE POOL FILES THEM UNDER — what every serve
+ * path withholds.
+ *
+ * A link is in exactly one genre's pool, so it is blocked for serving when its
+ * block is that genre's. A URL the pool does not hold is checked against the
+ * default genre, which is harmless either way: there is nothing to serve.
+ */
+export async function getBlockedPoolUrls(): Promise<string[]> {
+  const [pairs, index] = await Promise.all([getBlockedPairs(), getPoolGenreIndex()])
+  const out = new Set<string>()
+  for (const p of pairs) {
+    if ((index.get(p.url) ?? DEFAULT_GENRE) === p.genre) out.add(p.url)
+  }
+  return Array.from(out)
+}
+
+/** url → the genres it is blocked in. For rows that carry their own genre. */
+export async function getBlockedIndex(): Promise<Map<string, Set<string>>> {
+  const m = new Map<string, Set<string>>()
+  for (const p of await getBlockedPairs()) {
+    const s = m.get(p.url) ?? new Set<string>()
+    s.add(p.genre)
+    m.set(p.url, s)
+  }
+  return m
 }
 
 // ── Broken links ─────────────────────────────────────────────────────────────
@@ -3371,6 +4610,9 @@ export interface LinkStat {
 export async function saveLinkStats(
   stats: { url: string; hearts: number | null; views: number | null; isPhoto?: boolean | null }[]
 ): Promise<number> {
+  // The table behind these cached reads is about to change; the next
+  // reader rebuilds rather than being served last minute's answer.
+  invalidate('linkStats')
   const clean = stats.filter(
     (s) => s.url && (s.hearts !== null || s.views !== null || (s.isPhoto ?? null) !== null)
   )
@@ -3394,7 +4636,13 @@ export async function saveLinkStats(
   return rowCount ?? 0
 }
 
-export async function getLinkStats(): Promise<Record<string, LinkStat>> {
+export function getLinkStats(): Promise<Record<string, LinkStat>> {
+  // Cached: see lib/poolCache. This is a whole-table read and it used to
+  // run on every request that touched the link pool.
+  return cached('linkStats', TTL.pool, getLinkStatsUncached)
+}
+
+async function getLinkStatsUncached(): Promise<Record<string, LinkStat>> {
   await ensureClickedTable()
   const { rows } = await pool.query<{
     url: string
@@ -3423,7 +4671,13 @@ export async function countLinkStats(): Promise<number> {
   return Number(rows[0]?.n ?? 0)
 }
 
-export async function getLinkTitles(): Promise<Record<string, string>> {
+export function getLinkTitles(): Promise<Record<string, string>> {
+  // Cached: see lib/poolCache. This is a whole-table read and it used to
+  // run on every request that touched the link pool.
+  return cached('linkTitles', TTL.pool, getLinkTitlesUncached)
+}
+
+async function getLinkTitlesUncached(): Promise<Record<string, string>> {
   await ensureClickedTable()
   const { rows } = await pool.query<{ url: string; title: string }>('SELECT url, title FROM link_title')
   const out: Record<string, string> = {}
@@ -3435,6 +4689,9 @@ export async function getLinkTitles(): Promise<Record<string, string>> {
 
 // Bulk-save fetched titles (upsert). Returns how many rows were written.
 export async function saveLinkTitles(titles: Record<string, string>): Promise<number> {
+  // The table behind these cached reads is about to change; the next
+  // reader rebuilds rather than being served last minute's answer.
+  invalidate('linkTitles')
   const entries = Object.entries(titles).filter(([u, t]) => u && t && !isGenericTitle(t))
   if (entries.length === 0) return 0
   await ensureClickedTable()
@@ -3450,7 +4707,13 @@ export async function saveLinkTitles(titles: Record<string, string>): Promise<nu
 }
 
 // Distinct-user "unrelated" flag count per URL (for the admin links page).
-export async function getUnrelatedCountsByUrl(): Promise<Record<string, number>> {
+export function getUnrelatedCountsByUrl(): Promise<Record<string, number>> {
+  // Cached: see lib/poolCache. This is a whole-table read and it used to
+  // run on every request that touched the link pool.
+  return cached('unrelatedCounts', TTL.clicks, getUnrelatedCountsByUrlUncached)
+}
+
+async function getUnrelatedCountsByUrlUncached(): Promise<Record<string, number>> {
   await ensureClickedTable()
   const { rows } = await pool.query<{ url: string; n: number }>(
     `SELECT url, COUNT(*)::int AS n FROM unrelated_link GROUP BY url`
@@ -3535,6 +4798,13 @@ export async function recordClick(
   servedComment?: string | null
 ): Promise<void> {
   await ensureClickedTable()
+  // NOT INVALIDATING THE CLICK COUNTS HERE, and it is a decision rather than an
+  // oversight. A click is the one write that happens thousands of times a day;
+  // dropping the cached counts on each would defeat the cache entirely and put
+  // the full-table aggregate back on the request path, which is the thing that
+  // cost 58% of the database bill. The counts ride their 60-second TTL instead:
+  // they feed retirement thresholds and ordering, where a minute behind moves
+  // nothing anybody can see.
   const forProduct = product ?? null
   await pool.query(
     `INSERT INTO clicked_link (user_id, url, search_query, platform, product, served_comment)
@@ -3711,7 +4981,13 @@ export async function linkHasProduct(url: string, product: string): Promise<bool
  * Only links that have been extracted appear at all. A missing url means "never
  * looked at", which is a different thing from "none found" and is shown that way.
  */
-export async function getProductCommentCountsByUrl(): Promise<Record<string, Record<string, number>>> {
+export function getProductCommentCountsByUrl(): Promise<Record<string, Record<string, number>>> {
+  // Cached: see lib/poolCache. This is a whole-table read and it used to
+  // run on every request that touched the link pool.
+  return cached('ourCountsByUrl', TTL.scan, getProductCommentCountsByUrlUncached)
+}
+
+async function getProductCommentCountsByUrlUncached(): Promise<Record<string, Record<string, number>>> {
   await ensureClickedTable()
   const { rows } = await pool.query<{ url: string; product: string; n: number }>(
     `SELECT url, product, COUNT(*)::int AS n
@@ -3831,7 +5107,13 @@ export interface EffectiveLimits {
   retirePlatforms: Set<string>
 }
 
-export async function getEffectivePlatformLimits(): Promise<EffectiveLimits> {
+export function getEffectivePlatformLimits(): Promise<EffectiveLimits> {
+  // Cached: see lib/poolCache. This is a whole-table read and it used to
+  // run on every request that touched the link pool.
+  return cached('platformLimits', TTL.pool, getEffectivePlatformLimitsUncached)
+}
+
+async function getEffectivePlatformLimitsUncached(): Promise<EffectiveLimits> {
   const raw = await getPlatformLimits().catch(() => ({}) as Record<string, PlatformLimit>)
   const limits: Record<string, PlatformLimit> = {}
   const enforced = new Set<string>()
@@ -3861,6 +5143,9 @@ export async function getEffectivePlatformLimit(
 // Save one platform's quota + wait window. Its two switches are left untouched
 // (use setPlatformEnabled / setPlatformRetireEnabled for those).
 export async function setPlatformLimit(platform: string, limit: number, windowMs: number): Promise<void> {
+  // The table behind these cached reads is about to change; the next
+  // reader rebuilds rather than being served last minute's answer.
+  invalidate('platformLimits')
   await ensurePlatformLimitTable()
   const lim = Math.trunc(Number(limit))
   const win = Math.max(1000, Math.trunc(Number(windowMs)))
@@ -3971,6 +5256,15 @@ export function ensureUserProfileTable(): Promise<void> {
         -- money. Added after the fact, so existing rows have NULL and the
         -- dashboard asks them for it before they can work.
         ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS phone    TEXT;
+        -- Which bank the account number is at. A number alone is not a payment:
+        -- the transfer needs the bank, and asking each worker on Telegram is how
+        -- payday turned into a day of messages. Added after the fact, so existing
+        -- rows have NULL and the dashboard asks them before they can work.
+        ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS bank_name TEXT;
+        -- When the TikTok link last CHANGED to a different account. The comment
+        -- checks read only links opened since then: the ones before were opened
+        -- with the old account, whose comments the new one cannot have.
+        ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS tiktok_changed_at TIMESTAMPTZ;
         ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS telegram TEXT;
         ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS tiktok_url_norm    TEXT;
         ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS youtube_url_norm   TEXT;
@@ -4008,6 +5302,12 @@ export function ensureUserProfileTable(): Promise<void> {
 export interface UserProfile {
   name: string
   bank_account: string
+  /**
+   * The bank the account is at — one of ETHIOPIAN_BANKS or typed by hand.
+   * null when not given; on a write, null KEEPS what is stored (see
+   * upsertUserProfile), so a form that does not ask for it cannot wipe it.
+   */
+  bank_name: string | null
   tiktok_url: string | null
   youtube_url: string | null
   instagram_url: string | null
@@ -4102,10 +5402,45 @@ export async function findProfileLinkConflicts(
   return out
 }
 
+/**
+ * Take a profile link off whoever else holds it, so an admin can reassign it.
+ *
+ * WHY THIS EXISTS RATHER THAN A SKIPPED CHECK. The uniqueness is not only an
+ * app-level rule — there is a unique index on each *_url_norm column, because two
+ * profiles pointing at one TikTok account would let the same comments verify both
+ * of them. Ignoring the check would simply move the refusal from a readable 409
+ * to a 23505 from Postgres.
+ *
+ * So the admin's edit does what the admin means by it: one account belongs to one
+ * worker, the admin is saying which, and the previous holder loses the link. The
+ * caller is told whose it was, because taking somebody's account off their profile
+ * silently is not something that should be possible.
+ *
+ * Only the link is cleared — their name, bank details, contact and history stay.
+ */
+export async function releaseProfileLink(
+  platform: 'tiktok' | 'youtube' | 'instagram',
+  url: string | null,
+  exceptUserId: string
+): Promise<{ userId: string; name: string | null }[]> {
+  const norm = normalizeProfileUrl(url)
+  if (!norm) return []
+  await ensureUserProfileTable()
+  const col = `${platform}_url`
+  const { rows } = await pool.query<{ user_id: string; name: string | null }>(
+    `UPDATE user_profile
+        SET ${col} = NULL, ${col}_norm = NULL, updated_at = now()
+      WHERE user_id <> $1 AND ${col}_norm = $2
+      RETURNING user_id, name`,
+    [exceptUserId, norm]
+  )
+  return rows.map((r) => ({ userId: r.user_id, name: r.name }))
+}
+
 export async function getUserProfile(userId: string): Promise<UserProfile | null> {
   await ensureUserProfileTable()
   const { rows } = await pool.query<UserProfile>(
-    `SELECT name, bank_account, tiktok_url, youtube_url, instagram_url, phone, telegram
+    `SELECT name, bank_account, bank_name, tiktok_url, youtube_url, instagram_url, phone, telegram
      FROM user_profile WHERE user_id = $1`,
     [userId]
   )
@@ -4133,8 +5468,8 @@ export async function upsertUserProfile(userId: string, p: UserProfile): Promise
       `INSERT INTO user_profile
          (user_id, name, bank_account, tiktok_url, youtube_url, instagram_url,
           phone, telegram,
-          tiktok_url_norm, youtube_url_norm, instagram_url_norm, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+          tiktok_url_norm, youtube_url_norm, instagram_url_norm, bank_name, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
        ON CONFLICT (user_id) DO UPDATE SET
          name               = EXCLUDED.name,
          bank_account       = EXCLUDED.bank_account,
@@ -4147,13 +5482,21 @@ export async function upsertUserProfile(userId: string, p: UserProfile): Promise
          -- everyone whose link an admin corrected.
          phone              = COALESCE(EXCLUDED.phone, user_profile.phone),
          telegram           = COALESCE(EXCLUDED.telegram, user_profile.telegram),
+         bank_name          = COALESCE(EXCLUDED.bank_name, user_profile.bank_name),
          tiktok_url_norm    = EXCLUDED.tiktok_url_norm,
          youtube_url_norm   = EXCLUDED.youtube_url_norm,
          instagram_url_norm = EXCLUDED.instagram_url_norm,
+         -- Only when the account itself changes: tidying the same link (a query
+         -- string, the www.) is not a new account.
+         tiktok_changed_at  = CASE
+                                WHEN user_profile.tiktok_url_norm IS DISTINCT FROM EXCLUDED.tiktok_url_norm
+                                THEN now()
+                                ELSE user_profile.tiktok_changed_at
+                              END,
          updated_at         = now()`,
       [userId, p.name, p.bank_account, p.tiktok_url, p.youtube_url, p.instagram_url,
        normalizePhone(p.phone), normalizeTelegram(p.telegram),
-       tkN, ytN, igN]
+       tkN, ytN, igN, p.bank_name?.trim() || null]
     )
   } catch (e) {
     // Race-safety net: a concurrent registration slipped a duplicate past the
@@ -4172,6 +5515,25 @@ export async function upsertUserProfile(userId: string, p: UserProfile): Promise
 }
 
 // A profile counts as "complete" once name + bank account are filled in.
+/**
+ * Does this person have to paste their TikTok link again?
+ *
+ * True only when they are otherwise FINISHED registering and the stored link
+ * does not name an account — no @, a video URL, or a vm.tiktok.com short link
+ * whose username is behind a redirect. Those cannot be repaired from here: the
+ * account they point at is knowable only to the person holding the phone.
+ *
+ * Links that are merely untidy are not this. `tiktok.com/@you` and the app's
+ * own `?_r=1&_t=…` share form both name the account perfectly well, so they are
+ * canonicalised on save and their owners are never stopped — which is most
+ * people. Asking 123 workers to resubmit a link that was already readable would
+ * be a cost paid by them for a tidiness we could have applied ourselves.
+ */
+export function needsTiktokProfileFix(p: UserProfile | null): boolean {
+  if (!p || !isProfileComplete(p)) return false
+  return isTiktokProfileMisformatted(p.tiktok_url)
+}
+
 export function isProfileComplete(p: UserProfile | null): boolean {
   // TikTok is required; YouTube and Instagram are optional. A phone number or a
   // Telegram username is required — either one, not both.
@@ -4179,6 +5541,25 @@ export function isProfileComplete(p: UserProfile | null): boolean {
     !!p &&
     p.name.trim().length > 0 &&
     p.bank_account.trim().length > 0 &&
+    !!p.bank_name?.trim() &&
+    !!p.tiktok_url?.trim() &&
+    hasContact(p)
+  )
+}
+
+/**
+ * Is this an EXISTING worker whose only gap is the bank name?
+ *
+ * The same reasoning as needsContactOnly: someone who registered before the
+ * bank name was asked for is told what changed and given one field, not sent
+ * through registration again.
+ */
+export function needsBankNameOnly(p: UserProfile | null): boolean {
+  return (
+    !!p &&
+    p.name.trim().length > 0 &&
+    p.bank_account.trim().length > 0 &&
+    !p.bank_name?.trim() &&
     !!p.tiktok_url?.trim() &&
     hasContact(p)
   )
@@ -4296,12 +5677,64 @@ export function ensureBlockedUserTable(): Promise<void> {
 // stored (so the correctable reasons key on exactly the field the user must
 // change): 'bank' → bank; 'tiktok' → TikTok; 'forever' → both. Email is always
 // stored (that's how sign-in is blocked). Signs them out immediately.
+/**
+ * THREE AUTOMATIC BLOCKS, THEN FOREVER.
+ *
+ * An automatic block is a TikTok block, and a TikTok block can be cleared by the
+ * person themselves by entering another TikTok link — which is how the same
+ * workers were blocked and back at work eight times in a week. So every
+ * automatic block is counted here, in a table an unblock never touches, and the
+ * one after the third is permanent: reason 'forever', every identifier recorded,
+ * nothing to fix on the paused screen.
+ *
+ * Counted from when this table first existed (2026-10-20), not from older
+ * blocks: earlier ones were not recorded anywhere that survived an unblock, and
+ * guessing at them from old messages would punish people for rules that were
+ * not in force.
+ */
+export const AUTO_BLOCKS_BEFORE_FOREVER = 3
+
+let ensuredAutoBlockEvents: Promise<unknown> | null = null
+function ensureAutoBlockEventTable() {
+  ensuredAutoBlockEvents ??= pool.query(`
+    CREATE TABLE IF NOT EXISTS auto_block_event (
+      id         BIGSERIAL PRIMARY KEY,
+      user_id    TEXT NOT NULL,
+      reason     TEXT NOT NULL,
+      blocked_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS auto_block_event_user_idx ON auto_block_event (user_id);
+  `)
+  return ensuredAutoBlockEvents
+}
+
+/** How many automatic blocks each user has had (see AUTO_BLOCKS_BEFORE_FOREVER). */
+export async function getAutoBlockCounts(): Promise<Record<string, number>> {
+  await ensureAutoBlockEventTable()
+  const { rows } = await pool.query<{ user_id: string; n: number }>(
+    'SELECT user_id, count(*)::int AS n FROM auto_block_event GROUP BY user_id'
+  )
+  return Object.fromEntries(rows.map((r) => [r.user_id, r.n]))
+}
+
 export async function blockUser(
   userId: string,
   reason: BlockReason = 'forever',
   auto = false
 ): Promise<void> {
   await ensureBlockedUserTable()
+  // Never a machine's block on a test account, whichever path asked for it.
+  if (auto && (await isTestUser(userId).catch(() => false))) return
+  if (auto) {
+    await ensureAutoBlockEventTable()
+    const { rows } = await pool.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM auto_block_event WHERE user_id = $1',
+      [userId]
+    )
+    // This is block number n+1. Past the allowance it is permanent.
+    if ((rows[0]?.n ?? 0) >= AUTO_BLOCKS_BEFORE_FOREVER) reason = 'forever'
+    await pool.query('INSERT INTO auto_block_event (user_id, reason) VALUES ($1, $2)', [userId, reason])
+  }
   const [info, profile] = await Promise.all([
     getUserNameEmail(userId).catch(() => null),
     getUserProfile(userId).catch(() => null),
@@ -4375,10 +5808,20 @@ export async function canAutoBlock(userId: string): Promise<boolean> {
  * has been exempt since September, and "already blocked, or exempt" read as
  * though the check had blocked him.
  */
+/** Is this user one of the owner's test accounts (see isTestEmail)? Cached. */
+export function isTestUser(userId: string): Promise<boolean> {
+  return cached(`isTestUser:${userId}`, 5 * 60_000, async () => {
+    const info = await getUserNameEmail(userId).catch(() => null)
+    return isTestEmail(info?.email)
+  })
+}
+
 export async function autoBlockStatus(
   userId: string
 ): Promise<{ blocked: boolean; exempt: boolean }> {
   await ensureBlockedUserTable()
+  // A test account is exempt from every automatic block, whatever the table says.
+  if (await isTestUser(userId).catch(() => false)) return { blocked: false, exempt: true }
   const { rows } = await pool.query<{ blocked: boolean; exempt: boolean }>(
     `SELECT EXISTS (SELECT 1 FROM blocked_user WHERE user_id = $1) AS blocked,
             EXISTS (SELECT 1 FROM auto_block_exempt WHERE user_id = $1) AS exempt`,
@@ -4498,6 +5941,22 @@ export function ensureAdminTables(): Promise<void> {
           word_max   INT NOT NULL,
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+        -- SERVE WHAT MEASURABLY WORKED, instead of what was generated.
+        --
+        -- Normally a click is answered from the written bank: a product's set for
+        -- the video's audience, chosen at random. With this on, the answer comes
+        -- from the comments that have actually been landing — the top few of this
+        -- product's own comments over a recent window, ranked by reach, by yield,
+        -- or by both.
+        --
+        -- It is a different trade, and the page says so: the bank is written per
+        -- AUDIENCE and this list is not, so turning it on buys measured
+        -- performance at the cost of matching the comment to the video.
+        ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS top_enabled BOOLEAN NOT NULL DEFAULT false;
+        ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS top_count INT NOT NULL DEFAULT 20;
+        -- links | ratio | balanced — the three orders the frequency modal offers.
+        ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS top_rank TEXT NOT NULL DEFAULT 'balanced';
+        ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS top_days INT NOT NULL DEFAULT 30;
         -- How a comment is written, per product. Defaults match what the
         -- generator did before these were settable, so an existing row keeps
         -- producing exactly what it produced yesterday.
@@ -4803,7 +6262,7 @@ export async function getProductWordBand(product: string, dflt: WordBand): Promi
 export async function getProductCommentSettings(
   product: string,
   dflt: WordBand
-): Promise<{ band: WordBand; style: CommentStyle }> {
+): Promise<{ band: WordBand; style: CommentStyle; top: TopListSetting }> {
   await ensureAdminTables()
   const { rows } = await pool.query<{
     word_min: number
@@ -4812,14 +6271,27 @@ export async function getProductCommentSettings(
     split_brand: boolean
     quote_brand: boolean
     voice: string
+    top_enabled: boolean
+    top_count: number
+    top_rank: string
+    top_days: number
   }>(
-    `SELECT word_min, word_max, emoji, split_brand, quote_brand, voice
+    `SELECT word_min, word_max, emoji, split_brand, quote_brand, voice,
+            top_enabled, top_count, top_rank, top_days
        FROM product_comment_setting WHERE product = $1`,
     [product]
   )
   const r = rows[0]
-  if (!r) return { band: dflt, style: DEFAULT_COMMENT_STYLE }
+  if (!r) return { band: dflt, style: DEFAULT_COMMENT_STYLE, top: DEFAULT_TOP_LIST }
   return {
+    // clampTopList validates the stored rank, so an unknown string falls back
+    // rather than being trusted into the type.
+    top: clampTopList({
+      enabled: r.top_enabled,
+      count: r.top_count,
+      rank: isTopListRank(r.top_rank) ? r.top_rank : undefined,
+      days: r.top_days,
+    }),
     band: { min: r.word_min, max: r.word_max },
     style: {
       emoji: r.emoji,
@@ -4869,6 +6341,35 @@ export async function setProductCommentStyle(product: string, style: CommentStyl
     [product, COMMENT_WORD_MIN, COMMENT_WORD_MAX, style.emoji, style.splitBrand, style.quoteBrand,
      style.voice]
   )
+}
+
+/** Save the "serve the top performers" setting, clamped. */
+export async function setProductTopList(
+  product: string,
+  v: Partial<TopListSetting>
+): Promise<TopListSetting> {
+  await ensureAdminTables()
+  const cur = (await getProductCommentSettings(product, {
+    min: COMMENT_WORD_MIN,
+    max: COMMENT_WORD_MAX,
+  }).catch(() => null))?.top ?? DEFAULT_TOP_LIST
+  const next = clampTopList({ ...cur, ...v })
+  await pool.query(
+    `INSERT INTO product_comment_setting
+       (product, word_min, word_max, top_enabled, top_count, top_rank, top_days, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+     ON CONFLICT (product) DO UPDATE SET
+       top_enabled = EXCLUDED.top_enabled,
+       top_count   = EXCLUDED.top_count,
+       top_rank    = EXCLUDED.top_rank,
+       top_days    = EXCLUDED.top_days,
+       updated_at  = now()`,
+    [product, COMMENT_WORD_MIN, COMMENT_WORD_MAX, next.enabled, next.count, next.rank, next.days]
+  )
+  // Saving is also the admin's "recompute": the list is cached for a couple of
+  // minutes, and a save is exactly when they want to see today's numbers.
+  invalidate(`topComments:${product}`)
+  return next
 }
 
 export async function setProductWordBand(product: string, band: WordBand): Promise<void> {
@@ -5680,6 +7181,7 @@ export async function savePromoAccounts(
   userId: string,
   accounts: { platform: string; url: string }[]
 ): Promise<void> {
+  await requirePromoTaskOn()
   await ensurePromoTables()
   for (const a of accounts) {
     const url = a.url.trim()
@@ -5712,10 +7214,27 @@ export async function countPromoLinksToday(userId: string, platform: string): Pr
   return rows[0]?.n ?? 0
 }
 
+/**
+ * Refuse anything that would record repost work while the task is off.
+ *
+ * THE CHECK LIVES WITH THE WRITE, not only in the routes. Six routes carried a
+ * copy of it, and a copy in six places is a hole waiting for the seventh — an
+ * older app build, a new endpoint, a script. This is the one place the rows are
+ * actually inserted, so nothing can get past it.
+ *
+ * Fail closed on purpose: if the flag cannot be read, the answer is no. A paused
+ * task that accepts a submission during a database hiccup has to pay for it.
+ */
+async function requirePromoTaskOn(): Promise<void> {
+  const on = await getPromoTaskEnabled().catch(() => false)
+  if (!on) throw new Error('The repost task is turned off')
+}
+
 export async function submitPromoLink(
   userId: string,
   v: { videoId: number | null; titleId: number | null; platform: string; url: string }
 ): Promise<void> {
+  await requirePromoTaskOn()
   await ensurePromoTables()
   await pool.query(
     `INSERT INTO promo_link (user_id, video_id, title_id, platform, url)
@@ -5875,6 +7394,13 @@ export async function releasePromoLock(product: string): Promise<void> {
 //                                because paying the worker must not clear the
 //                                referrer's balance, and paying the referrer
 //                                must not clear the worker's.
+//
+// AND NOTHING DONE TO THE WORKER CLEARS IT EITHER. Having its own marker was
+// not enough on its own: the commission window was also floored by the
+// WORKER's user_reset row, so the admin's habit of marking somebody paid and
+// then resetting them took the commission with it — owed to a third party who
+// was never paid and never told. The window now moves for exactly one reason,
+// which is the referrer being paid.
 
 let ensuredReferral: Promise<void> | null = null
 
@@ -6148,20 +7674,38 @@ export async function getReferralEarnings(userId: string): Promise<ReferralEarni
               p.name,
               r.created_at,
               COALESCE(SUM(cs.count) FILTER (
+                -- WHOSE PAYOUT CLOSES THIS WINDOW: the REFERRER'S, and nobody
+                -- else's. referral_pay_marker is keyed on the referrer, so the
+                -- commission is owed until the person it is owed TO is marked paid.
+                --
+                -- THE MEMBER'S OWN RESET USED TO BE IN HERE TOO (a join on
+                -- user_reset.user_id = r.user_id) and it quietly cancelled other
+                -- people's money. The admin routine is to mark a worker paid and
+                -- then reset them, a minute apart; the reset moved this floor to
+                -- now, and every comment that worker had ever made stopped earning
+                -- their referrer anything. It had happened to seven pairs before it
+                -- was found, one of them 10,638 comments: paying Sami Saeed wiped
+                -- the commission owed to Faiz Seid abdu, who was never paid it and
+                -- had done nothing but introduce him.
+                --
+                -- Nothing a MEMBER does or has done to them belongs in this floor.
+                -- The work happened. The commission was earned when it happened, and
+                -- it is a debt to a third party from that moment on.
                 WHERE cs.submitted_at >= GREATEST(
                         $2::timestamptz,
-                        COALESCE(ur.reset_at, $2::timestamptz),
                         COALESCE(rpm.paid_at, $2::timestamptz))
               ), 0) AS n,
+              -- "in total", which is what the dashboard calls it: everything
+              -- since the global reset, paid or not. Floored by the member's
+              -- reset it was not a total of anything — a worker watched their
+              -- own lifetime referral earnings fall because somebody else was
+              -- reset.
               COALESCE(SUM(cs.count) FILTER (
-                WHERE cs.submitted_at >= GREATEST(
-                        $2::timestamptz,
-                        COALESCE(ur.reset_at, $2::timestamptz))
+                WHERE cs.submitted_at >= $2::timestamptz
               ), 0) AS lifetime
          FROM referral r
          LEFT JOIN user_profile p          ON p.user_id  = r.user_id
          LEFT JOIN commented_submission cs ON cs.user_id = r.user_id
-         LEFT JOIN user_reset ur           ON ur.user_id = r.user_id
          LEFT JOIN referral_pay_marker rpm ON rpm.user_id = r.referrer_id
         WHERE r.referrer_id = $1
         GROUP BY r.user_id, p.name, r.created_at
@@ -6208,22 +7752,21 @@ export async function getAllReferralEarnings(): Promise<Record<string, ReferralE
             r.user_id,
             p.name,
             r.created_at,
+            -- The same two windows as getReferralEarnings, and they have to
+            -- stay the same: this is what the admin approves a payment against,
+            -- and that one is what the worker is shown. See the comments there.
             COALESCE(SUM(cs.count) FILTER (
               WHERE cs.submitted_at >= GREATEST(
                       $1::timestamptz,
-                      COALESCE(ur.reset_at, $1::timestamptz),
                       COALESCE(rpm.paid_at, $1::timestamptz))
             ), 0) AS n,
             COALESCE(SUM(cs.count) FILTER (
-              WHERE cs.submitted_at >= GREATEST(
-                      $1::timestamptz,
-                      COALESCE(ur.reset_at, $1::timestamptz))
+              WHERE cs.submitted_at >= $1::timestamptz
             ), 0) AS lifetime
        FROM referral r
        LEFT JOIN user_profile p          ON p.user_id  = r.user_id
        LEFT JOIN user_profile rp         ON rp.user_id = r.referrer_id
        LEFT JOIN commented_submission cs ON cs.user_id = r.user_id
-       LEFT JOIN user_reset ur           ON ur.user_id = r.user_id
        LEFT JOIN referral_pay_marker rpm ON rpm.user_id = r.referrer_id
       GROUP BY r.referrer_id, rp.referral_code, r.user_id, p.name, r.created_at
       ORDER BY r.referrer_id, r.created_at`,
@@ -6268,7 +7811,13 @@ export interface PendingPayments {
   comments: PendingTask
   video: PendingTask
   promo: PendingTask
-  /** Mailboxes an admin has validated. Payable, and part of `total`. */
+  /**
+   * Mailboxes an admin has validated.
+   *
+   * NOT in `total`: email work is settled on the Email tasks page, where it is
+   * checked. Reported here so the user card can show what that page owes them,
+   * and so nobody has to open two screens to see the whole picture.
+   */
   accounts: PendingTask
   /**
    * 20% of the comment pay earned by people this user referred.
@@ -6355,8 +7904,15 @@ export async function getUserPendingPayments(userId: string): Promise<PendingPay
     count: awaitingCount,
     birr: awaitingCount * ACCOUNT_PAY_BIRR,
   }
-  // `accountsAwaiting` is NOT in the total — see the interface.
-  const total = comments.birr + video.birr + promo.birr + accounts.birr + referrals.birr
+  // MAILBOX MONEY IS NOT IN THE TOTAL, and neither is the awaiting kind.
+  //
+  // Email work is approved, paid and marked on the Email tasks page — one address
+  // at a time, by whoever just checked it. Leaving it inside this total meant the
+  // same money appeared in two places: the admin approves a balance on the user
+  // card that silently includes mailboxes already settled elsewhere, and the two
+  // screens disagree about what is owed. `accounts` is still reported, so the
+  // card can SHOW it; it is simply not part of the sum anybody approves here.
+  const total = comments.birr + video.birr + promo.birr + referrals.birr
 
   // The approved amount is frozen when the admin approves; anything earned after
   // that is unapproved. total only grows while approved (a paid-mark clears it).
@@ -6597,6 +8153,121 @@ export async function reviewAccountSubmission(
   return { ok: true }
 }
 
+/**
+ * Mark approved mailboxes as PAID, per submission or for one worker.
+ *
+ * EMAIL WORK IS PAID ON ITS OWN. Every other task settles through the user card:
+ * approve the whole balance, then mark the whole balance paid. Mailboxes do not
+ * fit that — they are checked one at a time on their own page, they are worth a
+ * flat rate each, and the person paying them is usually looking at the address
+ * they just validated, not at somebody's month.
+ *
+ * Nothing new is needed to keep the two apart: `paid` already lives on the
+ * submission row, and the pending total only counts `status = 'approved' AND paid
+ * = false`. So a row marked here leaves the main balance by itself — no second
+ * ledger, no chance of paying it twice from two places.
+ *
+ * ONLY APPROVED ROWS. A pending mailbox is worth nothing until somebody has
+ * confirmed it exists, and a rejected one is worth nothing at all; paying either
+ * would be paying for work that was never accepted.
+ */
+export async function markAccountSubmissionsPaid(v: {
+  ids?: number[]
+  userId?: string
+}): Promise<{ paid: number; birr: number }> {
+  await ensureAdminTables()
+  const ids = (v.ids ?? []).filter((n) => Number.isFinite(n) && n > 0)
+  const userId = (v.userId ?? '').trim()
+  if (ids.length === 0 && !userId) return { paid: 0, birr: 0 }
+  // ONE BRANCH EACH, spelled out. The first version of this built a single
+  // statement with `id = ANY($1) OR $2 IS NULL`, which reads as "these rows, or
+  // this user's rows" and means "these rows, or EVERY row" the moment one
+  // argument is absent. Marking every worker's mailboxes paid is not a thing to
+  // leave to operator precedence.
+  const { rowCount } = ids.length
+    ? await pool.query(
+        `UPDATE account_submission SET paid = true
+          WHERE status = 'approved' AND paid = false AND id = ANY($1::bigint[])`,
+        [ids]
+      )
+    : await pool.query(
+        `UPDATE account_submission SET paid = true
+          WHERE status = 'approved' AND paid = false AND user_id = $1`,
+        [userId]
+      )
+  const paid = rowCount ?? 0
+  return { paid, birr: paid * ACCOUNT_PAY_BIRR }
+}
+
+/** Undo a payment mark, for the one that was pressed by mistake. */
+export async function unmarkAccountSubmissionPaid(id: number): Promise<boolean> {
+  await ensureAdminTables()
+  const { rowCount } = await pool.query(
+    `UPDATE account_submission SET paid = false WHERE id = $1 AND paid = true`,
+    [id]
+  )
+  return (rowCount ?? 0) > 0
+}
+
+/**
+ * What email work is owed, per worker, for the page that pays it.
+ *
+ * Approved-and-unpaid is the money; the other two counts are there so the page
+ * can show the whole picture without a second query, and so "why is this person
+ * not in the list" has an answer on screen.
+ */
+export interface AccountPayRow {
+  userId: string
+  name: string
+  email: string
+  phone: string | null
+  telegram: string | null
+  owed: number
+  owedBirr: number
+  paidCount: number
+  pendingCount: number
+}
+
+export async function getAccountPayByUser(): Promise<AccountPayRow[]> {
+  await ensureAdminTables()
+  const { rows } = await pool.query<{
+    user_id: string
+    name: string
+    email: string
+    phone: string | null
+    telegram: string | null
+    owed: number
+    paid_count: number
+    pending_count: number
+  }>(
+    `SELECT a.user_id,
+            COALESCE(u.name, '')  AS name,
+            COALESCE(u.email, '') AS email,
+            p.phone, p.telegram,
+            COUNT(*) FILTER (WHERE a.status = 'approved' AND NOT a.paid)::int AS owed,
+            COUNT(*) FILTER (WHERE a.status = 'approved' AND a.paid)::int     AS paid_count,
+            COUNT(*) FILTER (WHERE a.status = 'pending')::int                 AS pending_count
+       FROM account_submission a
+       LEFT JOIN "user" u ON u.id = a.user_id
+       LEFT JOIN user_profile p ON p.user_id = a.user_id
+      GROUP BY a.user_id, u.name, u.email, p.phone, p.telegram
+     HAVING COUNT(*) FILTER (WHERE a.status = 'approved' AND NOT a.paid) > 0
+         OR COUNT(*) FILTER (WHERE a.status = 'pending') > 0
+      ORDER BY 6 DESC, 8 DESC`
+  )
+  return rows.map((r) => ({
+    userId: r.user_id,
+    name: r.name,
+    email: r.email,
+    phone: r.phone,
+    telegram: r.telegram,
+    owed: r.owed,
+    owedBirr: r.owed * ACCOUNT_PAY_BIRR,
+    paidCount: r.paid_count,
+    pendingCount: r.pending_count,
+  }))
+}
+
 /** How many mailboxes are waiting for someone to check them. */
 export async function countPendingAccountSubmissions(): Promise<number> {
   await ensureAdminTables()
@@ -6764,8 +8435,43 @@ export async function unapproveUserPay(userId: string): Promise<void> {
 // Permanently delete a user and all of their data (admin action). Best-effort
 // deletes the user's uploaded blobs (screenshots + videos) too. Broadcast admin
 // messages are kept; only messages targeted at this user are removed.
+/**
+ * A blocked user being deleted is blocked FOR GOOD.
+ *
+ * The block row outlives the delete (it is keyed by email, bank and TikTok, not
+ * only by the user id), but a 'bank' or 'tiktok' block is one the person can
+ * clear themselves by entering a new value — so a deleted, blocked person could
+ * sign in with the same Google account, fix one field and be back. Deleting
+ * someone who is blocked means they are not coming back: the block becomes
+ * 'forever' and records every identifier they had, so the same email, bank
+ * account or TikTok profile is refused at sign-in and at registration.
+ *
+ * Read before anything is deleted, since the profile is what holds the bank
+ * account and the TikTok link. Returns whether a block was sealed.
+ */
+async function sealBlockOnDelete(userId: string): Promise<boolean> {
+  await ensureBlockedUserTable()
+  const [info, profile] = await Promise.all([
+    getUserNameEmail(userId).catch(() => null),
+    getUserProfile(userId).catch(() => null),
+  ])
+  const email = (info?.email || '').trim().toLowerCase() || null
+  const { rowCount } = await pool.query(
+    `UPDATE blocked_user
+        SET reason      = 'forever',
+            email       = COALESCE(email, $2),
+            bank_norm   = COALESCE($3, bank_norm),
+            tiktok_norm = COALESCE($4, tiktok_norm)
+      WHERE user_id = $1 OR (email IS NOT NULL AND email = $2)`,
+    [userId, email, normalizeBank(profile?.bank_account), normalizeProfileUrl(profile?.tiktok_url)]
+  )
+  return (rowCount ?? 0) > 0
+}
+
 export async function deleteUser(userId: string): Promise<void> {
   await Promise.all([ensureAdminTables(), ensurePromoTables()])
+  // First, while their profile still exists.
+  await sealBlockOnDelete(userId)
 
   // Collect the user's uploaded blob URLs before removing the rows.
   let blobUrls: string[] = []
@@ -7042,9 +8748,10 @@ export async function getAllPendingPay(): Promise<Record<string, PendingPayments
   }
   for (const uid of Object.keys(out)) {
     const p = out[uid]
-    // Same rule as getUserPendingPayments: awaiting-validation mailboxes are
-    // shown as unapproved and are NOT payable.
-    p.total = p.comments.birr + p.video.birr + p.promo.birr + p.accounts.birr + p.referrals.birr
+    // Same rule as getUserPendingPayments, both halves of it: awaiting-validation
+    // mailboxes are not payable, and VALIDATED ones are not in this total either
+    // — they are paid on the Email tasks page.
+    p.total = p.comments.birr + p.video.birr + p.promo.birr + p.referrals.birr
     p.approvedBirr = p.approved ? Math.min(snapshots[uid] ?? 0, p.total) : 0
     p.unapprovedBirr = Math.max(0, p.total - p.approvedBirr) + p.accountsAwaiting.birr
   }
@@ -7427,6 +9134,124 @@ export async function deleteAdminMessage(messageId: number): Promise<void> {
   await pool.query('DELETE FROM admin_message WHERE id = $1', [messageId])
 }
 
+/**
+ * Set a worker's pending pay to `newTotal` birr, by adjusting their COMMENTS.
+ *
+ * WHY COMMENTS. Pending pay is not stored; it is counted, from comment reports,
+ * videos, reposts and referral commission, each over its own window. The only
+ * part that is a plain number of units is the comment count, so the change is
+ * written as one more comment report: platform 'adjustment', a count of
+ * +N or -N comments, dated now. Everything that counts comments then agrees with
+ * it without being taught about edits:
+ *
+ *   their pending pay      the report is inside their current pay window;
+ *   their REFERRER'S pay   commission is 20% of the comment pay of the people
+ *                          they referred, counted from the same reports — so
+ *                          lowering a worker's pay lowers what their referrer
+ *                          earns on them, and raising it raises it;
+ *   paying them            the paid-mark moves the window past it, like any
+ *                          other report, so an edit is never paid twice.
+ *
+ * The other parts (videos, reposts, the referral commission this worker earns
+ * on OTHER people) are left as they are, so the new total cannot go below them.
+ * Comment pay is 0.5 birr a comment, so the total is rounded to the nearest
+ * half birr. Returns the comment delta written and the pending pay after it.
+ */
+export interface PayAdjustment {
+  id: number
+  beforeBirr: number
+  afterBirr: number
+  deltaComments: number
+  /** The referrer's commission change it caused, in birr (0 when none). */
+  referrerDeltaBirr: number
+  byEmail: string | null
+  at: string
+}
+
+let ensuredPayAdj: Promise<unknown> | null = null
+function ensurePayAdjustmentTable() {
+  ensuredPayAdj ??= pool.query(`
+    CREATE TABLE IF NOT EXISTS pay_adjustment (
+      id                  BIGSERIAL PRIMARY KEY,
+      user_id             TEXT NOT NULL,
+      before_birr         NUMERIC NOT NULL,
+      after_birr          NUMERIC NOT NULL,
+      delta_comments      INT NOT NULL,
+      referrer_delta_birr NUMERIC NOT NULL DEFAULT 0,
+      by_email            TEXT,
+      created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS pay_adjustment_user_idx ON pay_adjustment (user_id, created_at DESC);
+  `)
+  return ensuredPayAdj
+}
+
+/**
+ * Every pending-pay edit for these users, newest first — what it was, what it
+ * became, and who changed it. Kept forever: the edit itself is a comment
+ * adjustment that a payout later folds into "paid", so without this log
+ * nothing would show that the amount was ever different.
+ */
+export async function getPayAdjustments(userIds?: string[]): Promise<Record<string, PayAdjustment[]>> {
+  await ensurePayAdjustmentTable()
+  const { rows } = await pool.query<{
+    id: string; user_id: string; before_birr: string; after_birr: string
+    delta_comments: number; referrer_delta_birr: string; by_email: string | null; created_at: Date
+  }>(
+    `SELECT * FROM pay_adjustment
+      WHERE ($1::text[] IS NULL OR user_id = ANY($1::text[]))
+      ORDER BY created_at DESC`,
+    [userIds?.length ? userIds : null]
+  )
+  const out: Record<string, PayAdjustment[]> = {}
+  for (const r of rows) {
+    ;(out[r.user_id] ??= []).push({
+      id: Number(r.id),
+      beforeBirr: Number(r.before_birr),
+      afterBirr: Number(r.after_birr),
+      deltaComments: r.delta_comments,
+      referrerDeltaBirr: Number(r.referrer_delta_birr),
+      byEmail: r.by_email,
+      at: new Date(r.created_at).toISOString(),
+    })
+  }
+  return out
+}
+
+export async function adjustPendingPay(
+  userId: string,
+  newTotal: number,
+  byEmail: string | null = null
+): Promise<{ deltaComments: number; before: PendingPayments; after: PendingPayments }> {
+  const before = await getUserPendingPayments(userId)
+  const floor = before.total - before.comments.birr
+  if (!Number.isFinite(newTotal) || newTotal < floor) {
+    throw new Error(
+      `Pending pay cannot go below ${floor} birr: that much is videos, reposts and referral ` +
+        'commission, which are not changed here.'
+    )
+  }
+  const deltaComments = Math.round((newTotal - before.total) / COMMENT_PAY_RATE)
+  if (deltaComments !== 0) {
+    await addCommentedSubmission(userId, 'adjustment', deltaComments, null)
+  }
+  const after = await getUserPendingPayments(userId)
+  // THE HISTORY: what it was, what it became, and the commission it moved.
+  if (deltaComments !== 0) {
+    await ensurePayAdjustmentTable()
+    const referred = await pool
+      .query('SELECT 1 FROM referral WHERE user_id = $1', [userId])
+      .then((r) => (r.rowCount ?? 0) > 0)
+      .catch(() => false)
+    await pool.query(
+      `INSERT INTO pay_adjustment (user_id, before_birr, after_birr, delta_comments, referrer_delta_birr, by_email)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [userId, before.total, after.total, deltaComments, referred ? deltaComments * REFERRAL_PAY_RATE : 0, byEmail]
+    )
+  }
+  return { deltaComments, before, after }
+}
+
 export async function addCommentedSubmission(
   userId: string,
   platform: string,
@@ -7457,7 +9282,49 @@ export interface AdminUserRow {
   product: string | null
   profile: UserProfile | null
   clicksByPlatform: Record<string, number>
+  /**
+   * The same clicks split by the GENRE of the product stamped on each one.
+   *
+   * Exact, not estimated: clicked_link.product is frozen at click time, so a
+   * click says which genre's video the worker was sent to. Sums to
+   * totalClicks, with clicks made before the products had genres landing in
+   * '(none)'.
+   */
+  clicksByGenre: Record<string, number>
   totalClicks: number
+  /**
+   * WEIGHTS FOR DIVIDING THIS USER'S COMMENT PAY BY GENRE — counts of
+   * clicks, not money.
+   *
+   * Money cannot be measured per genre. commented_submission holds a platform
+   * and a count and no product, because the app asks a worker "how many TikTok
+   * videos did you comment on" and that is the whole report. So comment pay is
+   * APPORTIONED by the mix of links that worker opened inside the same window
+   * the pay is counted over — those links are the work the comments were
+   * made on, and they are the only product-stamped record of it.
+   *
+   * The window matters and is not the one clicksByGenre uses: comment pay is
+   * floored by GREATEST(global reset, their reset, their last comment payout),
+   * so a worker paid twice already must be weighted on the clicks since that
+   * payout and not on everything since the reset — otherwise work that is
+   * already settled votes on money that is still owed.
+   *
+   * Empty when they have pay but no clicks in that window; the dashboard then
+   * reports their pay as unsplit rather than guessing (3 of 98 workers and 0.1%
+   * of the money when this was written).
+   */
+  payClicksByGenre: Record<string, number>
+  /**
+   * The same, for referral commission: the clicks of the people THIS user
+   * referred, inside the commission window.
+   *
+   * Their members' mix, not their own. The commission is 20% of those people's
+   * comment pay, so it follows the genre THEY worked; a referrer who clicks
+   * nothing still earns it. Its window is floored by the REFERRER's payout and
+   * nothing else, matching getReferralEarnings — see the long note there
+   * for why a member's reset must never enter it.
+   */
+  referralClicksByGenre: Record<string, number>
   commentedByPlatform: Record<string, number>
   totalCommented: number
   sampleUrls: Record<string, string[]>
@@ -7485,6 +9352,14 @@ export interface AdminUserRow {
   blockReason: BlockReason | null // why they're blocked (null when not blocked)
   /** True when the nightly presence check blocked them, not a person. */
   blockAuto: boolean
+  /**
+   * When they last did ANY work — a click, a comment report, a video, a repost,
+   * a mailbox — or null if they never have.
+   *
+   * Not scoped to the reset: this answers "are they still here", which a reset
+   * has nothing to say about.
+   */
+  lastWorkAt: string | null
   lastSnapshotDay: string | null // day of this user's most recent saved past-state
   /** This user's own referral username, so an admin can look one up when a new
    *  worker says who invited them. Null until they have a profile. */
@@ -7514,7 +9389,18 @@ export interface AdminData {
 // Clicks per product since `resetAt`, plus the last N days of clicks (total and
 // split by product). Kept out of getAdminData's big Promise.all so the shape
 // stays readable; runs as one round-trip each.
-async function getClickAggregates(resetAt: Date): Promise<{
+async function getClickAggregates(
+  resetAt: Date,
+  /**
+   * Only clicks stamped with one of these products, or every click when null.
+   *
+   * The admin's master genre switch passes its genre's products. A click knows
+   * which product it was made for (clicked_link.product, frozen at click time),
+   * so this is an exact cut, not an estimate. Clicks with no product stamped
+   * belong to no genre and fall outside every one of them.
+   */
+  products: string[] | null = null
+): Promise<{
   clicksByProduct: Record<string, number>
   dailyClicks: { day: string; count: number }[]
   dailyClicksByProduct: Record<string, { day: string; count: number }[]>
@@ -7526,8 +9412,9 @@ async function getClickAggregates(resetAt: Date): Promise<{
       `SELECT COALESCE(NULLIF(cl.product, ''), '(none)') AS product, COUNT(*)::int AS n
          FROM clicked_link cl LEFT JOIN user_reset ur ON ur.user_id = cl.user_id
         WHERE cl.clicked_at >= GREATEST($1::timestamptz, COALESCE(ur.reset_at, $1::timestamptz))
+          AND ($2::text[] IS NULL OR cl.product = ANY($2::text[]))
         GROUP BY 1`,
-      [resetAt]
+      [resetAt, products]
     ),
     // generate_series zero-fills days with no clicks, so the table always shows
     // the full window instead of silently skipping quiet days.
@@ -7537,9 +9424,13 @@ async function getClickAggregates(resetAt: Date): Promise<{
               COALESCE(NULLIF(cl.platform, ''), '(none)') AS platform,
               COUNT(cl.id)::int AS n
          FROM generate_series(CURRENT_DATE - ($1::int - 1), CURRENT_DATE, '1 day') d
+         -- IN THE JOIN, not a WHERE: a WHERE on cl.product would drop the
+         -- zero-filled days the series exists to keep, and a quiet day for this
+         -- genre would vanish from the table instead of showing a 0.
          LEFT JOIN clicked_link cl ON cl.clicked_at::date = d::date
+               AND ($2::text[] IS NULL OR cl.product = ANY($2::text[]))
         GROUP BY 1, 2, 3 ORDER BY 1`,
-      [days]
+      [days, products]
     ),
   ])
 
@@ -7572,9 +9463,150 @@ async function getClickAggregates(resetAt: Date): Promise<{
 }
 
 // Everything the admin dashboard needs, all scoped to "since the last reset".
-export async function getAdminData(): Promise<AdminData> {
+/**
+ * When each user last did any work, whatever kind it was.
+ *
+ * FIVE TABLES, ONE ANSWER. A worker can be busy without clicking — uploading a
+ * video, submitting reposts, sending mailboxes — so "idle" has to mean idle at
+ * all of them, not just at the one that is easiest to query.
+ *
+ * NOT SCOPED TO THE RESET, deliberately. Every other count on the admin page is
+ * measured from the reset because it is about output since then; this is about
+ * whether somebody is still here, and a reset last Tuesday does not make a
+ * fortnight of silence into three days of it.
+ *
+ * Cached with the click counts: it is five grouped aggregates and the answer
+ * moves once a day per person.
+ */
+export function getLastWorkByUser(): Promise<Record<string, string>> {
+  return cached('lastWorkByUser', TTL.clicks, getLastWorkByUserUncached)
+}
+
+async function getLastWorkByUserUncached(): Promise<Record<string, string>> {
+  await Promise.all([ensureAdminTables(), ensureClickedTable(), ensurePromoTables()])
+  const { rows } = await pool.query<{ user_id: string; at: Date }>(
+    `SELECT user_id, max(at) AS at FROM (
+       SELECT user_id, max(clicked_at)   AS at FROM clicked_link        GROUP BY user_id
+       UNION ALL
+       -- An admin's pay adjustment is not work the person did.
+       SELECT user_id, max(submitted_at) AS at FROM commented_submission
+        WHERE platform <> 'adjustment' GROUP BY user_id
+       UNION ALL
+       SELECT user_id, max(uploaded_at)  AS at FROM video_submission     GROUP BY user_id
+       UNION ALL
+       SELECT user_id, max(submitted_at) AS at FROM promo_link           GROUP BY user_id
+       UNION ALL
+       SELECT user_id, max(submitted_at) AS at FROM account_submission   GROUP BY user_id
+     ) x GROUP BY user_id`
+  )
+  const out: Record<string, string> = {}
+  for (const r of rows) out[r.user_id] = r.at.toISOString()
+  return out
+}
+
+/**
+ * Per-user weights for dividing pay between genres, as click counts.
+ *
+ * See AdminUserRow.payClicksByGenre for why pay has to be apportioned at all:
+ * clicks carry a product, pay does not. Two grouped aggregates, cached with the
+ * other click counts since they move at the same rate.
+ */
+export interface PayGenreWeights {
+  /** Their own clicks in their own comment-pay window, by genre. */
+  own: Record<string, number>
+  /** Their members' clicks in the commission window, by genre. */
+  referral: Record<string, number>
+}
+
+export function getPayGenreWeights(resetAt: Date): Promise<Record<string, PayGenreWeights>> {
+  // resetAt is IN the key. It is an argument, and the 60s TTL would otherwise
+  // keep serving weights measured from the old floor for a minute after a
+  // reset, against pay that is not cached at all.
+  return cached(
+    `payGenreWeights:${resetAt.getTime()}`,
+    TTL.clicks,
+    () => getPayGenreWeightsUncached(resetAt)
+  )
+}
+
+async function getPayGenreWeightsUncached(
+  resetAt: Date
+): Promise<Record<string, PayGenreWeights>> {
+  await Promise.all([ensureAdminTables(), ensureClickedTable(), ensureReferralTables()])
+  const [own, referral] = await Promise.all([
+    // THE SAME FLOOR THE COMMENT PAY USES. getUserPendingPayments counts
+    // comments from GREATEST(global reset, their reset, their last comment
+    // payout); the clicks that divide that pay have to start at the same
+    // instant or the weights describe a different period than the money.
+    pool.query<{ user_id: string; product: string; n: number }>(
+      `WITH win AS (
+         SELECT u.user_id,
+                GREATEST($1::timestamptz,
+                         COALESCE(ur.reset_at, $1::timestamptz),
+                         COALESCE(cpm.paid_at, $1::timestamptz)) AS floor_at
+           FROM (SELECT DISTINCT user_id FROM commented_submission) u
+           LEFT JOIN user_reset ur          ON ur.user_id  = u.user_id
+           LEFT JOIN comment_pay_marker cpm ON cpm.user_id = u.user_id
+       )
+       SELECT cl.user_id, COALESCE(cl.product, '') AS product, COUNT(*)::int AS n
+         FROM clicked_link cl JOIN win w ON w.user_id = cl.user_id
+        WHERE cl.clicked_at >= w.floor_at
+        GROUP BY 1, 2`,
+      [resetAt]
+    ),
+    // The commission window, floored by the REFERRER's payout alone. Grouped
+    // onto the referrer: these are their members' clicks, which is what their
+    // commission is a share of.
+    pool.query<{ referrer_id: string; product: string; n: number }>(
+      `WITH win AS (
+         SELECT r.referrer_id, r.user_id AS member_id,
+                GREATEST($1::timestamptz, COALESCE(rpm.paid_at, $1::timestamptz)) AS floor_at
+           FROM referral r
+           LEFT JOIN referral_pay_marker rpm ON rpm.user_id = r.referrer_id
+       )
+       SELECT w.referrer_id, COALESCE(cl.product, '') AS product, COUNT(*)::int AS n
+         FROM win w
+         JOIN clicked_link cl ON cl.user_id = w.member_id AND cl.clicked_at >= w.floor_at
+        GROUP BY 1, 2`,
+      [resetAt]
+    ),
+  ])
+
+  const out: Record<string, PayGenreWeights> = {}
+  const slot = (id: string): PayGenreWeights => (out[id] ??= { own: {}, referral: {} })
+  // STRICT, NOT genreOfProduct: that falls back to 'humanizer' for anything it
+  // does not know, which would quietly file an unstamped click as humanizer
+  // money. An unknown product is its own bucket and the dashboard says so.
+  const bucket = (product: string): string => PRODUCT_GENRE[product] ?? '(none)'
+  for (const r of own.rows) {
+    const g = slot(r.user_id).own
+    g[bucket(r.product)] = (g[bucket(r.product)] ?? 0) + r.n
+  }
+  for (const r of referral.rows) {
+    const g = slot(r.referrer_id).referral
+    g[bucket(r.product)] = (g[bucket(r.product)] ?? 0) + r.n
+  }
+  return out
+}
+
+export async function getAdminData(
+  /**
+   * The admin's master genre. Every CLICK below is cut to its products, so the
+   * Links-clicked figure, the per-day table, each worker's clicks and the pay
+   * apportioned from them are all about one genre at once.
+   *
+   * What it cannot cut: comment reports carry a platform and a count and no
+   * product, so comment totals stay all-genre and are labelled that way on the
+   * page. Omitted, everything is all-genre, which is how this behaved before
+   * the switch existed.
+   */
+  genre: string | null = null
+): Promise<AdminData> {
   await Promise.all([ensureAdminTables(), ensureClickedTable(), ensureUserProfileTable()])
   const resetAt = await getResetAt()
+  // null, not [], for "every product": an empty array would match nothing and
+  // turn an unknown genre into an empty dashboard rather than a full one.
+  const genreProducts = genre && isGenre(genre) ? productsInGenre(genre) : null
 
   const [
     users,
@@ -7596,11 +9628,16 @@ export async function getAdminData(): Promise<AdminData> {
     await Promise.all([
       pool.query(`SELECT id, name, email, image, "createdAt"::text AS created_at FROM "user" ORDER BY "createdAt"`),
       pool.query(
-        `SELECT cl.user_id, cl.platform, COUNT(*)::int AS n
+        // Product comes back beside the platform so the page can split a
+        // worker's clicks by genre as well as by site. One row per
+        // (user, platform, product) now, so the reader below must ADD rather
+        // than assign.
+        `SELECT cl.user_id, cl.platform, COALESCE(cl.product, '') AS product, COUNT(*)::int AS n
          FROM clicked_link cl LEFT JOIN user_reset ur ON ur.user_id = cl.user_id
          WHERE cl.clicked_at >= GREATEST($1::timestamptz, COALESCE(ur.reset_at, $1::timestamptz))
-         GROUP BY cl.user_id, cl.platform`,
-        [resetAt]
+           AND ($2::text[] IS NULL OR cl.product = ANY($2::text[]))
+         GROUP BY cl.user_id, cl.platform, cl.product`,
+        [resetAt, genreProducts]
       ),
       // Who was reset on their own, and when. Every count above is measured
       // from GREATEST(global, theirs), so a rate has to divide by the same
@@ -7610,8 +9647,9 @@ export async function getAdminData(): Promise<AdminData> {
         `SELECT cl.user_id, cl.clicked_at::date::text AS day, COUNT(*)::int AS n
          FROM clicked_link cl LEFT JOIN user_reset ur ON ur.user_id = cl.user_id
          WHERE cl.clicked_at >= GREATEST($1::timestamptz, COALESCE(ur.reset_at, $1::timestamptz))
+           AND ($2::text[] IS NULL OR cl.product = ANY($2::text[]))
          GROUP BY cl.user_id, day ORDER BY day`,
-        [resetAt]
+        [resetAt, genreProducts]
       ),
       pool.query(
         `SELECT uld.user_id, uld.day::text AS day
@@ -7643,7 +9681,7 @@ export async function getAdminData(): Promise<AdminData> {
         [resetAt]
       ),
       pool.query(
-        `SELECT user_id, name, bank_account, tiktok_url, youtube_url, instagram_url,
+        `SELECT user_id, name, bank_account, bank_name, tiktok_url, youtube_url, instagram_url,
                 phone, telegram, referral_code
            FROM user_profile`
       ),
@@ -7672,7 +9710,7 @@ export async function getAdminData(): Promise<AdminData> {
     ])
   ).map((r) => r.rows) as [
     { id: string; name: string | null; email: string; image: string | null; created_at: string }[],
-    { user_id: string; platform: string; n: number }[],
+    { user_id: string; platform: string; product: string; n: number }[],
     { user_id: string; day: string }[],
     { user_id: string; day: string; n: number }[],
     { user_id: string; day: string }[],
@@ -7702,6 +9740,17 @@ export async function getAdminData(): Promise<AdminData> {
   const resetDay = new Date(resetAt).toISOString().slice(0, 10)
   const ownReset = new Map(userResets.map((r) => [r.user_id, r.day]))
 
+  // When each user last did anything, for the "hide idle workers" filter on the
+  // page. Its own cached query rather than derived from the counts above,
+  // because those are scoped to the reset and this must not be.
+  const lastWork = await getLastWorkByUser().catch(() => ({}) as Record<string, string>)
+
+  // How each user's pay divides between genres. Fetched here rather than in the
+  // big Promise.all above because the rows below need it already resolved.
+  const payWeights = await getPayGenreWeights(resetAt).catch(
+    () => ({}) as Record<string, PayGenreWeights>
+  )
+
   const byId = new Map<string, AdminUserRow>()
   for (const u of users) {
     byId.set(u.id, {
@@ -7713,7 +9762,10 @@ export async function getAdminData(): Promise<AdminData> {
       product: null,
       profile: null,
       clicksByPlatform: {},
+      clicksByGenre: {},
       totalClicks: 0,
+      payClicksByGenre: payWeights[u.id]?.own ?? {},
+      referralClicksByGenre: payWeights[u.id]?.referral ?? {},
       commentedByPlatform: {},
       totalCommented: 0,
       sampleUrls: {},
@@ -7736,6 +9788,7 @@ export async function getAdminData(): Promise<AdminData> {
       blocked: false,
       blockReason: null,
       blockAuto: false,
+      lastWorkAt: lastWork[u.id] ?? null,
       lastSnapshotDay: null,
       referralCode: null,
     })
@@ -7786,6 +9839,7 @@ export async function getAdminData(): Promise<AdminData> {
       u.profile = {
         name: p.name,
         bank_account: p.bank_account,
+        bank_name: p.bank_name ?? null,
         tiktok_url: p.tiktok_url,
         youtube_url: p.youtube_url,
         instagram_url: p.instagram_url,
@@ -7798,7 +9852,11 @@ export async function getAdminData(): Promise<AdminData> {
   for (const c of clicks) {
     const u = byId.get(c.user_id)
     if (u) {
-      u.clicksByPlatform[c.platform] = c.n
+      // ADDED, not assigned: the query now returns one row per product within
+      // each platform, so a platform's total is the sum of its rows.
+      u.clicksByPlatform[c.platform] = (u.clicksByPlatform[c.platform] ?? 0) + c.n
+      const g = PRODUCT_GENRE[c.product] ?? '(none)'
+      u.clicksByGenre[g] = (u.clicksByGenre[g] ?? 0) + c.n
       u.totalClicks += c.n
     }
   }
@@ -7874,7 +9932,7 @@ export async function getAdminData(): Promise<AdminData> {
     if (u) u.screenshots.push({ platform: s.platform, url: s.blob_url, uploaded_at: s.uploaded_at })
   }
 
-  const aggregates = await getClickAggregates(resetAt).catch(() => ({
+  const aggregates = await getClickAggregates(resetAt, genreProducts).catch(() => ({
     clicksByProduct: {} as Record<string, number>,
     dailyClicks: [] as { day: string; count: number }[],
     dailyClicksByProduct: {} as Record<string, { day: string; count: number }[]>,

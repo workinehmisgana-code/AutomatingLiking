@@ -1,10 +1,10 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { upload } from '@vercel/blob/client'
-import { PROMO_PLATFORMS, PROMO_PAY_BIRR, PRODUCTS, DEACTIVATED_PRODUCTS } from '@/lib/config'
+import { PROMO_PLATFORMS, PROMO_PAY_BIRR, DEACTIVATED_PRODUCTS, productsInGenre } from '@/lib/config'
 import type { PromoVideoAdmin } from '@/lib/db'
 
 function fmtSize(bytes: number | null) {
@@ -13,10 +13,24 @@ function fmtSize(bytes: number | null) {
   return Math.round(bytes / 1024) + ' KB'
 }
 
-export default function PromoAdmin({ videos }: { videos: PromoVideoAdmin[] }) {
+export default function PromoAdmin({
+  videos,
+  genre,
+}: {
+  videos: PromoVideoAdmin[]
+  /** The admin's master genre switch: only its products are offered. */
+  genre: string
+}) {
   const router = useRouter()
+  const genreProducts = productsInGenre(genre)
   // One product selection governs the whole page: upload + which videos show.
-  const [product, setProduct] = useState('')
+  // A genre with one product (website, slides) has nothing to choose, so it
+  // starts chosen.
+  const [product, setProduct] = useState(genreProducts.length === 1 ? genreProducts[0] : '')
+  useEffect(() => {
+    setProduct(genreProducts.length === 1 ? genreProducts[0] : '')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [genre])
   const [file, setFile] = useState<File | null>(null)
   const [busy, setBusy] = useState(false)
   const [pct, setPct] = useState(0)
@@ -77,7 +91,10 @@ export default function PromoAdmin({ videos }: { videos: PromoVideoAdmin[] }) {
   }
 
   // Videos scoped to the selected product (all videos until one is chosen).
-  const shownVideos = product ? videos.filter((v) => v.product === product) : videos
+  // No product chosen = every video of THIS genre, not every video.
+  const shownVideos = product
+    ? videos.filter((v) => v.product === product)
+    : videos.filter((v) => genreProducts.includes(v.product ?? ''))
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-6 sm:py-8">
@@ -108,10 +125,10 @@ export default function PromoAdmin({ videos }: { videos: PromoVideoAdmin[] }) {
           className="w-full bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
         >
           <option value="">Choose product…</option>
-          {PRODUCTS.map((p) => (
-            <option key={p} value={p} disabled={DEACTIVATED_PRODUCTS.includes(p)}>
+          {genreProducts.map((p) => (
+            <option key={p} value={p} disabled={(DEACTIVATED_PRODUCTS as readonly string[]).includes(p)}>
               {p}
-              {DEACTIVATED_PRODUCTS.includes(p) ? ' (off)' : ''}
+              {(DEACTIVATED_PRODUCTS as readonly string[]).includes(p) ? ' (off)' : ''}
             </option>
           ))}
         </select>

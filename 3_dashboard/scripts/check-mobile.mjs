@@ -88,5 +88,128 @@ check('  and selected', /p\.phone, p\.telegram/.test(db), true)
 // An admin holding a phone number is trying to find out whose submission it is.
 check('  searchable by them too', /lower\(COALESCE\(p\.phone, ''\)\) LIKE/.test(db), true)
 
+// ── the admin screens, as rules rather than as a snapshot ───────────────────
+//
+// Everything below is computed over every admin component, so a modal or a table
+// added later is held to the same rule without anybody editing this file.
+const { readdirSync } = await import('node:fs')
+const compDir = new URL('../components/', import.meta.url)
+const ADMIN = /^(Admin|Scan|Comment(Frequency)?|Verify(Links)?|Pipeline|Platform|Active|Apk|Guide|Promo|Llm|UserMessages|EditAccount)/
+const admin = readdirSync(compDir)
+  .filter((f) => f.endsWith('.tsx') && ADMIN.test(f))
+  .map((f) => ({ f, src: readFileSync(new URL(f, compDir), 'utf8') }))
+
+console.log('\nevery admin modal is the whole screen on a phone')
+// A 360px screen spent 32px of width and 64px of height on margins around a card
+// that then had 292px to render a table in. Below sm: the modal IS the screen.
+const overlays = []
+for (const { f, src } of admin) {
+  for (const m of src.matchAll(/className=(?:"|\{`)(fixed inset-0 [^"`]*)/g)) {
+    const cls = m[1]
+    // z-40 overlays are click-catchers behind a menu, not panels.
+    if (/z-40(?!\d)/.test(cls) && !/flex/.test(cls)) continue
+    if (!/flex/.test(cls)) continue
+    overlays.push({ f, cls })
+  }
+}
+check('  there are modals to check', overlays.length > 0, true)
+const padded = overlays.filter(
+  (o) => /\bp-4\b|\bpx-4\b|\bpy-8\b/.test(o.cls) && !/sm:p-4|sm:px-4|sm:py-8/.test(o.cls)
+)
+// px-4 alone on a short centred dialog is fine — the card is narrow anyway. What
+// must not happen is a big scrolling panel keeping its padding on a phone.
+const bigPadded = padded.filter((o) => /overflow-y-auto|items-start/.test(o.cls))
+check(
+  '  no big panel keeps its padding below sm',
+  bigPadded.map((o) => `${o.f}: ${o.cls.slice(0, 60)}`),
+  []
+)
+
+console.log('\nand no panel floats in the middle of a phone screen')
+const panels = []
+for (const { f, src } of admin) {
+  // Any panel wide enough to be a page: the named sizes and the bracket ones
+  // ([80rem] and friends), which the first version of this rule missed.
+  for (const m of src.matchAll(
+    /className="([^"]*\bmax-w-(?:2xl|3xl|4xl|5xl|6xl|7xl|\[[\w.]+\])[^"]*)"/g
+  )) {
+    panels.push({ f, cls: m[1] })
+  }
+}
+const floating = panels.filter(
+  (p2) =>
+    /\bmy-8\b|\bmy-auto\b|\bmt-6\b/.test(p2.cls) &&
+    !/sm:my-8|sm:my-auto|sm:mt-6/.test(p2.cls)
+)
+check('  wide panels lose their vertical margin below sm', floating.map((p2) => p2.f), [])
+const roundOnPhone = panels.filter(
+  (p2) =>
+    /\brounded-(?:xl|2xl)\b/.test(p2.cls) &&
+    !/rounded-none sm:rounded-(?:xl|2xl)/.test(p2.cls)
+)
+check('  and their corners', roundOnPhone.map((p2) => `${p2.f}: ${p2.cls.slice(0, 50)}`), [])
+
+console.log('\na short dialog can still be scrolled when it does not fit')
+const shortDialogs = []
+for (const { f, src } of admin) {
+  for (const m of src.matchAll(/className="([^"]*\bmax-w-(?:sm|md|lg)\b[^"]*\bp-5\b[^"]*)"/g)) {
+    shortDialogs.push({ f, cls: m[1] })
+  }
+}
+const unscrollable = shortDialogs.filter((d) => !/max-h-/.test(d.cls))
+check('  every one has a ceiling', unscrollable.map((d) => d.f), [])
+
+console.log('\nno table is left to squash')
+// A table wider than a phone is fine — it scrolls. A table wider than a phone
+// with nothing to scroll it makes the whole PAGE scroll sideways, which moves the
+// header and the buttons off screen too.
+const wide = []
+for (const { f, src } of admin) {
+  for (const m of src.matchAll(/min-w-\[(\d+)px\]/g)) {
+    if (Number(m[1]) <= 360) continue
+    const before = src.slice(Math.max(0, m.index - 400), m.index)
+    const scrolled = /overflow-x-auto|overflow-auto|<ScrollX/.test(before)
+    if (!scrolled) wide.push(`${f}: min-w-[${m[1]}px]`)
+  }
+}
+check('  each wide block sits in a scroller', wide, [])
+
+console.log('\nno grid keeps its columns on a phone')
+const grids = []
+for (const { f, src } of admin) {
+  for (const m of src.matchAll(/className="([^"]*)"/g)) {
+    const cls = m[1]
+    // THREE OR MORE with nothing to widen it later. Two columns of short stats
+    // is right on a phone and stays two; "grid-cols-2 sm:grid-cols-5" is the
+    // shape to aim for, not a fault. Three at 360px is 100px a column.
+    const base = cls.match(/(?:^|\s)grid-cols-([3-9]|1[0-2])(?:\s|$)/)
+    const responsive = /(?:sm|md|lg|xl):grid-cols-/.test(cls)
+    if (base && !responsive) grids.push(`${f}: ${cls.slice(0, 50)}`)
+  }
+}
+check('  every fixed column count is behind a breakpoint', grids, [])
+
+console.log('\nthe long rows wrap instead of shrinking to nothing')
+const freq = readFileSync(new URL('CommentFrequency.tsx', compDir), 'utf8')
+const dash = readFileSync(new URL('AdminDashboard.tsx', compDir), 'utf8')
+check('  the frequency list', /flex flex-wrap sm:flex-nowrap items-baseline/.test(freq), true)
+check('  the comment gets its own line', /order-last sm:order-none basis-full/.test(freq), true)
+check('  and position\u00b7date step aside', /hidden sm:inline-block/.test(freq), true)
+check('  the verify report links', /flex flex-wrap sm:flex-nowrap items-center/.test(dash), true)
+check('  the comment it found too', /order-last sm:order-none basis-full/.test(dash), true)
+
+console.log('\nthe charts are drawn to fit, not to a number')
+for (const { f, src } of admin) {
+  for (const m of src.matchAll(/<svg([^>]*)>/g)) {
+    const a = m[1]
+    if (!/viewBox/.test(a)) continue
+    // An icon may be 16x16; a chart must be told to fill its box.
+    if (/width="\d/.test(a) && Number((a.match(/width="(\d+)"/) || [])[1]) > 40) {
+      check(`  ${f} chart scales`, false, true)
+    }
+  }
+}
+check('  every chart uses a viewBox and w-full', /viewBox=\{`0 0 \$\{W\} \$\{H\}`\} className="w-full/.test(dash), true)
+
 console.log(`\n${fails === 0 ? 'all correct' : fails + ' FAILED'}`)
 process.exit(fails === 0 ? 0 : 1)

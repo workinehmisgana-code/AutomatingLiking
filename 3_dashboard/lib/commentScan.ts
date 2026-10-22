@@ -25,6 +25,13 @@ export interface ProductHit {
   likes: number
   username: string
   text: string
+  /**
+   * When the comment was posted, from TikTok's own create_time, or null.
+   *
+   * The first date on one of these rows that is not our clock: everything else
+   * records when WE looked, which cannot answer "what went up this week".
+   */
+  postedAt: string | null
 }
 
 export interface ScanResult {
@@ -100,6 +107,7 @@ export async function scanLink(url: string): Promise<ScanResult> {
         likes: c.likes,
         username: c.username,
         text: c.text.slice(0, 300),
+        postedAt: c.postedAt,
       })
     }
   })

@@ -1,9 +1,10 @@
 import { list, put } from '@vercel/blob'
 import { NextRequest, NextResponse } from 'next/server'
-import { saveLinkTitles, getBlockedUrls, getDateWeights, getLinkStats, type LinkStat } from '@/lib/db'
+import { invalidatePoolFile } from '@/lib/videos'
+import { saveLinkTitles, getBlockedIndex, getDateWeights, getLinkStats, type LinkStat } from '@/lib/db'
 import { overlayStats } from '@/lib/linkStats'
 import { computeDateScores } from '@/lib/dateScore'
-import { DEFAULT_DATE_WEIGHTS } from '@/lib/config'
+import { DEFAULT_DATE_WEIGHTS, DEFAULT_GENRE, genreOfRow, isGenre, repairRowPlatform } from '@/lib/config'
 
 type Video = Record<string, unknown> & {
   url?: unknown
@@ -58,6 +59,17 @@ function refreshLink(stored: Video, incoming: Video): boolean {
     stored.search_rank = nextRank
     changed = true
   }
+  // THE GENRE, OR A RE-UPLOAD SILENTLY LOSES IT. This function is the only
+  // thing that touches a row we already hold, and it copied two numbers — so
+  // re-scraping a website keyword that happens to return a link already in the
+  // pool would leave that link reading as humanizer for ever.
+  //
+  // Only ever SET, never cleared: an upload that forgot to say which genre it
+  // was must not be able to blank one that is already right.
+  if (isGenre(incoming.genre) && incoming.genre !== stored.genre) {
+    stored.genre = incoming.genre
+    changed = true
+  }
   return changed
 }
 
@@ -85,7 +97,7 @@ async function loadExisting(): Promise<Video[]> {
   })
   if (!res.ok) return []
   const data = await res.json()
-  return Array.isArray(data) ? (data as Video[]) : []
+  return Array.isArray(data) ? (data as Video[]).map(repairRowPlatform) : []
 }
 
 /** Keep one row per URL, preserving order (first occurrence wins). */
@@ -129,6 +141,23 @@ export async function POST(req: NextRequest) {
 
   const modeParam = req.nextUrl.searchParams.get('mode')
   const mode = modeParam === 'append' ? 'append' : modeParam === 'dedupe' ? 'dedupe' : 'replace'
+
+  // WHICH GENRE'S POOL THIS UPLOAD IS FOR, carried as one query param rather
+  // than as a column on every row: a search run has exactly one genre, so a
+  // column would repeat the same word two hundred times a file and would have to
+  // be threaded through four duplicated CSV writers to say it.
+  //
+  // An unrecognised or missing value is DEFAULT_GENRE, not an error. Uploads come
+  // from a desktop app that can be older than this deploy, and refusing the whole
+  // file would lose a scrape; reading it as humanizer is what every pre-genre
+  // upload already means.
+  const genreParam = req.nextUrl.searchParams.get('genre')
+  const genre = isGenre(genreParam) ? genreParam : DEFAULT_GENRE
+  for (const v of incoming) {
+    v.genre = genre
+    // An older upload.py tags a Reddit post 'unknown'; the URL says Reddit.
+    repairRowPlatform(v)
+  }
 
   let videos: Video[]
   let replacedPlatforms: string[] = []
@@ -195,8 +224,21 @@ export async function POST(req: NextRequest) {
     // Kept: every link of an untouched platform, AND every posted-date-only
     // link regardless of platform. Only search-rank links of the incoming
     // platforms are up for replacement.
+    //
+    // AND ONLY THIS UPLOAD'S GENRE. A replace is "this search is the whole of
+    // this genre's search-rank links on these platforms" — it says nothing
+    // about another genre's. Scoped by platform alone, a humanizer TikTok
+    // upload dropped every website-builder TikTok link in the pool, which is
+    // how the cocodly links served on 2026-10-17 left the pool by the 18th.
+    // Another genre's link that this batch re-uploads is the exception: it is
+    // taken over (refreshLink re-stamps its genre), not kept twice.
+    const incomingKeys = new Set(incoming.map(urlKey).filter(Boolean))
+    const sameGenre = (v: Video): boolean => genreOfRow({ genre: v.genre }) === genre
     const kept = existing.filter(
-      (v) => !incomingPlatforms.has(platformOf(v)) || dateClusteredOnly(v)
+      (v) =>
+        !incomingPlatforms.has(platformOf(v)) ||
+        dateClusteredOnly(v) ||
+        (!sameGenre(v) && !incomingKeys.has(urlKey(v)))
     )
     protectedDateOnly = existing.filter(
       (v) => incomingPlatforms.has(platformOf(v)) && dateClusteredOnly(v)
@@ -204,7 +246,12 @@ export async function POST(req: NextRequest) {
     const storedForPlatforms = new Map<string, Video>()
     for (const v of existing) {
       const k = urlKey(v)
-      if (k && incomingPlatforms.has(platformOf(v)) && !dateClusteredOnly(v)) {
+      if (
+        k &&
+        incomingPlatforms.has(platformOf(v)) &&
+        !dateClusteredOnly(v) &&
+        (sameGenre(v) || incomingKeys.has(k))
+      ) {
         storedForPlatforms.set(k, v)
       }
     }
@@ -251,15 +298,18 @@ export async function POST(req: NextRequest) {
   // The weights are the admin-set ones (Recluster modal), not the compiled
   // defaults — otherwise the next upload would silently undo the weighting the
   // admin last applied.
-  const [blockedList, dateWeights] = await Promise.all([
-    getBlockedUrls().catch(() => [] as string[]),
+  const [blockedIndex, dateWeights] = await Promise.all([
+    getBlockedIndex().catch(() => new Map<string, Set<string>>()),
     getDateWeights().catch(() => DEFAULT_DATE_WEIGHTS),
   ])
-  const blockedNow = new Set(blockedList)
   const linkStats = await getLinkStats().catch(() => ({}) as Record<string, LinkStat>)
   overlayStats(videos as unknown as { url?: unknown }[], linkStats)
   const scored = computeDateScores(
-    videos.filter((v) => !blockedNow.has(String(v.url ?? ''))),
+    // Blocked FOR THE ROW'S OWN GENRE — the rows are in hand, so no index of
+    // the old pool is needed (and this upload may just have re-filed some).
+    videos.filter(
+      (v) => !blockedIndex.get(String(v.url ?? ''))?.has(genreOfRow({ genre: v.genre }))
+    ),
     dateWeights,
     // Same photo flags as the Recluster button, so an upload cannot silently
     // score a known carousel back up as if it were a video.
@@ -273,6 +323,9 @@ export async function POST(req: NextRequest) {
   }
 
   try {
+    // The pool file is being replaced, so the cached copy of it is wrong from
+    // this moment; the next reader downloads the new one.
+    invalidatePoolFile()
     const blob = await put('videos.json', JSON.stringify(videos), {
       access: 'public',
       addRandomSuffix: false,
@@ -281,6 +334,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       ok: true,
       mode,
+      genre,
       received: incoming.length,
       added,
       updated,

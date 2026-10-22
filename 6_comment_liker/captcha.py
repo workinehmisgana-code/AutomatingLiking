@@ -42,6 +42,7 @@ Configure in .env, here or in ../3_dashboard/.env:
     CAPTCHA_API_KEY=...
     CAPTCHA_API_URL=...      # optional; inferred from the key when it can be
 """
+import base64
 import json
 import os
 import random
@@ -84,6 +85,14 @@ TRACK_SELECTORS = [
     "[class*='captcha_verify_slide--slidebar']",
     "[class*='secsdk-captcha-drag-wrapper']",
     "[class*='slidebar']",
+]
+# The whole widget. Used to photograph puzzles that are NOT rotations: those
+# cannot be reduced to an angle, so a person has to see the thing itself.
+CONTAINER_SELECTORS = [
+    "[class*='captcha_verify_container' i]",
+    "[class*='secsdk-captcha' i]",
+    "[class*='captcha' i]",
+    "[id*='captcha' i]",
 ]
 REFRESH_SELECTORS = [
     "[class*='secsdk_captcha_refresh']",
@@ -415,6 +424,107 @@ def _glide(page, x_from: float, x_to: float, y: float, steps: int = 0) -> None:
         time.sleep(random.uniform(0.008, 0.020))
 
 
+def shot(page):
+    """A PNG of the widget as base64, and its box on the page.
+
+    For everything the rotate endpoint cannot touch — "select the two objects of
+    the same shape", the jigsaw, whatever TikTok tries next. There is no number
+    that answers those, so the only way to hand one to a person who is not at
+    this machine is to send them the picture and take back where they tapped.
+
+    The box comes with it because a tap arrives as a FRACTION of the picture: the
+    phone showed it at whatever width the phone has, and turning that back into a
+    click needs the real geometry, which only this side knows.
+
+    Returns (b64, box) or (None, None).
+    """
+    for scope in _frames(page):
+        el, box = _first(scope, CONTAINER_SELECTORS)
+        if not el or not box:
+            continue
+        try:
+            # The ELEMENT's own screenshot, not a clipped page shot: the widget
+            # is often inside an iframe, where a clip in main-page coordinates
+            # would photograph the wrong rectangle.
+            png = el.screenshot(type="png")
+        except Exception:  # noqa: BLE001
+            continue
+        if png:
+            return base64.b64encode(png).decode("ascii"), box
+    return None, None
+
+
+def drag_angle(page, widget: dict, angle: float, verbose: bool = False) -> float:
+    """Turn the inner disc by `angle` degrees, the way a hand would.
+
+    The track spans one full turn, so the drag is that fraction of it. This is
+    the conversion the solving services publish alongside their answers, and it
+    is the same arithmetic whether the angle came from a service or from a person
+    looking at the puzzle on a phone — which is why it lives here rather than
+    inside solve().
+
+    Returns the distance dragged, in pixels.
+    """
+    hb = widget["handle_box"]
+    track_w = (
+        (widget["track_box"] or {}).get("width")
+        or (widget["img_box"] or {}).get("width")
+        or 260
+    )
+    usable = max(40.0, track_w - hb["width"])
+    distance = max(0.0, min(usable, usable * (angle % 360.0) / 360.0))
+    x0 = hb["x"] + hb["width"] / 2
+    y0 = hb["y"] + hb["height"] / 2
+    if verbose:
+        print(f"    dragging {distance:.0f}px of {usable:.0f} for {angle:.1f} deg")
+    page.mouse.move(x0, y0)
+    page.mouse.down()
+    time.sleep(random.uniform(0.08, 0.18))
+    _glide(page, x0, x0 + distance, y0)
+    # Settle on the mark before letting go, as a hand does.
+    time.sleep(random.uniform(0.10, 0.25))
+    page.mouse.move(x0 + distance + random.uniform(-0.8, 0.8), y0 + random.uniform(-0.6, 0.6))
+    time.sleep(random.uniform(0.08, 0.16))
+    page.mouse.up()
+    return distance
+
+
+def tap_points(page, box: dict, points, verbose: bool = False) -> int:
+    """Click where somebody tapped the picture. `points` are fractions of it.
+
+    Fractions rather than pixels because the taps were made on a phone showing a
+    scaled copy. Anything outside the box is dropped rather than clamped: a stray
+    tap belongs nowhere, and a clamped one lands on the edge of the widget and
+    burns the puzzle.
+    """
+    done = 0
+    for pt in points or []:
+        try:
+            fx, fy = float(pt[0]), float(pt[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0):
+            continue
+        x = box["x"] + box["width"] * fx
+        y = box["y"] + box["height"] * fy
+        if verbose:
+            print(f"    tap {done + 1} at {x:.0f},{y:.0f}")
+        page.mouse.move(x + random.uniform(-1.2, 1.2), y + random.uniform(-1.2, 1.2))
+        time.sleep(random.uniform(0.10, 0.22))
+        page.mouse.down()
+        time.sleep(random.uniform(0.04, 0.09))
+        page.mouse.up()
+        done += 1
+        # A person does not tap twice in the same frame.
+        time.sleep(random.uniform(0.25, 0.55))
+    return done
+
+
+def refresh(page) -> None:
+    """Ask TikTok for a different puzzle. Public name for _refresh."""
+    _refresh(page)
+
+
 def dump(page, tag: str) -> None:
     """Keep what a failure looked like, so the next fix works from evidence."""
     try:
@@ -475,34 +585,11 @@ def solve(page, attempts: int = MAX_ATTEMPTS, verbose: bool = True) -> bool:
                 _refresh(page)
             continue
 
-        hb = widget["handle_box"]
-        track_w = (
-            (widget["track_box"] or {}).get("width")
-            or (widget["img_box"] or {}).get("width")
-            or 260
-        )
-        usable = max(40.0, track_w - hb["width"])
-        # The track spans one full turn: this is the conversion the solving
-        # services publish alongside the angle, and the angle is theirs.
-        distance = max(0.0, min(usable, usable * (angle % 360.0) / 360.0))
-        x0 = hb["x"] + hb["width"] / 2
-        y0 = hb["y"] + hb["height"] / 2
-
         if verbose:
-            print(
-                f"    captcha {attempt}/{attempts}: solver says {angle:.1f} deg -> "
-                f"drag {distance:.0f}px of {usable:.0f}"
-            )
-
-        page.mouse.move(x0, y0)
-        page.mouse.down()
-        time.sleep(random.uniform(0.08, 0.18))
-        _glide(page, x0, x0 + distance, y0)
-        # Settle on the mark before letting go, as a hand does.
-        time.sleep(random.uniform(0.10, 0.25))
-        page.mouse.move(x0 + distance + random.uniform(-0.8, 0.8), y0 + random.uniform(-0.6, 0.6))
-        time.sleep(random.uniform(0.08, 0.16))
-        page.mouse.up()
+            print(f"    captcha {attempt}/{attempts}: solver says {angle:.1f} deg")
+        # The same drag a person's answer gets, because it is the same puzzle and
+        # the same widget; only where the angle came from differs.
+        drag_angle(page, widget, angle, verbose=verbose)
 
         page.wait_for_timeout(2500)
         if not present(page):

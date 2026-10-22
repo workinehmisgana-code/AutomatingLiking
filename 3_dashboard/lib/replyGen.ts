@@ -15,8 +15,9 @@
 // Drafts only. Nothing is posted from here — the admin reviews them on
 // /admin/replies and copies the ones worth using.
 
-import { groqChat } from './groq'
-import { PRODUCTS, DEACTIVATED_PRODUCTS, type Product } from './config'
+import { llmChat } from './llm'
+import { PRODUCTS, DEACTIVATED_PRODUCTS, genreOfProduct, type Product } from './config'
+import { REPLY_AFFIRM as AFFIRM, REPLY_RECOMMEND as RECOMMEND } from './prompts'
 import type { WordBand } from './db'
 
 export interface ReplyTarget {
@@ -45,52 +46,6 @@ export const CHUNK = 8
 /** Replies shorter than this cannot both answer a comment and name a product. */
 export const REPLY_WORD_MIN = 8
 export const REPLY_WORD_MAX = 22
-
-function rules(band: WordBand): string {
-  return (
-    `- be ${band.min} to ${band.max} words, lowercase, casual, like a real person replying on ` +
-    'their phone.\n' +
-    '- contain NO hashtags, NO emojis, NO quotes, NO @mentions.\n' +
-    '- never claim to be the video author and never insult the commenter.\n'
-  )
-}
-
-// The relevance test, shared by both prompts. A reply only belongs under a
-// comment whose author is already thinking about AI writing or getting caught —
-// anywhere else it is an advert nobody asked for, which is what gets accounts
-// restricted.
-const RELEVANCE =
-  'ONLY reply when the comment is about AI WRITING or AI DETECTION: humanizers, paraphrasers, ' +
-  '"bypass AI", Turnitin, GPTZero and other detectors, being flagged or caught, ' +
-  'ChatGPT-written essays, or how to make AI text sound human.\n' +
-  'If the comment is about ANYTHING ELSE — general study talk, the creator, jokes, unrelated ' +
-  'questions, abuse, spam — return exactly "SKIP" for that item instead of a reply. Do not ' +
-  'stretch to make something relevant: when in doubt, SKIP.\n'
-
-const RECOMMEND = (band: WordBand) =>
-  'You write REPLIES to comments under short study/AI videos on TikTok.\n' +
-  RELEVANCE +
-  'When you do reply, it must:\n' +
-  "- answer or react to the comment it replies to, in that comment's own terms. If the comment " +
-  'asks something, answer it. If it complains, sympathise. Never ignore what it says.\n' +
-  '- then mention the given product by name, once, as the thing that helped — a humanizer that ' +
-  'rewrites AI text so it reads as human and passes AI detectors.\n' +
-  rules(band) +
-  'Return STRICT JSON {"replies":[...]} — one string per item, SAME ORDER, exactly as many ' +
-  'entries as items. Use "SKIP" for items you are not replying to.'
-
-const AFFIRM = (band: WordBand) =>
-  'You write short REPLIES agreeing with comments that already recommend a product.\n' +
-  'The commenter has just named the product themselves and is happy with it. Your reply must:\n' +
-  '- simply AGREE with them. Second their experience, nothing more.\n' +
-  '- mention the SAME product they named, once.\n' +
-  '- NOT pitch, NOT list features, NOT explain what it does, NOT try to convince anyone. They ' +
-  'are already convinced. Anything salesy here reads as a bot.\n' +
-  rules(band) +
-  'If a comment only mentions the product in passing and is really about something else ' +
-  'entirely, return exactly "SKIP" for it instead.\n' +
-  'Return STRICT JSON {"replies":[...]} — one string per item, SAME ORDER, exactly as many ' +
-  'entries as items.'
 
 /** Active products, so drafts never advertise something switched off. */
 export function activeProducts(): Product[] {
@@ -141,6 +96,29 @@ async function runMode(
   band: WordBand
 ): Promise<{ drafts: ReplyDraft[]; skips: ReplySkip[] }> {
   if (items.length === 0) return { drafts: [], skips: [] }
+
+  // ONE CALL PER GENRE. The relevance test in the system prompt is specific to
+  // what the product is — "is this comment about AI detection" versus "is this
+  // comment about getting a website made" — and a batch can hold items for
+  // several products. Split first, then each call carries the right test.
+  //
+  // Recursion rather than a loop so everything below stays exactly as it was,
+  // handling one genre's items with one genre's prompt.
+  const genres = Array.from(new Set(items.map((t) => genreOfProduct(t.product))))
+  if (genres.length > 1) {
+    const parts = await Promise.all(
+      genres.map((g) =>
+        runMode(mode, items.filter((t) => genreOfProduct(t.product) === g), band)
+      )
+    )
+    return {
+      drafts: parts.flatMap((p) => p.drafts),
+      skips: parts.flatMap((p) => p.skips),
+    }
+  }
+  // Every item here is one genre, so any of their products answers for it.
+  const genreProduct = items[0].product
+
   const list = items
     .map(
       (t, i) =>
@@ -148,7 +126,7 @@ async function runMode(
     )
     .join('\n')
   try {
-    const { content } = await groqChat({
+    const { content } = await llmChat({
       temperature: mode === 'affirm' ? 0.7 : 0.85,
       jsonObject: true,
       // Scaled to the batch and the word band, not fixed. A fixed 1200 was
@@ -157,7 +135,10 @@ async function runMode(
       // the part it managed — so the entire chunk yielded nothing.
       maxTokens: Math.min(4000, 400 + items.length * (band.max * 4 + 40)),
       messages: [
-        { role: 'system', content: mode === 'affirm' ? AFFIRM(band) : RECOMMEND(band) },
+        {
+          role: 'system',
+          content: mode === 'affirm' ? AFFIRM(band) : RECOMMEND(band, genreProduct),
+        },
         { role: 'user', content: `Write one reply for each:\n${list}` },
       ],
     })
@@ -194,17 +175,27 @@ async function runMode(
  */
 export async function draftReplies(
   targets: ReplyTarget[],
-  band: WordBand = { min: REPLY_WORD_MIN, max: REPLY_WORD_MAX }
+  band: WordBand = { min: REPLY_WORD_MIN, max: REPLY_WORD_MAX },
+  /**
+   * The genre these links are in. Round-robin used to run over EVERY active
+   * product, so a website-builder video could be drafted a reply recommending
+   * a humanizer. With a genre, only its products are recommended, and a
+   * comment naming another genre's product is recommended to rather than
+   * affirmed.
+   */
+  genre?: string
 ): Promise<{ drafts: ReplyDraft[]; skips: ReplySkip[] }> {
   if (targets.length === 0) return { drafts: [], skips: [] }
-  const products = activeProducts()
+  const all = activeProducts()
+  const inGenre = genre ? all.filter((p) => genreOfProduct(p) === genre) : all
+  const products = inGenre.length > 0 ? inGenre : all
 
   const affirm: { url: string; topText: string; topUser: string | null; product: Product }[] = []
   const recommend: typeof affirm = []
   let i = 0
   for (const t of targets) {
     const named = productMentioned(t.topText)
-    if (named) {
+    if (named && (!genre || genreOfProduct(named) === genre)) {
       affirm.push({ ...t, product: named })
     } else {
       recommend.push({ ...t, product: products[i % products.length] })

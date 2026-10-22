@@ -22,7 +22,7 @@ export async function POST(req: NextRequest) {
   const gate = await profileGate(userId)
   if (gate) return gate
 
-  if (!(await getPromoTaskEnabled().catch(() => true))) {
+  if (!(await getPromoTaskEnabled().catch(() => false))) {
     return NextResponse.json({ error: 'The repost task is currently turned off' }, { status: 403 })
   }
 

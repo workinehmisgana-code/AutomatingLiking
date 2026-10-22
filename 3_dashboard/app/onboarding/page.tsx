@@ -5,8 +5,11 @@ import {
   getUserProfile,
   isProfileComplete,
   needsContactOnly,
+  needsBankNameOnly,
+  needsTiktokProfileFix,
   getBlockForEmail,
   getReferralOf,
+  getVerifyVideoUrl,
 } from '@/lib/db'
 import Onboarding from '@/components/Onboarding'
 import Login from '@/components/Login'
@@ -33,6 +36,7 @@ export default async function OnboardingPage() {
         reason={block.reason}
         email={session.user.email ?? ''}
         auto={block.auto}
+        videoUrl={await getVerifyVideoUrl().catch(() => '')}
       />
     )
   }
@@ -40,7 +44,13 @@ export default async function OnboardingPage() {
   const profile = await getUserProfile(session.user.id).catch(() => null)
   // Onboarding is just the profile now — users aren't assigned to a product,
   // they work for all of them.
-  if (isProfileComplete(profile)) redirect('/')
+  //
+  // THE TIKTOK EXCEPTION IS NOT OPTIONAL. Such a profile is "complete" by every
+  // other measure, so without it this redirects to /, which sends them to the
+  // TikTok gate, whose button sends them back here: a loop with a button in it,
+  // and no way for the person to do the one thing being asked of them.
+  const fixTiktok = needsTiktokProfileFix(profile)
+  if (isProfileComplete(profile) && !fixTiktok) redirect('/')
 
   // The referral question is asked once. Somebody who already has a referrer
   // recorded (a half-finished registration they are coming back to) is not
@@ -57,6 +67,8 @@ export default async function OnboardingPage() {
       // they filled in weeks ago. Without a word at the top it reads as being
       // asked to register again.
       contactOnly={needsContactOnly(profile)}
+      tiktokOnly={fixTiktok}
+      bankNameOnly={needsBankNameOnly(profile)}
     />
   )
 }

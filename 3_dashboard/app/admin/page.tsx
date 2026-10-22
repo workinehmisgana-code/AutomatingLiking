@@ -13,13 +13,15 @@ import {
   getPromoTaskEnabled,
   getPresenceAverages,
   getPresenceHistory,
+  getMinAccountAgeDays,
+  getPayAdjustments,
+  getAutoBlockCounts,
   getTiktokAccounts,
-  getUnreadReplies,
 } from '@/lib/db'
-import { isAdminEmail } from '@/lib/config'
+import { isAdminEmail, productsInGenre } from '@/lib/config'
+import { getAdminGenre } from '@/lib/adminGenre'
 import Login from '@/components/Login'
 import AdminDashboard from '@/components/AdminDashboard'
-import UserMessagesPopup from '@/components/UserMessagesPopup'
 
 export const dynamic = 'force-dynamic'
 
@@ -33,11 +35,16 @@ export default async function AdminPage() {
   if (!session) return <Login />
   if (!isAdminEmail(session.user.email)) redirect('/')
 
+  // The master genre switch. Read once, here, and handed to every query and
+  // to the page, so nothing on the screen can be about a different genre from
+  // the number beside it.
+  const genre = await getAdminGenre()
+
   const [
     data, pendingByUser, apk, appVersions, videoTaskEnabled, promoTaskEnabled,
-    presence, presenceHistory, tiktokAccounts, guideVideos, unreadReplies, referralByUser,
+    presence, presenceHistory, tiktokAccounts, guideVideos, referralByUser,
   ] = await Promise.all([
-    getAdminData(),
+    getAdminData(genre),
     getAllPendingPay().catch(() => ({})),
     getApk().catch(() => null),
     getUserAppVersions().catch(() => ({})),
@@ -45,8 +52,9 @@ export default async function AdminPage() {
     getPromoTaskEnabled().catch(() => true),
     // Comment-presence: the badge average, and the last 7 days for the
     // expanded view. Both are cheap aggregate reads.
-    getPresenceAverages().catch(() => ({})),
-    getPresenceHistory(7).catch(() => ({})),
+    // This genre's links only: presence is rebuilt from the per-link rows.
+    getPresenceAverages(productsInGenre(genre)).catch(() => ({})),
+    getPresenceHistory(7, productsInGenre(genre)).catch(() => ({})),
     // The numeric TikTok id behind each handle, which dates the account. Picked
     // up for free by presence checks; one small table.
     getTiktokAccounts().catch(() => ({})),
@@ -54,7 +62,6 @@ export default async function AdminPage() {
     // What users have written and nobody has answered. Server-rendered with
     // the rest of the page so it is on screen with the first paint rather than
     // appearing a second later, over whatever the admin had started reading.
-    getUnreadReplies().catch(() => []),
     // Who referred whom, and what it has earned. Also the moment every user who
     // registered before referrals existed gets a code of their own — their own
     // dashboard assigns it on their next visit, but the admin should not be
@@ -67,11 +74,7 @@ export default async function AdminPage() {
 
   return (
     <>
-      {/* Over everything, before anything else is read. A message from a user
-          had no home before this: it lived inside that user's own card, three
-          hundred cards down a list sorted by clicks, and could only be found by
-          somebody who already knew it was there. */}
-      <UserMessagesPopup initial={unreadReplies} />
+      {/* Users' messages are in the genre bar (app/admin/layout.tsx). */}
       <AdminDashboard
         data={data}
         adminEmail={session.user.email ?? ''}
@@ -85,6 +88,10 @@ export default async function AdminPage() {
         presenceHistory={presenceHistory}
         tiktokAccounts={tiktokAccounts}
         guideVideos={guideVideos}
+        minAgeDays={await getMinAccountAgeDays().catch(() => 90)}
+        payAdjustments={await getPayAdjustments().catch(() => ({}))}
+        autoBlockCounts={await getAutoBlockCounts().catch(() => ({}))}
+        genre={genre}
       />
     </>
   )

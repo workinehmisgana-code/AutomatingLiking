@@ -16,9 +16,11 @@ import {
   isCommentVoice,
   type CommentVoice,
 } from './config'
-import { groqChat } from './groq'
-import { buildAudiencePrompt } from './commentPrompt'
+import { llmChat } from './llm'
+import { buildAudiencePrompt } from './prompts'
 import { COMMENTS } from './comments'
+import { audiencesForProduct } from './config'
+import { copyForProduct, SHARED_JARGON } from './prompts'
 import {
   getProductCommentSettings,
   addCategoryVoice,
@@ -251,24 +253,23 @@ const SECOND_PERSON = new RegExp(String.raw`\b(you|your|you're|youre|u|ur)\b`, '
 //
 // So this catches only words no ordinary person reaches for. Shaping the rest
 // is the prompt's job; this is the backstop for when it drifts.
-const JARGON = new RegExp(
-  [
-    String.raw`\bhumaniz(e|es|ed|er|ers|ing|ation)\b`,
-    String.raw`\bai[\s-]?(content|text|writing|generated)\b`,
-    String.raw`\bbypass(es|ed|ing)?\b`,
-    String.raw`\bundetectable\b`,
-    String.raw`\balgorithm(s|ic)?\b`,
-    String.raw`\bparaphras(e|es|ed|ing|er)\b`,
-    String.raw`\b(nlp|api)\b`,
-    // The company's nouns for itself. "tool" is deliberately absent: people do
-    // say "this tool", and banning it cost more than it bought.
-    String.raw`\b(software|platform|solution|technology|engine)\b`,
-    String.raw`\b(output|input)s?\b`,
-    String.raw`\bgenerat(e|es|ed|ing|ion)\b`,
-    String.raw`\b(accuracy|efficiency|seamless(ly)?|effortless(ly)?|optimi[sz]e[ds]?)\b`,
-  ].join('|'),
-  'i'
-)
+// PER GENRE, because the giveaway words are. "humanize" is the tell for one
+// product and irrelevant to a slide deck; "drag-and-drop" is the tell for a
+// website builder and means nothing under an essay video. The company's own
+// nouns for itself are shared — see SHARED_JARGON.
+//
+// Cached per product: this is called once per candidate comment, and compiling
+// the same regex a few hundred times a batch is work for nothing.
+const jargonCache = new Map<string, RegExp>()
+
+function jargonFor(product: string): RegExp {
+  let re = jargonCache.get(product)
+  if (!re) {
+    re = new RegExp([...copyForProduct(product).jargon, ...SHARED_JARGON].join('|'), 'i')
+    jargonCache.set(product, re)
+  }
+  return re
+}
 
 /** Does the line read as a question at all? */
 function isQuestion(s: string): boolean {
@@ -341,7 +342,7 @@ export function sanitize(
     // every voice: the informational one is the plainest, not the most
     // technical, and it drifts hardest because "state what it is" reads to the
     // model as an invitation to describe the product.
-    if (JARGON.test(s)) continue
+    if (jargonFor(product).test(s)) continue
     if (DANGLING.test(stripEmoji(s))) continue
     // One or two upbeat emoji, appended when the model forgot and trimmed when
     // it got carried away. Doing it here rather than rejecting keeps a good
@@ -465,7 +466,12 @@ export async function regenerateCategoryProducts(
   // Groq tokens-per-minute limit and the later ones simply fail. One that gets
   // rate-limited anyway is left for the next run or the lazy 24h refresh.
   for (const p of products) {
-    for (const c of categories) {
+    // Only the audiences this product's genre uses, intersected with whatever
+    // the caller asked for. Generating a 'competitors' set for a slides product
+    // is one Groq call per product spent on comments the server will never
+    // reach — fallbackCategory sends those links to 'generic'.
+    const wanted = audiencesForProduct(p)
+    for (const c of categories.filter((x) => wanted.includes(x))) {
       const key = `${p}/${c}`
       try {
         out[key] = { ok: true, count: await regenerateCategory(p, c) }
@@ -543,9 +549,9 @@ async function callGroqForAudience(
     `Rewrite these ${base.length} comments. Each item gives the original text and ` +
     `the exact number of words its rewrite must have:\n${JSON.stringify(items, null, 0)}`
 
-  // groqChat tries each model in GROQ_MODELS, falling back on a quota/429 error.
+  // llmChat tries each model in LLM_MODELS, falling back on a quota/429 error.
   // Free tier counts (input + output) tokens/minute, so keep the cap modest.
-  const { content } = await groqChat({
+  const { content } = await llmChat({
     temperature: 0.9,
     jsonObject: true,
     maxTokens: tokenCap(base.length, band),
@@ -619,20 +625,40 @@ async function batchForVoice(
  * no recorded mix uses the product's current voice, which is exactly what every
  * set did before, and records it so the next rebuild matches this one.
  *
+ * AND THE ADMIN CAN OVERRULE THE RECIPE, which is the whole point of the voice
+ * selector. `voices` given here replaces it: the page sends the voice on screen
+ * when somebody presses Regenerate, because they are looking at that dropdown
+ * when they press it, and "set informational, press Regenerate, get questions"
+ * is indefensible however well the recipe rule is explained. The nightly cron
+ * passes nothing and keeps the recipe, which is what the recipe was for.
+ *
  * Deduped across voices on the same key appendToCategory uses, so two voices
  * that happen to produce the same line store it once.
  */
 export async function regenerateCategory(
   product: Product,
-  category: LinkCategory
+  category: LinkCategory,
+  /**
+   * Rebuild from exactly these instead of the set's recorded recipe.
+   *
+   * The admin page sends the selected voice; the cron sends nothing. Unknown
+   * values are dropped, and an empty result falls back to the recipe rather than
+   * generating nothing.
+   */
+  override?: readonly string[]
 ): Promise<number> {
   const base = baseComments(product)
   if (base.length === 0) return 0
   const { band, style } = await settingsFor(product)
 
   const stored = await getCategoryComments(product, category).catch(() => null)
+  const asked = (override ?? []).filter(isCommentVoice)
   const recorded = (stored?.voices ?? []).filter(isCommentVoice)
-  const voices: CommentVoice[] = recorded.length ? recorded : [style.voice]
+  const voices: CommentVoice[] = asked.length
+    ? asked
+    : recorded.length
+      ? recorded
+      : [style.voice]
 
   const key = (t: string) => stripEmoji(t).toLowerCase()
   const seen = new Set<string>()

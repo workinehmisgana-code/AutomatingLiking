@@ -1,0 +1,80 @@
+{
+  "search": {
+    "platforms": [
+      "youtube"
+    ],
+    "genre": "website",
+    "queries_by_genre": {
+      "humanizer": "humanizer\nai text detector\nparaphraser\nnaturalwrite humanizer\ngrubbyai humanizer\nwalterwritesai humanizer\nwritehuman humanizer\nLegitWriter humanizer\npaperbleach humanizer\nmaskai humanizer\nundetectableai humanizer\nverva humanizer\naihumanizer\nturnitin detector\ngptzero detector\noriginalityai detector\npangram detector",
+      "website": "ai website builder\nbuild a website with ai\nno code website\nbase44 website builder\nemergent website builder\nlovable website builder\nwix website builder\nwebador website builder\nshopify website builder\nSquarespace website builder\nHostinger AI website builder\nCatDoes website builder\nManus AI website builder\nFramer AI website builder\nReplit Agent website builder\nv0 AI website builder",
+      "slides": "ai presentation maker\nai powerpoint generator\nai slides generator\nai deck generator\nmake slides fast\ngamma ai presentation\nkimi ai presentation\nManus AI presentation\nCanva AI presentation"
+    },
+    "min": 200,
+    "max": 400,
+    "content": "all",
+    "output": "",
+    "upload_after": true,
+    "upload_mode": "replace"
+  },
+  "harvest": {
+    "limit": 2500,
+    "accounts": "",
+    "genre": "",
+    "dry_run": false,
+    "upload": true
+  },
+  "liker": {
+    "source": "dashboard",
+    "links": "",
+    "cluster_by": "rank",
+    "clusters": "all",
+    "platform": "tiktok",
+    "genre": "website",
+    "category": "",
+    "max_links": 5000,
+    "target": "products",
+    "users": "cocodly, co codlypurifytext, purify text, \u03c1\u03c5r\u0456f\u0443t\u0435xt, acoustictext, acoustic text, prohumanly,  pro humanly, cohumanly, humlexic",
+    "profiles": "c,g,h,a,e,b,f,d,j,i,o,n,q,l",
+    "at_once": 7,
+    "keywords": "",
+    "mode": "dom",
+    "pages": 4,
+    "scrolls": 6,
+    "delay": "0,1",
+    "limit": 0,
+    "headed": true,
+    "dry_run": false,
+    "unlike": false,
+    "keep_going": true,
+    "like_ties": false
+  },
+  "hearts": {
+    "service": "zefoy",
+    "source": "dashboard",
+    "csv": "",
+    "cluster_by": "date",
+    "clusters": "1,2",
+    "platform": "tiktok",
+    "category": "",
+    "genre": "humanizer",
+    "max_links": 5000,
+    "keyword": "purifytext, purify text, \u03c1\u03c5r\u0456f\u0443t\u0435xt, acoustictext, acoustic text, prohumanly,  pro humanly, cohumanly,co humanly, humlexic",
+    "to_top": true,
+    "margin": 9,
+    "floor": 0.25,
+    "rounds": 5,
+    "watch": 15,
+    "workers": 1,
+    "delay": 30,
+    "loop": false,
+    "loop_delay": 60,
+    "resume": false,
+    "fresh": true,
+    "tag": "desk",
+    "on_pc": true,
+    "on_phone": false,
+    "share": false,
+    "cdp": "http://127.0.0.1:9222",
+    "recover": 5
+  }
+}

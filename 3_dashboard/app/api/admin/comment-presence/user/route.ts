@@ -1,7 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { isAdminEmail } from '@/lib/config'
+import { getAdminGenre } from '@/lib/adminGenre'
+import { isAdminEmail, productsInGenre } from '@/lib/config'
 import {
   getPresenceLinks,
   getPresenceHistoryForUser,
@@ -56,11 +57,12 @@ export async function GET(req: NextRequest) {
   const days = Math.max(1, Math.min(60, Number(req.nextUrl.searchParams.get('days')) || 7))
 
   try {
+    const products = productsInGenre(await getAdminGenre())
     const [profile, info, rows, history] = await Promise.all([
       getUserProfile(userId).catch(() => null),
       getUserNameEmail(userId).catch(() => null),
-      getPresenceLinks(userId, days, LINK_LIMIT),
-      getPresenceHistoryForUser(userId, days).catch(() => []),
+      getPresenceLinks(userId, days, LINK_LIMIT, products),
+      getPresenceHistoryForUser(userId, days, products).catch(() => []),
     ])
     const username = handleFromProfile(profile?.tiktok_url ?? '')
     const deadline = Date.now() + BUDGET_MS

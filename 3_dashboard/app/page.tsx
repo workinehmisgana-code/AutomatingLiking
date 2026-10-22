@@ -6,7 +6,12 @@ import Login from '@/components/Login'
 import Blocked from '@/components/Blocked'
 import BlockedRemediation from '@/components/BlockedRemediation'
 import VerifyGate from '@/components/VerifyGate'
+// The age-aware, permanent verdict. A different thing from isUserVerified,
+// which is the rolling presence check that expires. See lib/profileGate.
+import { isTiktokVerified } from '@/lib/profileGate'
+import BankNameGate from '@/components/BankNameGate'
 import ContactGate from '@/components/ContactGate'
+import TiktokGate from '@/components/TiktokGate'
 import type { Video } from '@/components/Dashboard'
 import { auth } from '@/lib/auth'
 import {
@@ -17,17 +22,21 @@ import {
   getUserProfile,
   isProfileComplete,
   needsContactOnly,
+  needsBankNameOnly,
+  needsTiktokProfileFix,
   recordLoginDay,
   hasAnyLoginDay,
   getUnreadMessages,
   getUserPendingPayments,
   consumePayNotice,
   getApk,
-  getBlockedUrls,
+  getBlockedPoolUrls,
   getBlockForEmail,
   getEffectivePlatformLimits,
   isUserVerified,
   getUserValidity,
+  getTiktokVerification,
+  getVerifyVideoUrl,
   getClusterDateShare,
   getConfirmedBrokenUrls,
   getServeOnlyClean,
@@ -37,16 +46,19 @@ import {
   assignReferralCode,
   getReferralEarnings,
   getReferralOf,
+  getGenreMix,
 } from '@/lib/db'
 import { retiredUrlSet } from '@/lib/videos'
 import { buildUserFeed, FEED_PER_PLATFORM } from '@/lib/userFeed'
 import { BROKEN_AFTER_MISSES } from '@/lib/linkStats'
 import { DEFAULT_DATE_SHARE } from '@/lib/clusterMix'
 import {
+  genreWeights,
   isAdminEmail,
   SHOW_CLICKED_TODAY,
   VERIFY_VIDEO_URL,
   VERIFY_GATE_ENABLED,
+  repairRowPlatform,
 } from '@/lib/config'
 
 export const dynamic = 'force-dynamic'
@@ -60,7 +72,8 @@ async function getVideos(): Promise<Video[]> {
       cache: 'no-store',
     })
     if (!res.ok) return []
-    return res.json()
+    const data = await res.json()
+    return Array.isArray(data) ? (data as Video[]).map(repairRowPlatform) : []
   } catch {
     return []
   }
@@ -106,6 +119,7 @@ export default async function Home() {
         reason={block.reason}
         email={session.user.email ?? ''}
         auto={block.auto}
+        videoUrl={await getVerifyVideoUrl().catch(() => '')}
       />
     )
   }
@@ -129,20 +143,52 @@ export default async function Home() {
   if (needsContactOnly(profile)) {
     return <ContactGate name={profile?.name ?? session.user.name ?? null} />
   }
+  // The bank name was asked for after these accounts existed, the same way.
+  if (needsBankNameOnly(profile)) {
+    return <BankNameGate name={profile?.name ?? session.user.name ?? null} />
+  }
   if (!isProfileComplete(profile)) redirect('/onboarding')
+
+  // A LINK THAT DOES NOT NAME AN ACCOUNT STOPS HERE, and it has to stop before
+  // the verification gate below: that gate reads the @username out of
+  // tiktok_url and looks for it among a video's commenters, so with no username
+  // to find it can only ever answer "not verified". The person would sit behind
+  // a check that cannot pass, being told to go and comment, with nothing on
+  // screen to suggest the problem is a link they pasted months ago.
+  if (needsTiktokProfileFix(profile)) {
+    return (
+      <TiktokGate
+        name={profile?.name ?? session.user.name ?? null}
+        current={profile?.tiktok_url ?? null}
+      />
+    )
+  }
 
   // Comment-verification gate: until a check finds this user's comment on the
   // verification video, hold them here instead of serving links. Checked after
   // onboarding so a new user completes their profile (and TikTok link) first —
   // the gate needs that handle to have something to look for.
-  if (VERIFY_GATE_ENABLED && !(await isUserVerified(session.user.id).catch(() => false))) {
-    const { checkedAt } = await getUserValidity(session.user.id).catch(() => ({
-      validUntil: null,
-      checkedAt: null,
-    }))
+  //
+  // IT NOW ALSO CHECKS HOW OLD THE ACCOUNT IS. The comment proves they own the
+  // account; the numeric id carried on that same comment dates it (see
+  // lib/tiktokVerify). An account younger than three months is refused — a
+  // brand-new account's comments are the first TikTok filters away — so one
+  // comment answers both questions in a single pass.
+  //
+  // isTiktokVerified, not isUserVerified: the latter is the SEPARATE rolling
+  // presence check that expires every VERIFY_VALID_DAYS. This verdict is
+  // permanent and tied to the handle, so it is asked once and re-asked only
+  // when the worker points their profile at a different account.
+  if (VERIFY_GATE_ENABLED && !(await isTiktokVerified(session.user.id).catch(() => false))) {
+    const checkedAt =
+      (await getTiktokVerification(session.user.id).catch(() => null))?.checkedAt ?? null
+    // The STORED video, not the compiled constant: the admin can rotate it
+    // when a video's comment list gets too deep to read, and the gate and the
+    // check have to be looking at the same one.
+    const verifyVideo = await getVerifyVideoUrl().catch(() => VERIFY_VIDEO_URL)
     return (
       <VerifyGate
-        videoUrl={VERIFY_VIDEO_URL}
+        videoUrl={verifyVideo}
         tiktokUrl={profile?.tiktok_url ?? null}
         checkedAt={checkedAt}
         email={session.user.email ?? ''}
@@ -173,7 +219,7 @@ export default async function Home() {
       // Shown exactly once, on the first load after the admin marked them paid.
       consumePayNotice(session.user.id).catch(() => null),
       getApk().catch(() => null),
-      getBlockedUrls().catch(() => [] as string[]),
+      getBlockedPoolUrls().catch(() => [] as string[]),
       // Links the platform no longer serves, confirmed over two passes.
       getConfirmedBrokenUrls(BROKEN_AFTER_MISSES).catch(() => [] as string[]),
       // Off by default; on, links already carrying one of ours are withheld.
@@ -229,10 +275,14 @@ export default async function Home() {
     ? await getCleanSessionClicks(session.user.id).catch(() => [] as string[])
     : []
   const alreadyOpened = onlyClean ? sessionClicks : clickedUrls
+  // How much of this worker's list each genre gets. Read here rather than
+  // inside buildUserFeed so the feed stays a pure function of what it is given.
+  const genreMix = genreWeights(await getGenreMix().catch(() => null))
   const { served, remaining } = buildUserFeed(
     videos,
     new Set([...alreadyOpened, ...retiredUrls]),
-    FEED_PER_PLATFORM
+    FEED_PER_PLATFORM,
+    genreMix
   )
 
   // The audience each served link was sorted into, so the page copies a comment

@@ -38,7 +38,7 @@ import kotlin.concurrent.thread
  */
 class BubbleService : Service() {
 
-    private enum class PanelKind { PLATFORM, DETAILS }
+    private enum class PanelKind { PLATFORM, DETAILS, TESTER_COMMENTS }
 
     // A per-platform chip that shows the available count or a live reset timer.
     private class PlatformStat(val tv: TextView, val name: String, val available: Int, val resetAt: Long)
@@ -51,6 +51,7 @@ class BubbleService : Service() {
     private lateinit var params: WindowManager.LayoutParams
     private var counterView: TextView? = null
     private var urlView: TextView? = null
+    private var checkResultView: TextView? = null
     private var platformButton: Button? = null
     private var nextButton: Button? = null
     private var unrelatedButton: Button? = null
@@ -70,7 +71,54 @@ class BubbleService : Service() {
 
     // We don't preview the pending link; a link only opens/navigates when the user
     // taps Next (or Unrelated). This is what the bubble shows while idle.
-    private val nextHint = "Tap Next ▶ to open a link"
+    // The tester says so on its face: it is installed beside the Comment Helper
+    // and looks the same, and which one is in front has to be obvious.
+    private val nextHint =
+        if (BuildConfig.TESTER) "🧪 TESTER — tap Next ▶ for a link with none of ours"
+        else "Tap Next ▶ to open a link"
+
+    // ── Comment Tester: only links with none of our comments ────────────────
+    // url -> true when the video carries one of our product comments. Filled in
+    // the background for the next few links, so Next usually opens at once.
+    private val oursOn = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+    @Volatile private var prefetching = false
+    private val PREFETCH_AHEAD = 3
+
+    /** Ask the dashboard, reading the video's comments now. Unknown = usable. */
+    private fun hasOurs(token: String, url: String): Boolean {
+        oursOn[url]?.let { return it }
+        val (code, body) = Net.postJsonBody(
+            Config.HAS_OURS_URL, token, JSONObject().apply { put("url", url) }, this
+        )
+        val ours = code in 200..299 && try {
+            JSONObject(body).optBoolean("ours", false)
+        } catch (e: Exception) { false }
+        // Only a real answer is remembered; a failed read is asked again.
+        if (code in 200..299) oursOn[url] = ours
+        return ours
+    }
+
+    /** Check the next few links in the background. */
+    private fun prefetchClean() {
+        if (!BuildConfig.TESTER || prefetching) return
+        val token = AuthStore.token(this) ?: return
+        prefetching = true
+        thread {
+            try {
+                val list = LinkStore.items(this)
+                var i = LinkStore.index(this)
+                var looked = 0
+                while (i < list.size && looked < PREFETCH_AHEAD) {
+                    val url = list[i].url
+                    if (oursOn[url] == null) hasOurs(token, url)
+                    if (oursOn[url] != true) looked++
+                    i++
+                }
+            } finally {
+                prefetching = false
+            }
+        }
+    }
     private fun idleText(): String =
         if (LinkStore.size(this) > 0) nextHint else "No links — reopen to reload"
 
@@ -125,8 +173,13 @@ class BubbleService : Service() {
         // The comment LIST is no longer shown — the app auto-copies a random comment
         // from the admin's active-product pool on each Next. Hide the button.
         comments.visibility = View.GONE
+        // …except in the Comment Tester, where 💬 opens the admin's tester-only
+        // list and a tap copies the chosen comment.
+        if (BuildConfig.TESTER) {
+            comments.visibility = View.VISIBLE
+            comments.setOnClickListener { animateTap(it); togglePanel(PanelKind.TESTER_COMMENTS) }
+        }
         val details = v.findViewById<Button>(R.id.btnDetails)
-        val expand = v.findViewById<Button>(R.id.btnExpand)
         val finish = v.findViewById<Button>(R.id.btnFinish)
         val closeTop = v.findViewById<TextView>(R.id.btnCloseTop)
 
@@ -134,12 +187,20 @@ class BubbleService : Service() {
         updatePlatformLabel()
         urlView?.text = if (LinkStore.size(this) > 0) nextHint else "loading…"
 
+        // Comment Tester: the Check button asks whether this account's comment
+        // shows on the video just opened.
+        val check = v.findViewById<Button>(R.id.btnCheck)
+        checkResultView = v.findViewById(R.id.checkResult)
+        if (BuildConfig.TESTER) {
+            check.visibility = View.VISIBLE
+            check.setOnClickListener { animateTap(it); onCheckComment(check) }
+            checkResultView?.setOnClickListener { showCheckResult(null) }
+        }
         next.setOnClickListener { animateTap(it); onNext() }
         unrelated.setOnClickListener { animateTap(it); onMarkUnrelated() }
         platformButton?.setOnClickListener { togglePanel(PanelKind.PLATFORM) }
         details.setOnClickListener { togglePanel(PanelKind.DETAILS) }
         counterView?.setOnClickListener { togglePanel(PanelKind.DETAILS) }
-        expand.setOnClickListener { openDashboard() }
         finish.setOnClickListener { animateTap(it); openUrl(Config.FINISH_URL) }
         closeTop.setOnClickListener { stopSelf() }
 
@@ -260,6 +321,38 @@ class BubbleService : Service() {
      * see onMarkUnrelated(). Callers are responsible for the guard.
      */
     private fun openNextLink() {
+        // THE TESTER SKIPS EVERY LINK THAT ALREADY HAS ONE OF OURS, checked on the
+        // video itself just before opening (or by the background look-ahead), and
+        // only then opens the first one that is clean.
+        if (BuildConfig.TESTER && !needsUpdate) {
+            val token = AuthStore.token(this) ?: run { promptSignIn(); return }
+            if (busy) return
+            lock()
+            urlView?.text = "🔎 checking the next link for our comments…"
+            thread {
+                var skipped = 0
+                while (true) {
+                    val item = LinkStore.peek(this) ?: break
+                    if (!hasOurs(token, item.url)) break
+                    LinkStore.advance(this) // has ours: never opened, never clicked
+                    skipped++
+                }
+                ui.post {
+                    if (skipped > 0) {
+                        Toast.makeText(this, "Skipped $skipped link(s) that already have our comments", Toast.LENGTH_SHORT).show()
+                        refreshCounter()
+                    }
+                    unlock()
+                    openNextLinkNow()
+                    prefetchClean()
+                }
+            }
+            return
+        }
+        openNextLinkNow()
+    }
+
+    private fun openNextLinkNow() {
         if (needsUpdate) {
             updateInfo?.let { (vn, url) -> showUpdateBanner(vn, url) }
             Toast.makeText(this, "Update the app first to get links.", Toast.LENGTH_LONG).show()
@@ -311,6 +404,7 @@ class BubbleService : Service() {
                         // to the clipboard and open the link so the user can just paste.
                         LinkStore.advance(this)
                         urlView?.text = item.url
+                        showCheckResult(null) // the old verdict was about the previous link
                         refreshCounter()
                         copyCommentThen(commentText) { openUrl(item.url) }
                         // The click is recorded and the link is open: the
@@ -320,6 +414,57 @@ class BubbleService : Service() {
                 }
             }
         }
+    }
+
+    // Comment Tester: ask the dashboard whether a comment from this account is on
+    // the video currently open. Any comment counts, not only product ones —
+    // the test is whether what this account posts is visible to everyone else.
+    private fun onCheckComment(button: Button) {
+        val token = AuthStore.token(this) ?: run { promptSignIn(); return }
+        val current = LinkStore.current(this)
+        if (current == null) {
+            showCheckResult("Open a link first (tap Next), comment, then Check")
+            return
+        }
+        button.isEnabled = false
+        button.text = "⏳ Checking…"
+        showCheckResult("⏳ Reading the comments on this video… (up to a minute)")
+        thread {
+            val (code, body) = Net.postJsonBody(
+                Config.CHECK_URL, token, JSONObject().apply { put("url", current.url) }, this
+            )
+            val d = try { JSONObject(body) } catch (e: Exception) { JSONObject() }
+            val text = d.optString("text")
+            val msg = when {
+                code == -1 -> "⚠️ No connection, or the check timed out — try again"
+                code == 401 -> "⚠️ Signed out — sign in again, then Check"
+                code !in 200..299 -> "⚠️ " + d.optString("error", "").ifBlank {
+                    "Could not check (HTTP $code)" + body.take(120).let { if (it.isBlank()) "" else ": $it" }
+                }
+                !d.optBoolean("ok") -> "⚠️ Unexpected reply from the server: " + body.take(120)
+                d.optBoolean("found") ->
+                    "✅ Your comment is visible" + if (text.isNotBlank() && text != "null") ": \"${text}\"" else ""
+                d.optBoolean("certain") ->
+                    "❌ No comment from @${d.optString("username")} on this video — it is hidden or was not posted"
+                else ->
+                    "❓ Not found, but the video has more comments than could be read — try again in a minute"
+            }
+            ui.post {
+                button.isEnabled = true
+                button.text = "🔍 Check"
+                showCheckResult(msg)
+            }
+        }
+    }
+
+    // The Check verdict lives IN the bubble, not in a Toast: Android drops or
+    // hides Toasts raised by an overlay service, so a result shown only that way
+    // can simply never appear. It stays until tapped or the next link opens.
+    private fun showCheckResult(msg: String?) {
+        val view = checkResultView ?: return
+        if (msg == null) { view.visibility = View.GONE; return }
+        view.text = msg
+        view.visibility = View.VISIBLE
     }
 
     // Flag the link the user is CURRENTLY on (the last one opened) as unrelated —
@@ -396,7 +541,8 @@ class BubbleService : Service() {
             p = LayoutInflater.from(this).inflate(R.layout.comments_panel, null)
             val title = p.findViewById<TextView>(R.id.panelTitle)
             val list = p.findViewById<LinearLayout>(R.id.commentsList)
-            buildPlatformPanel(title, list) // only the platform picker uses this panel now
+            if (kind == PanelKind.TESTER_COMMENTS) buildTesterCommentsPanel(title, list)
+            else buildPlatformPanel(title, list)
             panelFullWidth = false
         }
         panel = p
@@ -436,6 +582,42 @@ class BubbleService : Service() {
                 Toast.makeText(this, "Loading $name…", Toast.LENGTH_SHORT).show()
                 refreshData()
             })
+        }
+    }
+
+    // Comment Tester: the admin's tester-only comments (Admin → 🧪 Tester
+    // comments), fetched fresh each time so an edit shows up on the next open.
+    // The panel window is focusable, so the clipboard write is honoured directly.
+    private fun buildTesterCommentsPanel(title: TextView, list: LinearLayout) {
+        title.text = "Tap a comment to copy it"
+        list.addView(makeCommentRow("loading…", null))
+        val token = AuthStore.token(this) ?: run { removePanel(); promptSignIn(); return }
+        thread {
+            val (code, body) = httpGet(Config.TESTER_COMMENTS_URL, token)
+            val arr = if (code in 200..299) runCatching { JSONObject(body).optJSONArray("comments") }.getOrNull() else null
+            val items = (0 until (arr?.length() ?: 0)).map { arr!!.optString(it) }.filter { it.isNotBlank() }
+            ui.post {
+                if (panelKind != PanelKind.TESTER_COMMENTS) return@post // closed meanwhile
+                list.removeAllViews()
+                when {
+                    code == 401 -> list.addView(makeCommentRow("⚠️ Signed out — sign in again", null))
+                    code !in 200..299 -> list.addView(makeCommentRow(
+                        if (code == -1) "⚠️ No connection — close and try again" else "⚠️ Could not load the list (HTTP $code)", null))
+                    items.isEmpty() -> list.addView(makeCommentRow(
+                        "No tester comments yet — add them on the admin dashboard (🧪 Tester comments)", null))
+                    else -> items.forEach { c ->
+                        list.addView(makeCommentRow(c) {
+                            val ok = runCatching {
+                                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                cm.setPrimaryClip(ClipData.newPlainText("comment", c))
+                            }.isSuccess
+                            removePanel()
+                            showCheckResult(if (ok) "📋 Copied — paste it: \"${c.take(80)}${if (c.length > 80) "…" else ""}\""
+                                            else "⚠️ Could not copy — try again")
+                        })
+                    }
+                }
+            }
         }
     }
 
@@ -635,6 +817,7 @@ class BubbleService : Service() {
             Triple("youtube_shorts", "YT Shorts", 0xFFF97316.toInt()),
             Triple("youtube_videos", "YT Videos", 0xFFEF4444.toInt()),
             Triple("instagram", "Instagram", 0xFFD946EF.toInt()),
+            Triple("reddit", "Reddit", 0xFFD97706.toInt()),
         )
         var total = 0
         plats.forEach { (k, _, _) -> total += today?.optInt(k, 0) ?: 0 }
@@ -703,7 +886,7 @@ class BubbleService : Service() {
         val c = card()
         val fetchedAt = StatusStore.fetchedAt(this)
         val strip = rowH()
-        listOf("tiktok" to "TikTok", "youtube_shorts" to "YT Shorts", "youtube_videos" to "YT Videos", "instagram" to "Instagram")
+        listOf("tiktok" to "TikTok", "youtube_shorts" to "YT Shorts", "youtube_videos" to "YT Videos", "instagram" to "Instagram", "reddit" to "Reddit")
             .forEach { (key, name) ->
                 val pj = platforms?.optJSONObject(key)
                 val available = pj?.optInt("available", 0) ?: 0
@@ -713,7 +896,7 @@ class BubbleService : Service() {
                 platformStats.add(PlatformStat(chip, name, available, resetAt))
                 strip.addView(chip)
             }
-        listOf("Reddit", "X", "Blog Post").forEach { name ->
+        listOf("X", "Blog Post").forEach { name ->
             strip.addView(platformChip("$name  soon").apply { alpha = 0.45f })
         }
         c.addView(hScroll(strip))
@@ -841,6 +1024,8 @@ class BubbleService : Service() {
                     } else {
                         val arr = o.optJSONArray("links")
                         LinkStore.setFromJson(this, (arr ?: org.json.JSONArray()).toString())
+                        // Tester: start checking the first few links straight away.
+                        if (BuildConfig.TESTER) ui.post { prefetchClean() }
                     }
                 } catch (_: Exception) {}
             }

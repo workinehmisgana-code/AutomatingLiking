@@ -1,4 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Comment Helper</string>
+    <!-- app_name comes from the build flavour (app/build.gradle.kts). -->
 </resources>

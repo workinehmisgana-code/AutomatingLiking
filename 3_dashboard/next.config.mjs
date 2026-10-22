@@ -14,11 +14,15 @@ const nextConfig = {
   // Dev is untouched, and nobody has to notice a build happened.
   distDir: process.env.NEXT_DIST_DIR || '.next',
   experimental: {
+    // instrumentation.ts: applies the genres added in the admin at server start.
+    instrumentationHook: true,
     // Keep pg out of the webpack bundle so its dynamic/optional native requires
     // (pg-native, pg-cloudflare) resolve at runtime instead of bundling to
     // `undefined`. Do NOT externalize better-auth: it's pure JS, and externalizing
     // it breaks SSR resolution of client components that import better-auth/react.
-    serverComponentsExternalPackages: ['pg'],
+    // The support desk's IMAP/SMTP/mail-parsing libraries are CommonJS with
+    // native-ish dependencies; they run from node_modules too.
+    serverComponentsExternalPackages: ['pg', 'imapflow', 'mailparser', 'nodemailer'],
   },
 }
 

@@ -12,12 +12,28 @@ Two ways to divide the work:
   --share split   (default)  each video goes to ONE account.
                              N accounts, N times the throughput.
   --share stack              every account visits every video.
-                             N accounts, N times the likes per comment.
+                             N accounts, N times the likes per comment — unless
+                             --spread, which divides each video's comments
+                             between them instead.
 
 Split is what you want to cover more ground. Stack is what you want if the point
 is to push a particular comment up — but note that several accounts liking the
 same comments within minutes is the clearest coordination signal there is, so
 stack with a long --delay or not at all.
+
+Stack used to give every comment on a video exactly N likes, N being the number
+of accounts, on every video — a set of comments agreeing to the unit, which is
+the easiest possible thing to find them all by.
+
+THAT IS NOW THE TIE RULE'S JOB, and it does it without giving up a like: a like
+of ours never lands two of our comments on the same number, because a group of
+comments already sharing a count gets exactly one like (tie_filter in like.py).
+
+--spread is the older, blunter answer, kept for when you want it: the roster goes
+to each worker as --peers and they hash out between themselves who likes what,
+without talking to each other — the first comment on a video gets the whole
+roster, the next about three quarters, and so on down. It costs a like on most
+videos, which is why it is off by default.
 
 Setup, once per account:
     python login.py --profile a
@@ -316,6 +332,21 @@ def run_pass(args, profiles, width, workers, log_dir, pass_no):
             "--window-slot", str(slot),
             "--window-count", str(len(profiles)),
         ]
+        # WHO ELSE IS ON THIS LINK, so the workers can divide the comments
+        # between them rather than each liking all of them.
+        #
+        # OPT-IN, and it did not start that way. Dividing them was the first
+        # answer to "our comments all have the same like count", and the tie rule
+        # (tie_filter in like.py) is the better one: it stops a like of ours
+        # putting two of our comments on the same number, without anybody giving
+        # up a like. Sharing costs likes on every video and no longer buys much,
+        # so it waits to be asked for.
+        #
+        # --share stack as well, because with --share split a link is visited
+        # once, there is nothing to divide, and passing the roster would only
+        # drop likes.
+        if args.spread and args.share == "stack" and len(profiles) > 1:
+            cmd += ["--peers", ",".join(profiles)]
         if args.per_account:
             cmd += ["--limit", str(args.per_account)]
         if args.users:
@@ -335,6 +366,9 @@ def run_pass(args, profiles, width, workers, log_dir, pass_no):
         # here. check_forwarding.py fails if the two ever diverge again.
         for flag, on in (
             ("--keep-failures", args.keep_failures),
+            ("--no-remote-captcha", args.no_remote_captcha),
+            ("--like-ties", args.like_ties),
+            ("--no-own-comments", args.no_own_comments),
             ("--headed", args.headed),
             ("--keep-going", args.keep_going),
             ("--solve-captcha", args.solve_captcha),
@@ -493,6 +527,25 @@ def run_pass(args, profiles, width, workers, log_dir, pass_no):
 def main() -> int:
     ap = argparse.ArgumentParser(description="Like with several accounts at once.")
     ap.add_argument("--profiles", required=True, help="comma-separated login.py profile names")
+    ap.add_argument("--no-own-comments", action="store_true",
+                    help="ignore comments.txt and take every comment from the "
+                         "dashboard's stored set. The file is used automatically "
+                         "whenever it has lines in it")
+    ap.add_argument("--like-ties", action="store_true",
+                    help="like every comment in a tied group. By default only the "
+                         "top comment of each like-count is liked, so a like of "
+                         "ours never puts two of our comments on the same number")
+    ap.add_argument("--no-remote-captcha", action="store_true",
+                    help="do not send captchas to the dashboard to be solved on "
+                         "a phone (see remote_captcha.py). Without this, a stuck "
+                         "account can be freed from anywhere — including on a "
+                         "headless run, which never had any way to ask before")
+    ap.add_argument("--spread", action="store_true",
+                    help="under --share stack, DIVIDE each video's comments "
+                         "between the accounts instead of every account liking "
+                         "every one. Costs likes, and the tie rule already stops "
+                         "our comments landing on the same like count, so this is "
+                         "off unless you ask for it"),
     ap.add_argument("--share", default="split", choices=["split", "stack"],
                     help="split: a video goes to one account. stack: every account visits every video")
     # Where the work comes from — same options like.py has.

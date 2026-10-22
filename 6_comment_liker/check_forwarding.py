@@ -56,6 +56,11 @@ CONSUMED = {
     "--products",
     # run_parallel spells this --per-account, and forwards it as --limit.
     "--limit",
+    # run_parallel spells the OPPOSITE: --spread, which is off by default. A
+    # worker is told to divide a video's comments by being handed --peers, so
+    # there is nothing for --no-spread to forward — it exists in like.py for
+    # anyone driving it directly.
+    "--no-spread",
 }
 
 missing = sorted(flags(like) - sent - CONSUMED)

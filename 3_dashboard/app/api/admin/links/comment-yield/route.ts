@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
+import { getAdminGenre } from '@/lib/adminGenre'
 import { isAdminEmail } from '@/lib/config'
 import { channelCommentYield } from '@/lib/commentYield'
 
@@ -27,7 +28,7 @@ export async function GET(req: NextRequest) {
     // read as "the feature is broken".
     const raw = Number(req.nextUrl.searchParams.get('minClicks'))
     const minClicks = Number.isFinite(raw) ? Math.max(1, Math.min(1000, Math.round(raw))) : 25
-    const report = await channelCommentYield(minClicks)
+    const report = await channelCommentYield(minClicks, await getAdminGenre())
     return NextResponse.json(report)
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 })

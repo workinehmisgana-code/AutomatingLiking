@@ -228,14 +228,36 @@ print("\nthe check asks the dashboard, the way the admin does")
 #   IT IS THE PUBLIC VIEW. A comment read from the account that wrote it proves
 #   only that its author can see it — TikTok shows a filtered comment to its
 #   author and to nobody else.
-check("  it asks first", "def ask_dashboard" in vc, True)
+# THE PUBLIC READ IS THE WHOLE CHECK NOW, not a first pass. Reading with other
+# accounts answers a narrower question — whether THIS machine's logins are
+# served the comment — and every such reader shares an address and a browser
+# build with the account that wrote it.
+check("  it reads the public list first", "def judge_public" in vc, True)
+check("  and stops there unless asked otherwise",
+      "NOTHING ELSE IS ASKED unless somebody asks for it" in vc, True)
+check("  a solid miss is a verdict, not a question",
+      '"gone",' in vc and "not in a complete public read of" in vc, True)
+# NAMED, NOT JUST COUNTED. "27 could not be judged" is a number nobody can act
+# on; with the link and the depth on screen one of them can be opened and looked
+# at by eye, which is the only thing that settles it.
+check("  the unjudged links are listed, not just counted",
+      "NAMED, NOT JUST COUNTED" in vc, True)
+check("  with how deep the read got",
+      'f"      read {read} of {total if total is not None' in vc, True)
+check("  a short read still judges nothing",
+      "the public read was too short to judge" in vc, True)
+check("  --browser is what adds the second opinion",
+      "after the public read, ask signed-in accounts" in vc, True)
 check("  before opening any browser",
-      vc.index("def ask_dashboard") < vc.index("def check_one"), True)
-check("  at the endpoint the admin's read backs",
-      '"/api/links/comment-check?"' in vc, True)
-check("  in batches, because each item is a round trip", "rows[i:i + 25]" in vc, True)
-check("  and the reason is written down", "what everyone else sees" in vc.lower()
-      or "IT IS WHAT EVERYONE ELSE SEES" in vc, True)
+      vc.index("def judge_public") < vc.index("def check_one"), True)
+check("  from this machine, not through the dashboard",
+      "/api/links/comment-check?" not in vc and "def read_public" in vc, True)
+check("  the same depth the dashboard reads", "PUBLIC_PAGES = 4" in vc, True)
+check("  matched on the text, as the dashboard matches it",
+      'needle = norm(row.get("text") or "")[:40]' in vc, True)
+check("  a short read is still not evidence of absence", "PUBLIC_THIN = 10" in vc, True)
+check("  and the rules that were tried and failed are written down",
+      '"read >= total"' in vc, True)
 
 print("\nand a miss is settled by the second source, not by arithmetic")
 # Three rules for "we read enough to call it gone" were tried against real
@@ -249,8 +271,14 @@ print("\nand a miss is settled by the second source, not by arithmetic")
 # So a hit is conclusive and a miss is not, and the account's own browser is
 # asked about the misses.
 check("  a public hit ends it", "in the public list, as @" in vc, True)
-check("  a miss goes to a signed-in account",
-      "asking signed-in accounts to look" in vc, True)
+# A MISS NO LONGER GOES ANYWHERE BY DEFAULT. It is answered where it was asked:
+# a complete, long enough read that does not contain the comment says the
+# comment is not in the public list, which is the admin dashboard's verdict and
+# the one worth having. --browser is what takes the rest to an account.
+check("  a solid miss is settled on the spot",
+      "not in a complete public read of" in vc, True)
+check("  and only --browser takes the rest to an account",
+      "ask signed-in accounts about the" in vc, True)
 # NOT SERVED TO ANY READER is its own answer, and the useful one: the comment
 # was posted, it cost a run, and it is reaching nobody who went looking.
 check("  which can find it unseen", "UNSEEN" in vc, True)
@@ -258,9 +286,9 @@ check("  reported as its own state", '"unseen"' in vc, True)
 check("  and counted apart from still-there", 'totals["unseen"]' in vc, True)
 # But only when the public read was worth trusting, or it is the same confident
 # guess in a new costume.
-check("  claimed only on a read worth trusting", 'get("thin", True)' in vc, True)
+check("  claimed only on a read worth trusting", 'get("judgeable")' in vc, True)
 check("  and a short read is not promoted to a verdict",
-      "list came back short" in vc, True)
+      "came back truncated, not that the comment is absent" in vc, True)
 
 print("\nand a thin read is never called a deletion")
 # A read of FOUR comments, marked complete, reported a comment as deleted that
@@ -270,9 +298,10 @@ check("  the guard exists", "const thin = read.comments.length < 10" in route, T
 check("  it does not trust TikTok's own total", "throttled along" in route, True)
 check("  the measurement is written down", '"1 of 1" for a video' in route, True)
 check("  a hit still counts on a partial read", "found ||" in route, True)
-# A thin read is never the last word: the liker says so and asks the browser.
+# A thin read is never the last word: it judges nothing and says so, rather
+# than becoming a deletion by default.
 check("  a thin read is never the last word",
-      "every one of those reads came back thin" in vc, True)
+      "too short to mean anything" in vc, True)
 check("  and the summary says which question it answered",
       "not a comment anybody else can" in vc, True)
 
@@ -292,8 +321,10 @@ check("  with the numbers", "1 and 4 comments read" in vc, True)
 check("  so the author is not the reader", "def reader_candidates" in vc, True)
 check("  a hit by any reader ends it", "A HIT ENDS IT" in vc, True)
 check("  a miss goes to the next account", "still unseen — asking" in vc, True)
-check("  more than one reader by default", '"--readers", type=int, default=2' in vc,
-      True)
+check("  one other account by default", '"--readers", type=int, default=1' in vc, True)
+check("  and a second is still one flag away", '--readers 2 asks a second account' in vc, True)
+check("  a miss by one is not called proof",
+      "that account missing it is weaker evidence" in vc, True)
 # TWO DIRECTORIES CAN BE ONE ACCOUNT: `default` and `a` are both @drnardime, and
 # `3` and `c` are both Martha A943.
 check("  profiles on the author's account come out",

@@ -1,6 +1,7 @@
 import { headers } from 'next/headers'
 import { redirect, notFound } from 'next/navigation'
 import { auth } from '@/lib/auth'
+import { getAdminGenre } from '@/lib/adminGenre'
 import {
   getProductCommentSettings,
   getCategoryComments,
@@ -8,12 +9,15 @@ import {
   getActiveCommentProducts,
 } from '@/lib/db'
 import {
+  audiencesForProduct,
   isAdminEmail,
   isProduct,
-  PRODUCTS,
+  genreOfProduct,
+  productsInGenre,
   COMMENT_WORD_MIN,
   COMMENT_WORD_MAX,
   DEFAULT_COMMENT_STYLE,
+  DEFAULT_TOP_LIST,
   LINK_CATEGORIES,
 } from '@/lib/config'
 import Login from '@/components/Login'
@@ -38,20 +42,32 @@ export default async function AdminProductCommentsPage({
   const product = params.product
   if (!isProduct(product)) notFound()
 
+  // The master genre switch. A product of another genre is not this page's
+  // business while the switch says otherwise, so flipping the switch while
+  // looking at purifytext lands on the selected genre's first product rather
+  // than leaving a humanizer page under a "Website builder" switch.
+  const genre = await getAdminGenre()
+  const genreProducts = productsInGenre(genre)
+  if (genreOfProduct(product) !== genre && genreProducts.length > 0) {
+    redirect(`/admin/comments/${genreProducts[0]}`)
+  }
+
   // Read what's currently stored (no generation here — that only happens when
   // the admin clicks Regenerate).
-  const { band, style } = await getProductCommentSettings(product, {
+  const { band, style, top } = await getProductCommentSettings(product, {
     min: COMMENT_WORD_MIN,
     max: COMMENT_WORD_MAX,
   }).catch(() => ({
     band: { min: COMMENT_WORD_MIN, max: COMMENT_WORD_MAX },
     style: DEFAULT_COMMENT_STYLE,
+    top: DEFAULT_TOP_LIST,
   }))
-  // The three audience sets (lib/linkCategory.ts) — the only comments there
-  // are. Each is read, never generated here: generation only happens when the
-  // admin asks for it.
+  // The audience sets this product's genre uses (lib/linkCategory.ts) — three
+  // for a humanizer, one for the others, because the classifier is not run on
+  // them and every link in them is 'generic'. Each is read, never generated
+  // here: generation only happens when the admin asks for it.
   const perCategory = await Promise.all(
-    LINK_CATEGORIES.map(async (category) => {
+    audiencesForProduct(product).map(async (category) => {
       const row = await getCategoryComments(product, category).catch(() => null)
       return {
         category,
@@ -72,7 +88,7 @@ export default async function AdminProductCommentsPage({
     getActiveCommentProducts().catch(() => [] as string[]),
   ])
   const activeSet = new Set(active)
-  const products = PRODUCTS.map((id) => ({
+  const products = genreProducts.map((id) => ({
     id,
     count: sizes[id] ?? 0,
     active: activeSet.has(id),
@@ -84,6 +100,7 @@ export default async function AdminProductCommentsPage({
       wordMin={band.min}
       wordMax={band.max}
       style={style}
+      top={top}
       perCategory={perCategory}
       products={products}
     />

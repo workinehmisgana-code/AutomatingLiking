@@ -1,13 +1,14 @@
 import {
   type Product,
   isProduct,
-  GROQ_MODEL,
-  GROQ_BASE_URL,
   PROMO_TITLE_COUNT,
   PROMO_REFRESH_MS,
   PROMO_MANDATORY_TAGS,
   PROMO_EXTRA_TAG_MAX,
 } from './config'
+import { llmChat } from './llm'
+import { promoSystem } from './prompts'
+import { copyForProduct, withProduct } from './prompts'
 import {
   getGeneratedPromo,
   saveGeneratedPromo,
@@ -34,51 +35,37 @@ function cleanTag(s: unknown): string | null {
   return t
 }
 
-// Ask Groq to generate promo caption titles + extra hashtags for a product.
-async function callGroq(product: Product): Promise<{ titles: string[]; tags: string[] }> {
-  const apiKey = process.env.GROQ_API_KEY
-  if (!apiKey) throw new Error('GROQ_API_KEY is not set')
-
+/**
+ * Ask the model for promo caption titles + extra hashtags for a product.
+ *
+ * THROUGH THE SHARED CLIENT, like everything else. This used to open its own
+ * connection to Groq with the model name compiled in, so the admin's model
+ * setting governed six generation paths and silently not this one — switching
+ * the app to Gemini would have left promo captions on Groq, and only a reader
+ * of this file would ever have known.
+ */
+async function callModel(product: Product): Promise<{ titles: string[]; tags: string[] }> {
   const mandatory = PROMO_MANDATORY_TAGS.join(' ')
-  const system =
-    `"${product}" is an AI humanizer website — it rewrites AI text so it reads as human and ` +
-    `bypasses every AI detector (Turnitin, GPTZero, Originality, Copyleaks, ZeroGPT). It is the ` +
-    `best humanizer right now. Generate short, catchy social-media video captions/titles that ` +
-    `advertise "${product}" in that light (best humanizer, beats all detectors, 0% AI), and a set ` +
-    `of extra relevant hashtags. Rules: titles are 4-12 words, catchy, lowercase-ish casual, no ` +
-    `surrounding quotes, no emojis; do NOT include hashtags inside the titles. Extra tags are ` +
-    `single hashtags (start with #, no spaces) that are relevant to AI writing / students / ` +
-    `humanizers; do NOT repeat these already-required tags: ${mandatory}. ` +
-    `Return strict JSON: {"titles": ["...", ...], "tags": ["#...", ...]} with ${PROMO_TITLE_COUNT} ` +
-    `titles and AT MOST ${PROMO_EXTRA_TAG_MAX} extra tags.`
+  // WHAT THE PRODUCT IS, and what a caption should boast about, come from the
+  // genre table. Hardcoding the humanizer pitch here would have a worker
+  // reposting a video captioned "beats every AI detector" about a slide maker.
+  const brief = withProduct(copyForProduct(product).promo, product)
+  const system = promoSystem(brief, mandatory)
 
-  const res = await fetch(`${GROQ_BASE_URL}/chat/completions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: GROQ_MODEL,
-      temperature: 0.9,
-      response_format: { type: 'json_object' },
-      reasoning_effort: 'low',
-      max_completion_tokens: 2000,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: `Generate captions and tags for "${product}".` },
-      ],
-    }),
-    signal: AbortSignal.timeout(45_000),
+  const { content, model } = await llmChat({
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: `Generate captions and tags for "${product}".` },
+    ],
+    temperature: 0.9,
+    jsonObject: true,
+    maxTokens: 2000,
   })
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '')
-    throw new Error(`Groq ${res.status}: ${detail.slice(0, 300)}`)
-  }
-  const data = await res.json()
-  const content: string = data?.choices?.[0]?.message?.content ?? ''
   let parsed: unknown
   try {
     parsed = JSON.parse(content)
   } catch {
-    throw new Error('Groq returned non-JSON content')
+    throw new Error(`${model} returned non-JSON content`)
   }
   const p = parsed as { titles?: unknown; tags?: unknown }
 
@@ -109,7 +96,7 @@ async function callGroq(product: Product): Promise<{ titles: string[]; tags: str
 }
 
 export async function regeneratePromo(product: Product): Promise<number> {
-  const { titles, tags } = await callGroq(product)
+  const { titles, tags } = await callModel(product)
   await saveGeneratedPromo(product, titles, tags)
   return titles.length
 }

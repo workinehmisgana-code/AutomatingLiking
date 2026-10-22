@@ -16,8 +16,9 @@ import {
   countLinkCategories,
   getChannelBios,
   harvestChannelBios,
-  getBlockedUrls,
+  getBlockedPoolUrls,
 } from './db'
+import { DEFAULT_GENRE, genreOfRow } from './config'
 import { categorizeChunk, CHUNK, type Categorizable } from './linkCategory'
 import { handleOf } from './channelRank'
 
@@ -32,13 +33,21 @@ export async function allTargets(): Promise<Categorizable[]> {
     loadVideosJson().catch(() => []),
     getLinkTitles().catch(() => ({}) as Record<string, string>),
     getChannelBios().catch(() => ({}) as Record<string, string>),
-    getBlockedUrls().catch(() => [] as string[]),
+    getBlockedPoolUrls().catch(() => [] as string[]),
   ])
   const blocked = new Set(blockedUrls)
   const out: Categorizable[] = []
   for (const v of videos) {
     const url = String(v.url ?? '')
     if (!url.startsWith('http') || blocked.has(url)) continue
+    // ONLY THE HUMANIZER POOL. The three audiences — competitors, ai_detector,
+    // generic — were drawn for humanizers, and the classifier's prompt names
+    // Turnitin and a list of rival humanizer brands. Run on a website-builder
+    // video it would answer 'competitors', which the server would then read as
+    // "the viewer is shopping for a rival humanizer" and serve a comment
+    // written for exactly that. A wrong label is worse than none: fallbackCategory
+    // sends these genres to 'generic', which is what they should get.
+    if (genreOfRow(v) !== DEFAULT_GENRE) continue
     const handle = handleOf(url)
     out.push({ url, title: titles[url] ?? '', bio: (handle && bios[handle]) || '' })
   }

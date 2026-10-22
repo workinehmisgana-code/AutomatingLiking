@@ -25,7 +25,13 @@ export default function AppLogin() {
         const d = await res.json().catch(() => ({}))
         if (cancelled) return
         if (res.ok && d?.token) {
-          const link = `nextbubble://auth?token=${encodeURIComponent(d.token)}`
+          // Two apps sign in through this page: the main one, and the Comment
+          // Tester (app-login?app=tester), which is a separate install with its
+          // own scheme so the token lands in the app that asked for it.
+          const tester =
+            new URLSearchParams(window.location.search).get('app') === 'tester'
+          const scheme = tester ? 'nextbubbletest' : 'nextbubble'
+          const link = `${scheme}://auth?token=${encodeURIComponent(d.token)}`
           setDeepLink(link)
           setStatus('Opening the app…')
           window.location.href = link

@@ -3,15 +3,17 @@ import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { isAdminEmail, LLM_MODELS, LLM_MODEL_LABELS, isLlmModel } from '@/lib/config'
 import { getLlmModel, setLlmModel } from '@/lib/db'
-import { groqChat, forgetLlmModelCache } from '@/lib/groq'
+import { llmChat, forgetLlmModelCache } from '@/lib/llm'
+import { LLM_PROBE_SYSTEM, LLM_PROBE_USER } from '@/lib/prompts'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 
 // Which model every generation uses.
 //
-// ONE setting for the whole app: comments, replies, title classification and
-// audience analysis all go through groqChat. Stored rather than compiled in, so
+// ONE setting for the whole app: comments, replies, the humanizer-related
+// marker, the audience categoriser, the mimic, promo captions and the presence
+// analysis all go through llmChat. Stored rather than compiled in, so
 // switching does not need a deploy — which is the point of having it, since the
 // reason to switch is usually that one model has started refusing or drifting.
 //
@@ -49,13 +51,17 @@ export async function POST(req: NextRequest) {
     }
     const started = Date.now()
     try {
-      const { content, model: used } = await groqChat({
+      const { content, model: used } = await llmChat({
         model,
+        // NO FALLBACK. Testing a model has to test that model: without this the
+        // button answered for whichever model happened to work, so a Gemini
+        // with no API key reported a pass from Groq.
+        only: true,
         jsonObject: true,
         maxTokens: 2000,
         messages: [
-          { role: 'system', content: 'Reply with strict JSON: {"ok": true}. Nothing else.' },
-          { role: 'user', content: 'Are you there?' },
+          { role: 'system', content: LLM_PROBE_SYSTEM },
+          { role: 'user', content: LLM_PROBE_USER },
         ],
       })
       let parsed: unknown = null

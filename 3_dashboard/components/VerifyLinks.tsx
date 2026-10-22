@@ -3,7 +3,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import ScrollX from '@/components/ScrollX'
-import { CLICK_PLATFORMS, CLICK_PLATFORM_LABELS } from '@/lib/config'
+import {
+  CLASSIFY_BATCH,
+  CLICK_PLATFORMS,
+  CLICK_PLATFORM_LABELS,
+  DEFAULT_GENRE,
+  GENRES,
+  GENRE_LABELS,
+  isGenre,
+} from '@/lib/config'
 
 const PAGE_SIZE = 500
 const UPLOAD_CHUNK = 500 // rows per upload request
@@ -13,6 +21,8 @@ interface VRow {
   url: string
   account: string | null
   platform: string
+  /** Which pool this joins when merged. Never '' - the server defaults it. */
+  genre: string
   view_count: number
   heart_count: number
   comment_count: number
@@ -77,14 +87,32 @@ interface ChannelRank {
   added: boolean
 }
 
-export default function VerifyLinks() {
+export default function VerifyLinks({
+  genre,
+}: {
+  /** The admin's master genre switch. The staged list is cut to it. */
+  genre: string
+}) {
   const [rows, setRows] = useState<VRow[]>([])
   const [total, setTotal] = useState(0)          // count matching the active filter
   const [totalAll, setTotalAll] = useState(0)    // count for the whole list, filter ignored
   const [page, setPage] = useState(0)
   const [loading, setLoading] = useState(true)
   const [selected, setSelected] = useState<Set<string>>(new Set())
-  const [pinSelected, setPinSelected] = useState(false)
+  /**
+   * The links "Mark unrelated" floated to the top, frozen as they were
+   * at that moment.
+   *
+   * A SNAPSHOT, NOT THE LIVE SELECTION. This used to be a boolean and the order
+   * was computed from `selected`, so ticking any box moved that row into the
+   * pinned block and the whole list re-flowed under the cursor — you went to
+   * select a second link and the page jumped to the channel's selected ones.
+   *
+   * Reviewing is exactly when somebody ticks and unticks a lot, so the order has
+   * to hold still while they do it. It is recomputed only by another Mark run,
+   * and cleared when a new page loads.
+   */
+  const [pinnedUrls, setPinnedUrls] = useState<Set<string>>(new Set())
   const [classifying, setClassifying] = useState(false)
   // Merge is gated on this: the current page must be run through "Mark humanizer
   // unrelated" before it can be merged. Resets whenever a new page/batch loads.
@@ -102,6 +130,14 @@ export default function VerifyLinks() {
   // How many links each platform holds, read from the URLs. Shown in the
   // dropdown: an option that would empty the page should say so first.
   const [platformCounts, setPlatformCounts] = useState<Record<string, number>>({})
+  // Genre filter, server-side for the same reason as the other two.
+  //
+  // Worth having its own filter rather than reading the badge down the list:
+  // the genre a link is staged with decides which product's comments can ever
+  // be served on it, so reviewing one genre's intake at a time is reviewing it
+  // against the right question — a slides video is not judged by whether it
+  // suits a humanizer. Set by the master switch above the page (a prop).
+  const [genreCounts, setGenreCounts] = useState<Record<string, number>>({})
   // Channels present in the verify list, for the whole-channel merge.
   const [accounts, setAccounts] = useState<{ account: string; platform: string; n: number }[]>([])
   // Channels ticked for merging. A set, so a search's worth can be cleared in
@@ -160,6 +196,7 @@ export default function VerifyLinks() {
       const res = await fetch(
         `/api/admin/verify-links?page=${p}&limit=${PAGE_SIZE}&title=${titleFilter}` +
           (platform ? `&platform=${platform}` : '') +
+          (genre ? `&genre=${genre}` : '') +
           (accountsParam ? `&accounts=${accountsParam}` : '')
       )
       const d = await res.json().catch(() => ({}))
@@ -170,16 +207,19 @@ export default function VerifyLinks() {
         if (d.platformCounts && typeof d.platformCounts === 'object') {
           setPlatformCounts(d.platformCounts as Record<string, number>)
         }
+        if (d.genreCounts && typeof d.genreCounts === 'object') {
+          setGenreCounts(d.genreCounts as Record<string, number>)
+        }
       } else {
         alert(d?.error || 'Could not load the verify list.')
       }
     } finally {
       setSelected(new Set())
-      setPinSelected(false)
+      setPinnedUrls(new Set())
       setClassifiedThisPage(false) // a freshly-loaded page must be re-classified before merge
       setLoading(false)
     }
-  }, [titleFilter, platform, mergeAccounts])
+  }, [titleFilter, platform, genre, mergeAccounts])
 
   useEffect(() => { fetchPage(page) }, [page, fetchPage])
 
@@ -370,16 +410,50 @@ export default function VerifyLinks() {
     setPage(0)
   }
 
+  // Back to page 0 when the switch moves: page 4 of the humanizer list is not
+  // page 4 of anything else, and landing past the end looks like an empty list.
+  useEffect(() => { setPage(0) }, [genre])
+
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE))
 
-  // Selected rows float to the top of the page after "Mark unrelated".
+  /**
+   * The page in reading order after "Mark unrelated": three blocks.
+   *
+   *   1. what the classifier called unrelated — the ones to look at and block
+   *   2. the rest WITHOUT a title
+   *   3. the rest with a title
+   *
+   * Block 2 is second because those links were never classified at all: Mark
+   * only sends rows that have a title (see markUnrelated), so an untitled link
+   * has had no verdict and is the one still needing a human. Leaving them mixed
+   * in among hundreds of judged rows is how they got missed.
+   *
+   * Original order is kept inside each block, which keeps a channel's links
+   * together there — the headings come from runs of the same account, so
+   * reordering inside a block rather than across one is what stops a channel
+   * being split into several headings.
+   *
+   * Depends on `pinnedUrls`, never on `selected`: see that state.
+   */
   const displayRows = useMemo(() => {
-    if (!pinSelected || selected.size === 0) return rows
-    const sel: VRow[] = []
-    const rest: VRow[] = []
-    for (const r of rows) (selected.has(r.url) ? sel : rest).push(r)
-    return [...sel, ...rest]
-  }, [rows, pinSelected, selected])
+    // Untouched until the page has been through Mark. Before that the query's
+    // own channel-grouped order is the only one that means anything.
+    if (!classifiedThisPage) return rows
+    const pinned: VRow[] = []
+    const untitled: VRow[] = []
+    const titled: VRow[] = []
+    for (const r of rows) {
+      if (pinnedUrls.has(r.url)) pinned.push(r)
+      else if (!r.title || !r.title.trim()) untitled.push(r)
+      else titled.push(r)
+    }
+    return [...pinned, ...untitled, ...titled]
+    // NOT pinnedUrls ALONE. Blocking the unrelated links clears the snapshot -
+    // those rows have left the page - and keying the whole order on it would
+    // take the untitled ones back out of the top at the exact moment they
+    // become the only thing left to review. classifiedThisPage survives a
+    // block and is reset by a fresh page, which is the life this order wants.
+  }, [rows, pinnedUrls, classifiedThisPage])
 
   // Consecutive rows of the same channel, so the table can print one heading per
   // channel instead of repeating the account on every line. The query already
@@ -390,12 +464,19 @@ export default function VerifyLinks() {
   // to the top the display order is what the reader sees, and a heading that
   // disagreed with it would be worse than none.
   const rowGroups = useMemo(() => {
-    const out: { account: string | null; platform: string | null; bio: string | null; rows: VRow[] }[] = []
+    const out: {
+      account: string | null
+      platform: string | null
+      bio: string | null
+      // A channel's links all share its genre, so it belongs on the group.
+      genre: string
+      rows: VRow[]
+    }[] = []
     for (const r of displayRows) {
       const key = (r.account || '').toLowerCase()
       const last = out[out.length - 1]
       if (last && (last.account || '').toLowerCase() === key) last.rows.push(r)
-      else out.push({ account: r.account, platform: r.platform, bio: r.bio, rows: [r] })
+      else out.push({ account: r.account, platform: r.platform, bio: r.bio, genre: r.genre, rows: [r] })
     }
     return out
   }, [displayRows])
@@ -448,6 +529,9 @@ export default function VerifyLinks() {
         posted_date: iDate >= 0 ? r[iDate] : '', title: iTitle >= 0 ? r[iTitle] : '',
         // Channel bio — the scraper stamps it on every one of that channel's rows.
         bio: iBio >= 0 ? r[iBio] : '',
+        // Staged into the genre the switch is on: a CSV uploaded while on
+        // Website builder is website-builder intake.
+        genre,
       }))
       let saved = 0
       for (let i = 0; i < parsed.length; i += UPLOAD_CHUNK) {
@@ -470,8 +554,33 @@ export default function VerifyLinks() {
   }
 
   // ── Mark humanizer-UNRELATED (classify page titles in up to 5 Groq batches) ─
+  /**
+   * What the marker is about to judge these links against.
+   *
+   * Taken from the GENRES ON THE PAGE, not from the filter: with the filter on
+   * "All genres" the page can hold website and humanizer links together, and
+   * each is judged against its own. The button has to say which, because
+   * "unrelated" means nothing without naming what it is unrelated TO — and
+   * the old label said "humanizer" while marking a page of website links.
+   */
+  const pageGenres = useMemo(() => {
+    const seen = new Set<string>()
+    for (const r of rows) if (r.title) seen.add(isGenre(r.genre) ? r.genre : DEFAULT_GENRE)
+    return GENRES.filter((g) => seen.has(g))
+  }, [rows])
+  const markLabel =
+    pageGenres.length === 0
+      ? 'nothing to mark'
+      : pageGenres.length === 1
+        ? (GENRE_LABELS[pageGenres[0]] ?? pageGenres[0])
+        : `${pageGenres.length} genres, each against its own`
+
   async function markUnrelated() {
-    const items = rows.filter((r) => r.title).map((r) => ({ url: r.url, title: r.title as string }))
+    // The genre travels with each row: the page can show several at once, and
+    // what counts as "related" is a different question for each of them.
+    const items = rows
+      .filter((r) => r.title)
+      .map((r) => ({ url: r.url, title: r.title as string, genre: r.genre }))
     if (items.length === 0) {
       // Nothing to classify on this page → count it as reviewed so merge can proceed.
       setClassifiedThisPage(true)
@@ -480,7 +589,13 @@ export default function VerifyLinks() {
     }
     setClassifying(true)
     try {
-      const batchSize = Math.max(1, Math.ceil(items.length / CLASSIFY_BATCHES))
+      // CAPPED, not just divided. Five batches of a 500-row page is 100 each,
+      // which fits under the endpoint's limit by arithmetic rather than by
+      // intent — raise PAGE_SIZE and the batches silently grow past it.
+      const batchSize = Math.min(
+        CLASSIFY_BATCH,
+        Math.max(1, Math.ceil(items.length / CLASSIFY_BATCHES))
+      )
       const related = new Set<string>()
       for (let i = 0; i < items.length; i += batchSize) {
         const res = await fetch('/api/admin/links/classify', {
@@ -493,9 +608,14 @@ export default function VerifyLinks() {
       }
       const unrelated = items.filter((it) => !related.has(it.url)).map((it) => it.url)
       setSelected(new Set(unrelated))
-      setPinSelected(true)
+      // Frozen here and nowhere else, so the order holds still while the page is
+      // reviewed.
+      setPinnedUrls(new Set(unrelated))
       setClassifiedThisPage(true) // this page is now reviewed → merge is allowed
-      alert(`Selected ${unrelated.length} humanizer-unrelated link(s) of ${items.length} — floated to the top. Review, then Block.`)
+      alert(
+        `Selected ${unrelated.length} unrelated link(s) of ${items.length} ` +
+          `(${markLabel}) — floated to the top. Review, then Block.`
+      )
     } finally {
       setClassifying(false)
     }
@@ -530,7 +650,7 @@ export default function VerifyLinks() {
       setTotal((t) => Math.max(0, t - goneCount))
       setTotalAll((t) => Math.max(0, t - goneCount))
       setSelected(new Set())
-      setPinSelected(false)
+      setPinnedUrls(new Set())
       alert(`Blocked ${d?.blocked ?? urls.length} link(s) and removed them from the verify list.`)
     } finally {
       setDeleting(false)
@@ -543,10 +663,19 @@ export default function VerifyLinks() {
     // Clean ignores the Title filter — it wipes the whole list, so it must warn
     // with the UNFILTERED count, not the (possibly much smaller) filtered one.
     if (!confirm(`Clean the WHOLE verify list?\n\nThis permanently removes ALL ${totalAll.toLocaleString()} link(s) from the "Links to verify" list${
-      titleFilter !== 'all' || platform
-        ? ` — including the ones the ${[platform && 'Platform', titleFilter !== 'all' && 'Title']
-            .filter(Boolean)
-            .join(' and ')} filter${platform && titleFilter !== 'all' ? 's are' : ' is'} currently hiding`
+      titleFilter !== 'all' || platform || genre
+        ? (() => {
+            // Named one by one, and pluralised by how many are actually on:
+            // this sentence is the only warning that Clean ignores the filters,
+            // so it has to list all of them rather than the two it knew about
+            // when it was written.
+            const on = [platform && 'Platform', genre && 'Genre', titleFilter !== 'all' && 'Title']
+              .filter(Boolean)
+              .join(', ')
+              .replace(/, ([^,]*)$/, ' and $1')
+            const many = [platform, genre, titleFilter !== 'all'].filter(Boolean).length > 1
+            return ` — including the ones the ${on} filter${many ? 's are' : ' is'} currently hiding`
+          })()
         : ''
     }. It does NOT touch the main links list.`)) return
     setCleaning(true)
@@ -557,7 +686,7 @@ export default function VerifyLinks() {
       })
       const d = await res.json().catch(() => ({}))
       if (!res.ok) { alert(d?.error || 'Clean failed.'); return }
-      setRows([]); setTotal(0); setTotalAll(0); setSelected(new Set()); setPinSelected(false); setPage(0)
+      setRows([]); setTotal(0); setTotalAll(0); setSelected(new Set()); setPinnedUrls(new Set()); setPage(0)
       alert(`Cleaned ${d?.removed ?? 0} link(s) from the verify list.`)
     } finally {
       setCleaning(false)
@@ -574,11 +703,19 @@ export default function VerifyLinks() {
     site: string
     handle: string
     note: string | null
+    /** Which pool its videos join when merged. Never '' - the server defaults it. */
+    genre: string
     addedAt: string
   }
   const [addOpen, setAddOpen] = useState(false)
   const [addInput, setAddInput] = useState('')
   const [addSite, setAddSite] = useState('')
+  // WHICH POOL THIS CHANNEL'S VIDEOS JOIN. Picked once per channel rather than
+  // per video: every link extracted from it inherits this, and the merge files
+  // them in that genre's pool. Adding a cocodly channel is the whole of telling
+  // the system that its videos are cocodly videos.
+  const [addGenre, setAddGenre] = useState<string>(genre || DEFAULT_GENRE)
+  useEffect(() => { setAddGenre(genre || DEFAULT_GENRE) }, [genre])
   const [addNote, setAddNote] = useState('')
   const [addBusy, setAddBusy] = useState(false)
   const [addMsg, setAddMsg] = useState('')
@@ -624,7 +761,12 @@ export default function VerifyLinks() {
       const res = await fetch('/api/admin/verify-links/channels', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: addInput, site: detectedSite || addSite, note: addNote }),
+        body: JSON.stringify({
+          input: addInput,
+          site: detectedSite || addSite,
+          note: addNote,
+          genre: addGenre,
+        }),
       })
       const d = await res.json().catch(() => ({}))
       if (!res.ok) {
@@ -927,6 +1069,12 @@ export default function VerifyLinks() {
     // Which channels answered with nothing, so a small hand-picked run can say
     // which one rather than how many.
     const emptyHandles: string[] = []
+    // Channels TikTok would not answer for. Kept apart from the empty ones
+    // because the two call for opposite things: an empty channel is finished
+    // with, a refused one has not been looked at and the run wants pressing
+    // again.
+    let throttled = 0
+    const throttledHandles: string[] = []
     // Listed videos the channel had posted BEFORE the newest one we already
     // hold. Shown because a big number here is the back catalogue that used
     // to be staged as if it were new.
@@ -948,11 +1096,17 @@ export default function VerifyLinks() {
         for (const h of (Array.isArray(d.failedHandles) ? d.failedHandles : []) as string[]) {
           if (!emptyHandles.includes(h) && emptyHandles.length < 40) emptyHandles.push(h)
         }
+        throttled += Number(d.throttled) || 0
+        for (const h of (Array.isArray(d.throttledHandles) ? d.throttledHandles : []) as string[]) {
+          if (!throttledHandles.includes(h) && throttledHandles.length < 40) throttledHandles.push(h)
+        }
         setExDone(offset); setExNew(found); setExFailed(failed)
         setExTotal(Number(d.total) || handles.length)
         setExNote(
           `${found.toLocaleString()} new link(s) staged so far` +
-          (older ? ` — ${older.toLocaleString()} older one(s) passed over.` : '.')
+          (older ? ` — ${older.toLocaleString()} older one(s) passed over` : '') +
+          (throttled ? ` — ${throttled.toLocaleString()} refused by TikTok so far` : '') +
+          '.'
         )
         if (d.done) {
           const skipped = Number(d.skippedOtherSites) || 0
@@ -974,8 +1128,18 @@ export default function VerifyLinks() {
                 `channel(s) answered with no videos: ` +
                 emptyHandles.slice(0, 8).map((h) => `@${h}`).join(', ') +
                 (emptyHandles.length > 8 ? `, and ${emptyHandles.length - 8} more` : '') +
-                '. Either the handle is wrong, the account is gone or private, or TikTok is ' +
-                'throttling the listing — open the profile to tell which.'
+                '. Either the handle is wrong or the account is gone or private — open the ' +
+                'profile to tell which.'
+              : '') +
+            // NOT THE SAME AS EMPTY, and this is the message that was missing.
+            // TikTok answers a burst with "overload-protect triggered"; those
+            // channels were never read, so the run simply wants pressing again.
+            (throttled
+              ? ` ${throttled.toLocaleString()} channel(s) were NOT checked — TikTok refused ` +
+                'the listing (it throttles bursts): ' +
+                throttledHandles.slice(0, 8).map((h) => `@${h}`).join(', ') +
+                (throttledHandles.length > 8 ? `, and ${throttledHandles.length - 8} more` : '') +
+                '. Press ⬇ again in a moment; nothing about them has been decided.'
               : '')
           )
           break
@@ -1034,9 +1198,10 @@ export default function VerifyLinks() {
             {mergeAccounts.size > 0 &&
               ` from ${mergeAccounts.size === 1 ? `@${Array.from(mergeAccounts)[0]}` : `${mergeAccounts.size} channels`}`}
             {platform && ` on ${CLICK_PLATFORM_LABELS[platform] ?? platform}`}
+            {genre && ` in ${GENRE_LABELS[genre] ?? genre}`}
             {titleFilter !== 'all' &&
               ` ${titleFilter === 'has' ? 'with' : 'without'} a title`}
-            {(mergeAccounts.size > 0 || titleFilter !== 'all' || !!platform) &&
+            {(mergeAccounts.size > 0 || titleFilter !== 'all' || !!platform || !!genre) &&
               `, of ${totalAll.toLocaleString()}`}
             ). Upload a
             channel CSV, mark &amp; block the humanizer-unrelated ones, then merge the rest into the main list.
@@ -1055,10 +1220,18 @@ export default function VerifyLinks() {
         </label>
         <button
           type="button" onClick={markUnrelated} disabled={classifying || rows.length === 0}
-          title="Classify this page's titles with Groq (5 batches) and select the humanizer-unrelated ones"
+          title={
+            `Classify this page's titles and select the ones that are NOT about ` +
+            `${markLabel}. Each link is judged against its own genre, so a page ` +
+            `holding more than one is asked a different question per genre.`
+          }
           className="text-sm text-white bg-amber-600 hover:bg-amber-500 disabled:opacity-40 rounded-lg px-3 py-1.5 transition-colors"
         >
-          {classifying ? 'Analyzing…' : '🤖 Mark humanizer unrelated'}
+          {classifying
+            ? 'Analyzing…'
+            : pageGenres.length === 1
+              ? `🤖 Mark ${GENRE_LABELS[pageGenres[0]] ?? pageGenres[0]} unrelated`
+              : '🤖 Mark unrelated'}
         </button>
         <button
           type="button" onClick={blockSelected} disabled={deleting || selected.size === 0}
@@ -1078,7 +1251,7 @@ export default function VerifyLinks() {
             selected.size > 0
               ? `${selected.size} link(s) are selected — block them (or clear the selection) before merging the page, otherwise they would be merged too.`
               : !classifiedThisPage
-                ? "Run '🤖 Mark humanizer unrelated' on this page first, then you can merge it."
+                ? "Run the '🤖 Mark unrelated' button on this page first, then you can merge it."
                 : 'Merge the links currently on this page into the main links list (date-only clustering)'
           }
           className="text-sm text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 rounded-lg px-3 py-1.5 transition-colors"
@@ -1338,6 +1511,20 @@ export default function VerifyLinks() {
               spellCheck={false}
               className="flex-1 min-w-[18rem] bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-emerald-500"
             />
+            {/* THE SWITCH'S GENRE, not a choice here: a channel added while
+                looking at Website is a website channel. To add one to another
+                genre, move the switch at the top first. */}
+            <span
+              title={
+                "This channel's videos join the genre the switch at the top is on.\n\n" +
+                'Every video extracted from it inherits it, and only that ' +
+                "genre's comments are ever served on them. Move the switch to add " +
+                'a channel to another genre.'
+              }
+              className="bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-sm text-zinc-400"
+            >
+              {GENRE_LABELS[addGenre] ?? addGenre}
+            </span>
             <select
               value={detectedSite || addSite}
               onChange={(e) => setAddSite(e.target.value)}
@@ -1431,6 +1618,18 @@ export default function VerifyLinks() {
               </p>
               {extras.map((c) => (
                 <div key={`${c.site}:${c.handle}`} className="flex items-center gap-3 text-xs py-0.5">
+                  {/* Named per row: a channel filed under the wrong genre stages
+                      its videos into the wrong pool, and re-adding it with the
+                      right one is the fix — which nobody can do without being
+                      able to see what it is now. */}
+                  <span
+                    className={
+                      c.genre === DEFAULT_GENRE ? 'text-zinc-600 shrink-0' : 'text-amber-300/80 shrink-0'
+                    }
+                    title={`Its videos join the ${GENRE_LABELS[c.genre] ?? c.genre} pool. Re-add the channel to change this.`}
+                  >
+                    {GENRE_LABELS[c.genre] ?? c.genre}
+                  </span>
                   <a
                     href={channelUrl(c.handle, c.site) as string}
                     target="_blank"
@@ -1783,6 +1982,22 @@ export default function VerifyLinks() {
               </span>
               <span className="min-w-0 flex items-center gap-1.5">
                 <span className="text-sm text-zinc-100 truncate">@{g.account || 'no channel'}</span>
+                {/* WHICH POOL THESE WILL JOIN. Worth seeing before pressing
+                    Merge: it is the last moment the choice can be corrected,
+                    and afterwards only the Links page says so. Dim for the
+                    default, lit for anything else, so a mis-filed channel
+                    catches the eye rather than having to be looked for. */}
+                <span
+                  className={
+                    (g.genre && g.genre !== DEFAULT_GENRE
+                      ? 'text-amber-300/90 border-amber-400/30'
+                      : 'text-zinc-500 border-zinc-700') +
+                    ' shrink-0 text-[10px] uppercase tracking-wide border rounded px-1 py-px'
+                  }
+                  title={`Merging these adds them to the ${GENRE_LABELS[g.genre] ?? g.genre} pool, where only that genre's comments are served.`}
+                >
+                  {GENRE_LABELS[g.genre] ?? g.genre}
+                </span>
                 {href && (
                   <a
                     href={href}
@@ -1911,12 +2126,12 @@ export default function VerifyLinks() {
       {/* Every staged channel, to be reviewed one at a time */}
       {channelsOpen && (
         <div
-          className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center p-4 overflow-y-auto"
+          className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center p-0 sm:p-4 overflow-y-auto"
           onClick={() => setChannelsOpen(false)}
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-3xl mt-6 rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
+            className="w-full max-w-3xl mt-0 sm:mt-6 rounded-none sm:rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
           >
             <div className="flex items-start justify-between gap-4 px-4 py-3 border-b border-zinc-800">
               <div>

@@ -1,6 +1,7 @@
 import { headers } from 'next/headers'
 import { redirect } from 'next/navigation'
 import { auth } from '@/lib/auth'
+import { getAdminGenre } from '@/lib/adminGenre'
 import { getPromoAdminData } from '@/lib/db'
 import { isAdminEmail } from '@/lib/config'
 import Login from '@/components/Login'
@@ -19,5 +20,5 @@ export default async function AdminPromoPage() {
   if (!isAdminEmail(session.user.email)) redirect('/')
 
   const videos = await getPromoAdminData().catch(() => [])
-  return <PromoAdmin videos={videos} />
+  return <PromoAdmin videos={videos} genre={await getAdminGenre()} />
 }

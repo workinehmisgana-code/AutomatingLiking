@@ -37,6 +37,26 @@
             android:textSize="12sp"
             android:textStyle="bold" />
 
+        <!-- Comment Tester only (shown from code): is my comment on this video? -->
+        <Button
+            android:id="@+id/btnCheck"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="6dp"
+            android:background="@drawable/btn_ghost_bg"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:paddingTop="6dp"
+            android:paddingBottom="6dp"
+            android:text="🔍 Check"
+            android:textAllCaps="false"
+            android:textColor="#34D399"
+            android:textSize="12sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
         <TextView
             android:id="@+id/urlText"
             android:layout_width="0dp"
@@ -64,6 +84,23 @@
             android:textSize="15sp"
             android:textStyle="bold" />
     </LinearLayout>
+
+    <!-- Comment Tester only: the last Check result, kept on screen (a Toast from
+         an overlay service is often never shown). Tap to dismiss. -->
+    <TextView
+        android:id="@+id/checkResult"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:background="@drawable/btn_ghost_bg"
+        android:maxWidth="320dp"
+        android:paddingStart="10dp"
+        android:paddingEnd="10dp"
+        android:paddingTop="6dp"
+        android:paddingBottom="6dp"
+        android:textColor="#FFFFFF"
+        android:textSize="12sp"
+        android:visibility="gone" />
 
     <!-- Row A: drag handle, counter, Next (centered in the row) -->
     <LinearLayout
@@ -119,24 +156,10 @@
         android:gravity="center_vertical"
         android:orientation="horizontal">
 
-        <!-- Expand-to-native-dashboard button. Temporarily deactivated (hidden).
-             Re-enable by removing android:visibility="gone". -->
-        <Button
-            android:id="@+id/btnExpand"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginEnd="4dp"
-            android:background="@drawable/btn_ghost_bg"
-            android:minWidth="0dp"
-            android:minHeight="0dp"
-            android:paddingStart="10dp"
-            android:paddingEnd="10dp"
-            android:paddingTop="8dp"
-            android:paddingBottom="8dp"
-            android:text="⛶"
-            android:textColor="#34D399"
-            android:textSize="15sp"
-            android:visibility="gone" />
+        <!-- No expand button: removed at the owner's request. The native
+             dashboard (Video task, Repost & earn, Comment liker) has no other
+             entry point in the bubble, so those screens are unreachable from
+             here until one is added back. -->
 
         <Button
             android:id="@+id/btnDetails"

@@ -15,6 +15,9 @@ import android.widget.Toast
 object ApkUpdater {
     /** True when [versionName] is newer than what's installed. */
     fun isUpdateAvailable(ctx: Context, versionName: String?): Boolean {
+        // The dashboard's APK is the Comment Helper; the tester is a separate
+        // app and must never be told to "update" into it.
+        if (BuildConfig.TESTER) return false
         val remote = versionName?.trim().orEmpty()
         if (remote.isBlank()) return false
         return isNewer(remote, AppInfo.versionName(ctx))

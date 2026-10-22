@@ -10,10 +10,12 @@ import { useRouter } from 'next/navigation'
 import {
   RETIRE_MIN_TIKTOK_YT,
   clusterCountForDimension,
-  SCAN_MAX_LINKS,
   SEARCH_FIELDS,
   DEFAULT_SEARCH_FIELDS,
+  CLASSIFY_BATCH,
   type SearchField,
+  GENRE_LABELS,
+  audiencesForGenre,
 } from '@/lib/config'
 
 // Default (px) widths for the resizable columns; the Link column flexes to fill.
@@ -111,7 +113,9 @@ const SEARCH_HINT =
   'posted.\n\n' +
   'A field we hold nothing for never matches: a link with no title cannot be ' +
   'found by title, and one whose channel we never learned cannot be found by ' +
-  'channel.'
+  'channel.\n\n' +
+  'The same menu holds "Whole word only", which stops "human" from matching ' +
+  '"humanizer", and "Match case".'
 
 // Why the Rank header sorts the way it does. Long enough to be worth naming
 // rather than inlining into the JSX.
@@ -126,6 +130,7 @@ const PLATFORMS: { key: string; label: string; dot: string }[] = [
   { key: 'youtube_shorts', label: 'YT Shorts', dot: 'bg-orange-500' },
   { key: 'youtube_videos', label: 'YT Videos', dot: 'bg-red-500' },
   { key: 'instagram', label: 'Instagram', dot: 'bg-fuchsia-500' },
+  { key: 'reddit', label: 'Reddit', dot: 'bg-amber-600' },
 ]
 
 // Rows on screen at once. Divides WINDOW_SIZE exactly, which the paging relies
@@ -261,7 +266,10 @@ export default function AdminLinks({
   retireCap,
   instagramRetire,
   clusterCount,
+  genre,
 }: {
+  /** The admin's master genre switch. Every query on this page is cut to it. */
+  genre: string
   retireCap: number
   instagramRetire: number
   clusterCount: number
@@ -313,7 +321,8 @@ export default function AdminLinks({
   // the admin turns on "Show titles" (also auto-enabled by Process).
   const titleMode = unrelatedOnly || showTitles
   const [processing, setProcessing] = useState(false)
-  const [classifying, setClassifying] = useState(false)
+  // '' when idle, otherwise the progress to show on the button ('100/500').
+  const [classifying, setClassifying] = useState('')
   const [blockingNext, setBlockingNext] = useState(false)
 
   // Resizable column widths (px), drag the right edge of a header cell to resize.
@@ -345,6 +354,9 @@ export default function AdminLinks({
   // reaches decides what comment it should get, while the keyword it happened to
   // be scraped under says little. The keyword itself is still on the link's
   // tooltip, and still searchable in the box above.
+  // The genre comes from the master switch above the page (a prop), not from a
+  // dropdown here: the genres do not share links, so the whole page is about
+  // one pool at a time.
   const [category, setCategory] = useState('') // '' = every audience
   // The search keyword a link was scraped under. The server already filters on
   // it exactly; the list of what exists comes back with every window, so the
@@ -514,7 +526,8 @@ export default function AdminLinks({
    * Classify every listed title with Groq and tick the ones that are NOT about
    * AI humanizers or AI detectors.
    *
-   * The endpoint takes 120 titles at a time, and this list runs to hundreds, so
+   * The endpoint takes CLASSIFY_MAX_ITEMS titles at a time, and this list runs
+   * to hundreds, so
    * it goes in batches with the progress on the button — a silent two-minute
    * wait reads as a hang. A batch that fails is reported and the run stops
    * rather than leaving a half-classified selection that looks complete.
@@ -529,17 +542,16 @@ export default function AdminLinks({
       )
       return
     }
-    const BATCH = 100
     setRankOnlyNote('')
     setRankOnlyClassifying(`0/${items.length}`)
     try {
       const related = new Set<string>()
-      for (let i = 0; i < items.length; i += BATCH) {
+      for (let i = 0; i < items.length; i += CLASSIFY_BATCH) {
         setRankOnlyClassifying(`${i}/${items.length}`)
         const res = await fetch('/api/admin/links/classify', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items: items.slice(i, i + BATCH) }),
+          body: JSON.stringify({ items: items.slice(i, i + CLASSIFY_BATCH) }),
         })
         const d = await res.json().catch(() => ({}))
         if (!res.ok || !Array.isArray(d.related)) {
@@ -578,7 +590,7 @@ export default function AdminLinks({
       const res = await fetch('/api/admin/links/blocked', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'block', urls }),
+        body: JSON.stringify({ action: 'block', urls, genre }),
       })
       const d = await res.json().catch(() => ({}))
       if (!res.ok) { setRankOnlyNote(d?.error || 'Could not block those links.'); return }
@@ -942,11 +954,12 @@ export default function AdminLinks({
   const [blSelChannels, setBlSelChannels] = useState<Set<string>>(new Set())
   const [blLinkCount, setBlLinkCount] = useState(0)
   useEffect(() => {
-    fetch('/api/admin/links/blocked?count=1')
+    // This genre's block list only: blocks are per genre.
+    fetch(`/api/admin/links/blocked?count=1&genre=${encodeURIComponent(genre)}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => { if (d) setBlTotal(Number(d.matched) || 0) })
       .catch(() => { /* label just stays unnumbered */ })
-  }, [])
+  }, [genre])
 
   const [refreshDaysText, setRefreshDaysText] = useState('30')
   const refreshDays = Math.max(0, Math.floor(Number(refreshDaysText) || 0))
@@ -989,9 +1002,24 @@ export default function AdminLinks({
   const [searchIn, setSearchIn] = useState<Set<SearchField>>(
     () => new Set<SearchField>(DEFAULT_SEARCH_FIELDS)
   )
+  // How the needle is matched, rather than where it is looked for. Both off by
+  // default, which is the substring search this box has always been.
+  const [wholeWord, setWholeWord] = useState(false)
+  const [caseSensitive, setCaseSensitive] = useState(false)
   const [searchMenuOpen, setSearchMenuOpen] = useState(false)
   const searchBoxRef = useRef<HTMLDivElement>(null)
-  const [clusterBy, setClusterBy] = useState<ClusterBy>('rank') // which dimension
+  // COMBINED, NOT RANK. "Cluster by: rank" means only links that HAVE a search
+  // rank, and the pool has stopped being mostly those: 4,443 links carry a rank
+  // and 192,022 do not, because channel extraction and the verify-list merge
+  // have overtaken search scraping as the source. Defaulting to rank showed 2%
+  // of the pool and hid the other 98%, which is how somebody who had just
+  // merged a channel's videos looked for them here, did not find them, and
+  // concluded the extract button was broken.
+  //
+  // Combined carries both dimensions, so nothing is left out and the rank
+  // ordering is still there. Rank is still selectable for when that is the
+  // question being asked.
+  const [clusterBy, setClusterBy] = useState<ClusterBy>('combined') // which dimension
   // The posted-date score's three parts. Only shown when the DATE dimension is
   // what orders the table — under "Search rank" these numbers explain nothing
   // about the order on screen.
@@ -1271,13 +1299,18 @@ export default function AdminLinks({
     scanAbort.current?.abort()
   }
 
-  // The scan is gated on how many links the filter actually matches, because
-  // that is what decides how long it runs — a few seconds each. It used to be
-  // gated on the number of CLUSTERS ticked, which measured nothing useful: a
-  // cluster is a relative slice, so five of them is ~900 links under one filter
-  // and tens of thousands under another, and a small deliberate selection with
-  // no clusters ticked was refused outright.
-  const scanAllowed = matched > 0 && matched <= SCAN_MAX_LINKS
+  // THE ONLY THING THAT STOPS THE SCAN IS AN UNBOUNDED ONE.
+  //
+  // It used to refuse above a link count as well, on the grounds that a long scan
+  // is expensive. It is — but it is also resumable, stoppable, and its cost is the
+  // admin's to spend: refusing to start a job somebody asked for, because it would
+  // take a while, is the tool deciding what its owner may do with an evening.
+  //
+  // A cluster selection is different in kind. Without one the filter can match the
+  // entire pool, which is not a long job but an unbounded one — and nobody presses
+  // the button meaning "read every link we have ever collected". So: clusters
+  // ticked and at least one link matching, and nothing else.
+  const scanAllowed = matched > 0 && clusters.size > 0
 
   async function runHarvest() {
     if (harvesting) return
@@ -1334,9 +1367,14 @@ export default function AdminLinks({
       `Read the comments of all ${matched.toLocaleString()} filtered link(s)?\n\n` +
       'Every link is READ AGAIN — this is a fresh count, not a top-up of the last one, so ' +
       'it takes a few seconds per video however many times you have scanned before.\n\n' +
+      // NO CEILING ANY MORE, so the size has to be said out loud instead: the
+      // button will start whatever was asked for, and four thousand links is
+      // hours.
+      `At a few seconds each that is roughly ${Math.max(1, Math.round((matched * 3) / 60))} ` +
+      'minute(s) of reading, in batches — it resumes by itself and you can stop it at any ' +
+      'point.\n\n' +
       'The result is saved as one entry in the scan history, so you can see whether our ' +
-      'comments on these links are growing. You can stop and resume; stopping keeps what ' +
-      'was read.'
+      'comments on these links are growing. Stopping keeps what was read.'
     )) return
 
     stopScan.current = false
@@ -1687,7 +1725,7 @@ export default function AdminLinks({
       setBlLoading(true)
       try {
         const p = new URLSearchParams({
-          offset: String(offset), limit: String(BLOCKED_PAGE), q, sort,
+          offset: String(offset), limit: String(BLOCKED_PAGE), q, sort, genre,
         })
         if (byChannel) p.set('channels', '1')
         const res = await fetch(`/api/admin/links/blocked?${p}`)
@@ -1706,8 +1744,13 @@ export default function AdminLinks({
         setBlLoading(false)
       }
     },
-    []
+    [genre]
   )
+  // The switch moved while the block list was open: show the new genre's.
+  useEffect(() => {
+    if (blOpen) { setBlSel(new Set()); loadBlocked(0, blQuery, blSort, blByChannel) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [genre])
 
   function openBlocked() {
     setBlOpen(true)
@@ -1720,7 +1763,7 @@ export default function AdminLinks({
   async function selectAllMatching() {
     setBlBusy(true)
     try {
-      const res = await fetch(`/api/admin/links/blocked?urls=1&q=${encodeURIComponent(blQuery)}`)
+      const res = await fetch(`/api/admin/links/blocked?urls=1&genre=${encodeURIComponent(genre)}&q=${encodeURIComponent(blQuery)}`)
       const d = await res.json().catch(() => ({}))
       if (!res.ok) { setBlNote(d?.error || 'Could not select all.'); return }
       setBlSel(new Set<string>(Array.isArray(d.urls) ? d.urls : []))
@@ -1751,7 +1794,7 @@ export default function AdminLinks({
       const res = await fetch('/api/admin/links/blocked', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(handles.length > 0 ? { action, handles } : { action, urls }),
+        body: JSON.stringify(handles.length > 0 ? { action, handles, genre } : { action, urls, genre }),
       })
       const d = await res.json().catch(() => ({}))
       if (!res.ok) { setBlNote(d?.error || `Could not ${action}.`); return }
@@ -1915,6 +1958,7 @@ export default function AdminLinks({
       if (retiredOnly) p.set('retired', '1')
       if (unrelatedOnly) p.set('unrelated', '1')
       if (blockedOnly) p.set('blocked', '1')
+      if (genre) p.set('genre', genre)
       if (category) p.set('category', category)
       if (uploadDate) p.set('uploadDate', uploadDate)
       if (titleFilter) p.set('title', titleFilter)
@@ -1932,14 +1976,16 @@ export default function AdminLinks({
         // Sent only alongside a real search: the parameter narrows nothing on
         // its own, and an empty box with it set would look like a filter.
         p.set('searchIn', Array.from(searchIn).join(','))
+        if (wholeWord) p.set('wholeWord', '1')
+        if (caseSensitive) p.set('caseSensitive', '1')
       }
       if (sort) { p.set('sortCol', sort.col); p.set('sortDir', sort.dir) }
       p.set('offset', String(winOffset))
       p.set('limit', String(WINDOW_SIZE))
       return p.toString()
     },
-    [platform, productSel, retiredOnly, unrelatedOnly, blockedOnly, category, keyword, oursFilter, oursProduct, uploadDate,
-     titleFilter, mediaFilter, clusters, clusterBy, minOurs, maxOurs, minClicks, maxClicks, minRatio, maxRatio, q, searchIn, sort]
+    [platform, productSel, retiredOnly, unrelatedOnly, blockedOnly, genre, category, keyword, oursFilter, oursProduct, uploadDate,
+     titleFilter, mediaFilter, clusters, clusterBy, minOurs, maxOurs, minClicks, maxClicks, minRatio, maxRatio, q, searchIn, wholeWord, caseSensitive, sort]
   )
 
   const loadWindow = useCallback(
@@ -2063,6 +2109,19 @@ export default function AdminLinks({
   const pageCount = Math.max(1, Math.ceil(matched / PAGE_SIZE))
   const clampedOffset = Math.min(Math.max(0, offset), Math.max(0, matched - 1))
   const clampedPage = Math.floor(clampedOffset / PAGE_SIZE) // for the "N / M" display only
+  /**
+   * Where the last page starts — what Next is allowed to reach.
+   *
+   * IT HAS TO COME FROM `matched`, NOT FROM `ordered.length`. Next was bounded
+   * by the window we hold, which is at most WINDOW_SIZE rows: with 1,478 links
+   * matching and a 1,000-row window, page 2 of 3 put the cursor at 500, 500 +
+   * 500 was already the whole window, and the button went dead while the counter
+   * still read "2 / 3". The last 478 links could not be reached at all.
+   *
+   * Paging past the window is not the problem it looks like: the effect above
+   * notices the cursor has left the rows we hold and fetches the next window.
+   */
+  const lastOffset = Math.max(0, (pageCount - 1) * PAGE_SIZE)
   const inWindow = clampedOffset - winStart
   const shown = inWindow >= 0 ? ordered.slice(inWindow, inWindow + PAGE_SIZE) : []
 
@@ -2186,35 +2245,92 @@ export default function AdminLinks({
   // Instagram serves a login wall so it usually can't be resolved).
   async function processTitles() {
     setShowTitles(true) // reveal the Title column
+    // A selection that is entirely off this page would otherwise fetch nothing
+    // and look like a dead button.
+    if (selected.size > 0 && !shown.some((l) => selected.has(l.url))) {
+      alert(
+        `${selected.size} link(s) are selected but none of them is on this page, ` +
+          'so there is nothing here to refetch. Clear the selection to do the ' +
+          'whole page.'
+      )
+      return
+    }
     setProcessing(true)
     try {
-      // Re-fetch the title from source for EVERY link on the page (even ones we
-      // already have saved) — the freshly-fetched value overwrites the cache.
-      const need = shown
+      // WHAT TO REFETCH. Titles go stale and some were wrong from the start —
+      // a scrape that caught a login wall, or a caption that has since been
+      // edited. Ticking those rows and pressing Process refetches exactly them;
+      // with nothing ticked it still does the whole page, which is how this
+      // worked before and what you want on a page you have not read yet.
+      //
+      // Either way the value from source overwrites the cache: this is a
+      // refetch, not a fill-in-the-blanks.
+      const need = selected.size > 0 ? shown.filter((l) => selected.has(l.url)) : shown
       const tiktoks = need.filter((l) => l.platform === 'tiktok')
       const others = need.filter((l) => l.platform !== 'tiktok')
 
       // TikTok — browser-side oEmbed, a few at a time.
+      //
+      // RATE LIMITED, AND IT USED TO BE SILENT. Five workers asking oEmbed for a
+      // page of 500 links is enough to get `{"ratelimit triggered"}` with HTTP
+      // 429 back for every one of them, and `if (r.ok)` then quietly kept the old
+      // title. The button finished, nothing changed, and nothing said why — so a
+      // title that was wrong stayed wrong however many times it was refetched.
+      //
+      // Now: fewer at a time, a retry with backoff when TikTok asks for one, and
+      // a count of what could not be read, said out loud at the end.
       const tkTitles: Record<string, string> = {}
+      let limited = 0
+      let failed = 0
       let next = 0
+      const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms))
       const worker = async () => {
         while (next < tiktoks.length) {
           const l = tiktoks[next++]
-          try {
-            // TikTok's oEmbed only accepts /video/ URLs — photo (slideshow) posts
-            // share the same item id, so rewrite /photo/ → /video/ to get their caption.
-            const oembedUrl = l.url.replace('/photo/', '/video/')
-            const r = await fetch(`https://www.tiktok.com/oembed?url=${encodeURIComponent(oembedUrl)}`)
-            if (r.ok) {
-              const j = await r.json()
-              if (j?.title) tkTitles[l.url] = String(j.title)
+          // TikTok's oEmbed only accepts /video/ URLs — photo (slideshow) posts
+          // share the same item id, so rewrite /photo/ → /video/ to get their caption.
+          const oembedUrl = l.url.replace('/photo/', '/video/')
+          let got = false
+          // Remembered from the attempts we already made: asking again just to
+          // find out why would spend another request on the limit that is the
+          // problem.
+          let lastStatus = 0
+          for (let attempt = 0; attempt < 3 && !got; attempt++) {
+            try {
+              const r = await fetch(
+                `https://www.tiktok.com/oembed?url=${encodeURIComponent(oembedUrl)}`
+              )
+              lastStatus = r.status
+              if (r.ok) {
+                const j = await r.json()
+                if (j?.title) {
+                  tkTitles[l.url] = String(j.title)
+                  got = true
+                }
+                break
+              }
+              if (r.status === 429) {
+                // Backing off is the only thing that helps, and it has to be
+                // long enough to be worth doing: 2s, then 8s.
+                if (attempt < 2) await sleep(2000 * (attempt + 1) * (attempt + 1))
+                continue
+              }
+              break
+            } catch {
+              break
             }
-          } catch {
-            /* ignore this one */
+          }
+          // Which kind of miss it was decides what to tell the user: waiting
+          // fixes a rate limit, nothing fixes a deleted video.
+          if (!got) {
+            if (lastStatus === 429) limited++
+            else failed++
           }
         }
       }
-      await Promise.all(Array.from({ length: Math.min(5, tiktoks.length) }, worker))
+      // Three at a time rather than five: the limit is on requests, and the whole
+      // page is wasted when it trips.
+      await Promise.all(Array.from({ length: Math.min(3, tiktoks.length) }, worker))
 
       // YouTube (works) + Instagram (best-effort) — server-side. The route caps
       // each request at 60 items, so send them in batches to cover the whole page.
@@ -2232,6 +2348,27 @@ export default function AdminLinks({
 
       const fresh = { ...serverTitles, ...tkTitles }
       setTitles((prev) => ({ ...prev, ...fresh }))
+      // SAID, BECAUSE "NOTHING CHANGED" IS NOT A RESULT. A press that read none
+      // of the titles it was asked for looks exactly like a press that found
+      // them all unchanged, and the difference is the whole question when a
+      // title is wrong.
+      const asked = need.length
+      const read = Object.keys(fresh).length
+      if (limited > 0 || failed > 0) {
+        alert(
+          `Refetched ${read} of ${asked} title(s).\n\n` +
+            (limited > 0
+              ? `${limited} were refused by TikTok with a rate limit (HTTP 429). ` +
+                'That is per IP and it lasts minutes, not seconds — wait, then ' +
+                'press again with fewer rows selected. Their stored titles are ' +
+                'unchanged.\n\n'
+              : '') +
+            (failed > 0
+              ? `${failed} could not be read at all (deleted, private, or a ` +
+                'login wall). Their stored titles are unchanged.'
+              : '')
+        )
+      }
       // Persist the newly-fetched titles so we never fetch them again.
       if (Object.keys(fresh).length > 0) {
         fetch('/api/admin/links/titles/save', {
@@ -2245,33 +2382,51 @@ export default function AdminLinks({
     }
   }
 
-  // Use the LLM to classify titles as humanizer/AI-detector related, then select
-  // either the RELATED ones or the UNRELATED ones (and float them to the top).
+  /**
+   * Use the LLM to classify titles as humanizer/AI-detector related, then select
+   * either the RELATED ones or the UNRELATED ones (and float them to the top).
+   *
+   * BATCHED, LIKE THE VERIFY PAGE AND THE RANK-ONLY PANEL. This sent the whole
+   * page in one request — up to 500 titles — and the endpoint read the first 120.
+   * The other ~380 came back absent from `related` and were therefore ticked as
+   * humanizer-unrelated without ever being classified, with Block & Bring Next
+   * waiting one click away. A page of 500 is five requests now, with the count on
+   * the button, and a failed batch cancels the whole selection rather than
+   * leaving a partial one that looks finished.
+   */
   async function markByTitle(mode: 'related' | 'unrelated') {
     const items = shown.filter((l) => titles[l.url]).map((l) => ({ url: l.url, title: titles[l.url] }))
     if (items.length === 0) { alert('Fetch titles first (Process).'); return }
-    setClassifying(true)
+    setClassifying(`0/${items.length}`)
     try {
-      const res = await fetch('/api/admin/links/classify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items }),
-      })
-      const d = await res.json().catch(() => ({}))
-      if (!res.ok) { alert(d?.error || 'Could not classify titles.'); return }
-      const relatedSet = new Set<string>(Array.isArray(d?.related) ? d.related : [])
+      const relatedSet = new Set<string>()
+      for (let i = 0; i < items.length; i += CLASSIFY_BATCH) {
+        setClassifying(`${i}/${items.length}`)
+        const res = await fetch('/api/admin/links/classify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: items.slice(i, i + CLASSIFY_BATCH) }),
+        })
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok || !Array.isArray(d?.related)) {
+          alert(
+            (d?.error || 'Could not classify titles.') +
+              `\n\nStopped after ${i} of ${items.length} — nothing was selected, ` +
+              'so no half-classified page can be blocked by mistake.'
+          )
+          return
+        }
+        for (const u of d.related as string[]) relatedSet.add(u)
+      }
       const pick =
         mode === 'related'
           ? items.filter((it) => relatedSet.has(it.url))
           : items.filter((it) => !relatedSet.has(it.url))
-      // Select the picked rows and float them to the top of the CURRENT PAGE
-      // (pinSelected) so the admin can review them before blocking — without
-      // leaving the batch they're on (no jump), keeping the cursor math intact.
-      setSelected((prev) => {
-        const n = new Set(prev)
-        pick.forEach((it) => n.add(it.url))
-        return n
-      })
+      // REPLACES the selection rather than adding to it, as the verify page does:
+      // what is ticked after this is the classifier's answer and nothing else. A
+      // hand-tick left over from another page used to survive into Block & Bring
+      // Next.
+      setSelected(new Set(pick.map((it) => it.url)))
       setPinSelected(true)
       const untitled = shown.length - items.length
       alert(
@@ -2282,7 +2437,7 @@ export default function AdminLinks({
             : '')
       )
     } finally {
-      setClassifying(false)
+      setClassifying('')
     }
   }
 
@@ -2292,6 +2447,13 @@ export default function AdminLinks({
   async function blockAndNext() {
     const urls = Array.from(selected)
     if (urls.length === 0) { alert('Select some links first (e.g. Mark humanizer unrelated).'); return }
+    // ASKED, as the verify page asks. This is a permanent block on up to a page
+    // of links, one click after a button that selects them for you.
+    if (!confirm(
+      `Block ${urls.length} selected link(s) forever, then load the next batch?\n\n` +
+      `They stay hidden from every user even if a future upload re-adds them. ` +
+      `(Not a delete — you can unblock from the block list on this page.)`
+    )) return
     setBlockingNext(true)
     try {
       const res = await fetch('/api/admin/links', {
@@ -2331,6 +2493,11 @@ export default function AdminLinks({
     )
     setOffset(0)
   }
+  // How many ticked rows are on THIS page — the ones Process would refetch. A
+  // selection can outlive a page change, and "12 selected" meaning twelve rows
+  // somewhere else is how a button ends up claiming work it will not do.
+  const selectedOnPage = shown.filter((l) => selected.has(l.url)).length
+
   // The placeholder says what is ticked, so the box never claims to search
   // something it is not. Two or fewer are named; more would not fit.
   const searchLabel = (() => {
@@ -2353,6 +2520,7 @@ export default function AdminLinks({
     (retiredOnly ? '&retired=1' : '')
 
   const reset = () => setOffset(0)
+  useEffect(() => { setOffset(0); setCategory('') }, [genre])
 
   // Pagination controls, shown both above and below the table.
   const paginationBar = (
@@ -2365,15 +2533,21 @@ export default function AdminLinks({
           </>
         )}
         {clusterBy === 'rank' && counts.dateOnly > 0 && (
-          <span
-            className="text-zinc-600"
-            title={
-              'Links merged from the verify list have no search rank, so they ' +
-              'cannot belong to a rank cluster.\n\nThey are all there under ' +
-              'Cluster by: Posted date or Combined.'
-            }
-          >
-            {' '}· {counts.dateOnly.toLocaleString()} without a search rank hidden
+          <span className="text-amber-300/80">
+            {' '}· {counts.dateOnly.toLocaleString()} hidden here — no search rank{' '}
+            <button
+              type="button"
+              onClick={() => { setClusterBy('combined'); reset() }}
+              title={
+                'Channel-merged links (⬇ Extract new videos, then Merge) and restored ' +
+                'blocked links carry no search rank, so they cannot belong to a rank ' +
+                'cluster and this view leaves them out.\n\n' +
+                'Combined shows them alongside the ranked ones.'
+              }
+              className="underline decoration-dotted hover:text-amber-200"
+            >
+              show them
+            </button>
           </span>
         )}
         {loading && <span className="text-zinc-600"> · loading…</span>}
@@ -2391,8 +2565,8 @@ export default function AdminLinks({
           {clampedPage + 1} / {pageCount}
         </span>
         <button
-          onClick={() => setOffset((o) => Math.min(Math.max(0, ordered.length - 1), o + PAGE_SIZE))}
-          disabled={clampedOffset + PAGE_SIZE >= ordered.length}
+          onClick={() => setOffset((o) => Math.min(lastOffset, o + PAGE_SIZE))}
+          disabled={clampedOffset >= lastOffset}
           className="px-3 py-1.5 rounded-lg bg-zinc-800 text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
         >
           Next →
@@ -2701,21 +2875,29 @@ export default function AdminLinks({
           <button
             type="button"
             onClick={() => setSearchMenuOpen((o) => !o)}
-            title="Choose which fields the search looks in"
+            title="Choose which fields the search looks in, and how the words are matched"
             aria-expanded={searchMenuOpen}
             className={`shrink-0 border border-l-0 border-zinc-700 rounded-r-lg px-2.5 text-sm transition-colors ${
               searchMenuOpen ? 'bg-zinc-700 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
             }`}
           >
-            in: {searchIn.size} ▾
+            in: {searchIn.size}
+            {wholeWord && <span className="text-emerald-400 ml-1">word</span>}
+            {caseSensitive && <span className="text-emerald-400 ml-1">Aa</span>}
+            {' ▾'}
           </button>
           {searchMenuOpen && (
-            <div className="absolute z-50 top-full right-0 mt-1 w-44 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl p-1">
+            <div className="absolute z-50 top-full right-0 mt-1 w-56 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl p-1">
               <div className="flex items-center justify-between gap-1 px-1 pb-1 mb-1 border-b border-zinc-800">
                 <span className="text-[10px] text-zinc-500">search in</span>
                 <button
                   type="button"
-                  onClick={() => { setSearchIn(new Set(DEFAULT_SEARCH_FIELDS)); reset() }}
+                  onClick={() => {
+                    setSearchIn(new Set(DEFAULT_SEARCH_FIELDS))
+                    setWholeWord(false)
+                    setCaseSensitive(false)
+                    reset()
+                  }}
                   className="text-[10px] text-zinc-400 hover:text-white"
                 >
                   Reset
@@ -2746,6 +2928,36 @@ export default function AdminLinks({
                   {f.label}
                 </label>
               ))}
+              <div className="px-1 pt-1.5 mt-1 border-t border-zinc-800">
+                <span className="text-[10px] text-zinc-500">how to match</span>
+              </div>
+              <label
+                className="flex items-center gap-2 px-1 py-1 rounded hover:bg-zinc-800 cursor-pointer text-sm text-zinc-200"
+                title={
+                  'Only whole words count: "human" matches "human text", "a human." ' +
+                  'and "ai-human-text", and stops matching "humanizer" or "superhuman".'
+                }
+              >
+                <input
+                  type="checkbox"
+                  checked={wholeWord}
+                  onChange={() => { setWholeWord((v) => !v); reset() }}
+                  className="accent-teal-500"
+                />
+                Whole word only
+              </label>
+              <label
+                className="flex items-center gap-2 px-1 py-1 rounded hover:bg-zinc-800 cursor-pointer text-sm text-zinc-200"
+                title={'Capitals have to line up: "Human" stops matching "human".'}
+              >
+                <input
+                  type="checkbox"
+                  checked={caseSensitive}
+                  onChange={() => { setCaseSensitive((v) => !v); reset() }}
+                  className="accent-teal-500"
+                />
+                Match case
+              </label>
               <p className="text-[10px] text-zinc-600 px-1 pt-1.5 mt-1 border-t border-zinc-800 leading-snug">
                 Channel name and bio describe the ACCOUNT — a match returns all of
                 that channel&rsquo;s links.
@@ -2767,7 +2979,14 @@ export default function AdminLinks({
           className="text-sm text-white bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 disabled:opacity-40 rounded-lg px-3 py-1.5 transition-colors"
         >
           {reclustering ? 'Reclustering…' : '🧮 Recluster links'}
+          {/* Scores are percentiles over the whole pool, so a recluster always
+              runs over every genre at once. */}
+          <span className="text-zinc-500 text-[11px] ml-1">(all genres)</span>
         </button>
+        {/* HUMANIZER ONLY. The audiences (competitors / ai detector) are
+            humanizer audiences; every other genre's links are 'generic' by
+            definition, so the button has nothing to do under another genre. */}
+        {audiencesForGenre(genre).length > 1 && (
         <button
           type="button"
           onClick={() => categorize(false)}
@@ -2780,18 +2999,20 @@ export default function AdminLinks({
         >
           {catRunning ? '■ Stop categorising' : '🎯 Categorise links'}
         </button>
+        )}
         <button
           type="button"
           onClick={scanComments}
           disabled={!scanning && !scanAllowed}
           title={
             scanAllowed || scanning
-              ? "Read every filtered link's comments: which of our product comments are already there, how far up, and their likes."
+              ? "Read every filtered link's comments: which of our product comments are already " +
+                'there, how far up, and their likes. Runs to a deadline and resumes, so a long ' +
+                'one is many batches — stop it whenever you like and what was read is saved.'
               : matched === 0
                 ? 'No links match this filter.'
-                : `${matched.toLocaleString()} links match — narrow the filter to ` +
-                  `${SCAN_MAX_LINKS.toLocaleString()} or fewer. Each link costs a few ` +
-                  'seconds of reading, so this is hours of work either way.'
+                : 'Tick at least one cluster first. Without one the filter can match the whole ' +
+                  'pool, and that is not a long scan but an unbounded one.'
           }
           className={`text-sm rounded-lg px-3 py-1.5 border transition-colors ${
             scanning
@@ -2869,6 +3090,8 @@ export default function AdminLinks({
                 className="text-sm rounded-lg px-3 py-1.5 border border-zinc-700 bg-zinc-800 text-white hover:bg-zinc-700 disabled:opacity-50 transition-colors"
               >
                 {harvesting ? '⏳ Running…' : '⚙️ Run pipeline step'}
+                {/* The automatic cycle works every genre's channels at once. */}
+                <span className="text-[11px] font-normal text-zinc-500"> · all genres</span>
               </button>
               <button
                 type="button"
@@ -2894,29 +3117,38 @@ export default function AdminLinks({
                 type="button"
                 onClick={processTitles}
                 disabled={processing}
+                title={
+                  selectedOnPage > 0
+                    ? `Refetch the title from source for the ${selectedOnPage} selected link(s) on this page, replacing what is stored`
+                    : 'Fetch the title from source for every link on this page, replacing what is stored. Tick rows first to refetch just those.'
+                }
                 className="text-sm text-white bg-teal-600 hover:bg-teal-500 disabled:opacity-40 rounded-lg px-3 py-1.5 transition-colors"
               >
-                {processing ? 'Processing…' : '⚙ Process — fetch video titles'}
+                {processing
+                  ? 'Processing…'
+                  : selectedOnPage > 0
+                    ? `⚙ Refetch titles (${selectedOnPage} selected)`
+                    : '⚙ Process — fetch video titles'}
               </button>
               {Object.keys(titles).length > 0 && (
                 <>
                   <button
                     type="button"
                     onClick={() => markByTitle('related')}
-                    disabled={classifying}
+                    disabled={Boolean(classifying)}
                     title="Use AI to select links whose titles ARE about AI humanizers / AI detectors"
                     className="text-sm text-white bg-violet-600 hover:bg-violet-500 disabled:opacity-40 rounded-lg px-3 py-1.5 transition-colors"
                   >
-                    {classifying ? 'Analyzing…' : '🤖 Mark humanizer related'}
+                    {classifying ? `Analyzing ${classifying}…` : '🤖 Mark humanizer related'}
                   </button>
                   <button
                     type="button"
                     onClick={() => markByTitle('unrelated')}
-                    disabled={classifying}
+                    disabled={Boolean(classifying)}
                     title="Use AI to select links whose titles are NOT about AI humanizers / AI detectors"
                     className="text-sm text-white bg-amber-600 hover:bg-amber-500 disabled:opacity-40 rounded-lg px-3 py-1.5 transition-colors"
                   >
-                    {classifying ? 'Analyzing…' : '🤖 Mark humanizer unrelated'}
+                    {classifying ? `Analyzing ${classifying}…` : '🤖 Mark humanizer unrelated'}
                   </button>
                   <button
                     type="button"
@@ -3012,7 +3244,13 @@ export default function AdminLinks({
             </div>
           </div>
           <div>
-            <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">How links are served</div>
+            <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">
+              How links are served{' '}
+              {/* These two are serving rules for the whole app, read by every
+                  genre's feed, so they say so rather than looking like this
+                  genre's setting. */}
+              <span className="normal-case tracking-normal text-zinc-600">· applies to all genres</span>
+            </div>
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
@@ -3294,9 +3532,12 @@ export default function AdminLinks({
                 className="w-full bg-zinc-900 border border-zinc-700 rounded px-1 py-0.5 text-[10px] normal-case tracking-normal text-zinc-300 focus:outline-none focus:border-emerald-500"
               >
                 <option value="">All categories</option>
-                <option value="competitors">Competitors</option>
-                <option value="ai_detector">AI detector</option>
-                <option value="generic">Generic</option>
+                {/* Only the audiences this genre has. */}
+                {audiencesForGenre(genre).map((c) => (
+                  <option key={c} value={c}>
+                    {c === 'competitors' ? 'Competitors' : c === 'ai_detector' ? 'AI detector' : 'Generic'}
+                  </option>
+                ))}
               </select>
               <span onMouseDown={(e) => startResize('keyword', e)} title="Drag to resize" className="absolute top-0 -right-1 h-full w-2 cursor-col-resize hover:bg-teal-500/60 z-10" />
             </div>
@@ -3482,6 +3723,18 @@ export default function AdminLinks({
           >
             {bulkDeleting ? '…' : '🗑 Delete all'}
           </button>
+          {/* The same select-page box at the right end, above the rows' right
+              checkboxes, so a wide table can be worked from either side. */}
+          <span className="w-6 shrink-0 flex items-center justify-center">
+            <input
+              type="checkbox"
+              checked={allPageSelected}
+              ref={(el) => { if (el) el.indeterminate = somePageSelected && !allPageSelected }}
+              onChange={toggleSelectPage}
+              title="Select all on this page"
+              className="accent-teal-500 cursor-pointer"
+            />
+          </span>
         </div>
         {shown.length === 0 ? (
           <p className="text-sm text-zinc-500 text-center py-12">
@@ -3799,6 +4052,18 @@ export default function AdminLinks({
                 >
                   {deletingUrl === l.url ? '…' : '🗑'}
                 </button>
+                {/* A second selection box at the right end of the row — the
+                    same selection, the same shift-click range — so a row can be
+                    picked without scrolling the wide table back to the left. */}
+                <span className="w-6 shrink-0 flex items-center justify-center">
+                  <input
+                    type="checkbox"
+                    checked={selected.has(l.url)}
+                    onChange={(e) => handleRowCheck(idx, l.url, (e.nativeEvent as MouseEvent).shiftKey)}
+                    aria-label="Select link"
+                    className="accent-teal-500 cursor-pointer"
+                  />
+                </span>
               </div>
             )
           })
@@ -3895,11 +4160,11 @@ export default function AdminLinks({
       {/* Permanent block list */}
       {blOpen && (
         <div
-          className="fixed inset-0 z-50 flex items-start justify-center bg-black/70 p-4 overflow-y-auto"
+          className="fixed inset-0 z-50 flex items-start justify-center bg-black/70 p-0 sm:p-4 overflow-y-auto"
           onClick={() => !blBusy && setBlOpen(false)}
         >
           <div
-            className="bg-zinc-900 border border-zinc-700 rounded-xl w-full max-w-5xl my-8"
+            className="bg-zinc-900 border border-zinc-700 rounded-none sm:rounded-xl w-full max-w-5xl my-0 sm:my-8 min-h-[100dvh] sm:min-h-0"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Header: search and sort */}
@@ -4196,7 +4461,7 @@ export default function AdminLinks({
           onClick={() => !reclustering && setReclusterOpen(false)}
         >
           <div
-            className="bg-zinc-900 border border-zinc-700 rounded-xl max-w-md w-full p-5"
+            className="bg-zinc-900 border border-zinc-700 rounded-xl max-w-md w-full p-5 max-h-[92vh] overflow-y-auto"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="text-sm font-semibold text-white mb-1">Posted-date cluster weights</div>
@@ -4308,7 +4573,7 @@ export default function AdminLinks({
           onClick={() => setReviewLink(null)}
         >
           <div
-            className="bg-zinc-900 border border-zinc-700 rounded-xl max-w-sm w-full p-5"
+            className="bg-zinc-900 border border-zinc-700 rounded-xl max-w-sm w-full p-5 max-h-[92vh] overflow-y-auto"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="text-sm font-semibold text-white mb-1">Review flagged link</div>
@@ -4342,12 +4607,12 @@ export default function AdminLinks({
       {/* Channels in the rank clusters but not the date ones */}
       {rankOnlyOpen && (
         <div
-          className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center p-4 overflow-y-auto"
+          className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center p-0 sm:p-4 overflow-y-auto"
           onClick={() => setRankOnlyOpen(false)}
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-[92rem] mt-6 rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
+            className="w-full max-w-[92rem] mt-0 sm:mt-6 rounded-none sm:rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
           >
             <div className="flex items-start justify-between gap-4 px-4 py-3 border-b border-zinc-800">
               <div>
@@ -4378,7 +4643,7 @@ export default function AdminLinks({
                   {/* The whole comparison, not only its result: three numbers
                       that add up are far easier to trust than one that does
                       not say what it was taken from. */}
-                  <div className="grid grid-cols-3 gap-2 mb-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mb-3">
                     {([
                       ['on the rank side only', rankOnlyShown.length, 'text-amber-300'],
                       ['on both sides', rankOnly.both, 'text-zinc-300'],
@@ -4621,12 +4886,12 @@ export default function AdminLinks({
       {/* Channels that take clicks and give nothing back */}
       {yieldOpen && (
         <div
-          className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center p-4 overflow-y-auto"
+          className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center p-0 sm:p-4 overflow-y-auto"
           onClick={() => setYieldOpen(false)}
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-[80rem] mt-6 rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
+            className="w-full max-w-[80rem] mt-0 sm:mt-6 rounded-none sm:rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
           >
             <div className="flex items-start justify-between gap-4 px-4 py-3 border-b border-zinc-800">
               <div>
@@ -5126,12 +5391,12 @@ export default function AdminLinks({
       {/* Links the platform no longer serves */}
       {brokenOpen && (
         <div
-          className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center p-4 overflow-y-auto"
+          className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center p-0 sm:p-4 overflow-y-auto"
           onClick={() => setBrokenOpen(false)}
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-5xl mt-6 rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
+            className="w-full max-w-5xl mt-0 sm:mt-6 rounded-none sm:rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
           >
             <div className="flex items-start justify-between gap-4 px-4 py-3 border-b border-zinc-800">
               <div>

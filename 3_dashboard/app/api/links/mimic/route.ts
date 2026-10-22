@@ -1,5 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { activeProductsForPlatform, pickFairProductForUrl } from '@/lib/db'
+import { DEFAULT_GENRE, productsInGenre } from '@/lib/config'
+import { genreOfUrl } from '@/lib/videos'
 import { mimicComment, mentionsRival } from '@/lib/commentMimic'
 import { COMPETITOR_BRANDS } from '@/lib/linkCategory'
 import { isProduct, platformFromUrl } from '@/lib/config'
@@ -55,7 +57,13 @@ export async function POST(req: NextRequest) {
   // the mimic setting on does not quietly change which product gets promoted.
   const wanted = String(body?.product ?? '').trim()
   const platform = platformFromUrl(url)
-  const active = await activeProductsForPlatform(platform).catch(() => [] as string[])
+  const allowed = await activeProductsForPlatform(platform).catch(() => [] as string[])
+  // Narrowed to the link's own genre, the same wall serveCommentForUrl puts
+  // up: a product from another genre under this video is a stranger talking
+  // about something else. Applied BEFORE the fair pick so a video whose
+  // leader is out of genre gets the next product in line rather than none.
+  const inGenre = new Set(productsInGenre(await genreOfUrl(url).catch(() => DEFAULT_GENRE)))
+  const active = allowed.filter((p) => inGenre.has(p))
   if (!active.length) {
     return NextResponse.json({ error: 'No active products for this platform' }, { status: 409 })
   }

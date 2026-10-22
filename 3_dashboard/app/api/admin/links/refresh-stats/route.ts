@@ -1,7 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { isAdminEmail } from '@/lib/config'
+import { getAdminGenre, adminGenreUrlTest } from '@/lib/adminGenre'
+import { isAdminEmail, genreOfRow } from '@/lib/config'
 import { loadVideosJson } from '@/lib/videos'
 import { saveLinkStats, countLinkStats } from '@/lib/db'
 import { fetchStats, tiktokVideoId } from '@/lib/linkStats'
@@ -45,7 +46,9 @@ const DEFAULT_MAX_AGE_DAYS = 30
  * of them that checking is cheaper than reasoning about it.
  */
 async function refreshableUrls(maxAgeDays: number): Promise<string[]> {
-  const videos = await loadVideosJson().catch(() => [])
+  // The master switch's genre only: a website session refreshes website links.
+  const genre = await getAdminGenre()
+  const videos = (await loadVideosJson().catch(() => [])).filter((v) => genreOfRow(v) === genre)
   const cutoff = maxAgeDays > 0 ? Date.now() - maxAgeDays * 86_400_000 : null
   const urls: string[] = []
   for (const v of videos) {

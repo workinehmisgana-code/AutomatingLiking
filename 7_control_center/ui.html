@@ -1,0 +1,1444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Control Center</title>
+<style>
+  /* One place for every colour, so the window is recoloured by editing six
+     lines rather than two hundred. */
+  :root {
+    --bg:#0b0f14; --panel:#111823; --panel-2:#16202e; --line:#1e2a3a;
+    --ink:#e6edf6; --ink-dim:#8da2bd; --ink-faint:#5b6b82;
+    --accent:#2f81f7; --accent-ink:#fff;
+    --ok:#2ea043; --warn:#d29922; --bad:#f85149; --run:#58a6ff;
+    --radius:10px;
+    --font:"Segoe UI Variable Display","Segoe UI",system-ui,-apple-system,sans-serif;
+    --mono:"Cascadia Mono",Consolas,"SF Mono",Menlo,monospace;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink); font-family:var(--font);
+    font-size:14px; line-height:1.5; overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::-webkit-scrollbar { width:10px; height:10px; }
+  ::-webkit-scrollbar-thumb { background:#243245; border-radius:6px; }
+  ::-webkit-scrollbar-thumb:hover { background:#2f4259; }
+  ::-webkit-scrollbar-track { background:transparent; }
+
+  /* ── shell ────────────────────────────────────────────────────────────── */
+  .app { display:grid; grid-template-columns:232px 1fr; height:100vh; }
+
+  .side { background:var(--panel); border-right:1px solid var(--line); display:flex; flex-direction:column; }
+  .brand { padding:18px 18px 14px; border-bottom:1px solid var(--line); }
+  .brand h1 { margin:0; font-size:15px; letter-spacing:.2px; font-weight:600; }
+  .brand p { margin:3px 0 0; font-size:11.5px; color:var(--ink-faint); }
+
+  nav { padding:10px 10px; flex:1; overflow:auto; }
+  nav button {
+    display:flex; align-items:center; gap:10px; width:100%; text-align:left;
+    background:transparent; border:0; color:var(--ink-dim); font:inherit;
+    padding:9px 10px; border-radius:8px; cursor:pointer; margin-bottom:2px;
+  }
+  nav button:hover { background:var(--panel-2); color:var(--ink); }
+  nav button.on { background:var(--accent); color:var(--accent-ink); font-weight:600; }
+  nav button .ic { width:18px; text-align:center; opacity:.95; }
+  nav .count {
+    margin-left:auto; font-size:11px; background:#0d1520; color:var(--run);
+    border-radius:20px; padding:1px 7px; font-variant-numeric:tabular-nums;
+  }
+  nav button.on .count { background:rgba(255,255,255,.18); color:#fff; }
+  nav .sec { font-size:10.5px; text-transform:uppercase; letter-spacing:.8px;
+             color:var(--ink-faint); padding:14px 10px 6px; }
+
+  .side-foot { border-top:1px solid var(--line); padding:12px 14px; font-size:11.5px; color:var(--ink-faint); }
+  .dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:6px; }
+
+  /* ── main ─────────────────────────────────────────────────────────────── */
+  main { overflow:auto; padding:22px 26px 40px; }
+  .head { display:flex; align-items:flex-start; gap:16px; margin-bottom:18px; }
+  .head h2 { margin:0 0 3px; font-size:19px; font-weight:600; letter-spacing:-.2px; }
+  .head p { margin:0; color:var(--ink-dim); font-size:13px; max-width:68ch; }
+  .head .spacer { flex:1; }
+
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:18px 20px; margin-bottom:16px; }
+  .card h3 { margin:0 0 2px; font-size:13px; font-weight:600; }
+  .card .sub { margin:0 0 14px; color:var(--ink-faint); font-size:12px; }
+
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:14px 18px; }
+  label.f { display:block; }
+  label.f > span { display:block; font-size:11.5px; color:var(--ink-dim); margin-bottom:5px; }
+  input[type=text], input[type=number], select, textarea {
+    width:100%; background:#0c131c; color:var(--ink); border:1px solid var(--line);
+    border-radius:8px; padding:8px 10px; font:inherit; font-size:13px; outline:none;
+  }
+  textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:12.5px; line-height:1.6; }
+  input:focus, select:focus, textarea:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(47,129,247,.15); }
+  input[disabled], select[disabled] { opacity:.45; }
+
+  /* A dropdown that takes more than one answer. Built rather than borrowed:
+     <select multiple> is a scrolling box that needs ctrl-click to add a second
+     item, which is a thing people discover by accident or never. */
+  .picker { position:relative; }
+  .picker-btn {
+    width:100%; display:flex; align-items:center; gap:8px; text-align:left;
+    background:#0c131c; color:var(--ink); border:1px solid var(--line);
+    border-radius:8px; padding:8px 10px; font:inherit; font-size:13px; cursor:pointer;
+  }
+  .picker-btn:hover { border-color:#2b3a4e; }
+  .picker-btn .caret { margin-left:auto; color:var(--ink-faint); font-size:11px; }
+  .picker.open .picker-btn { border-color:var(--accent); box-shadow:0 0 0 3px rgba(47,129,247,.15); }
+  .picker-menu {
+    position:absolute; z-index:40; top:calc(100% + 4px); left:0; right:0;
+    background:var(--panel-2); border:1px solid var(--line); border-radius:8px;
+    padding:6px; box-shadow:0 12px 32px rgba(0,0,0,.45);
+  }
+  .picker-menu label.c { padding:6px 8px; border-radius:6px; }
+  .picker-menu label.c:hover { background:#1b2736; }
+  .picker-foot { display:flex; gap:12px; border-top:1px solid var(--line); margin-top:4px; padding:7px 8px 2px; }
+  button.link { background:none; border:0; color:var(--accent); font:inherit; font-size:11.5px; cursor:pointer; padding:0; }
+  button.link:hover { text-decoration:underline; }
+
+  .phone-state { font-size:13px; display:flex; align-items:center; gap:8px; }
+  .phone-state .pdot { width:9px; height:9px; border-radius:50%; background:var(--ink-faint); }
+  .phone-state.up .pdot { background:var(--ok); }
+  .phone-state.down .pdot { background:var(--bad); }
+  .phone-state.part .pdot { background:var(--warn); }
+  .phone-state small { color:var(--ink-faint); }
+
+  .checks { display:flex; flex-wrap:wrap; gap:8px 18px; }
+  label.c { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--ink); cursor:pointer; }
+  label.c input { accent-color:var(--accent); width:15px; height:15px; }
+  label.c small { color:var(--ink-faint); }
+
+  .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  button.btn {
+    background:var(--accent); color:#fff; border:0; border-radius:8px;
+    padding:9px 16px; font:inherit; font-weight:600; font-size:13px; cursor:pointer;
+  }
+  button.btn:hover { filter:brightness(1.1); }
+  button.btn.ghost { background:var(--panel-2); color:var(--ink); border:1px solid var(--line); font-weight:500; }
+  button.btn.ghost:hover { background:#1b2736; }
+  button.btn.danger { background:#30181a; color:#ffa198; border:1px solid #5c2b2b; font-weight:500; }
+  button.btn:disabled { opacity:.4; cursor:default; filter:none; }
+
+  .cmd {
+    font-family:var(--mono); font-size:11.5px; color:var(--ink-dim);
+    background:#0a1017; border:1px solid var(--line); border-radius:8px;
+    padding:9px 11px; margin-top:12px; white-space:pre-wrap; word-break:break-all;
+  }
+  .cmd b { color:var(--ink); font-weight:600; }
+
+  .note { font-size:12px; color:var(--ink-faint); margin-top:10px; }
+  .note b { color:var(--ink-dim); font-weight:600; }
+
+  /* ── jobs ─────────────────────────────────────────────────────────────── */
+  .jobs { display:grid; gap:10px; }
+  .job { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); overflow:hidden; }
+  .job-head { display:flex; align-items:center; gap:12px; padding:11px 14px; cursor:pointer; }
+  .job-head:hover { background:var(--panel-2); }
+  .job-title { font-size:13px; font-weight:600; }
+  .job-meta { font-size:11.5px; color:var(--ink-faint); }
+  .pill { font-size:10.5px; font-weight:700; letter-spacing:.4px; text-transform:uppercase;
+          padding:2px 8px; border-radius:20px; }
+  .pill.running { background:rgba(88,166,255,.14); color:var(--run); }
+  .pill.done { background:rgba(46,160,67,.14); color:var(--ok); }
+  .pill.failed { background:rgba(248,81,73,.14); color:var(--bad); }
+  .pill.stopped { background:rgba(210,153,34,.14); color:var(--warn); }
+  .pill.starting { background:rgba(141,162,189,.14); color:var(--ink-dim); }
+  .pill.queued { background:rgba(210,153,34,.12); color:var(--warn); }
+
+  /* The answer box. Only shown while a job is running, because typing at a
+     finished one is a message into a closed pipe. */
+  .ask { display:flex; align-items:center; gap:8px; padding:8px 10px 8px 14px;
+         border-top:1px solid var(--line); background:#0a1017; }
+  .ask input {
+    flex:1; background:#070b10; color:var(--ink); border:1px solid var(--line);
+    border-radius:6px; padding:5px 9px; font-family:var(--mono); font-size:12px;
+  }
+  .ask input:focus { border-color:var(--accent); outline:none; }
+  .ask .why { font-size:11px; color:var(--ink-faint); }
+  .ask.waiting { background:#141003; border-top-color:#4a3a0d; }
+  .ask.waiting .why { color:var(--warn); }
+  .log-wrap { border-top:1px solid var(--line); background:#070b10; }
+  .log-bar {
+    display:flex; align-items:center; gap:8px; padding:7px 10px 7px 14px;
+    border-bottom:1px solid var(--line); background:#0a1017;
+  }
+  .log-bar .spacer { flex:1; }
+  .log-bar .hint { font-size:11px; color:var(--ink-faint); }
+  .log-bar .hint.live { color:var(--run); }
+  .log-bar .hint.held { color:var(--warn); }
+  button.mini {
+    background:var(--panel-2); color:var(--ink-dim); border:1px solid var(--line);
+    border-radius:6px; padding:3px 10px; font:inherit; font-size:11.5px; cursor:pointer;
+  }
+  button.mini:hover { background:#1b2736; color:var(--ink); }
+  button.mini.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .log {
+    font-family:var(--mono); font-size:12px; line-height:1.55; white-space:pre-wrap;
+    word-break:break-word; background:#070b10;
+    padding:12px 14px; max-height:380px; overflow:auto; color:#c9d7e8;
+  }
+  /* The editable view is the same text in a box you can type in. Same font and
+     colours, so turning it on does not look like a different screen. */
+  textarea.log-edit {
+    display:block; width:100%; min-height:260px; max-height:380px; resize:vertical;
+    font-family:var(--mono); font-size:12px; line-height:1.55;
+    background:#070b10; color:#c9d7e8; border:0; border-radius:0;
+    padding:12px 14px; outline:none; white-space:pre;
+  }
+  textarea.log-edit:focus { box-shadow:inset 0 0 0 2px rgba(47,129,247,.35); }
+  .log .err { color:#ff9f95; }
+  .log .ok { color:#79d18b; }
+  .log .dim { color:var(--ink-faint); }
+  .empty { color:var(--ink-faint); font-size:13px; padding:28px; text-align:center;
+           border:1px dashed var(--line); border-radius:var(--radius); }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <h1>Control Center</h1>
+      <p>Scrape · stage · heart</p>
+    </div>
+    <nav>
+      <div class="sec">Collect</div>
+      <button data-page="search" class="on"><span class="ic">◎</span> Search extraction</button>
+      <button data-page="harvest"><span class="ic">◈</span> Instagram channels</button>
+      <div class="sec">Promote</div>
+      <button data-page="hearts"><span class="ic">♥</span> Zefoy liker</button>
+      <button data-page="liker"><span class="ic">◉</span> Account liker</button>
+      <div class="sec">Activity</div>
+      <button data-page="jobs"><span class="ic">▤</span> Jobs <span class="count" id="jobCount">0</span></button>
+    </nav>
+    <div class="side-foot">
+      <div id="health"></div>
+      <div id="saved" style="margin-top:6px"></div>
+    </div>
+  </aside>
+
+  <main>
+    <!-- ── search ─────────────────────────────────────────────────────── -->
+    <section id="page-search">
+      <div class="head">
+        <div>
+          <h2>Search extraction</h2>
+          <p>Search a platform for your phrases and record every video it returns, with its
+             rank, likes and views. The result goes to the dashboard as <b>search-rank links</b>.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>What to search</h3>
+        <p class="sub">One phrase per line. Each is searched separately and the results are merged.</p>
+        <div class="grid">
+          <label class="f"><span>Platforms</span>
+            <div class="picker" id="s_platforms_box">
+              <button type="button" class="picker-btn" id="s_platforms_btn"
+                      aria-haspopup="true" aria-expanded="false">
+                <span id="s_platforms_label">TikTok</span><span class="caret">▾</span>
+              </button>
+              <div class="picker-menu hidden" id="s_platforms_menu">
+                <label class="c"><input type="checkbox" data-plat="tiktok"> TikTok</label>
+                <label class="c"><input type="checkbox" data-plat="youtube"> YouTube</label>
+                <label class="c"><input type="checkbox" data-plat="instagram"> Instagram</label>
+                <label class="c"><input type="checkbox" data-plat="reddit"> Reddit</label>
+                <div class="picker-foot">
+                  <button type="button" class="link" id="s_platforms_all">Select all</button>
+                  <button type="button" class="link" id="s_platforms_none">Clear</button>
+                </div>
+              </div>
+            </div>
+          </label>
+          <label class="f"><span>YouTube tab</span>
+            <select id="s_content"
+              title="YouTube shows Shorts and long videos mixed together, and the scraper only clicks a filter tab when it is told which one. Both means two runs: the Shorts tab first, then the Videos tab.">
+              <option value="all">Both — Shorts first, then Videos</option>
+              <option value="shorts">Shorts only</option>
+              <option value="videos">Videos only</option>
+            </select>
+          </label>
+          <label class="f"><span>Minimum per phrase</span>
+            <input type="number" id="s_min" min="0" step="10"></label>
+          <label class="f"><span>Maximum per phrase</span>
+            <input type="number" id="s_max" min="0" step="10"></label>
+        </div>
+        <label class="f" style="margin-top:14px"><span>Product genre</span>
+          <select id="s_genre"
+            title="Each genre keeps its own search phrases and its own link pool. A humanizer phrase finds nothing a website builder wants to be under, so one genre is searched at a time and its links upload into that genre's pool.">
+            <option value="humanizer">Humanizer</option>
+            <option value="website">Website builder (cocodly)</option>
+            <option value="slides">Slides (pptera)</option>
+          </select>
+        </label>
+        <label class="f" style="margin-top:14px"><span>Search phrases for this genre</span>
+          <textarea id="s_queries" spellcheck="false"></textarea></label>
+        <label class="f" style="margin-top:14px"><span>Output CSV (optional — blank lets the scraper name it)</span>
+          <input type="text" id="s_output" placeholder="results/links_2026-10-05.csv"></label>
+      </div>
+
+      <div class="card">
+        <h3>When it finishes</h3>
+        <p class="sub">The upload runs as its own job, so you can watch it, stop it, or re-run it alone.</p>
+        <div class="checks">
+          <label class="c"><input type="checkbox" id="s_upload_after">
+            Upload to the dashboard automatically</label>
+        </div>
+        <div class="grid" style="margin-top:12px">
+          <label class="f"><span>Upload mode</span>
+            <select id="s_upload_mode">
+              <option value="replace">Replace — this scrape is the current ranking</option>
+              <option value="append">Append — add without removing anything</option>
+            </select>
+          </label>
+        </div>
+        <p class="note"><b>Replace</b> drops rank links that this scrape no longer returns, which is
+           what you want for a full sweep of a keyword. <b>Append</b> is for one keyword out of
+           several uploaded separately. Neither touches links that have no search rank, and
+           <b>neither touches another genre</b>: a Website builder search replaces only the
+           Website builder links of that platform, never the Humanizer ones.</p>
+        <p class="note">Each platform uploads <b>its own file</b>, named by the scraper that wrote
+           it — not “the newest CSV”, which with several searches running at once belongs to
+           whichever finished last.</p>
+        <p class="note">Platforms are searched <b>one after another</b>: they share a Chrome
+           profile and Chromium allows one window per profile. The queue is on the Jobs page.
+           Searches <b>start straight away</b> — there is no log-in-and-press-Enter step. The
+           Chrome profile keeps your logins; if Instagram finds itself signed out, it waits in
+           the browser window and starts by itself once you log in.</p>
+        <p class="note"><b>YouTube counts as two runs</b> when both tabs are wanted. Its results
+           page mixes Shorts with long videos, and the scraper only clicks a filter tab when it
+           is told which one — so “Both” runs the Shorts tab first and the Videos tab after,
+           each writing and uploading its own file.</p>
+        <div class="cmd" id="s_cmd"></div>
+        <div class="row" style="margin-top:14px">
+          <button class="btn" id="s_start" onclick="start('search')">Start search</button>
+          <button class="btn ghost" onclick="start('upload')">Upload the newest CSV now</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── harvest ────────────────────────────────────────────────────── -->
+    <section id="page-harvest" class="hidden">
+      <div class="head">
+        <div>
+          <h2>Instagram channels</h2>
+          <p>The dashboard turns its Instagram links into a <b>ranked channel list</b> — the same
+             order the Links-to-verify extract page shows — and this visits the best of them and
+             collects the posts newer than what we already hold. Everything found is staged on
+             <b>Links to verify</b> for you to review and merge.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>How much to scan</h3>
+        <p class="sub">Channels come from the dashboard's own ranking, Instagram only, best
+           first — so a smaller number is the strongest ones, not an arbitrary slice.
+           With a genre picked, the ranking is filtered to that genre first, so the
+           number is that many of <i>its</i> channels rather than that many overall.</p>
+        <div class="grid">
+          <label class="f"><span>Product genre</span>
+            <select id="h_genre"
+              title="Which pool this harvest is for. It picks the channels &#10;&#10;— only accounts already feeding that genre — and stamps the genre on every post it stages, so only that product's comments are ever served on them.&#10;&#10;All genres harvests every genre's channels, and each post is staged under its OWN channel's genre. A genre with no Instagram links yet has no channels to rank, and the run says so instead of scraping nothing.">
+              <option value="">All genres</option>
+              <option value="humanizer">Humanizer</option>
+              <option value="website">Website builder (cocodly)</option>
+              <option value="slides">Slides (pptera)</option>
+            </select>
+          </label>
+          <label class="f"><span>Channels this run</span>
+            <input type="number" id="h_limit" min="1" step="5"></label>
+          <label class="f">
+            <span>Accounts file — leave blank to use the dashboard's ranking</span>
+            <input type="text" id="h_accounts"
+              title="Blank asks the dashboard for its ranked Instagram channels. A path here skips that and uses your file instead, in the order it is written."
+              placeholder="blank = the dashboard's ranked channels"></label>
+        </div>
+        <div class="checks" style="margin-top:14px">
+          <label class="c"><input type="checkbox" id="h_upload">
+            Stage what it finds on Links to verify</label>
+          <label class="c"><input type="checkbox" id="h_dry_run">
+            Dry run <small>— find, report, change nothing</small></label>
+        </div>
+        <p class="note">Nothing here reaches a user. Staged links still have to be reviewed and
+           merged on the Links-to-verify page, exactly as an uploaded CSV does.</p>
+        <p class="note">The browser is <b>always on screen</b> for this one — Instagram's profile
+           page is a JavaScript shell, so the posts only exist once something has run the page.
+           There is no headless mode to turn on.</p>
+        <div class="cmd" id="h_cmd"></div>
+        <div class="row" style="margin-top:14px">
+          <button class="btn" onclick="start('harvest')">Start harvest</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── hearts ─────────────────────────────────────────────────────── -->
+    <section id="page-hearts" class="hidden">
+      <div class="head">
+        <div>
+          <h2>Zefoy liker</h2>
+          <p>Give hearts to our comments through Zefoy or Freer, so the comment a visitor reads
+             first is ours. No account of ours is used — the free service does the liking.
+             For our own accounts, see <b>Account liker</b>. Runs alongside everything else
+             on this page.</p>
+        </div>
+      </div>
+
+      <div class="card" id="phoneCard">
+        <h3>The phone</h3>
+        <p class="sub">Hearts can be given from the phone's own Chrome instead of a browser
+           here — its session, its IP, its captcha. Attach it first; the run refuses to start
+           without it.</p>
+        <div class="row" style="gap:14px">
+          <span id="phoneDot" class="phone-state">checking…</span>
+          <span class="spacer" style="flex:1"></span>
+          <button class="btn ghost" onclick="phoneRefresh(true)">Check again</button>
+          <button class="btn" id="phoneConnect" onclick="phoneConnect()">Connect the phone</button>
+        </div>
+        <div class="grid" style="margin-top:14px">
+          <label class="f"><span>Wi-Fi address (optional — only for a phone not on USB)</span>
+            <input type="text" id="z_addr" placeholder="192.168.1.20:5555"
+              title="A phone on Wi-Fi has to be dialled before anything can be forwarded to it. Leave blank for a phone on the cable, or one already paired."></label>
+        </div>
+        <p class="note" id="phoneSteps"></p>
+        <p class="note">Connecting runs <b>adb connect</b> (if an address is given), then
+           <b>adb reconnect</b> and <b>adb forward</b>, and restarts Chrome on the phone if its
+           debugging socket is missing — Chrome opens that socket once at startup, so a Chrome
+           that ran through a disconnect has none. A restarted Chrome has no Zefoy session, so
+           expect a captcha; the AI solves it.</p>
+      </div>
+
+      <div class="card">
+        <h3>Where to run</h3>
+        <p class="sub">Tick both and one press starts two runs — the PC's browser and the
+           phone's — working the same list.</p>
+        <div class="checks">
+          <label class="c"><input type="checkbox" id="z_on_pc">
+            This PC <small>— its own browser window</small></label>
+          <label class="c"><input type="checkbox" id="z_on_phone">
+            The phone <small>— over adb, its session and its IP</small></label>
+        </div>
+        <div class="checks" style="margin-top:12px" id="z_shareRow">
+          <label class="c"><input type="checkbox" id="z_share">
+            Work the same list together <small>— neither repeats the other</small></label>
+        </div>
+        <p class="note" id="z_whereNote"></p>
+      </div>
+
+      <div class="card">
+        <h3>Service and links</h3>
+        <div class="grid">
+          <label class="f"><span>Service</span>
+            <select id="z_service">
+              <option value="zefoy">Zefoy</option>
+              <option value="freer">Freer</option>
+              <option value="both">Both — Zefoy first, then Freer</option>
+            </select>
+          </label>
+          <label class="f"><span>Links from</span>
+            <select id="z_source">
+              <option value="dashboard">The dashboard's live pool</option>
+              <option value="csv">A CSV or list of links</option>
+            </select>
+          </label>
+          <label class="f"><span>CSV / link list</span>
+            <input type="text" id="z_csv" placeholder="…/links.csv"></label>
+          <label class="f"><span>Cluster by</span>
+            <select id="z_cluster_by">
+              <option value="rank">Search rank</option>
+              <option value="date">Posted date</option>
+              <option value="combined">Combined</option>
+            </select>
+          </label>
+          <label class="f"><span>Clusters</span>
+            <input type="text" id="z_clusters" placeholder="all, or 1,2"></label>
+          <label class="f"><span>Platform</span>
+            <select id="z_platform">
+              <option value="tiktok">TikTok</option>
+              <option value="instagram">Instagram</option>
+              <option value="youtube_shorts">YouTube Shorts</option>
+            </select>
+          </label>
+          <label class="f"><span>Product genre</span>
+            <select id="z_genre"
+              title="Which product genre's links to work. Blank works every genre at once; picking one aims the run at that product's videos, which is the only way a single product's keyword set makes sense.">
+              <option value="">All genres</option>
+              <option value="humanizer">Humanizer</option>
+              <option value="website">Website builder (cocodly)</option>
+              <option value="slides">Slides (pptera)</option>
+            </select>
+          </label>
+          <label class="f"><span>Audience category (optional)</span>
+            <input type="text" id="z_category"></label>
+          <label class="f"><span>Max links to pull</span>
+            <input type="number" id="z_max_links" min="0" step="100"></label>
+          <label class="f"><span>Keywords (optional — blank uses the dashboard's products)</span>
+            <input type="text" id="z_keyword" placeholder="purifytext,acoustictext"></label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Target</h3>
+        <p class="sub">What “done” means for a video.</p>
+        <div class="checks">
+          <label class="c"><input type="checkbox" id="z_to_top">
+            Pass the best other comment <small>— instead of aiming at a share of the video's likes</small></label>
+        </div>
+        <div class="grid" style="margin-top:14px">
+          <label class="f"><span>Lead by (margin)</span>
+            <input type="number" id="z_margin" min="1"></label>
+          <label class="f"><span>Heart batches per video</span>
+            <input type="number" id="z_rounds" min="1"></label>
+          <label class="f"><span>Watch the real count for (s)</span>
+            <input type="number" id="z_watch" min="0" step="5"></label>
+          <label class="f"><span>Floor — least share of the video's likes</span>
+            <input type="number" id="z_floor" min="0" max="0.85" step="0.05"
+              title="A comment under this share of the video's own likes is hearted even when it already leads the section: topping a section on 11 hearts under a 40,000-like video still reads as a comment nobody noticed. 0 makes leading enough."></label>
+        </div>
+        <p class="note">Two limits, and the comment is worked to sit between them: never thinner
+           than the <b>floor</b> (a share of the video's own likes, worked even when it already
+           leads) and never thicker than the ceiling, <b>HEART_THRESHOLD</b> — a comment carrying
+           more hearts than the video it sits under is a comment nobody believes. A <b>tie</b> is
+           the one exception to the ceiling: level with the best stranger, it sends one batch and
+           moves on.</p>
+      </div>
+
+      <div class="card">
+        <h3>Pace, place and memory</h3>
+        <div class="grid">
+          <label class="f"><span>Browser windows</span>
+            <input type="number" id="z_workers" min="1" max="8"></label>
+          <label class="f"><span>Delay between videos (s) — Freer only</span>
+            <input type="number" id="z_delay" min="0"></label>
+          <label class="f"><span>Run on the phone (CDP address)</span>
+            <input type="text" id="z_cdp" placeholder="http://127.0.0.1:9222"></label>
+          <label class="f"><span>Reconnect attempts if the phone drops</span>
+            <input type="number" id="z_recover" min="0" max="20"></label>
+          <label class="f"><span>Record name (tag)</span>
+            <input type="text" id="z_tag" placeholder="phone"></label>
+          <label class="f"><span>Seconds between loop passes</span>
+            <input type="number" id="z_loop_delay" min="10"></label>
+        </div>
+        <div class="checks" style="margin-top:14px">
+          <label class="c"><input type="checkbox" id="z_resume">
+            Carry on where the last run stopped</label>
+          <label class="c"><input type="checkbox" id="z_fresh">
+            Start the list over <small>— forgets the record</small></label>
+          <label class="c"><input type="checkbox" id="z_loop">
+            Sweep the list again when it finishes</label>
+        </div>
+        <p class="note">On the phone, keep Chrome in front and the screen unlocked — a tab nobody
+           is looking at is not drawn, and the captcha image never arrives.</p>
+        <p class="note"><b>Two runs, two ways.</b> Give them <b>different tags</b> and they are
+           independent: separate records, each working the whole list. Give them the <b>same tag
+           and tick Share</b> and they are one piece of work: a link claimed by one is skipped by
+           the other, so neither repeats it — and if the phone drops, the PC goes back for
+           whatever it was holding and finishes the list alone.</p>
+        <div class="cmd" id="z_cmd"></div>
+        <div class="row" style="margin-top:14px">
+          <button class="btn" id="z_start" onclick="start('hearts')">Start liker</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── account liker ─────────────────────────────────── -->
+    <section id="page-liker" class="hidden">
+      <div class="head">
+        <div>
+          <h2>Account liker</h2>
+          <p>Hearts our comments from <b>our own TikTok accounts</b> — the sessions
+             <code>login.py</code> saved — rather than through a free service. Slower and
+             finite, because it spends our accounts' own standing, but it does not queue
+             behind anybody's quota and there is no captcha to solve.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Which links</h3>
+        <p class="sub">The same pool the Zefoy liker works from, and the same clustering —
+           the dashboard assigns the clusters, this only picks which ones to take.</p>
+        <div class="grid">
+          <label class="f"><span>Where the links come from</span>
+            <select id="k_source"
+              title="The dashboard gives you a cluster selection of the live pool. A file is for anything ad hoc — one list, in the order it is written.">
+              <option value="dashboard">The dashboard's pool</option>
+              <option value="file">A links file</option>
+            </select>
+          </label>
+          <label class="f"><span>Links file — only when the source is a file</span>
+            <input type="text" id="k_links" placeholder="links.txt or links.csv"></label>
+          <label class="f"><span>Cluster by</span>
+            <select id="k_cluster_by"
+              title="Clustering is also a FILTER. Search rank keeps only links that carry one, which is about 1.5% of the pool — everything scraped from a channel is date-only. Combined is the one that sees all of it.">
+              <option value="combined">Combined</option>
+              <option value="date">Posted date</option>
+              <option value="rank">Search rank</option>
+            </select>
+          </label>
+          <label class="f"><span>Clusters</span>
+            <input type="text" id="k_clusters" placeholder="all, or 1,2"></label>
+          <label class="f"><span>Platform</span>
+            <select id="k_platform">
+              <option value="tiktok">TikTok</option>
+              <option value="instagram">Instagram</option>
+              <option value="youtube_shorts">YouTube Shorts</option>
+            </select>
+          </label>
+          <label class="f"><span>Product genre</span>
+            <select id="k_genre"
+              title="Which pool to work. It matters here because the comment this likes is OUR comment, and which comment is ours depends on the genre — a cocodly link carries cocodly comments and nothing else. Blank works every genre at once.">
+              <option value="">All genres</option>
+              <option value="humanizer">Humanizer</option>
+              <option value="website">Website builder (cocodly)</option>
+              <option value="slides">Slides (pptera)</option>
+            </select>
+          </label>
+          <label class="f"><span>Audience category (optional)</span>
+            <input type="text" id="k_category" placeholder="competitors, ai_detector, generic"></label>
+          <label class="f"><span>Most links to pull</span>
+            <input type="number" id="k_max_links" min="0" step="50"></label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>What to like, and as whom</h3>
+        <p class="sub">A video costs one page load, and every matching comment on it is liked
+           while the page is open.</p>
+        <div class="grid">
+          <label class="f"><span>What counts as a target</span>
+            <select id="k_target"
+              title="Our products matches comments naming one of the products switched on in the dashboard, with punctuation and case stripped. Named handles is for liking specific workers' comments instead.">
+              <option value="products">Comments naming our products</option>
+              <option value="users">Comments by named handles</option>
+            </select>
+          </label>
+          <label class="f"><span>Handles — only when the target is named handles</span>
+            <input type="text" id="k_users" placeholder="worker1,worker2"></label>
+          <label class="f" style="grid-column:1/-1">
+            <span>Words that make a comment ours — blank uses the dashboard's active products</span>
+            <input type="text" id="k_keywords"
+              title="Given here, these REPLACE the product list, which is how you work one product out of several or match a name the dashboard does not carry.&#10;&#10;Spelling barely matters: punctuation, case and spaces are stripped before matching, and lookalike glyphs are folded back — so purifytext, Purify-Text, 'purify text' and the Greek-letter spelling are all one word. Listing both halves of a two-word name costs nothing."
+              placeholder="purifytext, acoustictext, prohumanly"></label>
+          <label class="f" style="grid-column:1/-1">
+            <span>Accounts to like from — one run each</span>
+            <div id="k_profile_pick" class="checks"
+                 style="margin:2px 0 6px; gap:10px 16px"></div>
+            <input type="text" id="k_profiles"
+              title="The logins login.py has saved, comma-separated. Ticking a name adds it; typing one by hand works too.&#10;&#10;Each account is a separate run with its own browser and its own record, started together. Every account likes every matching comment; the only one passed is a comment tied on likes with another of ours."
+              placeholder="default"></label>
+          <label class="f"><span>Accounts at once (0 = all)</span>
+            <input type="number" id="k_at_once" min="0" step="1"
+              title="How many of the ticked accounts run at the same time.&#10;&#10;0 starts every ticked account together. With more ticked than this, the first ones start and the rest wait as QUEUED in the job list; each takes the place of an account that finishes its links (or is stopped). Stop on a queued one cancels it before it starts."></label>
+          <label class="f"><span>How it reads the comments</span>
+            <select id="k_mode"
+              title="Clicking the heart is the only route that actually applies a like — the request route is accepted and then silently not applied. Keep this on the page unless you are re-testing that.">
+              <option value="dom">The page (reliable)</option>
+              <option value="fast">Requests (does not apply)</option>
+              <option value="api">API</option>
+            </select>
+          </label>
+          <label class="f"><span>Comment pages per video</span>
+            <input type="number" id="k_pages" min="1" step="1"></label>
+          <label class="f"><span>Scrolls per video</span>
+            <input type="number" id="k_scrolls" min="0" step="1"></label>
+          <label class="f"><span>Delay between likes (seconds, low,high)</span>
+            <input type="text" id="k_delay" placeholder="1,3"></label>
+          <label class="f"><span>Stop after this many likes (0 = no cap)</span>
+            <input type="number" id="k_limit" min="0" step="10"></label>
+        </div>
+        <div class="checks" style="margin-top:14px">
+          <label class="c"><input type="checkbox" id="k_keep_going">
+            Carry on past a video that fails</label>
+          <label class="c"
+            title="OFF (the default): one like per group of our comments that share a like count AND name the same product. Three purifytext comments on 5 likes get ONE of them taken to 6; the other two are left alone. A purifytext comment and a humlexic comment both on 5 are two groups, so both are liked.&#10;&#10;ON: every comment in the tied group is liked. Use it when the comments are genuinely different and independently earned — a run aimed at named handles, where the tie is an accident of where they happened to land rather than something we created.&#10;&#10;The cost of ON: our comments line up on identical counts again, which is the pattern the rule was written to stop.">
+            <input type="checkbox" id="k_like_ties">
+            Like every comment in a tied group
+            <small>— off: one per like-count per product</small></label>
+          <label class="c"><input type="checkbox" id="k_headed">
+            Show the browser</label>
+          <label class="c"><input type="checkbox" id="k_dry_run">
+            Dry run <small>— find the targets, like nothing</small></label>
+          <label class="c"><input type="checkbox" id="k_unlike">
+            Unlike instead <small>— removes the heart</small></label>
+        </div>
+        <p class="note">Every like is written to <code>done.csv</code> as it happens and rows
+           already there are skipped, so a re-run carries on rather than repeating.</p>
+        <p class="note"><b>Sign in first.</b> This uses a session <code>login.py</code> saved;
+           a profile that has never been logged in has nothing to like with.</p>
+        <div class="cmd" id="k_cmd"></div>
+        <div class="row" style="margin-top:14px">
+          <button class="btn" id="k_start" onclick="start('liker')">Start the account liker</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── jobs ───────────────────────────────────────────────────────── -->
+    <section id="page-jobs" class="hidden">
+      <div class="head">
+        <div>
+          <h2>Jobs</h2>
+          <p>Everything this window has started. They run independently — stopping one leaves
+             the others alone. The <b>scraper and the harvester share one Chrome profile</b>,
+             so those queue: Chromium allows a single window per profile, and a second one
+             would be refused on the spot.</p>
+        </div>
+        <div class="spacer"></div>
+        <button class="btn danger" onclick="stopAll()">Stop everything</button>
+      </div>
+      <div class="jobs" id="jobList"></div>
+    </section>
+  </main>
+</div>
+
+<script>
+// ── plumbing ────────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+let STATE = { jobs: [], settings: {}, tools: [] };
+let OPEN = null;              // the job whose log is expanded
+let SEEN = 0;                 // how much of that log we already hold
+let EDITING = false;          // is that log open as a text box right now
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return r.json().catch(() => ({}));
+}
+
+// Which input belongs to which saved setting. One table, so a field added to a
+// form is wired by adding a line here and nowhere else.
+const FIELDS = {
+  // `platforms` is handled on its own below: it is a set of checkboxes, not one
+  // input, so it does not fit the read/fill-by-id table.
+  search: { content:'s_content', min:'s_min', max:'s_max',
+            queries:'s_queries', output:'s_output',
+            upload_after:'s_upload_after', upload_mode:'s_upload_mode' },
+  harvest:{ limit:'h_limit', accounts:'h_accounts', genre:'h_genre',
+            dry_run:'h_dry_run', upload:'h_upload' },
+  liker:  { source:'k_source', links:'k_links', cluster_by:'k_cluster_by',
+            clusters:'k_clusters', platform:'k_platform', genre:'k_genre',
+            category:'k_category', max_links:'k_max_links',
+            target:'k_target', users:'k_users', profiles:'k_profiles', at_once:'k_at_once',
+            keywords:'k_keywords',
+            mode:'k_mode', pages:'k_pages', scrolls:'k_scrolls',
+            delay:'k_delay', limit:'k_limit',
+            headed:'k_headed', dry_run:'k_dry_run', unlike:'k_unlike',
+            keep_going:'k_keep_going', like_ties:'k_like_ties' },
+  hearts: { service:'z_service', source:'z_source', csv:'z_csv',
+            cluster_by:'z_cluster_by', clusters:'z_clusters', platform:'z_platform',
+            category:'z_category', genre:'z_genre',
+            max_links:'z_max_links', keyword:'z_keyword',
+            to_top:'z_to_top', margin:'z_margin', rounds:'z_rounds', watch:'z_watch',
+            floor:'z_floor',
+            workers:'z_workers', delay:'z_delay', loop:'z_loop',
+            loop_delay:'z_loop_delay', resume:'z_resume', fresh:'z_fresh',
+            tag:'z_tag', cdp:'z_cdp', recover:'z_recover', share:'z_share',
+            on_pc:'z_on_pc', on_phone:'z_on_phone' },
+};
+const CMD_BOX = { search:'s_cmd', harvest:'h_cmd', hearts:'z_cmd', liker:'k_cmd' };
+
+// THE PHRASES FOR EVERY GENRE, not just the one on screen.
+//
+// One textarea shows one genre at a time, so the other two have to live
+// somewhere or switching the dropdown would blank them. Held here, written back
+// on every change, and sent whole — the server stores the object.
+let QBG = {};
+let QBG_GENRE = 'humanizer';
+const GENRE_SEL = () => $('s_genre');
+
+/** Put what is in the textarea into the genre it belongs to. */
+function stashQueries() {
+  const box = $('s_queries');
+  if (box) QBG[QBG_GENRE] = box.value;
+}
+
+/** Show one genre's phrases, stashing whatever is on screen first. */
+function showGenre(genre) {
+  stashQueries();
+  QBG_GENRE = genre;
+  const box = $('s_queries');
+  if (box) box.value = QBG[genre] ?? '';
+}
+
+const PLAT_BOXES = () => [...document.querySelectorAll('#s_platforms_menu input[data-plat]')];
+const platformsPicked = () => PLAT_BOXES().filter(b => b.checked).map(b => b.dataset.plat);
+
+function readForm(tool) {
+  const out = {};
+  for (const [key, id] of Object.entries(FIELDS[tool])) {
+    const el = $(id);
+    if (!el) continue;
+    out[key] = el.type === 'checkbox' ? el.checked
+             : el.type === 'number' ? Number(el.value || 0)
+             : el.value;
+  }
+  if (tool === 'search') {
+    out.platforms = platformsPicked();
+    // The textarea belongs to the selected genre; the whole set goes with it so
+    // the other genres' phrases survive the save.
+    stashQueries();
+    out.genre = QBG_GENRE;
+    out.queries_by_genre = { ...QBG };
+  }
+  return out;
+}
+
+function fillForm(tool, values) {
+  for (const [key, id] of Object.entries(FIELDS[tool])) {
+    const el = $(id);
+    if (!el || values[key] === undefined) continue;
+    if (el.type === 'checkbox') el.checked = !!values[key];
+    else el.value = values[key];
+  }
+  if (tool === 'search') {
+    // A settings file from before this was a list holds a string.
+    const want = new Set([].concat(values.platforms || []));
+    for (const b of PLAT_BOXES()) b.checked = want.has(b.dataset.plat);
+    paintPlatforms();
+    // The per-genre phrases, then the one to show. The server has already merged
+    // in any genre the saved file was missing, and migrated a pre-genre file's
+    // flat `queries` into the humanizer slot.
+    QBG = { ...(values.queries_by_genre || {}) };
+    QBG_GENRE = values.genre || 'humanizer';
+    if (GENRE_SEL()) GENRE_SEL().value = QBG_GENRE;
+    const box = $('s_queries');
+    if (box) box.value = QBG[QBG_GENRE] ?? '';
+  }
+}
+
+// The button has to say what is ticked, or the menu is the only way to find out
+// and it is shut most of the time.
+function paintPlatforms() {
+  const names = { tiktok:'TikTok', youtube:'YouTube', instagram:'Instagram', reddit:'Reddit' };
+  const on = platformsPicked();
+  const label = $('s_platforms_label');
+  label.textContent = on.length === 0 ? 'none — pick at least one'
+                    : on.length <= 2 ? on.map(p => names[p]).join(' + ')
+                    : on.length === PLAT_BOXES().length ? 'All four platforms'
+                    : `${on.length} platforms`;
+  label.style.color = on.length ? '' : 'var(--warn)';
+}
+
+// Fields that only mean something in one mode are disabled rather than hidden:
+// a box that moves is harder to use than one that greys out.
+function syncEnabled() {
+  // --content is YouTube's alone, so it matters whenever YouTube is among them.
+  const yt = platformsPicked().includes('youtube');
+  $('s_content').disabled = !yt;
+  $('s_upload_mode').disabled = !$('s_upload_after').checked;
+
+  const fromCsv = $('z_source').value === 'csv';
+  for (const id of ['z_cluster_by','z_clusters','z_platform','z_category','z_max_links'])
+    $(id).disabled = fromCsv;
+  $('z_csv').disabled = !fromCsv;
+  const top = $('z_to_top').checked;
+  for (const id of ['z_margin','z_rounds','z_watch','z_floor']) $(id).disabled = !top;
+  $('z_delay').disabled = $('z_service').value === 'zefoy';
+  $('z_loop_delay').disabled = !$('z_loop').checked;
+  $('z_recover').disabled = !$('z_cdp').value.trim();
+  // Where to run, and what that leaves to decide.
+  const onPc = $('z_on_pc').checked, onPhone = $('z_on_phone').checked;
+  const both = onPc && onPhone;
+  $('z_shareRow').style.opacity = both ? '1' : '.45';
+  $('z_share').disabled = !both;          // one run has nobody to share with
+  $('z_cdp').disabled = !onPhone;
+  $('z_recover').disabled = !onPhone;
+  const note = $('z_whereNote');
+  if (note) {
+    note.innerHTML = !onPc && !onPhone
+      ? '<b style="color:var(--warn)">Nothing ticked — there is nowhere to run.</b>'
+      : both && $('z_share').checked
+        ? 'Two runs on <b>one record</b>: a link claimed by one is skipped by the other, and if '
+          + 'the phone drops the PC goes back for whatever it was holding and finishes alone.'
+        : both
+          ? 'Two runs on <b>separate records</b> (<code>-pc</code> and <code>-phone</code>), each '
+            + 'working the whole list. Tick the box above to make them one piece of work.'
+          : onPhone
+            ? 'One run, on the phone. Attach it with the card above first.'
+            : 'One run, in a browser window on this PC.';
+  }
+  // Resume and fresh are opposite instructions; ticking one unticks the other.
+  if ($('z_fresh').checked) $('z_resume').checked = false;
+}
+
+let saveTimer = null;
+let pendingTool = null;        // a change typed but not yet written
+
+/**
+ * Remember what was typed.
+ *
+ * Settings go to disk as you type, so the next window opens on the same search
+ * phrases, the same clusters and the same tag. Debounced, because a keystroke
+ * per write would be a file write per letter.
+ */
+function touched(tool) {
+  syncEnabled();
+  pendingTool = tool;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => saveNow(tool), 180);
+}
+
+async function saveNow(tool, keepalive) {
+  clearTimeout(saveTimer);
+  pendingTool = null;
+  const body = JSON.stringify({ tool, values: readForm(tool) });
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body, keepalive: !!keepalive,
+    }).then(x => x.json());
+    if (r.preview !== undefined) showCmd(tool, r.preview);
+    markSaved();
+  } catch (e) {
+    const el = $('saved');
+    if (el) el.innerHTML = '<span class="dot" style="background:var(--bad)"></span>not saved';
+  }
+}
+
+function markSaved() {
+  const el = $('saved');
+  if (!el) return;
+  const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  el.innerHTML = `<span class="dot" style="background:var(--ok)"></span>settings saved ${t}`;
+}
+
+// THE LAST THING TYPED IS THE ONE MOST LIKELY TO BE LOST. A debounce means a
+// change is still in the air for a moment, and closing the window in that moment
+// used to drop it. keepalive lets the request outlive the page.
+for (const ev of ['blur', 'pagehide', 'beforeunload']) {
+  window.addEventListener(ev, () => { if (pendingTool) saveNow(pendingTool, true); });
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden' && pendingTool) saveNow(pendingTool, true);
+});
+
+function showCmd(tool, text) {
+  const box = $(CMD_BOX[tool]);
+  if (!box) return;
+  const lines = String(text).split('\n');
+  // One line per run, numbered when there is more than one, because "three
+  // platforms" and "three programs about to start" are the same fact.
+  box.innerHTML = '<b>runs:</b> ' + lines
+    .map((l, i) => (lines.length > 1 ? `\n${i + 1}. ` : '') + escapeHtml(l))
+    .join('');
+  if (tool === 'hearts') {
+    // Counted from the preview for the same reason the search button is: the
+    // window must not say "start" while two commands are listed under it.
+    const n = lines.filter(l => l.includes('automate.py')).length;
+    const btn = $('z_start');
+    if (btn) btn.textContent = n > 1 ? `Start ${n} runs` : 'Start liker';
+  }
+  if (tool === 'search') {
+    // COUNTED FROM THE PREVIEW, not from the ticked platforms. YouTube is read a
+    // tab at a time, so four platforms can be five runs, and a button that said
+    // "4" while five commands were listed above it would be the window
+    // contradicting itself.
+    const n = lines.filter(l => l.includes('--platform')).length;
+    const btn = $('s_start');
+    if (btn) btn.textContent = n > 1 ? `Start ${n} runs` : 'Start search';
+  }
+}
+const escapeHtml = (s) => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+for (const tool of Object.keys(FIELDS))
+  for (const id of Object.values(FIELDS[tool])) {
+    const el = $(id);
+    if (el) el.addEventListener('input', () => touched(tool));
+  }
+
+// ── the platform picker ─────────────────────────────────────────────────────
+const platBox = $('s_platforms_box'), platMenu = $('s_platforms_menu');
+$('s_platforms_btn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const open = platMenu.classList.toggle('hidden');
+  platBox.classList.toggle('open', !open);
+  $('s_platforms_btn').setAttribute('aria-expanded', String(!open));
+});
+// Clicking inside must not close it: ticking three platforms is three clicks.
+platMenu.addEventListener('click', (e) => e.stopPropagation());
+document.addEventListener('click', () => {
+  platMenu.classList.add('hidden');
+  platBox.classList.remove('open');
+  $('s_platforms_btn').setAttribute('aria-expanded', 'false');
+});
+for (const b of PLAT_BOXES())
+  b.addEventListener('change', () => { paintPlatforms(); touched('search'); });
+// Switching genre swaps the textarea. The save that follows carries the new
+// genre AND the phrases of the one just left, which stashQueries has put back.
+if (GENRE_SEL()) {
+  GENRE_SEL().addEventListener('change', () => {
+    showGenre(GENRE_SEL().value);
+    touched('search');
+  });
+}
+
+$('s_platforms_all').addEventListener('click', () => {
+  for (const b of PLAT_BOXES()) b.checked = true;
+  paintPlatforms(); touched('search');
+});
+$('s_platforms_none').addEventListener('click', () => {
+  for (const b of PLAT_BOXES()) b.checked = false;
+  paintPlatforms(); touched('search');
+});
+
+// ── pages ───────────────────────────────────────────────────────────────────
+document.getElementById('z_cdp').addEventListener('change', () => phoneRefresh(true));
+setInterval(() => phoneRefresh(false), 8000);
+
+document.querySelectorAll('nav button').forEach((b) => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('nav button').forEach(x => x.classList.remove('on'));
+    b.classList.add('on');
+    // READ FROM THE DOM, not from a list written here. This was
+    // a literal array of the four page names, and adding the Account liker
+    // meant a nav button and a section the switcher had never heard of:
+    // clicking it hid the other four and left page-liker hidden, so the tab
+    // highlighted and the page went blank. A list in two places is a list that
+    // will disagree.
+    for (const p of document.querySelectorAll('main > section'))
+      p.classList.toggle('hidden', p.id !== 'page-' + b.dataset.page);
+    if (b.dataset.page === 'hearts') phoneRefresh(true);
+  });
+});
+
+
+// ── the saved logins, as tick boxes over the text field ─────────────────
+//
+// The field is still the truth — it is what gets saved and what the command is
+// built from — and these only write into it. A name typed by hand that has no
+// directory stays typed, because a login created after the page loaded should
+// not be erased by the page.
+//
+// Read from disk rather than offered as a free-text box alone: a typo here is a
+// browser opening a brand-new signed-out profile and liking nothing, which
+// looks like a working run.
+async function loadLogins() {
+  const box = $('k_profile_pick');
+  if (!box) return;
+  let logins = [];
+  try {
+    const r = await fetch('/api/logins');
+    logins = (await r.json()).logins || [];
+  } catch (e) { return; }
+  if (!logins.length) {
+    box.innerHTML = '<span class="sub">No saved logins yet \u2014 run login.py in 6_comment_liker first.</span>';
+    return;
+  }
+  const chosen = () => new Set(($('k_profiles').value || '')
+    .split(',').map(x => x.trim()).filter(Boolean));
+  box.innerHTML = '';
+  for (const l of logins) {
+    const lab = document.createElement('label');
+    lab.className = 'c';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = chosen().has(l.name);
+    // A directory with no Default/ inside has never been signed in.
+    lab.title = l.ready ? 'signed in' : 'never opened \u2014 login.py has not run for this one';
+    cb.addEventListener('change', () => {
+      const set = chosen();
+      if (cb.checked) set.add(l.name); else set.delete(l.name);
+      $('k_profiles').value = [...set].join(',');
+      $('k_profiles').dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    lab.appendChild(cb);
+    lab.appendChild(document.createTextNode(' ' + l.name + (l.ready ? '' : ' \u00b7 new')));
+    box.appendChild(lab);
+  }
+  // Typing in the field re-ticks the boxes, so the two never disagree.
+  $('k_profiles').addEventListener('input', () => {
+    const set = chosen();
+    box.querySelectorAll('label.c').forEach((lab, i) => {
+      const cb = lab.querySelector('input');
+      if (cb) cb.checked = set.has(logins[i].name);
+    });
+  });
+}
+
+// ── the phone ───────────────────────────────────────────────────────────────
+// Asked only while the liker tab is open: this shells out to adb, and polling it
+// from a page nobody is looking at would run adb every few seconds all day.
+let phoneBusy = false;
+
+async function phoneRefresh(force) {
+  if (phoneBusy) return;
+  if (!force && $('page-hearts').classList.contains('hidden')) return;
+  const cdp = ($('z_cdp').value || '').trim();
+  const el = $('phoneDot');
+  if (!cdp) {
+    el.className = 'phone-state';
+    el.innerHTML = '<span class="pdot"></span>no address — this run would use a browser here, not the phone';
+    return;
+  }
+  const st = await api('/api/phone?cdp=' + encodeURIComponent(cdp));
+  const n = (st.devices || []).length;
+  if (st.ok) {
+    el.className = 'phone-state up';
+    el.innerHTML = `<span class="pdot"></span>ready <small>— ${escapeHtml(st.detail)}${n ? ' · ' + escapeHtml(st.devices[0]) : ''}</small>`;
+  } else if (n) {
+    // adb can see it but Chrome cannot be reached: the common half-connected
+    // state, and the one Connect actually fixes.
+    el.className = 'phone-state part';
+    el.innerHTML = `<span class="pdot"></span>phone found, Chrome not reachable <small>— ${escapeHtml(st.detail)}</small>`;
+  } else if (st.found) {
+    // Seen on the network but not dialled yet — Connect does exactly that.
+    el.className = 'phone-state part';
+    el.innerHTML = `<span class="pdot"></span>phone seen on the network at ${escapeHtml(st.found)}`
+                 + ` <small>— press Connect to dial it</small>`;
+  } else if (st.adbError) {
+    // ADB ITSELF IS THE PROBLEM, not the phone. This used to read "no phone",
+    // which sends you to the handset when the fault is on this machine - most
+    // often another program sitting on adb's port 5037.
+    el.className = 'phone-state down';
+    el.innerHTML = `<span class="pdot"></span>adb is not working <small>— ${escapeHtml(st.adbError)}</small>`;
+  } else {
+    el.className = 'phone-state down';
+    el.innerHTML = `<span class="pdot"></span>no phone <small>— ${escapeHtml(st.detail)}</small>`;
+  }
+  // Said only when it is not the usual one: adb moved itself off 5037 because
+  // something else had it, and that is worth seeing on the card rather than in
+  // a console nobody has open.
+  if (st.adbPort && st.adbPort !== 5037) {
+    el.innerHTML += ` <small>· adb on port ${st.adbPort}</small>`;
+  }
+}
+
+async function phoneConnect() {
+  const btn = $('phoneConnect');
+  const cdp = ($('z_cdp').value || '').trim() || 'http://127.0.0.1:9222';
+  if (!$('z_cdp').value.trim()) { $('z_cdp').value = cdp; touched('hearts'); }
+  phoneBusy = true;
+  btn.disabled = true;
+  btn.textContent = 'Connecting… (up to ~30s)';
+  $('phoneSteps').textContent = '';
+  try {
+    const r = await api('/api/phone/connect', { cdp, address: ($('z_addr').value || '').trim() });
+    $('phoneSteps').textContent = (r.steps || []).join(' · ');
+    phoneBusy = false;
+    await phoneRefresh(true);
+  } finally {
+    phoneBusy = false;
+    btn.disabled = false;
+    btn.textContent = 'Connect the phone';
+  }
+}
+
+// ── running things ──────────────────────────────────────────────────────────
+async function start(tool) {
+  const values = readForm(tool === 'upload' ? 'search' : tool);
+  const r = await api('/api/start', { tool, values });
+  if (r.error) { alert(r.error); return; }
+  OPEN = r.job; SEEN = 0;
+  document.querySelector('nav button[data-page="jobs"]').click();
+  refresh();
+}
+
+async function stopJob(id, ev) {
+  ev.stopPropagation();
+  await api('/api/stop', { id });
+  refresh();
+}
+
+async function stopAll() {
+  if (!confirm('Stop every running job?')) return;
+  await api('/api/stop-all', {});
+  refresh();
+}
+
+function toggleLog(id) {
+  OPEN = (OPEN === id) ? null : id;
+  SEEN = 0;
+  EDITING = false;            // a different job starts in the reading view
+  const box = $('log-' + id);
+  if (box) box.textContent = '';
+  refresh();
+}
+
+/** The log as plain text, from whichever view is showing. */
+function logText(id) {
+  const edit = document.querySelector('#log-' + id + ' textarea.log-edit');
+  // A textarea hands back CRLF whatever went in. Normalised so a copied log
+  // is the same text wherever it is pasted.
+  if (edit) return edit.value.replace(/\r\n/g, '\n');
+  const box = $('log-' + id);
+  if (!box) return '';
+  return [...box.children].map(n => n.textContent).join('\n');
+}
+
+/**
+ * Read it, or edit it.
+ *
+ * EDITING PAUSES THE FOLLOW. New lines arriving under the cursor would move the
+ * text you are working on, and a log that rewrites itself while you cut a
+ * traceback out of it is worse than one that stops. The job keeps running and
+ * keeps its output; this is the view, and nothing typed here is saved anywhere.
+ */
+function toggleEdit(id, ev) {
+  if (ev) ev.stopPropagation();
+  EDITING = !EDITING;
+  const box = $('log-' + id);
+  if (!box) return;
+  if (EDITING) {
+    const text = logText(id);
+    box.innerHTML = '';
+    const ta = document.createElement('textarea');
+    ta.className = 'log-edit';
+    ta.spellcheck = false;
+    ta.value = text;
+    box.appendChild(ta);
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+    ta.scrollTop = ta.scrollHeight;
+  } else {
+    // Back to following: ask for the whole log again rather than trying to
+    // reconcile it with whatever was typed over it.
+    box.innerHTML = '';
+    SEEN = 0;
+  }
+  const btn = $('edit-' + id);
+  if (btn) { btn.textContent = EDITING ? 'Editing' : 'Edit'; btn.classList.toggle('on', EDITING); }
+  const hint = $('hint-' + id);
+  if (hint) {
+    hint.textContent = EDITING ? 'paused while you edit — nothing here is saved' : 'following';
+    hint.className = 'hint ' + (EDITING ? 'held' : 'live');
+  }
+}
+
+/**
+ * Copy the log to the clipboard.
+ *
+ * navigator.clipboard works here — 127.0.0.1 counts as a secure context even
+ * over http — but it still fails when the window is not focused or the
+ * permission is refused, and a Copy button that fails silently is worse than no
+ * Copy button. So there is a fallback, and both paths say what happened.
+ */
+async function copyLog(id, ev) {
+  if (ev) ev.stopPropagation();
+  const btn = $('copy-' + id);
+  const text = logText(id);
+  if (!text.trim()) { flash(btn, 'nothing yet'); return; }
+  let ok = true;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { ok = document.execCommand('copy'); } catch (e2) { ok = false; }
+    ta.remove();
+  }
+  const lines = text.split('\n').length;
+  flash(btn, ok ? `copied ${lines} line${lines === 1 ? '' : 's'}` : 'could not copy');
+}
+
+/**
+ * Answer whatever the job is waiting for.
+ *
+ * scraper.py stops on TikTok until somebody has logged in and pressed Enter.
+ * Run from a window with no keyboard attached to it, that wait used to end
+ * instantly in EOFError and take the whole run with it — so the window grew a
+ * keyboard.
+ */
+async function sendInput(id, ev) {
+  if (ev) ev.stopPropagation();
+  const box = $('in-' + id);
+  const text = box ? box.value : '';
+  const r = await api('/api/input', { id, text });
+  if (!r.ok) { alert('That job is not listening any more.'); return; }
+  if (box) box.value = '';
+  SEEN = 0;                       // the echo appears in the log
+  const wrap = $('ask-' + id);
+  if (wrap) wrap.classList.remove('waiting');
+}
+
+/**
+ * Is the job waiting on an answer right now?
+ *
+ * ONLY WHAT CAME AFTER THE LAST ANSWER COUNTS. Looking at the tail of the whole
+ * log kept the marker lit after the prompt had been answered: the question was
+ * still a few lines up, so it still matched, and a box that says "waiting for
+ * you" when nothing is waiting is worse than one that says nothing.
+ */
+function looksLikeAPrompt(text) {
+  const lines = text.split('\n');
+  let from = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].startsWith('> ')) { from = i + 1; break; }   // our own echo
+  }
+  const since = lines.slice(from).join('\n').toLowerCase();
+  return /press enter|\[y\/n\]|\(y\/n\)|password:|type .* to continue/.test(since);
+}
+
+function flash(btn, msg) {
+  if (!btn) return;
+  const was = btn.textContent;
+  btn.textContent = msg;
+  btn.disabled = true;
+  setTimeout(() => { btn.textContent = was; btn.disabled = false; }, 1400);
+}
+
+function ago(t) {
+  if (!t) return '';
+  const s = Math.max(0, Math.round(Date.now() / 1000 - t));
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+}
+
+function renderJobs() {
+  const list = $('jobList');
+  const jobs = [...STATE.jobs].reverse();
+  // Queued counts as work in hand: three searches waiting for the Chrome
+  // profile are three things still to happen, and a badge reading 1 would say
+  // the opposite.
+  $('jobCount').textContent = STATE.jobs.filter(
+    j => j.status === 'running' || j.status === 'starting' || j.status === 'queued').length;
+  if (!jobs.length) {
+    list.innerHTML = '<div class="empty">Nothing has been started yet.</div>';
+    return;
+  }
+  // Rebuilt only when the set or the statuses change: the log box is updated in
+  // place, so re-rendering on every poll would fight the scrollbar.
+  // A job finishing while you are mid-edit would otherwise rebuild the panel and
+  // take the box, and the text in it, with it.
+  if (EDITING) return;
+  const sig = jobs.map(j => j.id + j.status).join('|') + '|' + OPEN;
+  if (list.dataset.sig !== sig) {
+    list.dataset.sig = sig;
+    list.innerHTML = jobs.map(j => `
+      <div class="job">
+        <div class="job-head" onclick="toggleLog('${j.id}')">
+          <span class="pill ${j.status}">${j.status}</span>
+          <span class="job-title">${escapeHtml(j.title)}</span>
+          <span class="job-meta">${j.status === 'running' ? 'for ' + ago(j.started)
+                                  : j.ended ? 'ran ' + ago(j.started) : ''}
+            ${j.exit !== null && j.exit !== undefined ? ' · exit ' + j.exit : ''}</span>
+          <span style="flex:1"></span>
+          ${(j.status === 'running' || j.status === 'starting')
+            ? `<button class="btn ghost" onclick="stopJob('${j.id}',event)">Stop</button>` : ''}
+        </div>
+        <div class="log-wrap ${OPEN === j.id ? '' : 'hidden'}">
+          <div class="log-bar">
+            <button class="mini" onclick="copyLog('${j.id}',event)" id="copy-${j.id}">Copy</button>
+            <button class="mini ${EDITING ? 'on' : ''}" onclick="toggleEdit('${j.id}',event)"
+              id="edit-${j.id}">${EDITING ? 'Editing' : 'Edit'}</button>
+            <span class="spacer"></span>
+            <span class="hint ${EDITING ? 'held' : 'live'}" id="hint-${j.id}">${
+              EDITING ? 'paused while you edit — nothing here is saved'
+                      : (j.status === 'running' ? 'following' : 'finished')}</span>
+          </div>
+          <div class="log" id="log-${j.id}"></div>
+          ${j.can_type ? `
+          <div class="ask" id="ask-${j.id}">
+            <span class="why" id="why-${j.id}">answer a prompt</span>
+            <input type="text" id="in-${j.id}" placeholder="type here, or just press Enter"
+                   onkeydown="if(event.key==='Enter'){sendInput('${j.id}',event)}"
+                   onclick="event.stopPropagation()">
+            <button class="mini" onclick="sendInput('${j.id}',event)">Send</button>
+          </div>` : ''}
+        </div>
+      </div>`).join('');
+  }
+}
+
+async function pumpLog() {
+  if (!OPEN || EDITING) return;   // see toggleEdit
+  const box = $('log-' + OPEN);
+  if (!box) return;
+  const r = await api('/api/log?id=' + encodeURIComponent(OPEN) + '&since=' + SEEN);
+  if (!r || !r.lines) return;
+  if (!r.lines.length && SEEN) return;
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  for (const line of r.lines) {
+    const div = document.createElement('div');
+    const low = line.toLowerCase();
+    div.className = /\[!\]|error|traceback|fail/.test(low) ? 'err'
+                  : /\[\+\]|ok:|success|done/.test(low) ? 'ok'
+                  : /^\s*\$|^\s{2}in\s/.test(line) ? 'dim' : '';
+    div.textContent = line;
+    box.appendChild(div);
+  }
+  SEEN = r.seq;
+  if (atBottom) box.scrollTop = box.scrollHeight;
+
+  // A job that has asked something and is getting no answer is the one thing
+  // here worth colouring: it will sit there for as long as it takes.
+  const wrap = $('ask-' + OPEN);
+  if (wrap) {
+    const asking = looksLikeAPrompt(logText(OPEN));
+    wrap.classList.toggle('waiting', asking);
+    const why = $('why-' + OPEN);
+    if (why) why.textContent = asking ? 'waiting for you' : 'answer a prompt';
+  }
+}
+
+function renderHealth() {
+  const bad = STATE.tools.filter(t => !t.ok);
+  $('health').innerHTML = bad.length
+    ? `<span class="dot" style="background:var(--bad)"></span>${bad.length} tool(s) missing`
+    : `<span class="dot" style="background:var(--ok)"></span>all four tools found`;
+  $('health').title = STATE.tools.map(t => (t.ok ? '✓ ' : '✗ ') + t.path).join('\n');
+}
+
+/**
+ * Rebuild the genre dropdowns (Search, Harvest, Hearts, Account liker) from the
+ * dashboard's list. Keeps an "All genres" first option where there was one.
+ */
+function applyGenreOptions(genres) {
+  if (!genres.length) return;
+  for (const id of ['s_genre', 'h_genre', 'z_genre', 'k_genre']) {
+    const sel = $(id);
+    if (!sel) continue;
+    const keepAll = sel.querySelector('option[value=""]');
+    const was = sel.value;
+    sel.innerHTML = '';
+    if (keepAll) sel.appendChild(keepAll);
+    for (const g of genres) {
+      const o = document.createElement('option');
+      o.value = g.id;
+      o.textContent = g.label;
+      sel.appendChild(o);
+    }
+    sel.value = was;
+  }
+}
+
+let first = true;
+async function refresh() {
+  const s = await api('/api/state');
+  if (!s || !s.jobs) return;
+  STATE = s;
+  if (first) {
+    first = false;
+    // Genres added in the dashboard: every genre dropdown is rebuilt from the
+    // list before the forms are filled, so a saved added genre is selectable.
+    applyGenreOptions(s.genres || []);
+    for (const tool of Object.keys(FIELDS)) fillForm(tool, s.settings[tool] || {});
+    // After the forms are filled, so the tick boxes can read what was saved.
+    loadLogins();
+    syncEnabled();
+    // preview_only: the page is asking what these settings would run, not
+    // saying they changed. See the route.
+    for (const tool of Object.keys(FIELDS)) {
+      const r = await api('/api/settings', { tool, values: readForm(tool), preview_only: true });
+      if (r.preview !== undefined) showCmd(tool, r.preview);
+    }
+  }
+  renderHealth();
+  renderJobs();
+}
+
+refresh();
+setInterval(refresh, 1500);
+setInterval(pumpLog, 700);
+</script>
+</body>
+</html>

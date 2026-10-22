@@ -18,9 +18,9 @@
 // same sanitiser as every stored comment: the mention rule, the word band, the
 // jargon filter and the cliche filter. A rewrite that fails any of them is
 // thrown away and the caller falls back to the bank.
-import { groqChat } from './groq'
+import { llmChat } from './llm'
 import { sanitize, settingsFor } from './commentGen'
-import { buildMimicPrompt } from './commentPrompt'
+import { buildMimicPrompt } from './prompts'
 import { COMPETITOR_BRANDS } from './linkCategory'
 import type { Product } from './config'
 
@@ -59,7 +59,7 @@ export async function mimicComment(
   // tool. Measured: the first attempt at that sample produced nothing usable
   // three times out of three, so the second attempt says the quiet part loudly.
   const ask = async (strict: boolean) => {
-    const { content } = await groqChat({
+    const { content } = await llmChat({
       temperature: 0.9,
       jsonObject: true,
       maxTokens: band.max * 20 + 200,

@@ -99,7 +99,7 @@ export default function EditAccountLinks({
 
       {open && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
-          <form onSubmit={submit} className="bg-zinc-900 border border-zinc-700 rounded-xl max-w-md w-full p-5">
+          <form onSubmit={submit} className="bg-zinc-900 border border-zinc-700 rounded-xl max-w-md w-full p-5 max-h-[92vh] overflow-y-auto">
             <div className="flex items-start justify-between gap-4">
               <h3 className="text-base font-semibold text-white">Edit your account details</h3>
               <button
@@ -142,6 +142,11 @@ export default function EditAccountLinks({
                   placeholder="https://www.tiktok.com/@you"
                   inputMode="url"
                 />
+                <p className="text-xs text-zinc-500 mt-1">
+                  Must show your @username, like{' '}
+                  <span className="font-mono text-zinc-400">tiktok.com/@yourusername</span>. A video
+                  link or a short vm.tiktok.com link will not work.
+                </p>
               </div>
               <div>
                 <label className={labelCls}>

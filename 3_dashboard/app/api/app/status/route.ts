@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { userIdFromApp } from '@/lib/appAuth'
 import {
+  getGenreMix,
   getHourlyClickTimes,
   getTodayClickCountsByPlatform,
   getUserNameEmail,
   getClickedUrls,
   getClickCountsByUrl,
-  getBlockedUrls,
+  getBlockedPoolUrls,
   getUserPendingPayments,
   recordAppVersion,
   getApk,
@@ -14,11 +15,13 @@ import {
   getUnrelatedUrls,
 } from '@/lib/db'
 import { loadVideosJson, retiredUrlSet } from '@/lib/videos'
-import { HOURLY_LINK_LIMIT, HOURLY_WINDOW_MS, RETIRE_AFTER_USERS, SHOW_CLICKED_TODAY } from '@/lib/config'
+import {
+  genreOfRow,
+  genreWeights, HOURLY_LINK_LIMIT, HOURLY_WINDOW_MS, RETIRE_AFTER_USERS, SHOW_CLICKED_TODAY } from '@/lib/config'
 
 export const dynamic = 'force-dynamic'
 
-const KEYS = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram']
+const KEYS = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram', 'reddit']
 
 // GET — everything the app's Details panel shows: today's clicks per platform,
 // pending pay, and per-platform available link counts + hourly-quota lock state.
@@ -48,7 +51,7 @@ export async function GET(req: NextRequest) {
     getClickCountsByUrl().catch(() => ({}) as Record<string, number>),
     loadVideosJson(),
     getUserPendingPayments(userId).catch(() => null),
-    getBlockedUrls().catch(() => [] as string[]),
+    getBlockedPoolUrls().catch(() => [] as string[]),
     getApk().catch(() => null),
     getUnrelatedUrls(userId).catch(() => [] as string[]),
   ])
@@ -62,9 +65,15 @@ export async function GET(req: NextRequest) {
   retired.forEach((u) => hidden.add(u))
   blocked.forEach((u) => hidden.add(u))
   unrelated.forEach((u) => hidden.add(u))
+  // A GENRE ON A ZERO SHARE IS NOT AVAILABLE. The feed interleaves by genre
+  // weight and never draws from a genre whose share is zero, so counting those
+  // links here would promise the app links it is never going to be handed —
+  // exactly the mismatch the note above exists to prevent.
+  const genreMix = genreWeights(await getGenreMix().catch(() => null))
   const avail: Record<string, number> = {}
   for (const v of videos) {
     if (!v.url || !v.url.startsWith('http') || hidden.has(v.url)) continue
+    if ((genreMix[genreOfRow(v)] ?? 0) <= 0) continue
     const p = String(v.platform ?? '')
     avail[p] = (avail[p] ?? 0) + 1
   }

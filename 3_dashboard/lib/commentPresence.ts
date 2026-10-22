@@ -13,6 +13,13 @@
 
 import { fetchComments } from './linkStats'
 import {
+  BLOCK_RULE_BOUNDS,
+  BLOCK_RULE_DEFAULTS,
+  clampRule,
+  type BlockRules,
+} from './config'
+import {
+  getBlockRules,
   getClickedOnDay,
   getJudgedLinks,
   saveJudgedLinks,
@@ -232,18 +239,32 @@ export const RECENT_SAMPLE = 300
  * population differs. Resumable in the same way: it judges what it can before
  * the deadline and reports how many are left.
  *
- * THE DAY SCORES ARE LEFT ALONE. Every verdict is written to the ledger, because
- * a reading is a reading and the next sweep should not repeat it, but the
- * per-day score rows are not recomputed from this sample — see refreshDay in
- * saveJudgedLinks. A hundred links spread over five days is a slice of each of
- * them, and a slice must not be allowed to redefine a day.
+ * THE DAY SCORES ARE LEFT ALONE BY DEFAULT. Every verdict is written to the
+ * ledger, because a reading is a reading and the next sweep should not repeat it,
+ * but the per-day score rows are not recomputed from this sample — see refreshDay
+ * in saveJudgedLinks. A sample spread over five days is a slice of each of them,
+ * and a slice must not be allowed to redefine a day.
+ *
+ * `refreshDays` is for the one caller where that reasoning inverts: the nightly
+ * cron, which is now the ONLY pass that reads these links. Left alone, the per-day
+ * history would simply stop being written. So the cron asks for the touched days
+ * to be recomputed from EVERY verdict the ledger holds for them — never from this
+ * pass alone, which is what would shrink a 400-link day to the nine of its links
+ * that fell inside the window.
  */
 export async function scoreUserRecent(
   userId: string,
   tiktokUrl: string,
   limit: number,
   deadline: number,
-  freshSince?: string | null
+  freshSince?: string | null,
+  /** Recompute the day rows this pass touched, from the whole ledger. */
+  refreshDays = false,
+  /**
+   * The window as it stood at this instant, so a user who keeps clicking cannot
+   * push the links already judged out of it. See getRecentClickedLinks.
+   */
+  before?: string | null
 ): Promise<{
   judged: number
   remaining: number
@@ -253,7 +274,7 @@ export async function scoreUserRecent(
 } | null> {
   const username = handleFromProfile(tiktokUrl)
   if (!username) return null
-  const recent = await getRecentClickedLinks(userId, limit).catch(
+  const recent = await getRecentClickedLinks(userId, limit, before).catch(
     () => [] as { url: string; day: string }[]
   )
   if (recent.length === 0) return null
@@ -282,7 +303,15 @@ export async function scoreUserRecent(
     }
   }
   for (const day of Array.from(perDay.keys())) {
-    await saveJudgedLinks(userId, day, perDay.get(day) ?? [], freshSince, false)
+    // NO freshSince WHEN REFRESHING A DAY: the row is rebuilt from everything the
+    // ledger knows about that day, not from this pass's slice of it.
+    await saveJudgedLinks(
+      userId,
+      day,
+      perDay.get(day) ?? [],
+      refreshDays ? null : freshSince,
+      refreshDays
+    )
   }
   await rememberAccount(userId, username, judged)
 
@@ -326,8 +355,15 @@ export async function scoreUserRecent(
 //
 // The admin can unblock from the dashboard; nothing here is irreversible.
 
-/** Judged links required before a no-comments verdict may block anyone. */
-export const BLOCK_SAMPLE = 50
+/**
+ * Judged links required before a no-comments verdict may block anyone.
+ *
+ * THE DEFAULT, not the rule. All three numbers below are settable on the admin
+ * dashboard and stored in app_kv; these are what a fresh database uses and what a
+ * caller gets if it asks for a verdict without reading the settings. The bounds
+ * and the reasons for them are in lib/config (BLOCK_RULE_BOUNDS).
+ */
+export const BLOCK_SAMPLE = BLOCK_RULE_DEFAULTS.sample
 
 /**
  * THE SECOND RULE: a rate, not an absence.
@@ -351,8 +387,8 @@ export const BLOCK_SAMPLE = 50
  * speak: a user with 170 judged links is not judged on 170, they are not judged at
  * all. Unreadable links are in neither half of the fraction.
  */
-export const RATIO_SAMPLE = 200
-export const RATIO_MIN_PCT = 10
+export const RATIO_SAMPLE = BLOCK_RULE_DEFAULTS.ratioSample
+export const RATIO_MIN_PCT = BLOCK_RULE_DEFAULTS.ratioMinPct
 /** Recent links to look back over to find RATIO_SAMPLE judged ones. */
 const RATIO_POOL = 500
 
@@ -370,8 +406,8 @@ const RATIO_POOL = 500
  * forever — which reads as "never blocks anyone" and would be blamed on the rule
  * rather than on the cap.
  */
-export const MIN_BLOCK_SAMPLE = 20
-export const MAX_BLOCK_SAMPLE = 80
+export const MIN_BLOCK_SAMPLE = BLOCK_RULE_BOUNDS.sample.min
+export const MAX_BLOCK_SAMPLE = BLOCK_RULE_BOUNDS.sample.max
 
 /**
  * Clamp a requested sample into the range that can actually be satisfied.
@@ -383,15 +419,9 @@ export const MAX_BLOCK_SAMPLE = 80
  * mistake it guards against is irreversible for whoever it lands on.
  */
 export function clampBlockSample(n: unknown): number {
-  if (n === null || n === undefined) return BLOCK_SAMPLE
-  if (typeof n === 'string' && n.trim() === '') return BLOCK_SAMPLE
-  const v = Number(n)
-  if (!Number.isFinite(v)) {
-    // Infinity is a coherent request — "as high as it goes". Anything else
-    // unreadable is a mistake and falls back.
-    return v === Infinity ? MAX_BLOCK_SAMPLE : BLOCK_SAMPLE
-  }
-  return Math.max(MIN_BLOCK_SAMPLE, Math.min(MAX_BLOCK_SAMPLE, Math.round(v)))
+  // ONE CLAMP. This used to hold its own copy of the same rules the settings now
+  // use, and two copies of a bound is two bounds waiting to disagree.
+  return clampRule(n, 'sample')
 }
 
 // How many recent links to consider in order to FIND that many judgeable ones.
@@ -416,6 +446,8 @@ export interface BlockVerdict {
   rule?: 'empty' | 'ratio'
   /** The rate over their last RATIO_SAMPLE judged links, when it could be read. */
   ratio?: { judged: number; found: number; pct: number } | null
+  /** The thresholds this verdict was reached under, for the report. */
+  rules?: BlockRules
 }
 
 /**
@@ -429,19 +461,47 @@ export async function noCommentVerdict(
   userId: string,
   tiktokUrl: string,
   deadline: number,
-  /** Judged links required before a block. Chosen per sweep by the admin;
-   *  defaults to BLOCK_SAMPLE so the cron and an unmodified caller agree. */
-  sample: number = BLOCK_SAMPLE
+  /**
+   * Judged links required before a block, when the caller wants to override the
+   * saved setting for one run — the manual sweep offers it as a field. Left out,
+   * the admin's saved value is used, which is what the cron and the per-user
+   * button do.
+   */
+  sample?: number,
+  /**
+   * The same pinned window the scoring pass used. It has to be the same instant
+   * or the two disagree about which links the verdict is about: the pass can
+   * report a finished window while this one reads three hundred links it has
+   * never seen, and the rule then judges a sample that was never checked.
+   */
+  before?: string | null
 ): Promise<BlockVerdict> {
   const empty: BlockVerdict = { judged: 0, found: 0, skipped: 0, block: false }
   const username = handleFromProfile(tiktokUrl)
   if (!username) return empty
 
+  // ONE SOURCE FOR THE THRESHOLDS. Read here rather than passed in by each
+  // caller, so the cron, the manual sweep and the verify button cannot be running
+  // three different rules — which is exactly what happened while the sweep took a
+  // field for the sample and the other two used the constant.
+  const rules = await getBlockRules().catch(() => ({
+    on: true,
+    sample: BLOCK_SAMPLE,
+    ratioSample: RATIO_SAMPLE,
+    ratioMinPct: RATIO_MIN_PCT,
+  }))
+  // OFF MEANS OFF, for every rule and every caller. A switch that only stopped
+  // the cron would be worse than none.
+  if (!rules.on) return { ...empty, rules }
+  const need = sample ?? rules.sample
+
   // Newest first, across days, so a short day is topped up from earlier ones.
   // Deliberately more than BLOCK_SAMPLE: skipped links have to be replaced by
   // older ones, not merely subtracted from the total.
-  const recent = await getRecentClickedLinks(userId, candidatePool(sample)).catch(() => [])
-  if (recent.length < sample) return empty
+  const recent = await getRecentClickedLinks(userId, candidatePool(need), before).catch(
+    () => []
+  )
+  if (recent.length < need) return { ...empty, rules }
 
   const known = await getJudgedVerdicts(userId, recent).catch(
     () => new Map<string, { found: boolean; judgeable: boolean }>()
@@ -470,14 +530,14 @@ export async function noCommentVerdict(
   // settles it, and judging the rest would just spend requests on an answer we
   // already have.
   let i = 0
-  while (found === 0 && judged < sample && i < pending.length) {
+  while (found === 0 && judged < need && i < pending.length) {
     if (Date.now() >= deadline) break
     // `recent` is ordered by click time, so one day's links are contiguous.
     const day = pending[i].day
     let j = i
     while (j < pending.length && pending[j].day === day) j++
-    const need = sample - judged
-    const slice = pending.slice(i, Math.min(j, i + need))
+    const want = need - judged
+    const slice = pending.slice(i, Math.min(j, i + want))
     i += slice.length
 
     const verdicts = await judgeLinks(username, slice.map((x) => x.url), deadline)
@@ -497,8 +557,8 @@ export async function noCommentVerdict(
   }
 
   // ── rule one: nothing at all on a sample of links ──────────────────────
-  if (judged >= sample && found === 0) {
-    return { judged, found, skipped, block: true, rule: 'empty' }
+  if (judged >= need && found === 0) {
+    return { judged, found, skipped, block: true, rule: 'empty', rules }
   }
 
   // ── rule two: something, but almost nothing ────────────────────────────
@@ -506,9 +566,11 @@ export async function noCommentVerdict(
   // Read from the ledger, so it costs no requests and cannot blow the deadline.
   // It applies only once RATIO_SAMPLE of their recent links have been judged —
   // before that there is no denominator and therefore no verdict.
-  const ratio = await getRecentJudgedRate(userId, RATIO_SAMPLE, RATIO_POOL).catch(() => null)
-  if (ratio && ratio.judged >= RATIO_SAMPLE && ratio.pct < RATIO_MIN_PCT) {
-    return { judged, found, skipped, block: true, rule: 'ratio', ratio }
+  const ratio = await getRecentJudgedRate(userId, rules.ratioSample, RATIO_POOL).catch(
+    () => null
+  )
+  if (ratio && ratio.judged >= rules.ratioSample && ratio.pct < rules.ratioMinPct) {
+    return { judged, found, skipped, block: true, rule: 'ratio', ratio, rules }
   }
-  return { judged, found, skipped, block: false, ratio }
+  return { judged, found, skipped, block: false, ratio, rules }
 }

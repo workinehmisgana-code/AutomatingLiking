@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { isTiktokVerified } from '@/lib/profileGate'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { profileGate } from '@/lib/profileGate'
-import { isProduct, VERIFY_VIDEO_URL, VERIFY_GATE_ENABLED } from '@/lib/config'
+import { isProduct, platformFromUrl, CLICK_PLATFORMS, VERIFY_VIDEO_URL, VERIFY_GATE_ENABLED } from '@/lib/config'
 import { serveCommentForUrl } from '@/lib/serveComment'
 import {
   getClickedUrls,
@@ -11,7 +12,8 @@ import {
   getServeOnlyClean,
   countRecentClicks,
   getEffectivePlatformLimit,
-  isUserVerified,
+
+  isTestUser,
 } from '@/lib/db'
 
 export const dynamic = 'force-dynamic'
@@ -28,7 +30,11 @@ export async function GET() {
   const gate = await profileGate(userId)
   if (gate) return gate
 
-  if (VERIFY_GATE_ENABLED && !(await isUserVerified(userId).catch(() => false))) {
+  // THE ACCOUNT-AGE VERIFICATION (tiktok_verification), the same check the web
+  // dashboard and userIdFromApp use. This read the OLD comment-validity table
+  // (user_validity), which nobody is written to any more, so once the gate was
+  // switched on it refused every worker — verified or not — links and clicks.
+  if (VERIFY_GATE_ENABLED && !(await isTiktokVerified(userId).catch(() => false))) {
     return NextResponse.json(
       { error: 'Comment on the verification video first', verifyRequired: true, verifyUrl: VERIFY_VIDEO_URL },
       { status: 403 }
@@ -67,6 +73,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
   }
   if (!url) return NextResponse.json({ error: 'Missing url' }, { status: 400 })
+  if (!platform || !(CLICK_PLATFORMS as readonly string[]).includes(platform)) {
+    platform = platformFromUrl(url)
+  }
 
   try {
     // Hard cap: at most `limit` links per platform per rolling window (both are
@@ -75,7 +84,8 @@ export async function POST(req: NextRequest) {
     // platform's switch is off — platforms are enforced independently.
     if (platform) {
       const { limit, windowMs, enforced } = await getEffectivePlatformLimit(platform)
-      if (enforced && limit > 0) {
+      // A test account is never held by the hourly limits.
+      if (enforced && limit > 0 && !(await isTestUser(userId).catch(() => false))) {
         const recent = await countRecentClicks(userId, platform, windowMs)
         if (recent >= limit) {
           return NextResponse.json(

@@ -9,9 +9,15 @@ import {
   VIDEO_PAYMENT_BIRR,
   COMMENT_PAY_RATE,
   PROMO_PAY_BIRR,
-  REFERRAL_SHARE,
+  ACCOUNT_PAY_BIRR,
   REFERRAL_PAY_RATE,
+  REFERRAL_SHARE,
   CLICK_PLATFORM_LABELS,
+  GENRES,
+  GENRE_LABELS,
+  DEFAULT_GENRE,
+  genreOfProduct,
+  productsInGenre,
 } from '@/lib/config'
 import type {
   AdminData,
@@ -21,14 +27,18 @@ import type {
   UserClick,
   GuideVideo,
   ReferralEarnings,
+  PayAdjustment,
 } from '@/lib/db'
 import ApkAdmin from '@/components/ApkAdmin'
 import GuideVideosAdmin from '@/components/GuideVideosAdmin'
 import LlmModelPicker from '@/components/LlmModelPicker'
+import BlockRules from '@/components/BlockRules'
 import ScrollX from '@/components/ScrollX'
 import PlatformLimits from '@/components/PlatformLimits'
 import ActiveProducts from '@/components/ActiveProducts'
-import { accountCreatedAt, accountAge } from '@/lib/tiktokId'
+import GenreMix from '@/components/GenreMix'
+import VerifySettings from '@/components/VerifySettings'
+import { accountCreatedAt, accountAge, accountAgeWords } from '@/lib/tiktokId'
 
 // Compare dotted version names numerically: returns >0 if a is newer than b
 // (e.g. "1.10" > "1.9" > "1.1" > "1.0"). Non-numeric parts count as 0.
@@ -66,6 +76,7 @@ const PLATFORMS: { key: string; label: string; dot: string }[] = [
   { key: 'youtube_shorts', label: 'YT Shorts', dot: 'bg-orange-500' },
   { key: 'youtube_videos', label: 'YT Videos', dot: 'bg-red-500' },
   { key: 'instagram', label: 'Instagram', dot: 'bg-fuchsia-500' },
+  { key: 'reddit', label: 'Reddit', dot: 'bg-amber-600' },
 ]
 
 function fmtDateTime(iso: string) {
@@ -490,13 +501,24 @@ export default function AdminDashboard({
   referralByUser,
   apk,
   guideVideos,
+  minAgeDays,
+  payAdjustments,
+  autoBlockCounts,
   appVersions,
   videoTaskEnabled,
   promoTaskEnabled,
   presence,
   presenceHistory,
   tiktokAccounts,
+  genre,
 }: {
+  /**
+   * The admin's master genre. The server has already cut every click in
+   * `data` to this genre's products, so most of this page is about it with no
+   * further work; this prop is for the parts that have to NAME it, and for the
+   * product lists that must not offer another genre's products.
+   */
+  genre: string
   data: AdminData
   adminEmail: string
   pendingByUser: Record<string, PendingPayments>
@@ -505,6 +527,12 @@ export default function AdminDashboard({
   referralByUser: Record<string, ReferralEarnings>
   apk: ApkInfo | null
   guideVideos: GuideVideo[]
+  /** The admin-set minimum TikTok account age, for flagging new accounts. */
+  minAgeDays: number
+  /** Every pending-pay edit, per user, newest first. */
+  payAdjustments: Record<string, PayAdjustment[]>
+  /** Automatic blocks per user, counted since 2026-10-20 (3 allowed, then forever). */
+  autoBlockCounts: Record<string, number>
   appVersions: Record<string, { name: string | null; code: number | null }>
   videoTaskEnabled: boolean
   promoTaskEnabled: boolean
@@ -514,7 +542,9 @@ export default function AdminDashboard({
   presenceHistory: Record<string, PresenceDayShape[]>
   /** Numeric TikTok id per user, learned from their own comments. It encodes
    *  the account's creation date — see lib/tiktokId. */
-  tiktokAccounts: Record<string, { handle: string; uid: string }>
+  // The source travels with the id: a registration check watched the account
+  // comment, a presence scan merely happened to see it. See getTiktokAccounts.
+  tiktokAccounts: Record<string, { handle: string; uid: string; source?: 'verified' | 'seen' }>
 }) {
   const router = useRouter()
   const [resetting, setResetting] = useState(false)
@@ -698,6 +728,16 @@ export default function AdminDashboard({
     /** The rate rule's size and threshold, so the panel can name them. */
     ratioSample: number
     ratioMinPct: number
+    /** False when auto-blocking is switched off in the settings. */
+    autoBlockOn: boolean
+    /**
+     * What the RATE RULE read, which is not what the header shows.
+     *
+     * The header is this check's own tally; the rule reads a fixed window of the
+     * newest judged links. When they differ, the rule's number is the one that
+     * decided, so it belongs on screen beside the other.
+     */
+    ruleRate: { judged: number; found: number; pct: number } | null
     /** Why it did not, when it did not. Empty while the check is unfinished. */
     blockNote: string
   }
@@ -705,6 +745,9 @@ export default function AdminDashboard({
   const [verifyProgress, setVerifyProgress] = useState<
     { who: string; done: number; total: number; note: string } | null
   >(null)
+  // Verify all: the decision on each user as it is made, newest first, so the
+  // outcome is visible while the run goes on rather than in a summary at the end.
+  const [verifyLog, setVerifyLog] = useState<{ who: string; text: string; blocked: boolean }[]>([])
   // The finished run, shown as a modal (null = closed).
   const [verifyReport, setVerifyReport] = useState<VerifyReportShape | null>(null)
   const stopVerify = useRef(false)
@@ -715,6 +758,11 @@ export default function AdminDashboard({
     verifyAbort.current?.abort()
   }
   const [verifyingAll, setVerifyingAll] = useState(false)
+  // Idle workers are out of the list by default — see isIdle. One click brings
+  // them back, because "where did that person go" must have an answer on screen.
+  const [showIdle, setShowIdle] = useState(false)
+  /** Which question the list is ordered to answer — see sortedUsers. */
+  const [userSort, setUserSort] = useState<'clicks' | 'pending' | 'comments' | 'name' | 'referrals'>('clicks')
   const [deductingUser, setDeductingUser] = useState<string | null>(null)
   const [blockingUser, setBlockingUser] = useState<string | null>(null)
 
@@ -798,19 +846,103 @@ export default function AdminDashboard({
     }
   }
 
+  /**
+   * The per-user check, run over everybody who worked this week.
+   *
+   * IT USED TO BE A DIFFERENT CHECK ENTIRELY: it matched each @username against
+   * comments_extracted.json, a file sitting in 2_comment_automation — which does
+   * not exist on the deployed dashboard at all, so the button could only fail
+   * there. And even where the file existed, "your handle appears somewhere in a
+   * corpus" is not the question the single-user button answers, so the two
+   * buttons disagreed by construction.
+   *
+   * Now it is the same call, in a loop: same endpoint, same 300 links, same two
+   * block rules, same freshness cutoff. One implementation, so a sweep cannot
+   * reach a verdict the report in front of you would not.
+   *
+   * WHO: everyone with a TikTok link who did any work in the last seven days.
+   * Somebody who stopped a fortnight ago is not evidence about this week, and
+   * reading their links is minutes that the people still working need.
+   *
+   * It is slow and it says so: 300 videos a person at 1-5 seconds each. Stoppable
+   * at any point, and everything judged before you stop is in the ledger.
+   */
   async function verifyAll() {
-    if (!confirm('Verify ALL users that have a TikTok profile link against comments_extracted.json?\n\nNo browser — this reads the extracted-comments file in 2_comment_automation and checks whether each user\'s TikTok @username commented there. Users found are marked valid for 7 days; the rest are marked unverified.')) return
+    const week = Date.now() - 7 * 86400000
+    const targets = data.users.filter((u) => {
+      // Blocked users are skipped: the check exists to decide whether to
+      // block someone, and they are already blocked.
+      if (u.blocked) return false
+      if (!u.profile?.tiktok_url) return false
+      const last = u.lastWorkAt ? Date.parse(u.lastWorkAt) : NaN
+      return Number.isFinite(last) && last >= week
+    })
+    if (targets.length === 0) {
+      alert('Nobody unblocked with a TikTok link has done any work in the last 7 days.')
+      return
+    }
+    if (!confirm(
+      `Check all ${targets.length} unblocked user(s) who worked in the last 7 days?\n\n` +
+      'Each one gets exactly the check the single 🔍 Verify button runs: their last ' +
+      '300 links read again now, and the two auto-block rules applied. Anyone who ' +
+      'fails them is blocked automatically — you can unblock from their row.\n\n' +
+      'This is 300 videos per person at a few seconds each, so it takes a while. ' +
+      'Stop whenever you like; everything judged before you stop is saved.'
+    )) return
+
+    stopVerify.current = false
+    setVerifyLog([])
     setVerifyingAll(true)
+    const blocked: string[] = []
+    const failedOn: string[] = []
+    let done = 0
     try {
-      const res = await fetch('/api/admin/verify-all', { method: 'POST' })
-      const d = await res.json().catch(() => ({}))
-      if (!res.ok) { alert(d?.error || 'Verify-all failed.'); return }
-      alert(`Verify all done: ${d.found ?? 0} of ${d.checked ?? 0} checked user(s) found in comments_extracted.json (marked valid for 7 days).`)
+      for (const u of targets) {
+        if (stopVerify.current) break
+        const who = u.profile?.name || u.name || u.email || 'user'
+        done++
+        setVerifyProgress({ who: `${who} (${done}/${targets.length})`, done: 0, total: 0, note: 'Starting…' })
+        const { report, failed } = await runVerify(u, (d2, t2, note) =>
+          setVerifyProgress({ who: `${who} (${done}/${targets.length})`, done: d2, total: t2, note })
+        )
+        if (failed) failedOn.push(`${who}: ${failed}`)
+        // DECIDED NOW, NOT AT THE END. The server applies the auto-block rules
+        // the moment this user's check finishes — exactly as the single Verify
+        // button does — so the decision is shown and the table refreshed here,
+        // before the next user starts.
+        const why = report?.blocked
+          ? report.blocked.rule === 'ratio'
+            ? `${report.blocked.pct ?? 0}% of ${report.blocked.judged} judged`
+            : `nothing on ${report.blocked.judged} judged`
+          : ''
+        if (report?.blocked) blocked.push(`${who} — ${why}`)
+        const text = failed
+          ? `not finished: ${failed}`
+          : report?.blocked
+            ? `🚫 blocked · ${why}`
+            : report
+              ? `✓ kept · ${report.found}/${report.checked} carry their comment${report.pct !== null ? ` (${report.pct}%)` : ''}`
+              : 'stopped'
+        setVerifyLog((prev) => [{ who, text, blocked: !!report?.blocked }, ...prev].slice(0, 50))
+        router.refresh()
+      }
       router.refresh()
+      alert(
+        [
+          stopVerify.current
+            ? `Stopped after ${done} of ${targets.length} user(s).`
+            : `Checked ${done} user(s).`,
+          blocked.length
+            ? `\nBlocked ${blocked.length}:\n` + blocked.join('\n')
+            : '\nNobody was blocked.',
+          failedOn.length ? `\nCould not finish:\n` + failedOn.join('\n') : '',
+        ].join('\n')
+      )
     } catch (e) {
       alert(`Verify-all error: ${String((e as Error)?.message || e)}`)
     } finally {
       setVerifyingAll(false)
+      setVerifyProgress(null)
     }
   }
   // ── Comment-presence sweep ─────────────────────────────────────────────────
@@ -988,6 +1120,96 @@ export default function AdminDashboard({
     }
   }
 
+  /**
+   * Run the per-user check to the end, resuming until nothing is left.
+   *
+   * THE ONE IMPLEMENTATION. Both the single button and "Verify all" call this,
+   * so a sweep cannot judge somebody differently from the way the report they are
+   * looking at judged them — same endpoint, same 300 links, same rules, same
+   * freshness cutoff.
+   *
+   * Returns the last report, or an error string. Never throws: a sweep must not
+   * stop because one worker's links would not load.
+   */
+  async function runVerify(
+    u: AdminUserRow,
+    onProgress: (done: number, total: number, note: string) => void
+  ): Promise<{ report: VerifyReportShape | null; failed: string }> {
+    const who = u.profile?.name || u.name || u.email || 'user'
+    let failed = ''
+    let last: VerifyReportShape | null = null
+    // The freshness cutoff for THIS check, minted by the server and echoed back
+    // so links judged a moment ago count as done. Without echoing it, every
+    // request would start a new pass and the loop would never finish.
+    let since = ''
+    for (;;) {
+      if (stopVerify.current) break
+      const ctl = new AbortController()
+      verifyAbort.current = ctl
+      let res: Response
+      try {
+        res = await fetch('/api/admin/verify-user', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(since ? { userId: u.id, since } : { userId: u.id }),
+          signal: ctl.signal,
+        })
+      } catch {
+        // Aborted or dropped. Every link judged before this batch is in the
+        // ledger, so resuming re-reads at most this batch.
+        if (!stopVerify.current) failed = 'Connection lost — progress saved.'
+        break
+      } finally {
+        verifyAbort.current = null
+      }
+      const d = await res.json().catch(() => ({}))
+      if (!res.ok) { failed = d?.error || 'Verification failed.'; break }
+      if (typeof d.since === 'string' && d.since) since = d.since
+      last = {
+        who,
+        username: String(d.username ?? ''),
+        checked: Number(d.checked) || 0,
+        found: Number(d.found) || 0,
+        skipped: Number(d.skipped) || 0,
+        pct: d.pct === null ? null : Number(d.pct),
+        total: Number(d.total) || 0,
+        from: String(d.from ?? ''),
+        to: String(d.to ?? ''),
+        days: Number(d.days) || 0,
+        links: Array.isArray(d.links) ? (d.links as JudgedLinkShape[]) : [],
+        comments: Array.isArray(d.comments) ? (d.comments as FoundCommentShape[]) : [],
+        blockSample: Number(d.blockSample) || 50,
+        blocked: d.blocked
+          ? {
+              judged: Number(d.blocked.judged) || 0,
+              skipped: Number(d.blocked.skipped) || 0,
+              rule: String(d.blocked.rule ?? ''),
+              pct: d.blocked.pct === null || d.blocked.pct === undefined
+                ? null
+                : Number(d.blocked.pct),
+            }
+          : undefined,
+        ratioSample: Number(d.ratioSample) || 200,
+        ratioMinPct: Number(d.ratioMinPct) || 10,
+        autoBlockOn: d.autoBlockOn !== false,
+        ruleRate:
+          d.ruleRate && Number.isFinite(Number(d.ruleRate.judged))
+            ? {
+                judged: Number(d.ruleRate.judged),
+                found: Number(d.ruleRate.found),
+                pct: Number(d.ruleRate.pct),
+              }
+            : null,
+        blockNote: String(d.blockNote ?? ''),
+      }
+      const total = Number(d.total) || 0
+      onProgress(total - (Number(d.remaining) || 0), total,
+        `${last.found}/${last.checked} link(s) carry their comment`)
+      if (d.done) break
+    }
+    return { report: last, failed }
+  }
+
   async function verifyUser(u: AdminUserRow) {
     const who = u.profile?.name || u.name || u.email || 'user'
     if (!u.profile?.tiktok_url) {
@@ -1003,88 +1225,21 @@ export default function AdminDashboard({
       'from an earlier result. Progress is saved as it goes; stopping and starting ' +
       'again re-reads what it had not finished. Three hundred videos is a few minutes, ' +
       'in several batches — the bar shows where it is.\n\n' +
-      'They will be BLOCKED automatically if EITHER holds: none of their last 50 judged ' +
-      'links carry their comment, or under 10% of their last 200 judged links do. Same ' +
-      'rules as the nightly check. A sample too small to judge blocks nobody. You can ' +
-      'unblock them again.'
+      'They may be BLOCKED automatically: the rules are on the dashboard under Auto-block ' +
+      'rules — nothing found on a sample of judged links, or under a set percentage of a ' +
+      'longer one. Same rules as the nightly check, and the report says which one acted. ' +
+      'A sample too small to judge blocks nobody, and you can unblock them again.'
     )) return
 
     stopVerify.current = false
     setVerifyingUser(u.id)
     setVerifyProgress({ who, done: 0, total: 0, note: 'Starting…' })
-    let failed = ''
-    let last: VerifyReportShape | null = null
-    // The freshness cutoff for THIS check, minted by the server and echoed back
-    // so links judged a moment ago count as done. Without echoing it, every
-    // request would start a new pass and the loop would never finish.
-    let since = ''
-
     try {
-      for (;;) {
-        if (stopVerify.current) break
-        const ctl = new AbortController()
-        verifyAbort.current = ctl
-        let res: Response
-        try {
-          res = await fetch('/api/admin/verify-user', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(since ? { userId: u.id, since } : { userId: u.id }),
-            signal: ctl.signal,
-          })
-        } catch {
-          // Aborted or dropped. Every link judged before this batch is in the
-          // ledger, so resuming re-reads at most this batch.
-          if (!stopVerify.current) failed = 'Connection lost — progress saved.'
-          break
-        } finally {
-          verifyAbort.current = null
-        }
-        const d = await res.json().catch(() => ({}))
-        if (!res.ok) { failed = d?.error || 'Verification failed.'; break }
-        if (typeof d.since === 'string' && d.since) since = d.since
-
-        last = {
-          who,
-          username: String(d.username ?? ''),
-          checked: Number(d.checked) || 0,
-          found: Number(d.found) || 0,
-          skipped: Number(d.skipped) || 0,
-          pct: d.pct === null ? null : Number(d.pct),
-          total: Number(d.total) || 0,
-          from: String(d.from ?? ''),
-          to: String(d.to ?? ''),
-          days: Number(d.days) || 0,
-          links: Array.isArray(d.links) ? (d.links as JudgedLinkShape[]) : [],
-          comments: Array.isArray(d.comments) ? (d.comments as FoundCommentShape[]) : [],
-          blockSample: Number(d.blockSample) || 50,
-          blocked: d.blocked
-            ? {
-                judged: Number(d.blocked.judged) || 0,
-                skipped: Number(d.blocked.skipped) || 0,
-                rule: String(d.blocked.rule ?? ''),
-                pct: d.blocked.pct === null || d.blocked.pct === undefined
-                  ? null
-                  : Number(d.blocked.pct),
-              }
-            : undefined,
-          ratioSample: Number(d.ratioSample) || 200,
-          ratioMinPct: Number(d.ratioMinPct) || 10,
-          blockNote: String(d.blockNote ?? ''),
-        }
-        const total = Number(d.total) || 0
-        const done = total - (Number(d.remaining) || 0)
-        setVerifyProgress({
-          who,
-          done,
-          total,
-          note: `${last.found}/${last.checked} link(s) carry their comment`,
-        })
-        if (d.done) break
-      }
-
+      const { report, failed } = await runVerify(u, (done, total, note) =>
+        setVerifyProgress({ who, done, total, note })
+      )
       if (failed) alert(failed)
-      else if (last) setVerifyReport(last)
+      else if (report) setVerifyReport(report)
       router.refresh()
     } catch (e) {
       alert(`Verification error: ${String((e as Error)?.message || e)}`)
@@ -1093,6 +1248,7 @@ export default function AdminDashboard({
       setVerifyProgress(null)
     }
   }
+
   // Message compose modal (null = closed). userId null = broadcast to everyone.
   const [composeTarget, setComposeTarget] = useState<{ userId: string | null; label: string } | null>(null)
   const [msgBody, setMsgBody] = useState('')
@@ -1200,7 +1356,80 @@ export default function AdminDashboard({
   }
 
   // Most clicks first. slice() so we never mutate data.users in place.
-  const filteredUsers = data.users.slice().sort((a, b) => b.totalClicks - a.totalClicks)
+  /**
+   * The order the list is read in.
+   *
+   * Clicks answers "who is working"; pending pay answers "who am I about to
+   * pay", which is the question on payout day and was unanswerable without
+   * opening every card — the amount lives in each row, so the eye has to do the
+   * sorting. Comments is the honest measure of output, since a click is only an
+   * intention until a comment lands.
+   *
+   * The mailbox money is NOT in the pending figure any more (it is settled on the
+   * Email tasks page), so this sorts by what the user card would actually pay.
+   */
+  const sortedUsers = data.users.slice().sort((a, b) => {
+    if (userSort === 'pending') {
+      const pa = pendingByUser[a.id]?.total ?? 0
+      const pb = pendingByUser[b.id]?.total ?? 0
+      // Ties fall back to clicks, so a page of zero-balance users is still in a
+      // meaningful order rather than whatever the database returned.
+      return pb - pa || b.totalClicks - a.totalClicks
+    }
+    if (userSort === 'comments')
+      return genreComments(b, genre) - genreComments(a, genre) || b.totalClicks - a.totalClicks
+    if (userSort === 'name') {
+      return (a.profile?.name || a.name || a.email).localeCompare(
+        b.profile?.name || b.name || b.email
+      )
+    }
+    return b.totalClicks - a.totalClicks
+  })
+
+  /**
+   * THE REFERRAL TREE: everybody nobody referred at the top level, each followed
+   * by the people they brought in, and theirs below them — so a referrer and the
+   * workers earning them commission sit together and read as one group.
+   *
+   * Built from referralByUser (referrer → members). Siblings keep the clicks
+   * order. Somebody whose referrer is not in the list (deleted) is a root, and a
+   * loop in the data — which recordReferral should never allow — cannot hang
+   * the page: each person is placed once.
+   */
+  const treeDepth = useMemo(() => {
+    const depth = new Map<string, number>()
+    if (userSort !== 'referrals') return depth
+    const ids = new Set(data.users.map((u) => u.id))
+    const parentOf = new Map<string, string>()
+    for (const [referrer, e] of Object.entries(referralByUser)) {
+      if (!ids.has(referrer)) continue
+      for (const m of e.members) if (ids.has(m.userId) && m.userId !== referrer) parentOf.set(m.userId, referrer)
+    }
+    const children = new Map<string, string[]>()
+    for (const u of sortedUsers) {
+      const p = parentOf.get(u.id)
+      if (p) children.set(p, [...(children.get(p) ?? []), u.id])
+    }
+    const visit = (id: string, d: number) => {
+      if (depth.has(id)) return
+      depth.set(id, d)
+      for (const c of children.get(id) ?? []) visit(c, d + 1)
+    }
+    for (const u of sortedUsers) if (!parentOf.has(u.id)) visit(u.id, 0)
+    for (const u of sortedUsers) visit(u.id, 0) // anything left (a loop) as a root
+    return depth
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userSort, data.users, referralByUser, sortedUsers.map((u) => u.id).join(',')])
+
+  const filteredUsers =
+    userSort === 'referrals'
+      ? (() => {
+          // The tree's own order: depth was assigned depth-first, and a Map
+          // keeps insertion order, so its keys ARE the order to draw in.
+          const byId = new Map(sortedUsers.map((u) => [u.id, u]))
+          return Array.from(treeDepth.keys()).map((id) => byId.get(id)!).filter(Boolean)
+        })()
+      : sortedUsers
 
   async function doReset() {
     if (resetTarget === null) return
@@ -1254,9 +1483,12 @@ export default function AdminDashboard({
   const totalUsers = filteredUsers.length
   // Products that actually have clicks, plus the configured list — so a product
   // with no clicks yet is still selectable and reads 0 rather than disappearing.
-  const clickProducts = Array.from(
-    new Set([...Object.keys(data.clicksByProduct), ...PRODUCTS])
-  ).filter((p) => p !== '(none)').sort()
+  // ONLY THIS GENRE'S. Every product of the genre is listed even with no
+  // clicks yet, so it reads 0 rather than disappearing; another genre's
+  // products are not offered at all, because the clicks behind them have
+  // already been cut away on the server and they would read a misleading 0.
+  const genreProductList = productsInGenre(genre)
+  const clickProducts = genreProductList.slice().sort()
   // The other direction. referralByUser is keyed by REFERRER; an admin looking
   // at a worker wants to know who is being paid a commission on that worker's
   // output, which is the same data read backwards.
@@ -1277,9 +1509,59 @@ export default function AdminDashboard({
   const clicksAllProducts = Object.values(data.clicksByProduct).reduce((a, b) => a + b, 0)
   // Per-product totals come from the product stamped on each CLICK, so they don't
   // shift when a user is moved between products (unlike summing users' totals).
-  const totalClicks = clickProduct ? (data.clicksByProduct[clickProduct] ?? 0) : clicksAllProducts
+  /**
+   * What the Links-clicked stat counts, under the product filter.
+   *
+   * WITHIN THE GENRE. This used to offer whole genres as well as products,
+   * because the page showed every genre at once and "how much went to website"
+   * meant adding two product rows by eye. The master switch answers that now,
+   * so the filter only narrows inside the genre already chosen.
+   *
+   * Summed from the per-product totals, which come from the product stamped on
+   * each CLICK, so the number does not shift when a user is reassigned.
+   */
+  const totalClicks = clickProduct
+    ? (data.clicksByProduct[clickProduct] ?? 0)
+    : clicksAllProducts
   const totalCommented = filteredUsers.reduce((s, u) => s + u.totalCommented, 0)
+  // This genre's apportioned share of those (see genreCommentShare).
+  const genreCommented = filteredUsers.reduce((s, u) => s + genreComments(u, genre), 0)
   // Pending (unapproved) pay across the filtered users, from the per-user data.
+  /**
+   * Workers who have done nothing for a fortnight, hidden rather than removed.
+   *
+   * WHY HIDDEN AND NOT DELETED. A list of 161 people where 100 of them stopped
+   * weeks ago is a list nobody can read, and the answer to that is a filter, not
+   * a destructor: deleting an account throws away their submissions, their
+   * screenshots and the record of what they were owed, and it cannot be undone
+   * if the rule catches somebody who was on holiday.
+   *
+   * WORK MEANS ANY WORK — a click, a comment report, a video, a repost, a
+   * mailbox — and it is NOT measured from the reset. A reset last Tuesday does
+   * not turn a fortnight of silence into three days of it.
+   *
+   * NEVER-WORKED ACCOUNTS COUNT AS IDLE once they are a fortnight old, which is
+   * what catches abandoned sign-ups and test accounts; a new registration gets
+   * the same two weeks before it disappears from the list.
+   *
+   * ANYONE STILL OWED MONEY STAYS VISIBLE, whatever the dates say. Hiding
+   * somebody you have not paid is how they stop being paid.
+   */
+  const IDLE_DAYS = 14
+  const idleCutoff = Date.now() - IDLE_DAYS * 86400000
+  const isIdle = (u: AdminUserRow): boolean => {
+    const p = pendingByUser[u.id]
+    const owed =
+      (p?.total ?? 0) > 0 ||
+      (p?.accounts.birr ?? 0) > 0 ||
+      (p?.accountsAwaiting.count ?? 0) > 0
+    if (owed) return false
+    const last = u.lastWorkAt ? Date.parse(u.lastWorkAt) : Date.parse(u.createdAt)
+    return Number.isFinite(last) && last < idleCutoff
+  }
+  const idleUsers = filteredUsers.filter(isIdle)
+  const shownUsers = showIdle ? filteredUsers : filteredUsers.filter((u) => !isIdle(u))
+
   const pendingSum = filteredUsers.reduce(
     (acc, u) => {
       const p = pendingByUser[u.id]
@@ -1296,6 +1578,94 @@ export default function AdminDashboard({
     },
     { comments: 0, video: 0, promo: 0, accounts: 0, referrals: 0, waiting: 0, total: 0 }
   )
+
+  /**
+   * Clicks and money, divided by genre, over the users currently shown.
+   *
+   * TWO DIFFERENT KINDS OF NUMBER IN ONE TABLE, and the table says which is
+   * which:
+   *
+   *   CLICKS ARE MEASURED. clicked_link.product is stamped at click time, so
+   *   every click already knows which genre's video it sent somebody to.
+   *
+   *   PAY IS APPORTIONED. commented_submission holds a platform, a count and
+   *   no product — the app asks "how many TikTok videos did you comment on"
+   *   and that is the entire report, so there is nothing in it to divide by.
+   *   Each worker's comment pay is therefore split in the proportion of the
+   *   links THEY opened in the same window the pay is counted over, and their
+   *   referral pay in the proportion their members opened. It is the best the
+   *   stored data supports; making it exact means asking the worker to report
+   *   per product, which is a change to what the app collects.
+   *
+   * Video and repost pay are not divided at all: those rows carry no product
+   * either and the work is not about one — a promo video is for the job, not
+   * for a genre. They are reported on their own line so the parts still add up
+   * to the pending total.
+   *
+   * Computed over the same list pendingSum uses, so the money here and the
+   * pending total in the strip above are always two views of one figure.
+   */
+  const genreSplit = useMemo(() => {
+    const rows: Record<string, { clicks: number; comments: number; referrals: number }> = {}
+    const row = (g: string) => (rows[g] ??= { clicks: 0, comments: 0, referrals: 0 })
+    let flat = 0
+    let unsplit = 0
+    const apportion = (
+      birr: number,
+      weights: Record<string, number>,
+      key: 'comments' | 'referrals'
+    ) => {
+      if (birr <= 0) return
+      const total = Object.values(weights).reduce((a, b) => a + b, 0)
+      // Pay with no clicks behind it in the same window cannot be attributed to
+      // anything. Reported as unsplit rather than dropped into the biggest
+      // genre, which would be a guess wearing a measurement's clothes.
+      if (total <= 0) {
+        unsplit += birr
+        return
+      }
+      for (const [g, n] of Object.entries(weights)) row(g)[key] += (birr * n) / total
+    }
+    for (const u of filteredUsers) {
+      for (const [g, n] of Object.entries(u.clicksByGenre ?? {})) row(g).clicks += n
+      const p = pendingByUser[u.id]
+      if (!p) continue
+      flat += p.video.birr + p.promo.birr
+      apportion(p.comments.birr, u.payClicksByGenre ?? {}, 'comments')
+      apportion(p.referrals.birr, u.referralClicksByGenre ?? {}, 'referrals')
+    }
+    // GENRES order first so the table reads the same way every time, then
+    // anything else (clicks made before products had genres) at the end.
+    const keys = [
+      ...GENRES.filter((g) => rows[g]),
+      ...Object.keys(rows).filter((g) => !GENRES.includes(g as never)),
+    ]
+    const list = keys.map((g) => ({ genre: g, ...rows[g], pay: rows[g].comments + rows[g].referrals }))
+    return {
+      list,
+      flat,
+      unsplit,
+      clicks: list.reduce((n, r) => n + r.clicks, 0),
+      pay: list.reduce((n, r) => n + r.pay, 0),
+    }
+  }, [filteredUsers, pendingByUser])
+
+  /**
+   * The selected genre's clicks and its share of what is owed.
+   *
+   * The split above still knows every genre, because the PAY weights are
+   * all-genre by design: a worker's comment pay is divided in the proportion of
+   * every link they were given, so the other genres have to be in the sum for
+   * this genre's share to come out right. Only this genre's row is shown.
+   */
+  const thisGenre = genreSplit.list.find((r) => r.genre === genre) ?? {
+    genre,
+    clicks: 0,
+    comments: 0,
+    referrals: 0,
+    pay: 0,
+  }
+
   // Addresses nobody has checked yet. Shown on the Email task button, because
   // that number is the only thing standing between a worker and their pay.
   const accountsWaiting = pendingSum.waiting
@@ -1354,6 +1724,13 @@ export default function AdminDashboard({
                 </span>
               )}
             </button>
+            <button
+              onClick={() => router.push('/admin/captcha')}
+              title="Solve a captcha that has stopped the liker — from here, on any network. The run posts the puzzle and waits for your answer."
+              className="text-sm text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg px-3 py-1.5 transition-colors"
+            >
+              🧩 Captcha
+            </button>
             <select
               value=""
               onChange={(e) => {
@@ -1363,11 +1740,23 @@ export default function AdminDashboard({
               className="text-sm text-white bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 hover:bg-zinc-700 transition-colors focus:outline-none focus:border-emerald-500"
             >
               <option value="">Product comments…</option>
-              {PRODUCTS.map((p) => (
-                <option key={p} value={p} disabled={DEACTIVATED_PRODUCTS.includes(p)}>
-                  {p}
-                  {DEACTIVATED_PRODUCTS.includes(p) ? ' (off)' : ''}
-                </option>
+              {/* Grouped by genre: the comments for a slides product have
+                  nothing in common with a humanizer's, so picking one from a
+                  flat list of eight invites opening the wrong page. */}
+              {[genre].map((g) => (
+                <optgroup key={g} label={GENRE_LABELS[g] ?? g}>
+                  {productsInGenre(g).map((p) => {
+                    // productsInGenre returns strings, so the widened list is
+                    // what answers "is this one switched off" here.
+                    const off = (DEACTIVATED_PRODUCTS as readonly string[]).includes(p)
+                    return (
+                      <option key={p} value={p} disabled={off}>
+                        {p}
+                        {off ? ' (off)' : ''}
+                      </option>
+                    )
+                  })}
+                </optgroup>
               ))}
             </select>
           </div>
@@ -1379,7 +1768,7 @@ export default function AdminDashboard({
             <button
               onClick={verifyAll}
               disabled={verifyingAll}
-              title="Verify all users that have a TikTok profile link by matching their @username against 2_comment_automation/comments_extracted.json (no browser — fast)"
+              title="Run the single-user check on every unblocked user who worked in the last 7 days (blocked users are skipped): their last 300 links read again, and the two auto-block rules applied. Slow — a few minutes per person — and stoppable."
               className="text-sm text-white bg-sky-600 hover:bg-sky-500 disabled:opacity-50 rounded-lg px-3 py-1.5 transition-colors"
             >
               {verifyingAll ? '⏳ Verifying all…' : '🔍 Verify all'}
@@ -1484,7 +1873,7 @@ export default function AdminDashboard({
         <Stat
           label="Links clicked"
           value={totalClicks.toLocaleString()}
-          hint={clickProduct ? `${clickProduct} only` : 'all products'}
+          hint={clickProduct ? `${clickProduct} only` : `all ${GENRE_LABELS[genre] ?? genre}`}
           control={
             <select
               value={clickProduct}
@@ -1501,12 +1890,24 @@ export default function AdminDashboard({
             </select>
           }
         />
-        <Stat label="Comments" value={totalCommented.toLocaleString()} />
+        {/* NOT SCOPED, and labelled so. A comment report says how many and on
+            which site, never which product, so there is nothing to cut it by
+            — showing it under a genre name without saying so would imply a
+            split that does not exist. */}
+        <Stat
+          label="Comments"
+          value={genreCommented.toLocaleString()}
+          hint={`≈ apportioned · ${totalCommented.toLocaleString()} in all genres`}
+        />
+        {/* THIS GENRE'S SHARE, with the whole beside it. A worker is paid one
+            total across every genre, so the genre's figure is apportioned from
+            the links they were given; the all-genre total stays in view because
+            it is the amount that will actually be paid. */}
         <Stat
           label="Pending pay"
-          value={`${fmtBirr(pendingSum.total)} birr`}
+          value={`${fmtBirr(thisGenre.pay)} birr`}
           accent="amber"
-          hint="unapproved · all tasks"
+          hint={`${GENRE_LABELS[genre] ?? genre} share ~ · ${fmtBirr(pendingSum.total)} owed in all genres`}
         />
         <Stat
           label="Of which video"
@@ -1514,10 +1915,114 @@ export default function AdminDashboard({
           accent="amber"
           hint={
             `comments ${fmtBirr(pendingSum.comments)} · repost ${fmtBirr(pendingSum.promo)}` +
-            (pendingSum.accounts > 0 ? ` · emails ${fmtBirr(pendingSum.accounts)}` : '')
+            // Email money is NOT in the total beside this one — it is settled on
+            // the Email tasks page — so it is named as separate rather than
+            // listed alongside the parts that are.
+            (pendingSum.accounts > 0
+              ? ` · emails ${fmtBirr(pendingSum.accounts)} (separate, on the Email tasks page)`
+              : '')
           }
         />
       </div>
+
+      {/* Clicks and pay, per genre. Measured clicks, apportioned money —
+          see genreSplit for why the two cannot both be exact. */}
+      {genreSplit.list.length > 0 && (
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3 mb-4">
+          <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2">
+            <div className="text-sm font-semibold text-white">
+              🎭 {GENRE_LABELS[genre] ?? genre}: clicks and pay
+            </div>
+            <div className="text-[11px] text-zinc-500">
+              {thisGenre.clicks.toLocaleString()} clicks · {fmtBirr(thisGenre.pay)} birr
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="text-xs border-collapse w-full min-w-[420px]">
+              <thead>
+                <tr>
+                  <th className="text-left text-[11px] uppercase tracking-wide text-zinc-500 font-medium pr-3 py-1">
+                    Genre
+                  </th>
+                  <th
+                    className="px-2 py-1 border-l border-zinc-800 text-right text-[11px] uppercase tracking-wide text-zinc-500 font-medium"
+                    title="Exact: every click carries the product it was made for."
+                  >
+                    Links clicked
+                  </th>
+                  <th
+                    className="px-2 py-1 border-l border-zinc-800 text-right text-[11px] uppercase tracking-wide text-zinc-500 font-medium"
+                    title="Apportioned: comment reports carry no product, so each worker's comment pay is split by the mix of links they opened."
+                  >
+                    Comment pay ~
+                  </th>
+                  <th
+                    className="px-2 py-1 border-l border-zinc-800 text-right text-[11px] uppercase tracking-wide text-zinc-500 font-medium"
+                    title="Apportioned the same way, but by the mix their referred workers opened — the commission is a share of those people's comments."
+                  >
+                    Referral pay ~
+                  </th>
+                  <th className="px-2 py-1 border-l border-zinc-800 text-right text-[11px] uppercase tracking-wide text-zinc-500 font-medium">
+                    Owed ~
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {/* One row: the switch has chosen the genre. The other genres
+                    are still in genreSplit because this one's pay is
+                    apportioned against them. */}
+                {[thisGenre].map((r) => (
+                  <tr key={r.genre} className="border-t border-zinc-800/70">
+                    <td className="pr-3 py-1 text-zinc-200 whitespace-nowrap">
+                      {GENRE_LABELS[r.genre] ?? (r.genre === '(none)' ? 'no product stamped' : r.genre)}
+                    </td>
+                    <td className="px-2 py-1 border-l border-zinc-800 text-right tabular-nums text-zinc-300">
+                      {r.clicks.toLocaleString()}
+                      <span className="text-zinc-600">
+                        {genreSplit.clicks > 0
+                          ? ` ${Math.round((r.clicks / genreSplit.clicks) * 100)}%`
+                          : ''}
+                      </span>
+                    </td>
+                    <td className="px-2 py-1 border-l border-zinc-800 text-right tabular-nums text-zinc-400">
+                      {fmtBirr(r.comments)}
+                    </td>
+                    <td className="px-2 py-1 border-l border-zinc-800 text-right tabular-nums text-zinc-400">
+                      {fmtBirr(r.referrals)}
+                    </td>
+                    <td className="px-2 py-1 border-l border-zinc-800 text-right tabular-nums font-semibold text-amber-300">
+                      {fmtBirr(r.pay)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {/* What the split does NOT cover, named rather than hidden, so the
+              numbers above can be trusted to be only what they claim. */}
+          <div className="mt-2 text-[11px] text-zinc-500 leading-relaxed">
+            <span className="text-zinc-400">~</span> apportioned, not measured: a comment report
+            says how many and on which site, never which product, so pay is divided in the
+            proportion of the links each worker was given in the same period.
+            {genreSplit.flat > 0 && (
+              <>
+                {' '}
+                Video and repost pay ({fmtBirr(genreSplit.flat)} birr) is not divided — that
+                work is not about a product.
+              </>
+            )}
+            {genreSplit.unsplit > 0 && (
+              <>
+                {' '}
+                <span className="text-amber-300/80">
+                  {fmtBirr(genreSplit.unsplit)} birr could not be divided
+                </span>{' '}
+                — pay from workers with no clicks recorded in the period it covers.
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Clicks per day, last 7 days (rolling — NOT scoped to the reset) */}
       <DailyClicksTable
@@ -1526,6 +2031,9 @@ export default function AdminDashboard({
         byPlatform={data.dailyClicksByPlatform}
         products={clickProducts}
       />
+
+      {/* When each worker's TikTok account was made. */}
+      <TiktokAgeReport users={data.users} accounts={tiktokAccounts} />
 
       {/* Settings, behind one disclosure.
           These five panels — APK, two task switches, platform limits, active
@@ -1551,6 +2059,21 @@ export default function AdminDashboard({
         </summary>
 
         <div className="border-t border-zinc-800 p-3 space-y-3">
+          {/* THE ONE SETTING HERE THAT IS PER GENRE: which of this genre's
+              products are served, and where. First, under its own heading, so
+              it is not read as one of the all-genre settings below. */}
+          <div className="text-[10px] uppercase tracking-wide text-emerald-500/80">
+            {GENRE_LABELS[genre] ?? genre} only
+          </div>
+          <ActiveProducts genre={genre} />
+          {/* ── THESE APPLY TO EVERY GENRE ── Said once, above them, so nobody
+              changes one under Website and is surprised that Humanizer moved
+              too. They are reachable from every switch position on purpose:
+              hiding them behind one genre would make them look like that
+              genre's setting. */}
+          <div className="text-[10px] uppercase tracking-wide text-zinc-600 pt-1">
+            Settings below apply to all genres
+          </div>
           <div className="grid gap-3 md:grid-cols-2">
             <TaskToggle
               title="🎬 Video task (150 birr work)"
@@ -1568,7 +2091,18 @@ export default function AdminDashboard({
             />
           </div>
           <PlatformLimits />
-          <ActiveProducts />
+          {/* The thresholds the nightly check blocks people on. Here rather than
+              beside the sweep button: they apply to every check, not to one run. */}
+          <BlockRules />
+          {/* Which genre gets how much of a worker's list. Above the product
+              matrix because it is the coarser decision: the matrix divides the
+              humanizer slice between six products, this decides how big that
+              slice is. */}
+          <GenreMix />
+          {/* The account-age gate: how old a TikTok account must be, and which
+              video proves ownership. Both are judgements that change with the
+              market, so neither needs a deploy. */}
+          <VerifySettings />
           <LlmModelPicker />
           <ApkAdmin apk={apk} />
           <GuideVideosAdmin videos={guideVideos} />
@@ -1576,20 +2110,67 @@ export default function AdminDashboard({
       </details>
 
       {/* Users list header */}
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
         <h2 className="text-sm font-semibold text-zinc-300">
-          Users <span className="text-zinc-600 font-normal">· sorted by clicks</span>
+          Users
+          <span className="text-zinc-600 font-normal"> · sorted by </span>
+          <select
+            value={userSort}
+            onChange={(e) => setUserSort(e.target.value as typeof userSort)}
+            title="Clicks: who is working. Pending pay: who you are about to pay, biggest first. Comments: what actually landed. Name: to find somebody."
+            className="bg-zinc-900 border border-zinc-700 rounded px-1.5 py-0.5 text-xs text-zinc-200 font-normal focus:outline-none focus:border-emerald-500"
+          >
+            <option value="clicks">clicks</option>
+            <option value="pending">pending pay</option>
+            <option value="comments">comments</option>
+            <option value="name">name</option>
+            <option value="referrals">referral tree</option>
+          </select>
         </h2>
-        <span className="text-xs text-zinc-600 tabular-nums">{data.users.length} total</span>
+        <div className="flex flex-wrap items-center gap-2">
+          {idleUsers.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowIdle((v) => !v)}
+              title={
+                `${idleUsers.length} worker(s) have done nothing for ${IDLE_DAYS} days — no ` +
+                'clicks, comments, videos, reposts or mailboxes. Nothing is deleted; they are ' +
+                'just out of the way. Anyone still owed money is never hidden.'
+              }
+              className={`text-xs rounded-lg px-2.5 py-1 border transition-colors ${
+                showIdle
+                  ? 'text-zinc-200 bg-zinc-700 border-zinc-600'
+                  : 'text-zinc-400 bg-zinc-900 border-zinc-700 hover:bg-zinc-800'
+              }`}
+            >
+              {showIdle
+                ? `hiding nothing · ${idleUsers.length} idle shown`
+                : `${idleUsers.length} idle hidden · show`}
+            </button>
+          )}
+          <span className="text-xs text-zinc-600 tabular-nums">
+            {shownUsers.length === data.users.length
+              ? `${data.users.length} total`
+              : `${shownUsers.length} of ${data.users.length}`}
+          </span>
+        </div>
       </div>
 
       {data.users.length === 0 ? (
         <p className="text-sm text-zinc-500 py-16 text-center">No users yet.</p>
       ) : (
         <div className="space-y-4">
-          {filteredUsers.map((u) => (
+          {shownUsers.map((u) => {
+            // Referral tree: indented under whoever referred them, one step
+            // per level, with a line down the left so the group reads as one.
+            const depth = userSort === 'referrals' ? (treeDepth.get(u.id) ?? 0) : 0
+            const card = (
             <UserCard
               key={u.id}
+              genre={genre}
+              minAgeDays={minAgeDays}
+              payHistory={payAdjustments[u.id] ?? []}
+              autoBlocks={autoBlockCounts[u.id] ?? 0}
               u={u}
               pending={pendingByUser[u.id] ?? null}
               referral={referralByUser[u.id] ?? null}
@@ -1625,14 +2206,29 @@ export default function AdminDashboard({
               onDeleteReply={deleteReply}
               onDeleteMessage={deleteMessage}
             />
-          ))}
+            )
+            if (depth === 0) return card
+            const by = referredByUser[u.id]
+            return (
+              <div
+                key={u.id}
+                style={{ marginLeft: `${Math.min(depth, 6) * 1.5}rem` }}
+                className="border-l-2 border-sky-800/60 pl-3"
+              >
+                <div className="text-[11px] text-sky-400/80 mb-1">
+                  ↳ referred by {by?.name || 'another user'}
+                </div>
+                {card}
+              </div>
+            )
+          })}
         </div>
       )}
 
       {/* Compose message modal */}
       {composeTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
-          <div className="bg-zinc-900 border border-zinc-700 rounded-xl max-w-md w-full p-5">
+          <div className="bg-zinc-900 border border-zinc-700 rounded-xl max-w-md w-full p-5 max-h-[92vh] overflow-y-auto">
             <h3 className="text-base font-semibold text-white">Message {composeTarget.label}</h3>
             <p className="text-xs text-zinc-500 mt-1 mb-3">
               They&apos;ll see this the next time they open the dashboard.
@@ -1666,7 +2262,7 @@ export default function AdminDashboard({
       {/* Reset confirm dialog (all users or a single user) */}
       {resetTarget !== null && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
-          <div className="bg-zinc-900 border border-zinc-700 rounded-xl max-w-sm w-full p-5">
+          <div className="bg-zinc-900 border border-zinc-700 rounded-xl max-w-sm w-full p-5 max-h-[92vh] overflow-y-auto">
             <h3 className="text-base font-semibold text-white">
               {resetTarget === 'all' ? 'Reset all data?' : `Reset ${targetName}'s data?`}
             </h3>
@@ -1703,7 +2299,7 @@ export default function AdminDashboard({
           const name = du ? du.profile?.name || du.name || du.email : 'this user'
           return (
             <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
-              <div className="bg-zinc-900 border border-red-500/40 rounded-xl max-w-sm w-full p-5">
+              <div className="bg-zinc-900 border border-red-500/40 rounded-xl max-w-sm w-full p-5 max-h-[92vh] overflow-y-auto">
                 <h3 className="text-base font-semibold text-white">⚠️ Delete {name}?</h3>
                 <p className="text-sm text-zinc-400 mt-2">
                   This <span className="text-red-300">permanently deletes</span> the user and{' '}
@@ -1711,6 +2307,13 @@ export default function AdminDashboard({
                   screenshots, video submissions, repost links, messages and login. Uploaded files are
                   removed too. <span className="text-amber-300">This cannot be undone.</span>
                 </p>
+                {du?.blocked && (
+                  <p className="text-sm text-red-300 mt-2">
+                    They are blocked, so deleting them makes the block <b>permanent</b>: their
+                    Google email, bank account and TikTok profile can never be used to register
+                    again, and they can no longer fix the block themselves.
+                  </p>
+                )}
                 <div className="flex justify-end gap-2 mt-5">
                   <button
                     onClick={() => setDeleteTarget(null)}
@@ -1733,8 +2336,8 @@ export default function AdminDashboard({
 
       {/* Screenshots modal — grouped by submission day */}
       {shotUser && (
-        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/70 px-4 py-8 overflow-y-auto">
-          <div className="bg-zinc-900 border border-zinc-700 rounded-xl max-w-3xl w-full p-5 my-auto">
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/70 px-0 py-0 sm:px-4 sm:py-8 overflow-y-auto">
+          <div className="bg-zinc-900 border border-zinc-700 rounded-none sm:rounded-xl max-w-3xl w-full p-4 sm:p-5 my-0 sm:my-auto min-h-[100dvh] sm:min-h-0">
             <div className="flex items-start justify-between gap-4 mb-4">
               <div>
                 <h3 className="text-base font-semibold text-white">
@@ -1792,8 +2395,8 @@ export default function AdminDashboard({
 
       {/* Clicked-links modal — every link this user opened, newest first */}
       {clicksUser && (
-        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/70 px-4 py-8 overflow-y-auto">
-          <div className="bg-zinc-900 border border-zinc-700 rounded-xl max-w-2xl w-full p-5 my-auto">
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/70 px-0 py-0 sm:px-4 sm:py-8 overflow-y-auto">
+          <div className="bg-zinc-900 border border-zinc-700 rounded-none sm:rounded-xl max-w-2xl w-full p-4 sm:p-5 my-0 sm:my-auto min-h-[100dvh] sm:min-h-0">
             <div className="flex items-start justify-between gap-4 mb-4">
               <div>
                 <h3 className="text-base font-semibold text-white">
@@ -1844,8 +2447,8 @@ export default function AdminDashboard({
 
       {/* Past-state snapshots modal (saved at each "mark paid") */}
       {snapUser && (
-        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/70 px-4 py-8 overflow-y-auto">
-          <div className="bg-zinc-900 border border-zinc-700 rounded-xl max-w-2xl w-full p-5 my-auto">
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/70 px-0 py-0 sm:px-4 sm:py-8 overflow-y-auto">
+          <div className="bg-zinc-900 border border-zinc-700 rounded-none sm:rounded-xl max-w-2xl w-full p-4 sm:p-5 my-0 sm:my-auto min-h-[100dvh] sm:min-h-0">
             <div className="flex items-start justify-between gap-4 mb-4">
               <h3 className="text-base font-semibold text-white">
                 Past states — {snapUser.profile?.name || snapUser.name || snapUser.email}
@@ -1964,11 +2567,11 @@ export default function AdminDashboard({
       {/* Sweep results */}
       {sweepReport && (
         <div
-          className="fixed inset-0 z-[80] flex items-start justify-center bg-black/70 p-4 overflow-y-auto"
+          className="fixed inset-0 z-[80] flex items-start justify-center bg-black/70 p-0 sm:p-4 overflow-y-auto"
           onClick={() => setSweepReport(null)}
         >
           <div
-            className="bg-zinc-900 border border-zinc-700 rounded-xl w-full max-w-3xl my-8"
+            className="bg-zinc-900 border border-zinc-700 rounded-none sm:rounded-xl w-full max-w-3xl my-0 sm:my-8 min-h-[100dvh] sm:min-h-0"
             onClick={(e) => e.stopPropagation()}
           >
             {(() => {
@@ -1986,7 +2589,12 @@ export default function AdminDashboard({
               return (
                 <>
                   <div className="p-4 border-b border-zinc-800">
-                    <div className="text-sm font-semibold text-white">Comment presence</div>
+                    {/* The sweep is the honesty check people are blocked on, so it
+                        reads every genre's links; the per-user presence in the
+                        list below is this genre's. */}
+                    <div className="text-sm font-semibold text-white">
+                      Comment presence <span className="text-[11px] font-normal text-zinc-500">· sweep over all genres</span>
+                    </div>
                     <div className="text-xs text-zinc-400 mt-0.5">
                       {sweepReport.length} user(s) scored
                       {avg !== null && <> · average <span className="text-zinc-200">{avg}%</span></>}
@@ -2091,11 +2699,11 @@ export default function AdminDashboard({
       {/* Per-user link breakdown, opened from a name in the presence report. */}
       {detail && (
         <div
-          className="fixed inset-0 z-[90] flex items-start justify-center bg-black/70 p-4 overflow-y-auto"
+          className="fixed inset-0 z-[90] flex items-start justify-center bg-black/70 p-0 sm:p-4 overflow-y-auto"
           onClick={() => setDetail(null)}
         >
           <div
-            className="bg-zinc-900 border border-zinc-700 rounded-xl w-full max-w-4xl my-8"
+            className="bg-zinc-900 border border-zinc-700 rounded-none sm:rounded-xl w-full max-w-4xl my-0 sm:my-8 min-h-[100dvh] sm:min-h-0"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="p-4 border-b border-zinc-800">
@@ -2301,11 +2909,11 @@ export default function AdminDashboard({
       {/* Single-user comment-presence report */}
       {verifyReport && (
         <div
-          className="fixed inset-0 z-[80] flex items-start justify-center bg-black/70 p-4 overflow-y-auto"
+          className="fixed inset-0 z-[80] flex items-start justify-center bg-black/70 p-0 sm:p-4 overflow-y-auto"
           onClick={() => setVerifyReport(null)}
         >
           <div
-            className="bg-zinc-900 border border-zinc-700 rounded-xl w-full max-w-3xl my-8"
+            className="bg-zinc-900 border border-zinc-700 rounded-none sm:rounded-xl w-full max-w-3xl my-0 sm:my-8 min-h-[100dvh] sm:min-h-0"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="p-4 border-b border-zinc-800">
@@ -2340,6 +2948,35 @@ export default function AdminDashboard({
                       </>
                     )}
                   </div>
+                  {/* THE NUMBER THE RULE ACTUALLY USED. Without it the header
+                      says 9% and the rule says 10%, and nobody can tell why
+                      somebody was spared. */}
+                  {verifyReport.ruleRate && verifyReport.ruleRate.judged > 0 && (
+                    <div className="text-[11px] mt-1">
+                      <span className="text-zinc-500">Block rule reads the newest </span>
+                      <span className="text-zinc-300">
+                        {verifyReport.ruleRate.judged} judged
+                      </span>
+                      <span className="text-zinc-500">: </span>
+                      <span
+                        className={
+                          verifyReport.ruleRate.pct < verifyReport.ratioMinPct
+                            ? 'text-rose-300'
+                            : 'text-zinc-300'
+                        }
+                      >
+                        {verifyReport.ruleRate.found} found — {verifyReport.ruleRate.pct}%
+                      </span>
+                      <span className="text-zinc-500">
+                        {' '}
+                        (blocks under {verifyReport.ratioMinPct}%
+                        {verifyReport.ruleRate.judged < verifyReport.ratioSample
+                          ? `, and needs ${verifyReport.ratioSample} judged`
+                          : ''}
+                        )
+                      </span>
+                    </div>
+                  )}
                   <div className="text-[11px] text-zinc-600 mt-1">
                     Their last {verifyReport.total} link(s)
                     {verifyReport.days > 0 &&
@@ -2385,7 +3022,10 @@ export default function AdminDashboard({
                 </div>
                 <div className="max-h-56 overflow-y-auto divide-y divide-zinc-800/60">
                   {verifyReport.comments.map((c) => (
-                    <div key={c.text} className="flex items-baseline gap-2 px-3 py-1.5">
+                    <div
+                      key={c.text}
+                      className="flex flex-wrap sm:flex-nowrap items-baseline gap-x-2 gap-y-0.5 px-3 py-1.5"
+                    >
                       <span
                         className={`shrink-0 text-[11px] tabular-nums rounded px-1.5 py-0.5 border ${
                           c.count > 1
@@ -2400,7 +3040,7 @@ export default function AdminDashboard({
                       >
                         ×{c.count}
                       </span>
-                      <span className="flex-1 min-w-0 text-xs text-zinc-300 break-words">
+                      <span className="order-last sm:order-none basis-full sm:basis-auto flex-1 min-w-0 text-xs text-zinc-300 break-words">
                         {c.text}
                       </span>
                       <span className="shrink-0 text-[11px] text-zinc-600 tabular-nums">
@@ -2440,8 +3080,14 @@ export default function AdminDashboard({
             ) : verifyReport.blockNote ? (
               <div className="mx-4 mt-3 rounded-lg border border-zinc-700 bg-zinc-800/40 px-3 py-2">
                 <div className="text-[11px] text-zinc-400">
-                  Auto-block rules (nothing on {verifyReport.blockSample} judged links, or under{' '}
-                  {verifyReport.ratioMinPct}% of {verifyReport.ratioSample}):{' '}
+                  {verifyReport.autoBlockOn ? (
+                    <>
+                      Auto-block rules (nothing on {verifyReport.blockSample} judged links, or
+                      under {verifyReport.ratioMinPct}% of {verifyReport.ratioSample}):{' '}
+                    </>
+                  ) : (
+                    <span className="text-amber-300">Auto-blocking is OFF: </span>
+                  )}
                   {verifyReport.blockNote}.
                 </div>
               </div>
@@ -2455,7 +3101,10 @@ export default function AdminDashboard({
                   <div className="p-6 text-center text-sm text-zinc-500">No links judged yet.</div>
                 ) : (
                   verifyReport.links.map((l, i) => (
-                    <div key={l.url + i} className="flex items-center gap-3 px-4 py-2">
+                    <div
+                      key={l.url + i}
+                      className="flex flex-wrap sm:flex-nowrap items-center gap-x-3 gap-y-1 px-3 sm:px-4 py-2"
+                    >
                       <span className="shrink-0 w-6 text-right text-[11px] text-zinc-600 tabular-nums">
                         {i + 1}
                       </span>
@@ -2487,7 +3136,7 @@ export default function AdminDashboard({
                       </a>
                       {l.found && l.text && (
                         <span
-                          className="shrink-0 max-w-[16rem] truncate text-[11px] text-emerald-300/80"
+                          className="order-last sm:order-none basis-full sm:basis-auto sm:shrink-0 min-w-0 sm:max-w-[16rem] break-words sm:truncate text-[11px] text-emerald-300/80"
                           title={l.text}
                         >
                           {l.text}
@@ -2543,6 +3192,16 @@ export default function AdminDashboard({
               }}
             />
           </div>
+          {/* Verify all: each user's outcome the moment it is decided. */}
+          {verifyingAll && verifyLog.length > 0 && (
+            <ul className="mt-2 max-h-32 overflow-y-auto space-y-0.5 text-[11px]">
+              {verifyLog.map((l, i) => (
+                <li key={i} className={`truncate ${l.blocked ? 'text-red-300' : 'text-zinc-400'}`}>
+                  <span className="text-zinc-200">{l.who}</span> · {l.text}
+                </li>
+              ))}
+            </ul>
+          )}
           <div className="flex items-center justify-between gap-2 mt-2">
             <span className="text-xs text-zinc-500 truncate">{verifyProgress.note}</span>
             <button
@@ -2557,6 +3216,26 @@ export default function AdminDashboard({
 
     </div>
   )
+}
+
+/**
+ * This genre's share of a worker's comments.
+ *
+ * A comment report says how many and on which site, never for which product,
+ * so a worker's comments cannot be cut by genre exactly. They are apportioned
+ * the way their comment pay is: by the share of their clicks in the same pay
+ * window that were for this genre's products. A worker who only clicked
+ * humanizer links has all of their comments under Humanizer and none under
+ * Website builder. Rounded, because a third of a comment is not a comment.
+ */
+function genreCommentShare(u: AdminUserRow, genre: string): number {
+  const w = u.payClicksByGenre ?? {}
+  const total = Object.values(w).reduce((a, b) => a + b, 0)
+  if (total <= 0) return genre === DEFAULT_GENRE ? 1 : 0
+  return (w[genre] ?? 0) / total
+}
+function genreComments(u: AdminUserRow, genre: string, n: number = u.totalCommented): number {
+  return Math.round(n * genreCommentShare(u, genre))
 }
 
 function UserCard({
@@ -2591,7 +3270,18 @@ function UserCard({
   presenceDays,
   tiktokAccount,
   onProfileSaved,
+  genre,
+  minAgeDays,
+  payHistory,
+  autoBlocks,
 }: {
+  /** How many times the check has blocked them automatically. */
+  autoBlocks: number
+  minAgeDays: number
+  /** This user's pending-pay edits, newest first. */
+  payHistory: PayAdjustment[]
+  /** The admin's master genre: comments shown are this genre's share. */
+  genre: string
   /** What this user has earned by referring others, or null if they referred
    *  nobody. */
   referral: ReferralEarnings | null
@@ -2620,7 +3310,7 @@ function UserCard({
   presenceDays: PresenceDayShape[]
   /** The numeric TikTok id learned from a comment of theirs, with the handle it
    *  was learned from. Null until a presence check has found one. */
-  tiktokAccount: { handle: string; uid: string } | null
+  tiktokAccount: { handle: string; uid: string; source?: 'verified' | 'seen' } | null
   onViewSnapshots: () => void
   onDeductClicks: () => void
   deducting: boolean
@@ -2676,6 +3366,14 @@ function UserCard({
   }, [open, knownUid, uidLookup, uidBusy, tiktokHandle, u.id])
   const tiktokUid = knownUid ?? uidLookup?.uid ?? null
   const tiktokCreated = accountCreatedAt(tiktokUid)
+  // Which of the two sources this id came from. The lazy lookup below reads a
+  // link the presence ledger says carries their comment, so it is a scan by
+  // another name — only the stored registration check counts as verified.
+  const uidSource: 'verified' | 'seen' | null = knownUid
+    ? (tiktokAccount?.source ?? 'seen')
+    : uidLookup?.uid
+      ? 'seen'
+      : null
 
   const [editLinks, setEditLinks] = useState(false)
   const [savingLinks, setSavingLinks] = useState(false)
@@ -2697,6 +3395,19 @@ function UserCard({
       })
       const d = await res.json().catch(() => ({}))
       if (!res.ok) { setLinkErr(d?.error || 'Could not save.'); return }
+      // TAKEN, NOT REFUSED. A link somebody else held is reassigned rather than
+      // rejected — the admin can see both profiles and is the one entitled to
+      // decide which is right — but taking an account off somebody's profile
+      // must never be silent.
+      const taken = Array.isArray(d?.takenFrom) ? d.takenFrom : []
+      if (taken.length > 0) {
+        const lines = taken.map(
+          (t: { platform: string; name: string | null }) =>
+            `The ${t.platform} link was taken from ${t.name || 'another user'} \u2014 it is ` +
+            'no longer on their profile.'
+        )
+        alert(['Saved.', '', ...lines].join('\n'))
+      }
       setEditLinks(false)
       onProfileSaved()
     } catch {
@@ -2708,6 +3419,51 @@ function UserCard({
 
   const unpaidReposts = u.promoLinks.filter((l) => !l.paid).length
   const pendingTotal = pending?.total ?? 0
+  const payRouter = useRouter()
+  const [editingPay, setEditingPay] = useState(false)
+  /**
+   * Set their pending pay to a new amount. Written as a comment adjustment on
+   * the server, so the commission their referrer earns on them moves with it —
+   * the confirmation says by how much before anything is saved.
+   */
+  async function editPendingPay() {
+    if (!pending) return
+    const floor = pending.total - pending.comments.birr
+    const raw = window.prompt(
+      `New pending pay for ${u.profile?.name || u.name || u.email}, in birr.\n\n` +
+        `Now: ${fmtBirr(pending.total)} birr. The change is made to their comment pay ` +
+        `(${COMMENT_PAY_RATE} birr a comment), so it cannot go below ${fmtBirr(floor)} birr ` +
+        '(videos, reposts and referral commission stay as they are).',
+      String(pending.total)
+    )
+    if (raw === null) return
+    const total = Number(raw.replace(/[^\d.]/g, ''))
+    if (!Number.isFinite(total) || raw.trim() === '') { alert('Type an amount in birr.'); return }
+    const deltaComments = Math.round((total - pending.total) / COMMENT_PAY_RATE)
+    if (deltaComments === 0) return
+    const refDelta = deltaComments * REFERRAL_PAY_RATE
+    if (!confirm(
+      `Change ${fmtBirr(pending.total)} → ${fmtBirr(pending.total + deltaComments * COMMENT_PAY_RATE)} birr ` +
+        `(${deltaComments > 0 ? '+' : ''}${deltaComments} comments)?` +
+        (referredBy
+          ? `\n\nTheir referrer ${referredBy.name ?? ''} earns ${Math.round(REFERRAL_SHARE * 100)}% of this, ` +
+            `so their commission changes by ${refDelta > 0 ? '+' : ''}${fmtBirr(refDelta)} birr too.`
+          : '')
+    )) return
+    setEditingPay(true)
+    try {
+      const res = await fetch('/api/admin/pay-adjust', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: u.id, total }),
+      })
+      const d = await res.json().catch(() => ({}))
+      if (!res.ok) { alert(d?.error || 'Could not change the pending pay.'); return }
+      payRouter.refresh()
+    } finally {
+      setEditingPay(false)
+    }
+  }
   // A submission is "unapproved" while it's unpaid AND the admin hasn't approved
   // this user's pending pay yet. Once approved (or paid) it's no longer unapproved.
   const approvedPending = !!pending?.approved
@@ -2795,7 +3551,10 @@ function UserCard({
                   `Reason: ${rLabel}. ` +
                   (u.blockReason === 'forever'
                     ? 'Hard block — no sign-in.'
-                    : 'They can self-unblock by entering a new value on sign-in.')
+                    : 'They can self-unblock by entering a new value on sign-in.') +
+                  (u.blockAuto
+                    ? ` Automatic blocks so far: ${autoBlocks}. After 3, the next one is permanent.`
+                    : '')
                 }
                 className={`text-[11px] font-semibold rounded px-1.5 py-0.5 border ${
                   u.blockAuto
@@ -2803,43 +3562,37 @@ function UserCard({
                     : 'border-red-500/50 bg-red-500/20 text-red-200'
                 }`}
               >
-                {u.blockAuto ? '🤖 auto-blocked' : '🚫 blocked'} · {rLabel}
+                {/* An auto-block always has the same reason, so it is just
+                    "auto-blocked"; the reason stays in the tooltip. */}
+                {u.blockAuto
+                  ? u.blockReason === 'forever'
+                    ? '🤖 auto-blocked for good'
+                    : `🤖 auto-blocked · ${autoBlocks} of 3`
+                  : <>🚫 blocked · {rLabel}</>}
               </span>
             )
           })()}
           <Chip label="clicked" value={u.totalClicks} />
-          <Chip label="comments" value={u.totalCommented} />
-          {/* PER DAY, which is the number that compares two workers.
-              Totals do not: somebody reset last Tuesday and somebody counted
-              since the start of the month have the same column meaning
-              different things. Both rates divide by that user's OWN counting
-              period — their reset if they have one, the global one otherwise,
-              and never from before their account existed. */}
+          {/* This genre's share; the all-genre count is in the tooltip. */}
           <Chip
-            label="clicks/day"
-            value={perDay(u.totalClicks, daysSince(u.countingFrom))}
+            label="comments"
+            value={genreComments(u, genre)}
+            title={`≈ ${GENRE_LABELS[genre] ?? genre} share of ${u.totalCommented.toLocaleString()} comment(s) in all genres, apportioned by their clicks`}
+          />
+          {/* WHEN THEIR TIKTOK ACCOUNT WAS MADE, read from its id — in place of
+              the per-day rates and the repost count (reposts are still listed in
+              the expanded details). Amber when it is under the minimum account
+              age set in the dashboard. */}
+          <Chip
+            label="tiktok age"
+            value={tiktokCreated ? accountAgeWords(tiktokCreated) : '—'}
+            accent={tiktokCreated && Date.now() - tiktokCreated.getTime() < minAgeDays * 86400000 ? 'amber' : undefined}
             title={
-              `${u.totalClicks.toLocaleString()} link(s) over ` +
-              `${daysSince(u.countingFrom)} day(s), counting from ${u.countingFrom}. ` +
-              (u.loginDays.length
-                ? `On the ${u.loginDays.length} day(s) they actually signed in it is ` +
-                  `${perDay(u.totalClicks, u.loginDays.length)} a day.`
-                : 'They have not signed in since then.')
+              tiktokCreated
+                ? `Created ${tiktokCreated.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })} · ${uidSource === 'verified' ? 'from the registration check' : 'seen during a presence scan'}`
+                : 'Not known yet — expand the row to look it up'
             }
           />
-          <Chip
-            label="comments/day"
-            value={perDay(u.totalCommented, daysSince(u.countingFrom))}
-            title={
-              `${u.totalCommented.toLocaleString()} comment(s) over ` +
-              `${daysSince(u.countingFrom)} day(s), counting from ${u.countingFrom}. ` +
-              (u.loginDays.length
-                ? `On the ${u.loginDays.length} day(s) they actually signed in it is ` +
-                  `${perDay(u.totalCommented, u.loginDays.length)} a day.`
-                : 'They have not signed in since then.')
-            }
-          />
-          <Chip label="reposts" value={u.promoLinks.length} accent={unapprovedReposts ? 'amber' : undefined} />
           {/* videos + logins counts are shown only in the expanded details, not the row */}
           {unapprovedReposts + unapprovedVideos > 0 && (
             <span
@@ -3040,16 +3793,76 @@ function UserCard({
             {/* Account */}
             <div className="rounded-lg border border-zinc-800 p-2.5 text-xs text-zinc-400 space-y-1">
               <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Account</div>
+              {/* WHOSE ACCOUNT THIS IS. The block listed a join date, a TikTok
+                  age and an id, and never said the person's name — so an expanded
+                  card read as a set of facts about nobody in particular, and
+                  three of them open at once were impossible to tell apart. */}
+              <div>
+                <span className="text-zinc-500">Name:</span>{' '}
+                <span className="text-zinc-100 font-medium">
+                  {u.profile?.name || u.name || <span className="text-zinc-600">(no name)</span>}
+                </span>
+              </div>
+              {/* Both names, when they differ. The one they registered with is
+                  what an old payment or a support message will be under. */}
+              {u.profile?.name && u.name && u.profile.name !== u.name ? (
+                <div>
+                  <span className="text-zinc-500">Signed up as:</span>{' '}
+                  <span className="text-zinc-300">{u.name}</span>
+                </div>
+              ) : null}
+              <div className="break-all">
+                <span className="text-zinc-500">Email:</span>{' '}
+                <span className="text-zinc-300">{u.email}</span>
+              </div>
+              {/* HOW TO ACTUALLY REACH THEM. Registration demands a phone
+                  number or a Telegram username precisely because the sign-in
+                  email is a Google address nobody reads, and until now the one
+                  screen where somebody needs to chase a payment or query a
+                  rejected link did not show either of them.
+
+                  Both are links, because that is what they are for: the number
+                  dials from a phone, the handle opens the chat. The dash is
+                  deliberate rather than the row being hidden - "no Telegram" is
+                  something to know before you plan to message them. */}
+              <div>
+                <span className="text-zinc-500">Phone:</span>{' '}
+                {u.profile?.phone ? (
+                  <a
+                    href={`tel:${u.profile.phone}`}
+                    className="text-zinc-200 hover:text-emerald-300"
+                    title="Call this number"
+                  >
+                    {u.profile.phone}
+                  </a>
+                ) : (
+                  <span className="text-zinc-600" title="They registered with a Telegram username instead.">
+                    {'—'}
+                  </span>
+                )}
+              </div>
+              <div>
+                <span className="text-zinc-500">Telegram:</span>{' '}
+                {u.profile?.telegram ? (
+                  <a
+                    href={`https://t.me/${u.profile.telegram}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-emerald-400 hover:text-emerald-300"
+                    title="Open this chat in Telegram"
+                  >
+                    @{u.profile.telegram}
+                  </a>
+                ) : (
+                  <span className="text-zinc-600" title="They registered with a phone number instead.">
+                    {'—'}
+                  </span>
+                )}
+              </div>
               <div>
                 <span className="text-zinc-500">Joined:</span>{' '}
                 <span className="text-zinc-200">{fmtDateTime(u.createdAt)}</span>
               </div>
-              {u.profile?.name && u.profile.name !== u.name ? (
-                <div>
-                  <span className="text-zinc-500">Profile name:</span>{' '}
-                  <span className="text-zinc-200">{u.profile.name}</span>
-                </div>
-              ) : null}
               <div>
                 <span className="text-zinc-500">TikTok account created:</span>{' '}
                 {tiktokCreated ? (
@@ -3057,8 +3870,14 @@ function UserCard({
                     className="text-zinc-200"
                     title={
                       `Decoded from their numeric TikTok id (${tiktokUid}), which encodes the ` +
-                      `second the account was minted. Read from a comment of theirs — TikTok ` +
-                      `publishes this nowhere else.`
+                      `second the account was minted. TikTok publishes this nowhere else.\n\n` +
+                      (uidSource === 'verified'
+                        ? 'Read from the comment they posted on the verification video when ' +
+                          'they registered, from the account they had registered. That is the ' +
+                          'id this number is meant to come from.'
+                        : 'Captured opportunistically beside one of their comments during a ' +
+                          'presence scan, not at registration. Still a real id, but it is ' +
+                          'whatever happened to be seen while judging something else.')
                     }
                   >
                     {tiktokCreated.toLocaleDateString(undefined, {
@@ -3067,6 +3886,20 @@ function UserCard({
                       day: 'numeric',
                     })}
                     <span className="text-zinc-500"> · {accountAge(tiktokCreated)}</span>
+                    {/* WHERE THE DATE CAME FROM. The registration check watched
+                        the account comment; a scan-captured id is a by-product
+                        of judging something else and can be stale. An admin
+                        deciding whether an account is too new should be able to
+                        see which of the two they are looking at. */}
+                    <span
+                      className={
+                        uidSource === 'verified'
+                          ? 'ml-1.5 text-[10px] text-emerald-400/80'
+                          : 'ml-1.5 text-[10px] text-zinc-600'
+                      }
+                    >
+                      {uidSource === 'verified' ? '· verified' : '· from a scan'}
+                    </span>
                   </span>
                 ) : uidBusy ? (
                   <span className="text-zinc-600">looking up…</span>
@@ -3095,6 +3928,10 @@ function UserCard({
               <div>
                 <span className="text-zinc-500">Bank:</span>{' '}
                 <span className="text-zinc-200">{u.profile?.bank_account || '—'}</span>
+                {' · '}
+                <span className={u.profile?.bank_name ? 'text-zinc-200' : 'text-amber-400'}>
+                  {u.profile?.bank_name || 'bank not given yet'}
+                </span>
               </div>
               {editLinks ? (
                 <div className="space-y-1.5 mt-1">
@@ -3174,8 +4011,8 @@ function UserCard({
                   <span className="text-zinc-600"> clicked</span>
                 </div>
                 <div className="text-sm text-zinc-200 tabular-nums">
-                  {u.commentedByPlatform[p.key] ?? 0}
-                  <span className="text-zinc-600"> commented</span>
+                  {genreComments(u, genre, u.commentedByPlatform[p.key] ?? 0)}
+                  <span className="text-zinc-600"> commented ≈</span>
                 </div>
                 {u.sampleUrls[p.key]?.length ? (
                   <a
@@ -3478,37 +4315,211 @@ function UserCard({
                   </span>
                 )}
               </span>
-              <span className={`text-sm font-bold tabular-nums ${pendingTotal > 0 ? 'text-amber-300' : 'text-emerald-300'}`}>
-                {fmtBirr(pendingTotal)} birr
+              <span className="flex items-center gap-2">
+                <span className={`text-sm font-bold tabular-nums ${pendingTotal > 0 ? 'text-amber-300' : 'text-emerald-300'}`}>
+                  {fmtBirr(pendingTotal)} birr
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void editPendingPay()}
+                  disabled={editingPay || !pending}
+                  title="Change this pending pay. Their referrer's commission on them changes with it."
+                  className="text-[11px] text-zinc-400 hover:text-white border border-zinc-700 hover:border-zinc-500 rounded px-1.5 py-0.5 disabled:opacity-40"
+                >
+                  {editingPay ? '…' : '✎ Edit'}
+                </button>
               </span>
             </div>
-            {pending && (
-              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-zinc-500 mb-2">
-                <span>Comments {fmtBirr(pending.comments.birr)} ({pending.comments.count})</span>
-                <span>Video {fmtBirr(pending.video.birr)} ({pending.video.count})</span>
-                <span>Repost {fmtBirr(pending.promo.birr)} ({pending.promo.count})</span>
-                <span>Emails {fmtBirr(pending.accounts.birr)} ({pending.accounts.count})</span>
-                <span
-                  title={
-                    `${Math.round(REFERRAL_SHARE * 100)}% of the comment pay of the ` +
-                    `${referral?.people ?? 0} user(s) this person referred. The count is THEIR ` +
-                    'comments, not this user\u2019s. Paid on top \u2014 nothing is deducted from them.'
-                  }
-                  className={pending.referrals.birr > 0 ? 'text-sky-300' : undefined}
-                >
-                  Referrals {fmtBirr(pending.referrals.birr)} ({pending.referrals.count})
-                </span>
-                {pending.accountsAwaiting.count > 0 && (
-                  <span
-                    className="text-amber-400/90"
-                    title="Addresses this worker sent that nobody has checked yet. Not in the total — approve them on the Email task page first."
-                  >
-                    + {fmtBirr(pending.accountsAwaiting.birr)} awaiting check (
-                    {pending.accountsAwaiting.count})
-                  </span>
-                )}
-              </div>
+            {/* THE ARITHMETIC, WRITTEN OUT. This was a row of five figures and a
+                total in the corner, which asks whoever is approving a payment to
+                add up somebody's wages in their head — and gives them no way to
+                see that the total already includes the referral share, which is
+                the one line people query because it is earned on OTHER people's
+                comments.
+
+                So: one line per kind of work, what it is made of, and the sum
+                spelled out. Zero lines are left out; a line that is in the total
+                but not this person's own work says so. */}
+            {/* EVERY EDIT, KEPT. What the pending pay was, what it was changed
+                to, by whom and when — the edit itself is folded into "paid" at
+                the next payout, so this is the only record it ever differed. */}
+            {payHistory.length > 0 && (
+              <details className="mb-2 text-[11px]">
+                <summary className="cursor-pointer text-zinc-500 hover:text-zinc-300">
+                  ✎ {payHistory.length} edit{payHistory.length === 1 ? '' : 's'} to this pending pay
+                </summary>
+                <ul className="mt-1 space-y-0.5">
+                  {payHistory.map((h) => (
+                    <li key={h.id} className="text-zinc-400 tabular-nums">
+                      {new Date(h.at).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}
+                      {' · '}
+                      <span className="text-zinc-300">{fmtBirr(h.beforeBirr)}</span>
+                      {' → '}
+                      <span className="text-amber-300">{fmtBirr(h.afterBirr)}</span> birr
+                      {' '}({h.deltaComments > 0 ? '+' : ''}{h.deltaComments} comments)
+                      {h.referrerDeltaBirr !== 0 &&
+                        ` · referrer ${h.referrerDeltaBirr > 0 ? '+' : ''}${fmtBirr(h.referrerDeltaBirr)}`}
+                      {h.byEmail && <span className="text-zinc-600"> · {h.byEmail}</span>}
+                    </li>
+                  ))}
+                </ul>
+              </details>
             )}
+            {pending && (() => {
+              const parts = [
+                {
+                  key: 'comments',
+                  label: 'Comments',
+                  count: pending.comments.count,
+                  unit: `${pending.comments.count} × ${COMMENT_PAY_RATE}`,
+                  birr: pending.comments.birr,
+                  note: 'their own approved comments',
+                  tone: 'text-zinc-300',
+                },
+                {
+                  key: 'referrals',
+                  label: 'Referral share',
+                  count: pending.referrals.count,
+                  unit: `${pending.referrals.count} × ${REFERRAL_PAY_RATE}`,
+                  birr: pending.referrals.birr,
+                  note:
+                    `${Math.round(REFERRAL_SHARE * 100)}% of ${referral?.people ?? 0} ` +
+                    'referred user(s) comment pay — other people\u2019s work, paid on top',
+                  tone: 'text-sky-300',
+                },
+                {
+                  key: 'video',
+                  label: 'Videos',
+                  count: pending.video.count,
+                  unit: `${pending.video.count} × ${VIDEO_PAYMENT_BIRR}`,
+                  birr: pending.video.birr,
+                  note: 'approved uploads',
+                  tone: 'text-zinc-300',
+                },
+                {
+                  key: 'promo',
+                  label: 'Reposts',
+                  count: pending.promo.count,
+                  unit: `${pending.promo.count} × ${PROMO_PAY_BIRR}`,
+                  birr: pending.promo.birr,
+                  note: 'approved repost links',
+                  tone: 'text-zinc-300',
+                },
+                // EMAIL WORK IS NOT IN THIS SUM. It is approved and paid on the
+                // Email tasks page, one address at a time, by whoever checked it.
+                // Adding it here would show the same money in two places and let
+                // an approval on this card cover mailboxes settled on that one.
+                // It is shown below the total instead, as what that page owes.
+              ].filter((x) => x.birr > 0)
+              const sum = parts.reduce((n, x) => n + x.birr, 0)
+              return (
+                <div className="mb-2">
+                  {parts.length === 0 ? (
+                    <div className="text-xs text-zinc-600">Nothing pending.</div>
+                  ) : (
+                    <>
+                      <div className="text-xs">
+                        {parts.map((x) => (
+                          <div
+                            key={x.key}
+                            className="flex flex-wrap items-baseline gap-x-2 py-0.5"
+                            title={x.note}
+                          >
+                            <span className={`w-28 shrink-0 ${x.tone}`}>{x.label}</span>
+                            <span className="w-24 shrink-0 text-zinc-600 tabular-nums">
+                              {x.unit}
+                            </span>
+                            <span className="text-zinc-600 hidden sm:inline">{x.note}</span>
+                            <span className="ml-auto tabular-nums text-zinc-200">
+                              {fmtBirr(x.birr)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                      {/* The addition itself. Two or more parts is where a total
+                          stops being obvious, so that is where it is shown. */}
+                      <div className="mt-1 pt-1 border-t border-amber-500/20 flex flex-wrap items-baseline gap-x-2 text-xs">
+                        {parts.length > 1 && (
+                          <span className="text-zinc-500 tabular-nums">
+                            {parts.map((x) => fmtBirr(x.birr)).join(' + ')} =
+                          </span>
+                        )}
+                        <span className="font-semibold tabular-nums text-amber-300">
+                          {fmtBirr(sum)} birr
+                        </span>
+                        <span className="text-zinc-600">total for this user</span>
+                      </div>
+                      {/* WHICH GENRE THIS WORKER'S MONEY IS FOR.
+                          Apportioned, not measured: a comment report carries a
+                          platform and a count and no product (see
+                          AdminUserRow.payClicksByGenre), so the pay is divided
+                          in the proportion of the links this worker was given
+                          over the same period, and the referral share in the
+                          proportion their members were given.
+                          Hidden for a worker whose work is all one genre,
+                          because then the split IS the total and the line is
+                          noise. That is everybody until the new products are
+                          switched on. */}
+                      {(() => {
+                        const split: Record<string, number> = {}
+                        const add = (amount: number, w: Record<string, number>) => {
+                          const t = Object.values(w).reduce((a, b) => a + b, 0)
+                          if (amount <= 0 || t <= 0) return
+                          for (const [g, n] of Object.entries(w)) {
+                            split[g] = (split[g] ?? 0) + (amount * n) / t
+                          }
+                        }
+                        add(pending.comments.birr, u.payClicksByGenre ?? {})
+                        add(pending.referrals.birr, u.referralClicksByGenre ?? {})
+                        const list = Object.entries(split)
+                          .filter(([, v]) => v >= 0.01)
+                          .sort((a, b) => b[1] - a[1])
+                        if (list.length < 2) return null
+                        return (
+                          <div className="mt-1 text-[11px] text-zinc-500">
+                            <span className="text-zinc-600">by genre, apportioned: </span>
+                            {list.map(([g, v], i) => (
+                              <span key={g}>
+                                {i > 0 ? ' \u00b7 ' : ''}
+                                <span className="text-zinc-400">
+                                  {GENRE_LABELS[g] ?? (g === '(none)' ? 'no product stamped' : g)}
+                                </span>{' '}
+                                <span className="tabular-nums">{fmtBirr(v)}</span>
+                              </span>
+                            ))}
+                          </div>
+                        )
+                      })()}
+                    </>
+                  )}
+                  {/* The email task, beside the total rather than inside it. An
+                      admin approving this balance needs to know the number exists
+                      and that it is somebody else's button. */}
+                  {(pending.accounts.count > 0 || pending.accountsAwaiting.count > 0) && (
+                    <div className="mt-1.5 pt-1.5 border-t border-zinc-800 text-[11px]">
+                      <span className="text-zinc-500">Email task, paid separately: </span>
+                      {pending.accounts.count > 0 && (
+                        <span className="text-sky-300">
+                          {fmtBirr(pending.accounts.birr)} for {pending.accounts.count} checked
+                          mailbox(es)
+                        </span>
+                      )}
+                      {pending.accountsAwaiting.count > 0 && (
+                        <span className="text-amber-400/90">
+                          {pending.accounts.count > 0 ? ' · ' : ''}
+                          {fmtBirr(pending.accountsAwaiting.birr)} for{' '}
+                          {pending.accountsAwaiting.count} awaiting a check
+                        </span>
+                      )}
+                      <span className="text-zinc-600">
+                        {' '}
+                        — settle it on the Email tasks page; it is not in the total above.
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )
+            })()}
             {/* The referral arrangement, both directions. An admin approving a
                 payment should be able to see who else is being paid because of
                 this user's work, and on whose work this user is being paid. */}
@@ -3608,9 +4619,184 @@ const PLATFORM_DOT: Record<string, string> = {
   youtube_shorts: 'bg-orange-500',
   youtube_videos: 'bg-red-500',
   instagram: 'bg-fuchsia-500',
+  reddit: 'bg-amber-600',
 }
 function platformDot(p: string): string {
   return PLATFORM_DOT[p] ?? 'bg-zinc-600'
+}
+
+
+/**
+ * When every worker's TikTok account was created, in one place.
+ *
+ * The expanded user card has shown this for a while, one person at a time,
+ * which is the wrong shape for the question it answers. Nobody wants to know
+ * how old ONE account is; they want to know which of these accounts were made
+ * last week, because an account minted days before it started working for us is
+ * the shape of a throwaway, and the six-year-old one with a real posting
+ * history is not.
+ *
+ * COSTS NOTHING TO SHOW. The ids are already on the page """ + EM + """ the presence checks
+ * record a worker's numeric TikTok id as they judge their comments, and the
+ * dashboard already passes that map down for the expanded card. The date is
+ * arithmetic on the id: its top 32 bits are the unix second the account was
+ * minted, which is the only place TikTok publishes this at all.
+ *
+ * Sorted NEWEST FIRST for the same reason, and the ones with no id yet are
+ * named rather than quietly left out """ + EM + """ "we do not know" and "it is old" must
+ * not look the same.
+ */
+function TiktokAgeReport({
+  users,
+  accounts,
+}: {
+  users: AdminUserRow[]
+  accounts: Record<string, { handle: string; uid: string }>
+}) {
+  const [open, setOpen] = useState(false)
+  const rows = useMemo(() => {
+    const out: {
+      id: string
+      name: string
+      handle: string
+      created: Date | null
+      /** They gave us a TikTok link but no id has been learned from it yet. */
+      pending: boolean
+    }[] = []
+    for (const u of users) {
+      const link = u.profile?.tiktok_url ?? ''
+      const handle = link.match(/@([^/?#\s]+)/)?.[1]?.toLowerCase() ?? ''
+      if (!handle) continue // no TikTok account at all, so nothing to date
+      const acc = accounts[u.id]
+      // Only an id learned from the handle they use NOW. A worker who changed
+      // handle has an id for the old account, and dating that one would be a
+      // confident answer to a question nobody asked.
+      const uid = acc && acc.handle === handle ? acc.uid : null
+      const created = accountCreatedAt(uid)
+      out.push({
+        id: u.id,
+        name: u.profile?.name || u.name || u.email,
+        handle,
+        created,
+        pending: !created,
+      })
+    }
+    // Newest account first; the ones we cannot date go last, under their own
+    // heading, rather than sorting as if they were ancient.
+    out.sort((a, b) => {
+      if (a.pending !== b.pending) return a.pending ? 1 : -1
+      return (b.created?.getTime() ?? 0) - (a.created?.getTime() ?? 0)
+    })
+    return out
+  }, [users, accounts])
+
+  const known = rows.filter((r) => !r.pending)
+  if (rows.length === 0) return null
+
+  // Buckets are the summary worth reading at a glance. The first two are the
+  // ones that matter: an account younger than the work it is doing.
+  const DAY = 86_400_000
+  const age = (d: Date) => (Date.now() - d.getTime()) / DAY
+  const buckets = [
+    { label: 'under 30 days', tone: 'text-red-300', n: known.filter((r) => age(r.created!) < 30).length },
+    { label: '1-6 months', tone: 'text-amber-300', n: known.filter((r) => age(r.created!) >= 30 && age(r.created!) < 183).length },
+    { label: '6-12 months', tone: 'text-zinc-300', n: known.filter((r) => age(r.created!) >= 183 && age(r.created!) < 365).length },
+    { label: 'over a year', tone: 'text-emerald-300', n: known.filter((r) => age(r.created!) >= 365).length },
+  ].filter((b) => b.n > 0)
+
+  const fmt = (d: Date) =>
+    d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+
+  return (
+    <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3 mb-4">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex flex-wrap items-baseline justify-between gap-2 text-left"
+      >
+        <span className="text-sm font-semibold text-white">
+          🎂 TikTok account ages
+          {/* About the person, not the work: an account is as old as it is in every genre. */}
+          <span className="text-[11px] font-normal text-zinc-500"> · every worker, all genres</span>
+        </span>
+        <span className="text-[11px] text-zinc-500">
+          {known.length} of {rows.length} dated
+          {buckets.map((b) => (
+            <span key={b.label}>
+              {' \u00b7 '}
+              <span className={b.tone}>{b.n}</span> {b.label}
+            </span>
+          ))}
+          <span className="text-zinc-600"> {open ? '\u25b4' : '\u25be'}</span>
+        </span>
+      </button>
+      {open && (
+        <div className="mt-2 overflow-x-auto">
+          <table className="text-xs border-collapse w-full min-w-[420px]">
+            <thead>
+              <tr>
+                {['Worker', 'TikTok', 'Account created', 'Age'].map((h, i) => (
+                  <th
+                    key={h}
+                    className={
+                      (i === 0 ? 'text-left pr-3' : 'px-2 border-l border-zinc-800 text-left') +
+                      ' text-[11px] uppercase tracking-wide text-zinc-500 font-medium py-1'
+                    }
+                  >
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.id} className="border-t border-zinc-800/70">
+                  <td className="pr-3 py-1 text-zinc-300 truncate max-w-[180px]" title={r.name}>
+                    {r.name}
+                  </td>
+                  <td className="px-2 py-1 border-l border-zinc-800">
+                    <a
+                      href={`https://www.tiktok.com/@${r.handle}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-sky-300/80 hover:text-sky-200 truncate"
+                    >
+                      @{r.handle}
+                    </a>
+                  </td>
+                  <td className="px-2 py-1 border-l border-zinc-800 tabular-nums text-zinc-400">
+                    {r.created ? (
+                      fmt(r.created)
+                    ) : (
+                      <span
+                        className="text-zinc-600"
+                        title="No numeric id learned for this handle yet. It is recorded the next time a presence check reads one of their comments, or when their row is expanded."
+                      >
+                        not known yet
+                      </span>
+                    )}
+                  </td>
+                  <td
+                    className={
+                      'px-2 py-1 border-l border-zinc-800 ' +
+                      (r.created && age(r.created) < 30 ? 'text-red-300' : 'text-zinc-400')
+                    }
+                  >
+                    {r.created ? accountAge(r.created) : '\u2014'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="mt-2 text-[11px] text-zinc-600 leading-relaxed">
+            Decoded from each account’s numeric TikTok id, whose top 32 bits are the second it
+            was minted — TikTok publishes the date nowhere else. The id is captured by the
+            comment-presence checks, so a worker nobody has scored yet reads as
+            “not known yet” rather than as an old account.
+          </p>
+        </div>
+      )}
+    </div>
+  )
 }
 
 function DailyClicksTable({
@@ -3631,6 +4817,33 @@ function DailyClicksTable({
   // Only products that actually saw a click in the window get a row; '(none)'
   // (clicks by users with no product) is shown last when present.
   const rows = [...products, '(none)'].filter((p) => (byProduct[p] ?? []).some((d) => d.count > 0))
+  /**
+   * The same days rolled up per genre.
+   *
+   * Summed from byProduct here rather than fetched: a genre is exactly the sum
+   * of its products, so a second server aggregate would be a second chance for
+   * the two to disagree.
+   *
+   * It is the coarse cut and goes ABOVE the product rows, which is also the
+   * order the question is usually asked in — which pool the week went to
+   * first, which advertiser inside it second. Shown only once more than one
+   * genre has clicks: a single-genre band is the All row again.
+   */
+  const genreRows = (() => {
+    const acc: Record<string, number[]> = {}
+    for (const [p, series] of Object.entries(byProduct)) {
+      if (p === '(none)') continue
+      const g = genreOfProduct(p)
+      const into = (acc[g] ??= days.map(() => 0))
+      series.forEach((d, i) => { if (i < into.length) into[i] += d.count })
+    }
+    const list = GENRES.filter((g) => acc[g]?.some((n) => n > 0)).map((g) => ({
+      key: g,
+      counts: acc[g],
+      total: acc[g].reduce((a, b) => a + b, 0),
+    }))
+    return list.length > 1 ? list : []
+  })()
   const platformRows = Object.entries(byPlatform)
     .map(([key, series]) => ({ key, series, total: series.reduce((n, d) => n + d.count, 0) }))
     .filter((r) => r.total > 0)
@@ -3680,6 +4893,34 @@ function DailyClicksTable({
                 </td>
               ))}
             </tr>
+            {genreRows.length > 0 && (
+              <tr>
+                <td
+                  colSpan={days.length + 1}
+                  className="text-[10px] uppercase tracking-wide text-zinc-600 pr-3 pt-2 pb-0.5 border-t border-zinc-800"
+                >
+                  by genre
+                </td>
+              </tr>
+            )}
+            {genreRows.map(({ key, counts, total }) => (
+              <tr key={`genre-${key}`}>
+                <td
+                  className="text-zinc-300 pr-3 py-1 whitespace-nowrap"
+                  title={`${total.toLocaleString()} click(s) in this window`}
+                >
+                  {GENRE_LABELS[key] ?? key}
+                </td>
+                {days.map((d, i) => (
+                  <td
+                    key={d.day}
+                    className="text-zinc-300 px-2 py-1 border-l border-t border-zinc-800 text-center tabular-nums"
+                  >
+                    {(counts[i] ?? 0).toLocaleString()}
+                  </td>
+                ))}
+              </tr>
+            ))}
             {rows.length > 0 && (
               <tr>
                 <td

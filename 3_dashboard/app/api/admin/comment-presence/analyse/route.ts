@@ -10,7 +10,8 @@ import {
   type PresenceLinkRow,
 } from '@/lib/db'
 import { handleFromProfile } from '@/lib/commentPresence'
-import { groqChat } from '@/lib/groq'
+import { llmChat } from '@/lib/llm'
+import { PRESENCE_SYSTEM } from '@/lib/prompts'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
@@ -222,45 +223,7 @@ export async function POST(req: NextRequest) {
       ...spread(skipped, 10).map((r) => sampleOf(r, 'skipped')),
     ]
 
-    const system =
-      'You are helping an admin work out why comments posted by one worker are ' +
-      'not appearing on TikTok videos.\n\n' +
-      'STATUS MEANINGS\n' +
-      '  found   — the comment is visible on the video\n' +
-      '  missing — the full comment list was read and the comment was not in it\n' +
-      '  skipped — the comment list could not be read in full; proves nothing\n\n' +
-      'A missing comment has several possible explanations. Weigh them against ' +
-      'the evidence rather than assuming the first one:\n' +
-      '  1. TikTok filtered or shadow-hid it — spam heuristics, text repeated ' +
-      'across many videos, brand names or links in the comment, posting rate, or ' +
-      'an account already under restriction.\n' +
-      '  2. The video creator deleted it, or has keyword filters. Common when the ' +
-      'video promotes a rival product.\n' +
-      '  3. The worker never actually posted it.\n' +
-      '  4. Nothing systematic — the read simply missed it.\n\n' +
-      'EVIDENCE\n' +
-      '`context` aggregates EVERY judged link in the window: per day, per ' +
-      'product, per video size, the words over-represented in the titles of ' +
-      'missing videos, the exact assigned comment text with its found/missing ' +
-      'tally, and the working pace in seconds between consecutive clicks. ' +
-      '`samples` are individual links you can quote.\n\n' +
-      'WHAT TO LOOK FOR\n' +
-      'Does missing cluster on particular DAYS? A clean run that stops dead ' +
-      'points at the account, not the videos. Does it cluster on one PRODUCT, or ' +
-      'one comment WORDING? That points at the text. Does it cluster on videos ' +
-      'whose titles name rival tools or carry links? That points at creator ' +
-      'moderation. Is the pace too fast for a human to have read the video and ' +
-      'typed a comment? That points at explanation 3.\n\n' +
-      'RULES\n' +
-      'Quote the specific numbers, days, terms or phrases you reason from. Rank ' +
-      'the explanations by how well the evidence supports each, and say plainly ' +
-      'which ones this data cannot tell apart. Treat skipped as no evidence. If ' +
-      'nothing separates found from missing, say so — a wrong pattern is worse ' +
-      'than none, because the admin may block someone over it. End with the one ' +
-      'thing the admin could most usefully check next.\n\n' +
-      'Answer in under 300 words, plain prose, short paragraphs. Use NO markdown ' +
-      'at all: no headings, no bullet lists, no ** for bold, no backticks. It is ' +
-      'rendered as plain text and the symbols would show.'
+    const system = PRESENCE_SYSTEM
 
     const user =
       `context = ${JSON.stringify(context)}\n\n` +
@@ -272,7 +235,7 @@ export async function POST(req: NextRequest) {
         : '') +
       `samples = ${JSON.stringify(samples)}`
 
-    const { content, model } = await groqChat({
+    const { content, model } = await llmChat({
       temperature: 0.2,
       maxTokens: 1100,
       messages: [

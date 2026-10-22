@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
+import { signOut } from '@/lib/auth-client'
 
 interface Props {
   videoUrl: string
@@ -29,17 +30,106 @@ export default function VerifyGate({ videoUrl, tiktokUrl, checkedAt, email }: Pr
   const [checking, setChecking] = useState(false)
   const handle = handleOf(tiktokUrl)
 
+  const [result, setResult] = useState<{ status: string; message: string } | null>(null)
+  const [editing, setEditing] = useState(false)
+  const [newUrl, setNewUrl] = useState(tiktokUrl ?? '')
+  const [saving, setSaving] = useState(false)
+  const [saveErr, setSaveErr] = useState('')
+
+  /**
+   * Point the account at a different TikTok profile, from here.
+   *
+   * THIS IS THE PAGE WHERE THEY FIND OUT. Being told the account is too young,
+   * or that the comment cannot be found, and then having to hunt for where the
+   * link is edited, is how somebody gives up — and the answer to both problems
+   * is usually a different account. The field is on the screen that raised the
+   * question.
+   *
+   * It re-sends the WHOLE profile because /api/profile takes the whole thing
+   * and rejects a partial one; the current values are fetched first so that
+   * changing the link cannot quietly blank a phone number. The server
+   * canonicalises and validates, so its complaint is the one shown.
+   */
+  async function saveLink() {
+    const url = newUrl.trim()
+    if (!url) {
+      setSaveErr('Paste your TikTok profile link first.')
+      return
+    }
+    setSaving(true)
+    setSaveErr('')
+    try {
+      const cur = await fetch('/api/profile').then((r) => r.json()).catch(() => null)
+      const p = (cur?.profile ?? {}) as Record<string, unknown>
+      const res = await fetch('/api/profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: p.name ?? '',
+          bank_account: p.bank_account ?? '',
+          youtube_url: p.youtube_url ?? '',
+          instagram_url: p.instagram_url ?? '',
+          phone: p.phone ?? '',
+          telegram: p.telegram ?? '',
+          tiktok_url: url,
+        }),
+      })
+      const d = (await res.json().catch(() => ({}))) as { error?: string }
+      if (!res.ok) {
+        setSaveErr(d.error || 'Could not save that link.')
+        return
+      }
+      // The old verdict was recorded against the OLD handle, so it stops
+      // counting by itself (see isTiktokVerified). Clear what is on screen so
+      // nothing stale is read as a verdict on the new account.
+      setResult(null)
+      setEditing(false)
+      router.refresh()
+    } catch {
+      setSaveErr('Could not reach the server. Try again.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  /**
+   * Run the check now, rather than refreshing and hoping.
+   *
+   * This used to only call router.refresh(), because verification ran out of
+   * band in a Python checker: the worker pressed the button, nothing visibly
+   * happened, and they pressed it again. The dashboard can read the video's
+   * comments itself, so pressing the button does the thing the button says.
+   */
   async function recheck() {
     setChecking(true)
+    setResult(null)
     try {
-      // Verification runs out of band (a checker reads the video's commenters),
-      // so this just re-reads our own status.
-      router.refresh()
-      await new Promise((r) => setTimeout(r, 900))
+      const res = await fetch('/api/verify-tiktok', { method: 'POST' })
+      const d = (await res.json().catch(() => ({}))) as {
+        verified?: boolean
+        status?: string
+        message?: string
+        error?: string
+      }
+      if (!res.ok) {
+        setResult({ status: 'unreadable', message: d.error || 'Could not check just now.' })
+        return
+      }
+      setResult({ status: String(d.status ?? ''), message: String(d.message ?? '') })
+      // Verified: the links are waiting behind this screen, so go and get them.
+      if (d.verified) router.refresh()
+    } catch {
+      setResult({ status: 'unreadable', message: 'Could not reach the server. Try again.' })
     } finally {
       setChecking(false)
     }
   }
+
+  // AN ACCOUNT THAT IS TOO NEW IS NOT A "TRY AGAIN". Pressing the button a
+  // second time cannot change how old it is, so that one answer is styled as
+  // the end of the road and says what to do instead, rather than sitting in
+  // the same neutral box as "we could not find your comment yet".
+  const terminal = result?.status === 'too_new'
 
   return (
     <div className="max-w-2xl mx-auto px-4 py-8">
@@ -143,7 +233,122 @@ export default function VerifyGate({ videoUrl, tiktokUrl, checkedAt, email }: Pr
           disabled={checking}
           className="text-sm text-zinc-200 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-lg px-4 py-2 transition-colors disabled:opacity-50"
         >
-          {checking ? 'Checking…' : "I've commented — check again"}
+          {checking ? 'Checking…' : "I've commented — check now"}
+        </button>
+      </div>
+
+      {result && (
+        <div
+          className={
+            'mt-4 rounded-xl border p-4 text-sm leading-relaxed ' +
+            (result.status === 'ok'
+              ? 'border-emerald-500/40 bg-emerald-500/5 text-emerald-200'
+              : terminal
+                ? 'border-rose-500/40 bg-rose-500/5 text-rose-200'
+                : 'border-zinc-700 bg-zinc-900/60 text-zinc-300')
+          }
+        >
+          <div className="font-medium mb-1">
+            {result.status === 'ok'
+              ? '✓ Verified'
+              : terminal
+                ? 'This account cannot be used'
+                : 'Not yet'}
+          </div>
+          <div>{result.message}</div>
+          {terminal && (
+            <button
+              onClick={() => setEditing(true)}
+              className="inline-block mt-3 text-sm font-medium text-white bg-rose-600 hover:bg-rose-500 rounded-lg px-4 py-2 transition-colors"
+            >
+              Use a different TikTok account
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* CHANGING THE ACCOUNT, from the page that raised the question. Shown
+          collapsed so it does not compete with the thing most people are here
+          to do, which is comment and press Check. */}
+      <div className="mt-6 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-sm text-zinc-300 font-medium">Your TikTok account</div>
+            <div className="text-xs text-zinc-500 font-mono break-all mt-0.5">
+              {tiktokUrl || 'none saved'}
+            </div>
+          </div>
+          {!editing && (
+            <button
+              onClick={() => {
+                setNewUrl(tiktokUrl ?? '')
+                setSaveErr('')
+                setEditing(true)
+              }}
+              className="text-sm text-zinc-200 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-lg px-3 py-1.5 transition-colors shrink-0"
+            >
+              Change
+            </button>
+          )}
+        </div>
+
+        {editing && (
+          <div className="mt-3">
+            <input
+              type="text"
+              value={newUrl}
+              onChange={(e) => setNewUrl(e.target.value)}
+              placeholder="https://www.tiktok.com/@yourusername"
+              autoComplete="off"
+              spellCheck={false}
+              className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-emerald-500"
+            />
+            <p className="text-xs text-zinc-500 mt-2 leading-relaxed">
+              It has to show your <b className="text-zinc-300">@username</b>. A link to one of
+              your videos will not work, and neither will a short vm.tiktok.com link — neither
+              of them has your username in it.
+            </p>
+            {saveErr && <p className="text-xs text-rose-300 mt-2">{saveErr}</p>}
+            <div className="flex items-center gap-2 mt-3">
+              <button
+                onClick={saveLink}
+                disabled={saving}
+                className="text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg px-4 py-2 transition-colors"
+              >
+                {saving ? 'Saving…' : 'Save this link'}
+              </button>
+              <button
+                onClick={() => {
+                  setEditing(false)
+                  setSaveErr('')
+                }}
+                disabled={saving}
+                className="text-sm text-zinc-400 hover:text-zinc-200 px-2 py-2 transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+            <p className="text-xs text-zinc-600 mt-3 leading-relaxed">
+              Saving a different account starts the check again for that one — comment from it,
+              then press Check.
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* A WAY OUT. This screen holds somebody before they can do anything
+          else, and without this the only exits are the browser's back button
+          and clearing cookies — which matters most on a shared phone, where
+          the person who needs to sign in is not the one currently signed in. */}
+      <div className="mt-6">
+        <button
+          onClick={async () => {
+            await signOut()
+            window.location.href = '/'
+          }}
+          className="text-xs text-zinc-500 hover:text-zinc-300"
+        >
+          Sign out
         </button>
       </div>
 

@@ -8,6 +8,7 @@ import {
   blockUser,
   addAdminMessage,
   canAutoBlock,
+  getBlockRules,
   dbNow,
   type PresenceDay,
 } from '@/lib/db'
@@ -63,9 +64,13 @@ export async function POST(req: NextRequest) {
   // them before this sweep blocks them. Chosen per sweep, clamped to a range
   // that can actually be satisfied — see MIN/MAX_BLOCK_SAMPLE. Absent means the
   // long-standing 50, so an old client keeps the behaviour it expects.
+  // Undefined means "use what is saved", which is what the cron and the verify
+  // button do. A value here overrides the saved sample for THIS sweep only —
+  // useful for trying a harsher pass without changing the standing rule.
+  const saved = await getBlockRules().catch(() => null)
   const blockSample =
     body.blockSample === undefined || body.blockSample === null
-      ? BLOCK_SAMPLE
+      ? (saved?.sample ?? BLOCK_SAMPLE)
       : clampBlockSample(body.blockSample)
 
   // When this sweep began. Everything judged before it is stale and gets read

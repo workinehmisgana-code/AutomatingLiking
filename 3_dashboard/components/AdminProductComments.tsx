@@ -1,19 +1,45 @@
 'use client'
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import {
   isCommentVoice,
   productForms,
   productWords,
+  TOP_LIST_BOUNDS,
   type CommentStyle,
   type CommentVoice,
   type LinkCategory,
   type Product,
+  type TopListRank,
+  type TopListSetting,
 } from '@/lib/config'
-import { buildAudiencePrompt } from '@/lib/commentPrompt'
+import { buildAudiencePrompt } from '@/lib/prompts'
 import LlmModelPicker from '@/components/LlmModelPicker'
+
+/** One row of the measured list, as the settings endpoint returns it. */
+interface TopRow {
+  text: string
+  /** Videos this comment is on, inside the window. */
+  links: number
+  /** Percent of servings that ended up on a link, or null if too few to judge. */
+  ratio: number | null
+  /** Times it was handed out in the window. */
+  served: number
+}
+
+const RANK_LABEL: Record<TopListRank, string> = {
+  links: 'most links',
+  ratio: 'best ratio',
+  balanced: 'reach + ratio',
+}
+
+const RANK_HINT: Record<TopListRank, string> = {
+  links: 'The comments on the most videos. Rewards what has been handed out a lot, whether or not it lands often.',
+  ratio: 'The comments that land most often per serving. Rewards a high hit rate even on few servings — so anything served under 20 times is left out.',
+  balanced: 'Half reach, half hit rate, each scored against the best in the list. The middle answer: nothing wins on volume alone or on a lucky handful.',
+}
 
 function fmtWhen(iso: string | null): string {
   if (!iso) return ''
@@ -90,6 +116,7 @@ export default function AdminProductComments({
   wordMin,
   wordMax,
   style,
+  top,
   perCategory,
   products,
 }: {
@@ -97,6 +124,8 @@ export default function AdminProductComments({
   wordMin: number
   wordMax: number
   style: CommentStyle
+  /** Serve the measured top list instead of the written bank, and how. */
+  top: TopListSetting
   perCategory: AudienceSet[]
   /** Every product, with its set size and whether it is being served. */
   products: { id: string; count: number; active: boolean }[]
@@ -110,6 +139,7 @@ export default function AdminProductComments({
   const [min, setMin] = useState(String(wordMin))
   const [max, setMax] = useState(String(wordMax))
   const [savingBand, setSavingBand] = useState(false)
+  const [savingStyle, setSavingStyle] = useState(false)
   // Writing style. Like the band, it applies on the NEXT regeneration - the
   // stored comments are not rewritten in place.
   const [emoji, setEmoji] = useState(style.emoji)
@@ -121,6 +151,120 @@ export default function AdminProductComments({
   const [voice, setVoice] = useState<CommentVoice>(style.voice)
   // What the server currently holds, so an edited-but-unsaved box is visible.
   const [savedBand, setSavedBand] = useState({ min: wordMin, max: wordMax })
+
+  // ── Serve the comments that measurably landed ──────────────────────────
+  // Everything below is about the OTHER source of comments: not what was
+  // written for this product, but which of its comments have actually been
+  // reaching videos lately.
+  const [topOn, setTopOn] = useState(top.enabled)
+  const [topCount, setTopCount] = useState(String(top.count))
+  const [topRank, setTopRank] = useState<TopListRank>(top.rank)
+  const [topDays, setTopDays] = useState(String(top.days))
+  const [savedTop, setSavedTop] = useState<TopListSetting>(top)
+  const [topSaving, setTopSaving] = useState(false)
+  const [topBusy, setTopBusy] = useState(false)
+  const [topErr, setTopErr] = useState('')
+  const [topList, setTopList] = useState<TopRow[] | null>(null)
+  // The settings the list ON SCREEN was ranked by, which is not always what the
+  // boxes say: changing a box does not re-rank anything until Preview or Save.
+  // Labelling the list from the boxes would rename a list without reordering it.
+  const [topListFor, setTopListFor] = useState<TopListSetting | null>(null)
+
+  /**
+   * Fetch the list the current boxes describe, WITHOUT saving them.
+   *
+   * The preview is the point: the whole setting is a judgement about which
+   * ranking and which window give a list worth serving, and that cannot be
+   * judged from four numbers. It is the same query the server serves from.
+   */
+  async function loadTopList(over?: Partial<TopListSetting>) {
+    setTopBusy(true)
+    setTopErr('')
+    try {
+      const q = new URLSearchParams({
+        product,
+        list: '1',
+        count: String(over?.count ?? topCount),
+        rank: String(over?.rank ?? topRank),
+        days: String(over?.days ?? topDays),
+      })
+      const res = await fetch(`/api/admin/comments/settings?${q.toString()}`)
+      const d = await res.json()
+      if (!res.ok) throw new Error(d?.error ?? 'Failed')
+      setTopList(Array.isArray(d?.list) ? d.list : [])
+      if (d?.listFor) setTopListFor(d.listFor)
+    } catch (e) {
+      setTopErr(String(e))
+      setTopList(null)
+    } finally {
+      setTopBusy(false)
+    }
+  }
+
+  /** Persist the given keys and re-read the list from what was stored. */
+  async function saveTop(patch: {
+    topEnabled?: boolean
+    topCount?: number
+    topRank?: TopListRank
+    topDays?: number
+  }) {
+    setTopSaving(true)
+    setTopErr('')
+    setErr('')
+    try {
+      const res = await fetch('/api/admin/comments/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // The band and style go along unchanged: this endpoint saves the row,
+        // and leaving them out would save the boxes' current text as the band.
+        body: JSON.stringify({ product, min: savedBand.min, max: savedBand.max, ...patch }),
+      })
+      const d = await res.json()
+      if (!res.ok) throw new Error(d?.error ?? 'Failed')
+      if (d?.top) {
+        // Show what was STORED, not what was typed: the server clamps.
+        setSavedTop(d.top)
+        setTopOn(!!d.top.enabled)
+        setTopCount(String(d.top.count))
+        setTopRank(d.top.rank)
+        setTopDays(String(d.top.days))
+      }
+      if (Array.isArray(d?.list) && d.list.length > 0) {
+        setTopList(d.list)
+        setTopListFor(d.top)
+      } else if (d?.top?.enabled) await loadTopList(d.top)
+      setMsg(
+        d?.top?.enabled
+          ? `Serving the top ${d.top.count} by ${RANK_LABEL[d.top.rank as TopListRank]} from the last ${d.top.days} days ✓`
+          : 'Back to the written comments below ✓'
+      )
+    } catch (e) {
+      setTopErr(String(e))
+    } finally {
+      setTopSaving(false)
+    }
+  }
+
+  // WHAT IS EDITED BUT NOT STORED, named one by one.
+  //
+  // This used to be a single sentence naming only the SAVED setting, which read
+  // as though the ranking just chosen were already the one in force — pick
+  // "best ratio" and the warning answered "reach + ratio", the value being
+  // replaced. Naming both ends of each change is the whole fix.
+  const topPending = [
+    Number(topCount) !== savedTop.count ? `how many ${savedTop.count} → ${topCount}` : '',
+    topRank !== savedTop.rank
+      ? `ranked by ${RANK_LABEL[savedTop.rank]} → ${RANK_LABEL[topRank]}`
+      : '',
+    Number(topDays) !== savedTop.days ? `last days ${savedTop.days} → ${topDays}` : '',
+  ].filter(Boolean)
+
+  // Already on when the page opens? Then the list IS what is being served, and
+  // it should be on screen without a click asking for it.
+  useEffect(() => {
+    if (top.enabled) void loadTopList(top)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [product])
 
   // Persist whatever is in the boxes and return the band the server actually
   // stored (it clamps and orders). Every Regenerate calls this first: the range
@@ -155,6 +299,61 @@ export default function AdminProductComments({
     } catch {
       setErr('Network error.')
       return false
+    }
+  }
+
+  /**
+   * Persist a style change the moment it is made.
+   *
+   * THIS WAS THE BUG. The voice selector and the two checkboxes only set local
+   * state, and the only things that wrote them to the database were the button
+   * labelled "Save range" and a regeneration. So changing the voice updated the
+   * preview, looked like it had worked, and was gone on the next page load —
+   * which is exactly "I cannot change the voice". Measured on the real rows: of
+   * six products, one had a voice saved from this control.
+   *
+   * The band keeps its own explicit Save because it is two numbers being typed,
+   * and saving on every keystroke would store "1" on the way to "14".
+   */
+  async function commitStyle(patch: {
+    voice?: CommentVoice
+    emoji?: boolean
+    splitBrand?: boolean
+  }) {
+    setSavingStyle(true)
+    setMsg('')
+    setErr('')
+    try {
+      const res = await fetch('/api/admin/comments/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          product,
+          // The band goes along unchanged: the endpoint takes the whole settings
+          // row, and leaving these out would reset it to the defaults.
+          min: Number(min) || wordMin,
+          max: Number(max) || wordMax,
+          emoji: patch.emoji ?? emoji,
+          splitBrand: patch.splitBrand ?? splitBrand,
+          quoteBrand,
+          voice: patch.voice ?? voice,
+        }),
+      })
+      const d = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setErr(d?.error || 'Could not save the writing style.')
+        return
+      }
+      // Show what the server stored, so a rejected value cannot sit on screen
+      // looking saved.
+      if (isCommentVoice(d.voice)) setVoice(d.voice)
+      if (typeof d.emoji === 'boolean') setEmoji(d.emoji)
+      if (typeof d.splitBrand === 'boolean') setSplitBrand(d.splitBrand)
+      setMsg('Saved. It applies to the next regeneration.')
+    } catch {
+      setErr('Network error.')
+    } finally {
+      setSavingStyle(false)
     }
   }
 
@@ -273,7 +472,26 @@ export default function AdminProductComments({
   // '' = idle, 'all' = the three together, otherwise the category running.
   const [audBusy, setAudBusy] = useState('')
 
+  /**
+   * Regenerate one audience IN THE VOICE ON SCREEN.
+   *
+   * It used to rebuild from the set's recorded recipe, so setting the voice to
+   * informational and pressing Regenerate produced questions — correct by the
+   * rule and indefensible as behaviour. The recipe still protects a hand-built
+   * mix from the nightly rebuild; it does not overrule the person pressing the
+   * button with the dropdown in front of them.
+   *
+   * A mix of two or more voices is worth one question before it is replaced,
+   * because rebuilding from one voice is how a mix gets lost.
+   */
   async function regenerateAudience(category: string) {
+    const set = perCategory.find((c) => c.category === category)
+    const mix = (set?.voices ?? []).filter((v) => v !== voice)
+    if (mix.length > 1 && !confirm(
+      `This set is rebuilt from ${set?.voices.join(' + ')}.\n\n` +
+      `Regenerate it in ${voice} alone? The mix is replaced, and later rebuilds ` +
+      `use ${voice} until you add another voice.`
+    )) return
     setAudBusy(category)
     setMsg('')
     setErr('')
@@ -282,11 +500,13 @@ export default function AdminProductComments({
       const res = await fetch('/api/admin/comments', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ product, category }),
+        body: JSON.stringify({ product, category, voices: [voice] }),
       })
       const d = await res.json().catch(() => ({}))
       if (!res.ok) { setErr(d?.error || 'Regeneration failed.'); return }
-      setMsg(`${AUDIENCE[category]?.label ?? category}: wrote ${d.count ?? 0} comments ✓`)
+      setMsg(
+        `${AUDIENCE[category]?.label ?? category}: wrote ${d.count ?? 0} ${voice} comments ✓`
+      )
       router.refresh()
     } catch {
       setErr('Network error.')
@@ -308,13 +528,15 @@ export default function AdminProductComments({
         const res = await fetch('/api/admin/comments', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ product, category }),
+          // The voice on screen, for the same reason as the single-audience
+          // button: this is a person pressing Regenerate, not the cron.
+          body: JSON.stringify({ product, category, voices: [voice] }),
         })
         const d = await res.json().catch(() => ({}))
         if (res.ok) done += Number(d.count) || 0
         else { setErr(d?.error || `Failed on ${category}.`); break }
       }
-      setMsg(`Wrote ${done} comments across the three audiences ✓`)
+      setMsg(`Wrote ${done} ${voice} comments across the three audiences ✓`)
       router.refresh()
     } catch {
       setErr('Network error.')
@@ -385,6 +607,46 @@ export default function AdminProductComments({
    * saved.
    */
   /**
+   * Make this set rebuild from the voice selected above, and nothing else.
+   *
+   * WHAT THE RECIPE IS FOR, now that Regenerate overrules it. The nightly rebuild
+   * has no dropdown to read, so it goes on making one batch per recorded voice —
+   * which is what stops it flattening a mix somebody built with Add. This button
+   * changes that record without generating anything, for the case where the
+   * nightly job should follow the selection too.
+   *
+   * It used to be the only way to make the voice take effect at all: Regenerate
+   * rebuilt from the recipe, so setting informational and pressing it produced
+   * questions. Correct by the rule and indefensible as behaviour.
+   */
+  async function useOnlyVoice(category: string) {
+    setAudBusy(category)
+    setMsg('')
+    setErr('')
+    try {
+      const res = await fetch('/api/admin/comments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ product, category, voices: [voice], recipeOnly: true }),
+      })
+      const d = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setErr(d?.error || 'Could not change the mix.')
+        return
+      }
+      setMsg(
+        `${AUDIENCE[category]?.label ?? category}: rebuilds from ${voice} alone from now on. ` +
+          'Regenerate it to replace the comments already written.'
+      )
+      router.refresh()
+    } catch {
+      setErr('Network error.')
+    } finally {
+      setAudBusy('')
+    }
+  }
+
+  /**
    * Take one voice out of a set's recipe.
    *
    * The comments it already contributed stay — they are indistinguishable from
@@ -406,7 +668,7 @@ export default function AdminProductComments({
       const res = await fetch('/api/admin/comments', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ product, category, voices: next }),
+        body: JSON.stringify({ product, category, voices: next, recipeOnly: true }),
       })
       const d = await res.json().catch(() => ({}))
       if (!res.ok) { setErr(d?.error || 'Could not change the mix.'); return }
@@ -531,7 +793,7 @@ export default function AdminProductComments({
               disabled={savingBand}
               className="text-sm text-white bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-lg px-3 py-1.5 transition-colors disabled:opacity-50"
             >
-              {savingBand ? 'Saving…' : 'Save range'}
+              {savingBand ? 'Saving…' : 'Save word range'}
             </button>
           </div>
         </div>
@@ -553,7 +815,17 @@ export default function AdminProductComments({
               <input
                 type="checkbox"
                 checked={value}
-                onChange={(e) => set(e.target.checked)}
+                disabled={savingStyle}
+                onChange={(e) => {
+                  set(e.target.checked)
+                  // Same bug as the voice: a checkbox that only moved local state
+                  // looked saved and was not.
+                  void commitStyle(
+                    label === 'Emoji'
+                      ? { emoji: e.target.checked }
+                      : { splitBrand: e.target.checked }
+                  )
+                }}
                 className="accent-emerald-500"
               />
               {label}
@@ -565,7 +837,12 @@ export default function AdminProductComments({
             voice
             <select
               value={voice}
-              onChange={(e) => setVoice(e.target.value as CommentVoice)}
+              onChange={(e) => {
+                const v = e.target.value as CommentVoice
+                setVoice(v)
+                void commitStyle({ voice: v })
+              }}
+              disabled={savingStyle}
               title={[
                 'question — the claim is ASSUMED and the comment asks about something else, so the reader draws the conclusion.',
                 'curious — a question asked OF a person that wants a real answer, with the product folded in as a short aside.',
@@ -596,6 +873,164 @@ export default function AdminProductComments({
             Currently stored: {spread.lo}–{spread.hi} words (avg {spread.avg}) across{' '}
             {storedComments.length} comment{storedComments.length === 1 ? '' : 's'}.
           </p>
+        )}
+      </div>
+
+      {/* Serve the comments that measurably landed, instead of the written ones */}
+      <div
+        className={`rounded-xl border p-3 mb-4 ${
+          topOn ? 'border-emerald-700/60 bg-emerald-950/20' : 'border-zinc-800 bg-zinc-900/40'
+        }`}
+      >
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0">
+            <label className="flex items-center gap-2 text-sm font-semibold text-white cursor-pointer">
+              <input
+                type="checkbox"
+                checked={topOn}
+                disabled={topSaving}
+                onChange={(e) => {
+                  setTopOn(e.target.checked)
+                  void saveTop({ topEnabled: e.target.checked })
+                }}
+                className="accent-emerald-500"
+              />
+              Serve the top comments
+            </label>
+            <p className="text-xs text-zinc-500 mt-1 max-w-md leading-relaxed">
+              On, every click for <span className="text-zinc-300">{product}</span> is answered
+              from the list below — this product&apos;s own comments that have been landing on
+              videos lately — instead of from the written sets further down.{' '}
+              <span className="text-amber-400/80">
+                The written sets are per audience and this list is not
+              </span>
+              , so this trades matching the comment to the video for serving what measurably
+              works.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-end gap-2">
+            <label className="text-xs text-zinc-400">
+              How many
+              <input
+                type="number"
+                min={TOP_LIST_BOUNDS.count.min}
+                max={TOP_LIST_BOUNDS.count.max}
+                value={topCount}
+                onChange={(e) => setTopCount(e.target.value)}
+                title={`The top N to draw from, ${TOP_LIST_BOUNDS.count.min}-${TOP_LIST_BOUNDS.count.max}. Fewer means the same lines repeat under more videos.`}
+                className="mt-1 block w-20 bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+              />
+            </label>
+            <label className="text-xs text-zinc-400">
+              Ranked by
+              <select
+                value={topRank}
+                onChange={(e) => setTopRank(e.target.value as TopListRank)}
+                title={Object.values(RANK_HINT).join('\n\n')}
+                className="mt-1 block bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+              >
+                <option value="balanced">reach + ratio</option>
+                <option value="ratio">best ratio</option>
+                <option value="links">most links</option>
+              </select>
+            </label>
+            <label className="text-xs text-zinc-400">
+              Last days
+              <input
+                type="number"
+                min={TOP_LIST_BOUNDS.days.min}
+                max={TOP_LIST_BOUNDS.days.max}
+                value={topDays}
+                onChange={(e) => setTopDays(e.target.value)}
+                title="Measured on comments POSTED inside this window. A short window follows what is working now; a long one has more to rank on."
+                className="mt-1 block w-20 bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+              />
+            </label>
+            <button
+              onClick={() =>
+                void saveTop({
+                  topCount: Number(topCount),
+                  topRank,
+                  topDays: Number(topDays),
+                })
+              }
+              disabled={topSaving || topBusy}
+              className="text-sm text-white bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-lg px-3 py-1.5 transition-colors disabled:opacity-50"
+            >
+              {topSaving ? 'Saving…' : 'Save'}
+            </button>
+            <button
+              onClick={() => void loadTopList()}
+              disabled={topBusy || topSaving}
+              title="Show the list these boxes describe, without saving them"
+              className="text-sm text-zinc-300 border border-zinc-700 hover:bg-zinc-800 rounded-lg px-3 py-1.5 transition-colors disabled:opacity-50"
+            >
+              {topBusy ? 'Measuring…' : 'Preview'}
+            </button>
+          </div>
+        </div>
+        <p className="text-[11px] text-zinc-600 mt-2 leading-relaxed">{RANK_HINT[topRank]}</p>
+        {topPending.length > 0 && (
+          <p className="text-[11px] text-amber-400/80 mt-1">
+            Not saved: {topPending.join(', ')}.{' '}
+            {topOn
+              ? `Clicks are still answered from the top ${savedTop.count} by ` +
+                `${RANK_LABEL[savedTop.rank]} over ${savedTop.days} days.`
+              : 'The switch above is off, so clicks come from the written sets below either way.'}{' '}
+            Preview ranks the boxes without saving them; Save makes them the stored setting.
+          </p>
+        )}
+        {topErr && <p className="text-xs text-red-400 mt-2">{topErr}</p>}
+
+        {(topOn || topList !== null) && (
+          <div className="mt-3 pt-3 border-t border-zinc-800">
+            <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2">
+              <div className="text-xs font-semibold text-white">
+                {topList === null || topListFor === null
+                  ? 'The list'
+                  : `Top ${topList.length} by ${RANK_LABEL[topListFor.rank]} · last ` +
+                    `${topListFor.days} days`}
+              </div>
+              <div className="text-[11px] text-zinc-600">
+                links = videos it is on · ratio = how often a serving lands · served = times
+                handed out
+              </div>
+            </div>
+            {topBusy && <p className="text-xs text-zinc-500">Measuring…</p>}
+            {!topBusy && topList !== null && topList.length === 0 && (
+              <p className="text-xs text-amber-400/80 leading-relaxed">
+                Nothing measured for {product} in this window
+                {(topListFor?.rank ?? topRank) !== 'links'
+                  ? ' with at least 20 servings to judge a ratio on'
+                  : ''}
+                .
+                Clicks fall back to the written sets below, so nobody is left without a comment
+                — widen the window, or scan more links, to fill this.
+              </p>
+            )}
+            {!topBusy && topList !== null && topList.length > 0 && (
+              <ol className="space-y-1.5">
+                {topList.map((r, i) => (
+                  <li
+                    key={r.text}
+                    className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs"
+                  >
+                    <span className="w-5 shrink-0 text-right text-zinc-600 tabular-nums">
+                      {i + 1}
+                    </span>
+                    <span className="flex-1 min-w-0 text-zinc-200 break-words">{r.text}</span>
+                    <span className="basis-full sm:basis-auto shrink-0 pl-7 sm:pl-0 text-zinc-500 tabular-nums">
+                      {r.links} link{r.links === 1 ? '' : 's'} ·{' '}
+                      <span className={r.ratio === null ? '' : 'text-emerald-400/70'}>
+                        {r.ratio === null ? 'ratio —' : `${r.ratio}%`}
+                      </span>{' '}
+                      · {r.served} served
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            )}
+          </div>
         )}
       </div>
 
@@ -717,6 +1152,26 @@ export default function AdminProductComments({
                   ))}
                   {!voices.length && (
                     <span className="text-[11px] text-zinc-600">(current voice, not a saved mix)</span>
+                  )}
+                  {/* WHAT THE RECIPE STILL DECIDES, now that Regenerate uses the
+                      voice on screen: the NIGHTLY rebuild, which has no dropdown to
+                      read. Saying which is which is the difference between a
+                      mechanism and a surprise. */}
+                  {voices.length > 0 && !voices.includes(voice) && (
+                    <>
+                      <span className="text-[11px] text-zinc-500">
+                        — the nightly rebuild uses that; Regenerate below uses {voice}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void useOnlyVoice(category)}
+                        disabled={audBusy !== ''}
+                        title={`Record ${voice} as this set's recipe, so the nightly rebuild uses it too. Writes no comments — the ones already here stay until you regenerate.`}
+                        className="text-[11px] text-white bg-teal-600 hover:bg-teal-500 rounded px-1.5 py-0.5 disabled:opacity-40"
+                      >
+                        use {voice} nightly too
+                      </button>
+                    </>
                   )}
                 </div>
                 <div className="border-b border-zinc-800">

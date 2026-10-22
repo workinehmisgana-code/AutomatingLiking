@@ -1,23 +1,49 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getClickersOnDay, blockUser, addAdminMessage, canAutoBlock, dbNow } from '@/lib/db'
-import { scoreUserDay, noCommentVerdict, BLOCK_SAMPLE } from '@/lib/commentPresence'
+import {
+  scoreUserRecent,
+  noCommentVerdict,
+  BLOCK_SAMPLE,
+  RECENT_SAMPLE,
+} from '@/lib/commentPresence'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 
-// Nightly: for everyone who opened links today, check how many of those links
-// actually carry a comment from their own account, and store the day's score.
+// Nightly: for everyone who opened links today, read their LAST 300 LINKS and
+// check how many carry a comment from their own account.
 //
-// A user whose comment appears on NONE of a 50-link sample is auto-blocked (see
-// noCommentVerdict). The sample is topped up from earlier days when the day
-// itself is short, unjudgeable links never count toward it, and one found
-// comment anywhere stops it — so a block means fifty consecutive links with
-// nothing on any of them. The admin can unblock from the dashboard.
+// THE LAST 300, NOT THE DAY. It used to score whichever links the user opened
+// today, in full — honest, but not comparable: a day is whatever length it
+// happens to be, so one user was judged on eleven links and another on 1,373, and
+// the same person meant something different on Monday than on Tuesday. The admin's
+// verify button already reads a fixed 300 for exactly that reason, and a nightly
+// check that uses a different population than the button is a check nobody can
+// reconcile with what they see on screen.
 //
-// RESUMABLE BY DESIGN. Scoring one user takes ~10–25 seconds (six links at 1–5s
-// each), so a single 60-second invocation covers only two or three users. The
-// cron therefore runs repeatedly through the evening and each run skips users
-// already scored for the day, picking up where the last one stopped.
+// Three hundred also feeds the rate rule, which needs 200 JUDGED links and gets
+// about 255 out of 300 read (roughly 15% cannot be judged).
+//
+// BOTH BLOCK RULES APPLY, and they are noCommentVerdict's, so this cron, the
+// manual sweep and the button cannot reach different conclusions about somebody:
+//
+//   nothing found on N judged links       — they are not commenting at all
+//   under P% of their last M judged links — they comment occasionally and claim
+//                                           a full day's work
+//
+// N, P and M are set on the dashboard. Unjudgeable links count toward neither,
+// one comment found anywhere stops the first rule, a sample too small to judge
+// blocks nobody, and the admin can unblock from the dashboard.
+//
+// RESUMABLE BY DESIGN, and it has to be: 300 links a person at 1–5 seconds each
+// is minutes per user, so one 60-second invocation covers a fraction of one
+// window. The cron runs every five minutes through the evening, each run skips
+// what the ledger already holds (see FRESH_HOURS) and stops at the first user
+// with links left, so the next run continues them rather than starting somebody
+// else halfway.
+//
+// A window that does not finish tonight simply does not produce a verdict: the
+// block only runs when `remaining` reaches zero.
 //
 // Vercel sends `Authorization: Bearer $CRON_SECRET`; anything else is rejected.
 
@@ -44,6 +70,38 @@ function todayUtc(): string {
   return new Date().toISOString().slice(0, 10)
 }
 
+/** The hour the nightly window opens, in UTC. Matches vercel.json's schedule. */
+const WINDOW_START_HOUR = Math.min(
+  23,
+  Math.max(0, Number(process.env.PRESENCE_WINDOW_START_HOUR || 17))
+)
+
+/**
+ * The instant every run tonight measures its windows from.
+ *
+ * THE WINDOW HAS TO STAND STILL OR NOTHING EVER FINISHES. A user's window is
+ * their newest 300 TikTok links, and these users open 150-400 a day — so each
+ * run judged links that the day's clicking then pushed out of the window, and
+ * the next run found the same 300 unjudged again. The ledger showed it exactly:
+ * three users with 150 links judged and 150 opened since, back to a full window.
+ * A verdict is only reached on a FINISHED window, so the check blocked nobody
+ * who was still working, which is everybody worth checking.
+ *
+ * Derived rather than stored, so it needs no table and every run of a given
+ * night agrees on it without coordinating: the most recent WINDOW_START_HOUR
+ * boundary. Runs before that hour (a manual call, a backfill) pin to the
+ * previous night's boundary, which is equally stable.
+ */
+function windowPin(now = new Date()): string {
+  const pin = new Date(now)
+  pin.setUTCMinutes(0, 0, 0)
+  if (now.getUTCHours() < WINDOW_START_HOUR) {
+    pin.setUTCDate(pin.getUTCDate() - 1)
+  }
+  pin.setUTCHours(WINDOW_START_HOUR)
+  return pin.toISOString()
+}
+
 export async function GET(req: NextRequest) {
   const secret = process.env.CRON_SECRET
   if (secret) {
@@ -52,7 +110,11 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
   }
-  // ?day=YYYY-MM-DD re-scores an earlier day (a missed night, say).
+  // WHICH PEOPLE, NOT WHICH LINKS. The day now selects whose windows to read —
+  // everyone who opened something that day — and the window itself is always
+  // their last RECENT_SAMPLE links, whenever those were opened. ?day=YYYY-MM-DD
+  // therefore means "check the people who were active then", which is what it is
+  // useful for after a missed night.
   const day = req.nextUrl.searchParams.get('day') || todayUtc()
 
   try {
@@ -60,7 +122,7 @@ export async function GET(req: NextRequest) {
     // Already-scored users are skipped, which is what makes repeated runs
     // converge instead of re-doing the same two people every time.
     // NOT "has a row": a row exists as soon as the first link is judged. Only
-    // a user whose every link is in the ledger is finished, and scoreUserDay
+    // a user whose whole window is in the ledger is finished, and scoreUserRecent
     // reports that itself — so nothing is filtered out here beyond users who
     // cannot be scored at all.
     const pending = clickers
@@ -70,19 +132,41 @@ export async function GET(req: NextRequest) {
     const nowIso = await dbNow().catch(() => new Date().toISOString())
     const freshSince = new Date(Date.parse(nowIso) - FRESH_HOURS * 3_600_000).toISOString()
 
+    // One pin for every run tonight: the same 300 links each time, so the work
+    // accumulates instead of being undone by the day's clicking.
+    const pinned = windowPin()
     const deadline = Date.now() + BUDGET_MS
     const scored: { userId: string; judged: number; remaining: number; total: number }[] = []
     const blocked: { userId: string; judged: number; rule?: string; pct?: number | null }[] = []
     for (const c of pending) {
       if (scored.length > 0 && Date.now() >= deadline) break
-      const r = await scoreUserDay(c.userId, c.tiktokUrl, day, deadline, freshSince)
-      if (r) scored.push({ userId: c.userId, ...r })
+      // refreshDays: this is the only pass that reads these links now, so the
+      // per-day rows behind the dashboard's history are rebuilt as it goes —
+      // from the whole ledger for each day, never from this window's slice.
+      const r = await scoreUserRecent(
+        c.userId,
+        c.tiktokUrl,
+        RECENT_SAMPLE,
+        deadline,
+        freshSince,
+        true,
+        pinned
+      )
+      if (r) scored.push({ userId: c.userId, judged: r.judged, remaining: r.remaining, total: r.total })
 
-      // Auto-block only once THIS user's day is fully judged — a partial day
-      // says nothing yet. noCommentVerdict tops the sample up from earlier days
-      // when the day itself is short, and refuses to block on a small sample.
+      // Auto-block only once THIS user's window is fully judged — a partial pass
+      // says nothing yet, because the links it has not reached are exactly where
+      // a comment might be. noCommentVerdict then applies both rules.
       if (r && r.remaining === 0 && (await canAutoBlock(c.userId).catch(() => false))) {
-        const v = await noCommentVerdict(c.userId, c.tiktokUrl, deadline).catch(() => null)
+        // The SAME pin, or the verdict would read a different set of links
+        // than the pass that just declared the window finished.
+        const v = await noCommentVerdict(
+          c.userId,
+          c.tiktokUrl,
+          deadline,
+          undefined,
+          pinned
+        ).catch(() => null)
         if (v?.block) {
           // 'tiktok' is the right reason: it tells them to register a different
           // TikTok account, which is the remedy whether their comments are being
@@ -113,7 +197,13 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json({
       ok: true,
+      // The day whose CLICKERS were checked. Their links may be older: each one
+      // is judged over their last `sample` links, not over this day's.
       day,
+      sample: RECENT_SAMPLE,
+      // The instant the windows are measured from. Every run tonight reports
+      // the same one; if it moves between runs, nothing will ever finish.
+      pinnedAt: pinned,
       clickers: clickers.length,
       usersTouched: scored.length,
       linksJudged: scored.reduce((a, x) => a + x.judged, 0),

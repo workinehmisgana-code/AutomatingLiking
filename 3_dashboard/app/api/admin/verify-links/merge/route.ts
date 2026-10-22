@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
+import { getAdminGenre } from '@/lib/adminGenre'
 import { isAdminEmail } from '@/lib/config'
 import { mergeVerifyLinks } from '@/lib/verifyMerge'
 
@@ -40,7 +41,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    return NextResponse.json(await mergeVerifyLinks({ urls, accounts }))
+    return NextResponse.json(await mergeVerifyLinks({ urls, accounts, genre: await getAdminGenre() }))
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 })
   }

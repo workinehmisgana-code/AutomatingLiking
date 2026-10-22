@@ -11,10 +11,10 @@
 // the links that are.
 
 import { list, put } from '@vercel/blob'
-import { type DateWeights } from './config'
+import { type DateWeights, repairRowPlatform } from './config'
 import {
   getAppState,
-  getBlockedUrls,
+  getBlockedPoolUrls,
   getDateWeights,
   getLinkStats,
   setAppState,
@@ -46,7 +46,7 @@ export async function reclusterPool(explicit?: DateWeights): Promise<ReclusterRe
     cache: 'no-store',
   })
   const data = await res.json()
-  const videos: Video[] = Array.isArray(data) ? data : []
+  const videos: Video[] = Array.isArray(data) ? (data as Video[]).map(repairRowPlatform) : []
   if (videos.length === 0) return { weights, scored: 0, skippedBlocked: 0, total: 0 }
 
   // Refreshed counts first — otherwise a recluster scores the stale numbers
@@ -54,7 +54,7 @@ export async function reclusterPool(explicit?: DateWeights): Promise<ReclusterRe
   // decides the video component far more accurately than the URL can.
   const stats = await getLinkStats().catch(() => ({}) as Record<string, LinkStat>)
   overlayStats(videos, stats)
-  const blocked = new Set(await getBlockedUrls().catch(() => [] as string[]))
+  const blocked = new Set(await getBlockedPoolUrls().catch(() => [] as string[]))
   const active = videos.filter((v) => !blocked.has(String(v.url ?? '')))
 
   // Mutates the rows in place, so untouched blocked entries stay exactly as they

@@ -221,11 +221,11 @@ export default function ScanHistory({ onClose }: { onClose: () => void }) {
 
   return (
     <div
-      className="fixed inset-0 z-[80] flex items-start justify-center bg-black/70 p-4 overflow-y-auto"
+      className="fixed inset-0 z-[80] flex items-start justify-center bg-black/70 p-0 sm:p-4 overflow-y-auto"
       onClick={onClose}
     >
       <div
-        className="bg-zinc-900 border border-zinc-700 rounded-xl w-full max-w-4xl my-8"
+        className="bg-zinc-900 border border-zinc-700 rounded-none sm:rounded-xl w-full max-w-4xl my-0 sm:my-8 min-h-[100dvh] sm:min-h-0"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-3 p-4 border-b border-zinc-800">

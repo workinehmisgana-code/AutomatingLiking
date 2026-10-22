@@ -30,6 +30,26 @@ object Net {
         -1 to ""
     }
 
+    /** POST JSON and return the status code and the response body. */
+    fun postJsonBody(urlStr: String, token: String, json: JSONObject, ctx: Context? = null): Pair<Int, String> = try {
+        val c = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            setRequestProperty("Authorization", "Bearer $token")
+            setRequestProperty("Content-Type", "application/json")
+            addVersion(ctx)
+            connectTimeout = 15000
+            readTimeout = 60000
+        }
+        c.outputStream.use { it.write(json.toString().toByteArray()) }
+        val code = c.responseCode
+        val body = (if (code in 200..299) c.inputStream else c.errorStream)
+            ?.bufferedReader()?.use { it.readText() } ?: ""
+        code to body
+    } catch (e: Exception) {
+        -1 to ""
+    }
+
     fun postJson(urlStr: String, token: String, json: JSONObject, ctx: Context? = null): Int = try {
         val c = (URL(urlStr).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"

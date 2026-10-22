@@ -102,9 +102,9 @@ whether to write again.
 
     python verify_comments.py --list                    # the links, no browser
     python verify_comments.py --profile a --list        # ...just this account's
-    python verify_comments.py --profile a               # read by other accounts
+    python verify_comments.py --profile a               # read by ONE other account
     python verify_comments.py --profile a --as c,d      # ...by these
-    python verify_comments.py --profile a --readers 3   # ask up to three
+    python verify_comments.py --profile a --readers 3   # ...ask up to three
     python verify_comments.py --all                     # every profile with posts
     python verify_comments.py --profile a --as-author   # what a itself can see
 """
@@ -196,58 +196,118 @@ WHOAMI_JS = """async () => {
 }"""
 
 
-def ask_dashboard(rows: list[dict]) -> dict[str, dict]:
-    """Ask the dashboard whether these comments are on the videos.
+# The public comment list, read from this machine with nobody signed in. Four
+# pages, the same depth the dashboard reads.
+PUBLIC_PAGES = 4
+# A read shorter than this is not evidence of absence. The dashboard's number,
+# and the reasoning behind it is worth repeating because the obvious
+# alternatives are wrong and were each tried against real videos:
+#
+#   "complete"      a 4-comment read called itself complete on a video whose
+#                   page showed 8, and reported a live comment gone.
+#   "read >= total" TikTok's own total is throttled along with the list. It
+#                   answered "1 of 1" for a video showing two comments, one of
+#                   which was ours.
+#
+# What is left is the count itself. A read in single figures is a limit on this
+# address, not a comment section.
+PUBLIC_THIN = 10
 
-    THE SAME READ THE ADMIN USES on a worker's comments: one plain request to
-    TikTok's comment list from the dashboard's own server, nobody signed in.
-    Two reasons it is the better answer, and both were measured:
 
-      IT WORKS. From this machine the same request comes back with one to four
-      comments on a video with hundreds — throttled — and a check that reads
-      four comments reports everything as gone. The dashboard's server reads
-      about fifty a link.
+def read_public(url: str, pages: int = PUBLIC_PAGES) -> dict:
+    """One video's comments, signed out. {comments, total, complete, unresolved}.
 
-      IT IS WHAT EVERYONE ELSE SEES. A comment read from the account that wrote
-      it proves only that its author can see it, and TikTok shows a filtered
-      comment to its author and to nobody else. The question worth asking is
-      whether the world can see it.
+    The same request the dashboard makes — TikTok's open comment list, no
+    account, nothing personalised — so the answer is what a stranger would see
+    rather than what a logged-in account on this machine is served.
 
-    Returns {url: result} for the rows it could ask about, and {} when the
-    dashboard is not configured or will not answer — the caller then falls back
-    to the browser, which is a weaker answer but still an answer.
+    `complete` means the list said it had no more to give. That is NOT the same
+    as "we saw everything", which is why PUBLIC_THIN exists beside it.
     """
-    from like import load_env  # local: keeps the import graph one-way
-
-    env = load_env()
-    base = (env.get("DASHBOARD_URL") or "").rstrip("/")
-    token = env.get("LINKS_EXPORT_TOKEN") or ""
-    if not base or not token:
-        return {}
-    out: dict[str, dict] = {}
-    # In batches: the endpoint has sixty seconds and each item is a round trip
-    # to TikTok. Twenty-five is its own cap.
-    for i in range(0, len(rows), 25):
-        chunk = rows[i:i + 25]
-        payload = {"items": [{"url": r["url"], "text": r["text"]} for r in chunk]}
-        req = urllib.request.Request(
-            base + "/api/links/comment-check?" + urlencode({"token": token}),
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"User-Agent": UA, "Content-Type": "application/json"},
-            method="POST",
-        )
+    aweme = video_id(url)
+    if not aweme:
+        return {"comments": [], "total": None, "complete": False, "unresolved": True}
+    out: list[dict] = []
+    seen: set[str] = set()
+    cursor = 0
+    total = None
+    complete = False
+    for _ in range(max(1, pages)):
+        api = (f"https://www.tiktok.com/api/comment/list/?aweme_id={aweme}"
+               f"&count=50&cursor={cursor}&aid=1988")
+        req = urllib.request.Request(api, headers={
+            "User-Agent": UA, "Referer": url, "Accept-Language": "en-US,en;q=0.9"})
         try:
-            with urllib.request.urlopen(req, timeout=90) as r:
-                data = json.loads(r.read().decode("utf-8", errors="replace"))
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace")[:110]
-            print(f"  the dashboard would not check: HTTP {e.code} {detail}")
-            return {}
-        except Exception as e:  # noqa: BLE001
-            print(f"  could not reach the dashboard: {str(e)[:70]}")
-            return {}
-        for res in data.get("results") or []:
-            out[str(res.get("url"))] = res
+            with urllib.request.urlopen(req, timeout=20) as r:
+                body = r.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            break
+        # A throttled request answers 200 with an empty body rather than an error.
+        if not body.strip():
+            break
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            break
+        if total is None and data.get("total") is not None:
+            try:
+                total = int(data["total"])
+            except (TypeError, ValueError):
+                total = None
+        page = data.get("comments") or []
+        for c in page:
+            cid = str(c.get("cid") or "")
+            if cid and cid in seen:
+                continue
+            if cid:
+                seen.add(cid)
+            out.append({
+                "text": str(c.get("text") or ""),
+                "user": str((c.get("user") or {}).get("unique_id") or "").lower(),
+            })
+        if not data.get("has_more") or not page:
+            complete = True
+            break
+        cursor = int(data.get("cursor") or cursor + len(page))
+    return {"comments": out, "total": total, "complete": complete, "unresolved": False}
+
+
+def judge_public(rows: list[dict]) -> dict[str, dict]:
+    """Is each posted comment in the public list? Same rules as the dashboard's.
+
+    MATCHED ON THE TEXT, not the handle: the handle this profile posts under is
+    only readable from inside a browser, and the ledger already knows the exact
+    words it wrote. The first forty characters of the normalised text, found
+    anywhere in a comment's normalised text — so a comment that TikTok has
+    truncated or decorated still matches itself.
+
+    A HIT IS CONCLUSIVE: somebody with no account can see it, which is the whole
+    question. A MISS IS NOT, unless the read was both complete and long enough to
+    mean something; otherwise the link goes to the signed-in readers.
+
+    Returns one entry per row, keyed by url.
+    """
+    out: dict[str, dict] = {}
+    for row in rows:
+        read = read_public(row["url"])
+        needle = norm(row.get("text") or "")[:40]
+        hit = None
+        if not read["unresolved"] and needle:
+            for c in read["comments"]:
+                if needle in norm(c["text"]):
+                    hit = c
+                    break
+        thin = len(read["comments"]) < PUBLIC_THIN
+        out[row["url"]] = {
+            "url": row["url"],
+            "found": hit is not None,
+            "judgeable": hit is not None or
+            (not read["unresolved"] and read["complete"] and not thin),
+            "thin": thin,
+            "readCount": len(read["comments"]),
+            "total": read["total"],
+            "username": (hit or {}).get("user") or None,
+        }
     return out
 
 
@@ -321,7 +381,12 @@ def list_comments(profile: str) -> int:
     print(f"[{profile}] commented on {len(rows)} link(s), newest first")
     for row in rows:
         when = (row["when"] or "").replace("T", " ")[:16]
-        print(f"  {when}  {row['product'] or '-'}")
+        # "own" is the list typed into the dashboard; "bank" the generated set;
+        # "mimic:x" a comment written to match a thread about x.
+        where = {"own": "your list", "bank": "generated"}.get(
+            row.get("source") or "", row.get("source") or "")
+        print(f"  {when}  {row['product'] or '-'}"
+              + (f"  · {where}" if where else ""))
         print(f"    {row['url']}")
         print(f"    \u201c{row['text']}\u201d")
         got = seen.get(row["url"])
@@ -336,6 +401,18 @@ def list_comments(profile: str) -> int:
             print("    not checked yet")
     if by_state:
         print("  " + ", ".join(f"{n} {k}" for k, n in sorted(by_state.items())))
+    # WHAT IT TRIED AND COULD NOT DO. A run that announces eight comments and
+    # posts none of them used to leave this page looking as though it had never
+    # been asked to, which reads exactly like the ledger not saving anything.
+    misses = failed_posts(profile)
+    if misses:
+        print(f"  {len(misses)} comment(s) were attempted and did not post "
+              f"(cleared and retried on the next run):")
+        for when, why, url in misses[-5:]:
+            print(f"    {when.replace('T', ' ')[:16]}  {why[:88] or 'no reason recorded'}")
+            print(f"      {url}")
+        if len(misses) > 5:
+            print(f"    … and {len(misses) - 5} more")
     return len(rows)
 
 
@@ -353,9 +430,42 @@ def posted_rows(profile: str) -> list[dict]:
         for r in csv.reader(f):
             if len(r) < 8 or not str(r[3]).startswith("post:") or r[6] != "ok":
                 continue
+            # The note's first word is where the comment came from, for rows
+            # written since that was recorded. Older rows have none, and say so
+            # by saying nothing.
+            note = str(r[7] or "")
+            source = note.split(" \u2014 ")[0].strip() if " \u2014 " in note else ""
             out.append({"when": r[0], "url": r[1], "aweme": r[2],
-                        "product": r[4], "text": r[5]})
+                        "product": r[4], "text": r[5],
+                        "source": source if source in ("own", "bank") or
+                        source.startswith("mimic") else ""})
     out.reverse()
+    return out
+
+
+def failed_posts(profile: str) -> list[tuple[str, str, str]]:
+    """Comments this profile TRIED to post and did not. (when, why, url).
+
+    Kept apart from posted_rows, which answers "what is out there" and must not
+    start listing things that are not. But a comment announced and never written
+    is the one thing somebody looking at this page wants to know about, and until
+    these rows existed there was nowhere at all to see it.
+
+    Failures are cleared at the start of the next run, so this is a picture of
+    the LAST run rather than a history.
+    """
+    path = done_path(profile)
+    if not path.exists():
+        return []
+    out: list[tuple[str, str, str]] = []
+    for r in csv.reader(path.open(encoding="utf-8", newline="")):
+        # Anything beginning "ok" is an outcome, not a failure: "ok" is a comment
+        # that posted, "ok:already" one that was deliberately not posted because
+        # the account already had one there. Neither belongs in a list of things
+        # that went wrong.
+        if len(r) < 8 or not str(r[3]).startswith("post:") or str(r[6]).startswith("ok"):
+            continue
+        out.append((r[0], str(r[7] or "").strip(), r[1]))
     return out
 
 
@@ -554,14 +664,15 @@ def read_pass(pw, reader: str, rows: list[dict], pages: int, headed: bool,
                 return {}, name or detail.lstrip("@")
             out[row["url"]] = (state, detail)
             if state in ("there", "changed"):
-                print(f"  [{i}/{len(rows)}] {row['aweme']}  {MARKS[state]}"
+                print(f"  [{i}/{len(rows)}] {MARKS[state]}"
                       + (f" — {detail}" if detail else "")
-                      + ("" if as_author else f", seen by @{handle or reader}"))
+                      + ("" if as_author else f", seen by @{handle or reader}")
+                      + f"\n      {row['url']}")
             else:
                 # NOT A VERDICT YET. Another account may well see it; the
                 # verdict is printed once every reader has had its look.
-                print(f"  [{i}/{len(rows)}] {row['aweme']}  not visible to "
-                      f"@{handle or reader}")
+                print(f"  [{i}/{len(rows)}] not visible to @{handle or reader}"
+                      f"\n      {row['url']}")
     finally:
         try:
             ctx.close()
@@ -571,8 +682,8 @@ def read_pass(pw, reader: str, rows: list[dict], pages: int, headed: bool,
 
 
 def run(profile: str, limit: int, pages: int, headed: bool, wait_min: int = 0,
-        no_dashboard: bool = False, as_profile: str = "", as_author: bool = False,
-        readers: int = 2) -> dict:
+        no_public: bool = False, as_profile: str = "", as_author: bool = False,
+        readers: int = 1, browser: bool = False) -> dict:
     rows = posted_rows(profile)
     if limit:
         rows = rows[:limit]
@@ -585,16 +696,26 @@ def run(profile: str, limit: int, pages: int, headed: bool, wait_min: int = 0,
         print(f"[{profile}] no posted comments in its ledger")
         return tally
 
-    # THE DASHBOARD FIRST, and not for convenience. It reads the comment list
-    # signed out, from another machine: no account, nothing to personalise,
-    # nothing to restrict. That is the widest view there is, and a comment found
-    # in it is a comment the world can see. It needs no browser either, so no
-    # profile has to be free for it.
+    # THE SIGNED-OUT READ FIRST, and not for convenience. TikTok's open comment
+    # list, asked with no account at all: nothing to personalise, nothing to
+    # restrict. That is the widest view there is, and a comment found in it is a
+    # comment the world can see. It needs no browser either, so no profile has to
+    # be free for it.
+    #
+    # READ HERE, NOT ASKED OF THE DASHBOARD. It used to post the links to the
+    # dashboard's /api/links/comment-check and let that server make the request.
+    # The rules are the dashboard's either way — judge_public is its route,
+    # line for line — but the request is one HTTP call to a public endpoint, and
+    # routing it through a deployment adds a token, a network hop, a 25-item
+    # batch limit and a sixty-second function timeout to something that needs
+    # none of them. Measured on eight of this profile's links, both routes read
+    # the same comments and reached the same verdicts.
     from_public: set[str] = set()
     answer: dict[str, tuple[str, str]] = {}
-    if not no_dashboard:
-        print(f"[{profile}] asking the dashboard about {len(rows)} posted comment(s)")
-        said = ask_dashboard(rows)
+    if not no_public:
+        print(f"[{profile}] reading the public comment list for "
+              f"{len(rows)} posted comment(s) — signed out, no browser")
+        said = judge_public(rows)
         if said:
             seen_publicly, unsure = [], []
             for row in rows:
@@ -603,26 +724,70 @@ def run(profile: str, limit: int, pages: int, headed: bool, wait_min: int = 0,
             for row in seen_publicly:
                 who = (said.get(row["url"]) or {}).get("username") or "?"
                 answer[row["url"]] = ("there", f"in the public list, as @{who}")
-                print(f"  {row['aweme']}  still there — in the public list, as @{who}")
-            if not unsure:
-                for state, _ in answer.values():
-                    tally[state] += 1
-                note_checks(profile, by_url, answer, ["the signed-out read"])
-                return tally
-            # A MISS IS NOT AN ANSWER. On a throttled read it mostly means the
-            # list came back short, not that the comment is absent — so the
-            # misses go to the signed-in readers rather than being called gone.
+                print(f"  {row['url']}\n    still there — in the public list, as @{who}")
+            # A MISS IS NOT AUTOMATICALLY AN ANSWER. On a short read it means
+            # the list came back truncated, not that the comment is absent. But
+            # a miss on a read that was both complete and long enough IS the
+            # answer, and it is the same one the admin dashboard gives about a
+            # worker's links: the comment is not in the public list.
             solid = {r["url"] for r in unsure
-                     if not (said.get(r["url"]) or {}).get("thin", True)}
-            print(f"[{profile}] {len(unsure)} not in the public read"
-                  + (f" ({len(solid)} of them on a read worth trusting)" if solid else
-                     " — every one of those reads came back thin")
-                  + " — asking signed-in accounts to look")
+                     if (said.get(r["url"]) or {}).get("judgeable")}
+            for row in unsure:
+                if row["url"] in solid:
+                    res = said.get(row["url"]) or {}
+                    answer[row["url"]] = (
+                        "gone",
+                        f"not in a complete public read of "
+                        f"{res.get('readCount')} comment(s)")
+                    print(f"  {MARKS['gone']} — not in the public list\n"
+                          f"      {row['url']}")
+            unsure = [r for r in unsure if r["url"] not in solid]
+            if unsure:
+                print(f"[{profile}] {len(unsure)} could not be judged — "
+                      "the public read came back too short to mean anything:")
+                # NAMED, NOT JUST COUNTED. "27 could not be judged" is a number
+                # nobody can act on: which 27, and how short was short? With the
+                # link and the depth on screen, one of them can be opened and
+                # looked at by eye, which is the only thing that settles it.
+                for row in unsure:
+                    res = said.get(row["url"]) or {}
+                    read = res.get("readCount")
+                    total = res.get("total")
+                    print(f"      read {read} of {total if total is not None else '?'}"
+                          f" comment(s) — {row['url']}")
             rows = unsure
             from_public = solid
         else:
-            print(f"[{profile}] the dashboard could not answer — "
-                  "opening a browser instead")
+            print(f"[{profile}] the public list could not be read at all")
+
+    # NOTHING ELSE IS ASKED unless somebody asks for it.
+    #
+    # This is the admin dashboard's check and only that: TikTok's open comment
+    # list, nobody signed in, a hit conclusive and a miss counted only on a read
+    # worth trusting. Reading with other accounts answers a narrower question —
+    # whether THIS machine's logins are served the comment — and every one of
+    # those readers shares an address and a browser build with the account that
+    # wrote it, so a hit from one proves less than it looks like it does and a
+    # miss costs a free profile and several minutes a video.
+    #
+    # --browser puts that second opinion back for the links the public read
+    # could not settle. --as-author is a different question again and still
+    # opens a browser, because the author's view is the only place a restricted
+    # comment appears.
+    if rows and not (browser or as_author):
+        for row in rows:
+            answer.setdefault(
+                row["url"],
+                ("unknown", "the public read was too short to judge"))
+        for state, _ in answer.values():
+            tally[state] += 1
+        note_checks(profile, by_url, answer, ["the signed-out read"])
+        return tally
+    if not rows:
+        for state, _ in answer.values():
+            tally[state] += 1
+        note_checks(profile, by_url, answer, ["the signed-out read"])
+        return tally
 
     # WHO LOOKS. Not this profile, unless it was asked for: the account that
     # wrote a comment is shown it whatever TikTok has done with it.
@@ -642,6 +807,7 @@ def run(profile: str, limit: int, pages: int, headed: bool, wait_min: int = 0,
     print(f"[{profile}] checking {len(rows)} posted comment(s) "
           + ("in its OWN browser — the author's view, the one view a restricted "
              "comment still appears in" if as_author
+             else "with one other account" if readers == 1
              else f"with up to {readers} other account(s)"))
     tally["browser"] = 1
     pending = list(rows)
@@ -710,7 +876,8 @@ def run(profile: str, limit: int, pages: int, headed: bool, wait_min: int = 0,
             detail += f"; none of {len(used)} accounts were served ours"
             answer[row["url"]] = (state, detail)
         state, detail = answer[row["url"]]
-        print(f"  {row['aweme']}  {MARKS[state]}" + (f" — {detail}" if detail else ""))
+        print(f"  {MARKS[state]}" + (f" — {detail}" if detail else "")
+              + f"\n      {row['url']}")
 
     for state, _ in answer.values():
         tally[state] += 1
@@ -734,15 +901,24 @@ def main() -> int:
     ap.add_argument("--as", dest="as_profile", default="", metavar="PROFILE",
                     help="read with these profiles (comma-separated) instead of "
                          "whichever idle ones are picked. Not the account being checked")
-    ap.add_argument("--readers", type=int, default=2, metavar="N",
-                    help="how many accounts may look before a comment nobody was "
-                         "served is reported. One account's miss is not evidence")
+    ap.add_argument("--readers", type=int, default=1, metavar="N",
+                    help="how many OTHER accounts may look before a comment is "
+                         "reported unseen (default 1). The account that wrote it "
+                         "is never one of them, which is the whole point: TikTok "
+                         "shows a restricted comment to its author and to nobody "
+                         "else. Raise it to 2 or 3 to make a miss harder to "
+                         "reach \u2014 one account's miss can be its own bad page "
+                         "load rather than a missing comment")
     ap.add_argument("--as-author", action="store_true",
                     help="read with the account that wrote the comments. That answers "
                          "a DIFFERENT question — whether its author can see it — and "
                          "a restricted comment looks perfectly healthy from there")
     ap.add_argument("--browser", action="store_true",
-                    help="skip the dashboard and go straight to a signed-in browser")
+                    help="after the public read, ask signed-in accounts about the "
+                         "links it could not judge. Off by default: that answers "
+                         "a narrower question — whether THIS machine's logins are "
+                         "served the comment — and costs a free profile and "
+                         "minutes a video")
     ap.add_argument("--wait", type=int, default=0, metavar="MIN",
                     help="if every profile that could do the reading is in a run, wait "
                          "this many minutes for one to come free")
@@ -777,8 +953,11 @@ def main() -> int:
     totals = {"posted": 0, "there": 0, "changed": 0, "unseen": 0, "gone": 0,
               "unknown": 0, "browser": 0}
     for n in names:
-        t = run(n, args.limit, args.pages, args.headed, args.wait, args.browser,
-                args.as_profile, args.as_author, max(1, args.readers))
+        # The public read always runs; --browser decides only whether anything
+        # it could not settle is taken to a signed-in account afterwards.
+        t = run(n, args.limit, args.pages, args.headed, args.wait, False,
+                args.as_profile, args.as_author, max(1, args.readers),
+                browser=args.browser)
         for k in totals:
             totals[k] += t[k]
         print()
@@ -786,11 +965,35 @@ def main() -> int:
     # Which question was actually answered. "Still there" from the author's own
     # browser is a weaker claim than "still there" from the public list, and a
     # summary that reads the same either way is the one nobody re-reads.
-    if totals.get("browser"):
+    # The public-only run opens no browser, so `browser` stays 0 — and the note
+    # explaining what was read is exactly as useful there. It was gated on the
+    # browser having run, which silenced it on the one path that is now the
+    # default.
+    if not totals.get("browser") and not args.browser and not args.as_author:
+        print("Read from TikTok's open comment list with nobody signed in — the same")
+        print("check the admin dashboard makes on a worker's links. A comment found")
+        print("in it is one the world can see. A comment missing from a read that was")
+        print("complete and long enough is reported GONE; a read that came back short")
+        print("judges nothing, because a truncated list is not an empty one.")
+        print("--browser asks a signed-in account about the ones it could not judge.")
+    elif totals.get("browser"):
         if args.as_author:
             print("Read from the profiles' OWN browsers. A comment is shown to its author")
             print("whatever TikTok has done with it, so \"still there\" here means only")
             print("that it has not been deleted — not that anybody else can see it.")
+        elif not args.browser:
+            print("Read from TikTok's open comment list with nobody signed in \u2014 the same")
+            print("check the admin dashboard makes on a worker's links. A comment found")
+            print("in it is one the world can see. A comment missing from a read that was")
+            print("complete and long enough is reported GONE; a read that came back short")
+            print("judges nothing, because a truncated list is not an empty one.")
+            print("--browser asks a signed-in account about the ones it could not judge.")
+        elif max(1, args.readers) == 1:
+            print("Read by ONE other signed-in account, because a comment its author can")
+            print("see is not a comment anybody else can. That account finding it is proof")
+            print("it is there; that account missing it is weaker evidence \u2014 a slow page")
+            print("or a comment below what loads reads the same as one that is gone.")
+            print("--readers 2 asks a second account before calling anything unseen.")
         else:
             print(f"Read by up to {max(1, args.readers)} other signed-in accounts, because a")
             print("comment its author can see is not a comment anybody else can. A hit by any")
@@ -807,8 +1010,10 @@ def main() -> int:
         # of the accounts that went looking — so whatever the mechanism, that
         # run bought nothing.
         print(f"  {totals['unseen']} UNSEEN — not served to any of the accounts that looked")
-        print("     (their authors still see them; only a signed-out read can call that")
-        print("      a restriction, which is what deploying the dashboard adds)")
+        print("     (their authors still see them. The signed-out read ran first and")
+        print("      came back too short to judge — a read in single figures is a")
+        print("      limit on this address, not a comment section, so it is not")
+        print("      allowed to call anything gone)")
     print(f"  {totals['gone']} gone")
     if totals["unknown"]:
         print(f"  {totals['unknown']} could not be checked — nothing learned about those")

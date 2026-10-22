@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
+import { getAdminGenre } from '@/lib/adminGenre'
 import { isAdminEmail } from '@/lib/config'
 import {
   buildAdminLinks,
@@ -20,9 +21,12 @@ const MAX_ROWS = 1000
 // The page's filters, parsed by the one shared parser, plus the paging this
 // endpoint alone needs. Every other endpoint that scopes work to "the links
 // currently filtered" reads the same query the same way.
-function parseQuery(sp: URLSearchParams): LinkQuery {
+async function parseQuery(sp: URLSearchParams): Promise<LinkQuery> {
   return {
     ...parseLinkQuery(sp),
+    // THE MASTER SWITCH, not the query string: every admin list is one
+    // genre's, and a stale tab sending another genre must not mix them.
+    genre: await getAdminGenre(),
     offset: Math.max(0, Number(sp.get('offset')) || 0),
     limit: Math.min(MAX_ROWS, Math.max(1, Number(sp.get('limit')) || MAX_ROWS)),
   }
@@ -38,7 +42,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   try {
-    const qy = parseQuery(req.nextUrl.searchParams)
+    const qy = await parseQuery(req.nextUrl.searchParams)
     const built = await buildAdminLinks(qy.product ?? '')
     const matched = sortAdminLinks(filterAdminLinks(built.rows, qy, built.retirePlatforms), qy)
 
@@ -54,6 +58,8 @@ export async function GET(req: NextRequest) {
       limit: qy.limit ?? MAX_ROWS,
       counts: built.counts,
       keywords: built.keywords,
+      // Which genre pools have links, so the filter cannot offer an empty one.
+      genres: built.genres,
       uploadDays: built.uploadDays,
       products: built.products,
       retirePlatforms: built.retirePlatforms,

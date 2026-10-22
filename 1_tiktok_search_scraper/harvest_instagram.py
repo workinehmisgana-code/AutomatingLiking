@@ -96,10 +96,27 @@ def api(env: dict, path: str, payload=None, token_key="UPLOAD_SECRET", timeout=1
         return json.loads(r.read().decode("utf-8", errors="replace") or "{}")
 
 
-def ranked_instagram(env: dict, limit: int) -> list[dict]:
-    """The dashboard's ranked Instagram channels, best first."""
+# Kept in step with 3_dashboard/lib/config.ts by hand; it is three words, and
+# the dashboard rejects anything else on upload anyway.
+GENRES = ("humanizer", "website", "slides")
+
+
+def ranked_instagram(env: dict, limit: int, genre: str = "") -> list[dict]:
+    """The dashboard's ranked Instagram channels, best first.
+
+    With a genre, only the channels that belong to it. A channel's genre is its
+    stated one if somebody added it by hand, otherwise the genre most of its
+    existing links already hold — so harvesting one genre visits the accounts
+    that are already feeding that pool, and nothing else.
+
+    THE LIMIT IS APPLIED AFTER THE FILTER. Taking the top 50 and then keeping
+    the website ones would ask for 50 channels and harvest four; the filter has
+    to come first or the number in the window means nothing.
+    """
     d = api(env, "/api/admin/verify-links/extract", token_key="LINKS_EXPORT_TOKEN")
     channels = [c for c in (d.get("channels") or []) if c.get("platform") == "instagram"]
+    if genre:
+        channels = [c for c in channels if (c.get("genre") or "humanizer") == genre]
     return channels[:limit] if limit else channels
 
 
@@ -146,28 +163,63 @@ def main() -> int:
     ap.add_argument("--accounts", help="use this accounts file instead of asking the dashboard")
     ap.add_argument("--dry-run", action="store_true",
                     help="do everything except the scrape and the upload")
-    ap.add_argument("--headed", action="store_true", help="show the browser")
+    ap.add_argument("--headed", action="store_true",
+                    help="(no effect — the scraping browser is always on screen)")
     ap.add_argument("--no-upload", action="store_true",
                     help="scrape, but leave the CSV for a manual upload")
+    # WHICH POOL THIS HARVEST IS FOR.
+    #
+    # Two effects, and both matter: it picks which channels are visited (only
+    # the ones already feeding that genre), and it stamps the genre on every row
+    # staged, so the posts join the right pool and only that product's comments
+    # are ever served on them. Blank is every genre, which is what it did before
+    # genres existed.
+    # No fixed choices: a genre added in the dashboard is valid too. The ranked
+    # channel list is filtered by it on the dashboard's side, and an unknown name
+    # simply matches no channel, which the run says.
+    ap.add_argument("--genre", default="", type=lambda v: v.strip().lower(),
+                    help="only harvest channels of this product genre, and stage "
+                         "their posts into it (blank = every genre)")
     args = ap.parse_args()
 
     env = load_env()
+
+    # Each channel's genre, so a post is staged into ITS channel's pool. Only
+    # filled when the dashboard was asked; see genre_of below.
+    channel_genre: dict[str, str] = {}
 
     # ── 1. which channels ─────────────────────────────────────────────────
     if args.accounts:
         accounts_file = Path(args.accounts)
         print(f"[1/3] using {accounts_file}")
     else:
-        print("[1/3] asking the dashboard for its ranked Instagram channels…")
-        channels = ranked_instagram(env, args.limit)
+        where = f" in {args.genre}" if args.genre else ""
+        print(f"[1/3] asking the dashboard for its ranked Instagram channels{where}…")
+        channels = ranked_instagram(env, args.limit, args.genre)
+        channel_genre = {
+            str(c.get("handle", "")).lstrip("@").lower(): (c.get("genre") or "humanizer")
+            for c in channels
+        }
         if not channels:
-            print("      none returned — is LINKS_EXPORT_TOKEN set, and are there Instagram links?")
+            if args.genre:
+                # Said plainly, because an empty genre is the likely answer long
+                # before a missing token is: a genre with no Instagram links yet
+                # has no channels to rank.
+                print(f"      no Instagram channel belongs to {args.genre} yet — nothing to harvest.")
+                print("      (a channel joins a genre by having links in it, or by being added "
+                      "with that genre on the Links-to-verify page)")
+            else:
+                print("      none returned — is LINKS_EXPORT_TOKEN set, and are there Instagram links?")
             return 1
         RESULTS.mkdir(exist_ok=True)
         accounts_file = RESULTS / f"ig-channels-{time.strftime('%Y%m%d_%H%M%S')}.txt"
         accounts_file.write_text(
             "\n".join(
-                [f"# {len(channels)} instagram channel(s), best first, from the dashboard", ""]
+                [
+                    f"# {len(channels)} instagram channel(s)"
+                    f"{', ' + args.genre if args.genre else ''}, best first, from the dashboard",
+                    "",
+                ]
                 + [f"https://www.instagram.com/{c['handle']}/" for c in channels]
             )
             + "\n",
@@ -185,11 +237,20 @@ def main() -> int:
         return 0
 
     # ── 2. scrape, with the browser that can actually see the posts ───────
+    if args.headed:
+        print("      (--headed is not needed: this scraper always shows its browser)")
     print("\n[2/3] scraping (incremental: stops at the first post already held)…")
     cmd = [sys.executable, "-u", str(HERE / "scrape_channels.py"),
            "--accounts", str(accounts_file), "--platform", "instagram"]
-    if args.headed:
-        cmd.append("--headed")
+    # --headed IS NOT FORWARDED, because scrape_channels.py has no such flag and
+    # refuses the whole run over it:
+    #
+    #   scrape_channels.py: error: unrecognized arguments: --headed
+    #   scrape exited 2 — stopping before the upload.
+    #
+    # It never needed one. That scraper opens a persistent context with
+    # headless=False: the browser is always on screen. The flag here is kept so
+    # an old command line still works, and says what it is.
     rc = subprocess.call(cmd, cwd=str(HERE))
     if rc != 0:
         print(f"      scrape exited {rc} — stopping before the upload.")
@@ -206,6 +267,34 @@ def main() -> int:
         print(f"      --no-upload: left in {after_file}")
         return 0
 
+    # WHICH GENRE EACH POST IS STAGED UNDER.
+    #
+    # A named --genre stamps every row with it. Blank ("every genre") used to
+    # stamp nothing, so the server filed every post as the default — a
+    # website-builder channel's posts landed in the humanizer pool. Now each
+    # row takes its own channel's genre from the ranking. An --accounts file
+    # has no ranking behind it, so the dashboard is asked once for the
+    # channels' genres; a channel it does not know stays unstamped (default).
+    if not args.genre and not channel_genre:
+        try:
+            channel_genre = {
+                str(c.get("handle", "")).lstrip("@").lower(): (c.get("genre") or "humanizer")
+                for c in ranked_instagram(env, 0, "")
+            }
+        except Exception as e:  # the stamp is a refinement, not worth failing over
+            print(f"      could not read channel genres ({e}); posts stage as the default genre")
+
+    def genre_of(row: dict) -> str:
+        if args.genre:
+            return args.genre
+        return channel_genre.get(str(row.get("account", "")).lstrip("@").lower(), "")
+
+    by_genre: dict[str, int] = {}
+    for r in fresh:
+        g = genre_of(r) or "humanizer"
+        by_genre[g] = by_genre.get(g, 0) + 1
+    print("      genres: " + ", ".join(f"{g} {n:,}" for g, n in sorted(by_genre.items())))
+
     sent = 0
     CHUNK = 500
     for i in range(0, len(fresh), CHUNK):
@@ -220,6 +309,11 @@ def main() -> int:
                 "posted_date": r.get("posted_date", ""),
                 "title": r.get("title", ""),
                 "bio": r.get("bio", ""),
+                # Stamped per row rather than per request because that is what
+                # saveVerifyLinks reads, and it is set-never-cleared there: a
+                # blank genre leaves an existing row's genre alone instead of
+                # resetting it to the default.
+                **({"genre": genre_of(r)} if genre_of(r) else {}),
             }
             for r in fresh[i : i + CHUNK]
         ]
@@ -231,7 +325,8 @@ def main() -> int:
             print(f"      upload failed: HTTP {e.code} {e.read()[:200]!r}")
             return 1
 
-    print(f"\nDone. {sent:,} link(s) are waiting on the Links-to-verify page.")
+    into = f" in {args.genre}" if args.genre else ""
+    print(f"\nDone. {sent:,} link(s){into} are waiting on the Links-to-verify page.")
     print("Review them there and merge the ones worth keeping — nothing is live yet.")
     return 0
 

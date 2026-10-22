@@ -35,7 +35,9 @@ const page = read('components/AdminLinks.tsx')
 console.log('the extract saves every comment of ours that it finds:')
 check('  the scan writes them', /saveLinkScan\(/.test(scan), true)
 check('  with the text', /text: h\.text|text/.test(db), true)
-check('  into its own table', /INSERT INTO link_product_comment \(url, product, rank, likes, username, text\)/.test(db), true)
+check('  into its own table',
+      /INSERT INTO link_product_comment \(url, product, rank, likes, username, text, posted_at\)/.test(db),
+      true)
 // A re-scan replaces them, or a comment deleted since would stay in the table for
 // ever and be counted as present.
 check('  replaced wholesale on a re-scan', /DELETE FROM link_product_comment WHERE url = \$1/.test(db), true)
@@ -86,6 +88,14 @@ check('  the ratio is computed once', /ratio: served > 0/.test(db), true)
 // NEVER SERVED IS NOT ZERO YIELD. 2,410 of the distinct texts were posted by the
 // liker and handed to nobody; dividing by nothing is not a failure.
 check('  never-served has no ratio', /NULL, NOT ZERO/.test(db), true)
+// AND "NONE IN THIS WINDOW" IS NOT "NEVER". On a 7-day view 2,146 comments have
+// no serving inside the window and 722 of those were served before it, some
+// hundreds of times. One number cannot tell those apart, so the query returns
+// both.
+check('  the all-time count comes back too', /served_ever AS/.test(db), true)
+check('  with the last date', /max\(k\.clicked_at\) AS last_at/.test(db), true)
+check('  and the row says which it is', /served earlier/.test(ui) && /never served/.test(ui), true)
+check('  saying how many came before the window', /before this window/.test(ui), true)
 check('  and the row says so', /not served/.test(ui), true)
 check('  the totals carry the served count', /served: Number\(srv\[0\]\?\.served \?\? 0\)/.test(db), true)
 
@@ -95,14 +105,87 @@ check('  with what it was out of', /of \{r\.served\.toLocaleString\(\)\} served/
 check('  the overall yield in the header', /overall !== null/.test(ui), true)
 check('  found over handed out, not links over handed out', /100 \* totals\.hits\) \/ totals\.served/.test(ui), true)
 // A low ratio is the actionable end, so it is reachable by one click.
-check('  sortable by worst ratio', /'ratio', 'Worst ratio'/.test(ui), true)
-check('  ignoring comments served a handful of times', /r\.served >= 20/.test(ui), true)
+check('  four orders to read it in', /'links', 'Most links'/.test(ui) && /'served', 'Most served'/.test(ui) &&
+      /'ratio', 'Best ratio'/.test(ui) && /'balanced', 'Reach \+ ratio'/.test(ui), true)
+// HALF AND HALF, each against the best in the list. The two numbers are on
+// different scales — a count that runs to 208 and a percentage mostly under 30 —
+// so adding them raw is a reach count with a rounding error on top.
+check('  the weighted one is 50/50', /0\.5 \* \(r\.links \/ maxLinks\) \+ 0\.5 \* \(\(r\.ratio \?\? 0\) \/ maxPct\)/.test(ui), true)
+check('  normalised, not added', /WHY NORMALISE RATHER THAN ADD/.test(ui), true)
+check('  and the row shows its score', /reach\+ratio score/.test(ui), true)
+check('  ignoring comments served a handful of times', /RATIO_MIN_SERVED = 20/.test(ui), true)
 check('  and a low one is coloured for it', /text-rose-300/.test(ui), true)
 // OVER 100% IS REAL: the liker posts from the same bank, so 43 comments are on
 // more links than they were ever served for. That must not read as a good yield.
 check('  over 100% is not shown as success', /\(r\.ratio \?\? 0\) > 100/.test(ui), true)
 check('  and explains itself', /more links than servings/.test(ui), true)
 check('  the copied list carries both numbers', /\$\{r\.served\}/.test(ui), true)
+
+console.log('\nand it can be narrowed to a period:')
+// BOTH HALVES OR NEITHER. Narrowing the found side to a month while the served
+// side keeps a year of clicks would divide this month's findings by all of last
+// year's serving and call the result a yield. Measured: over 7 days the yield
+// reads 57%, all-time 24% — same links, different denominators.
+check('  the tally takes a window', /days\?: number/.test(db), true)
+// THE COMMENT'S OWN DATE, now that the extract keeps it: TikTok returns
+// create_time on every comment and the parse used to throw it away with the other
+// forty fields. Rows written before that fall back to the link's last scan, which
+// is the only date there ever was.
+// THE COMMENT'S OWN DATE, AND ONLY THAT. Falling back to the link's last scan
+// put a comment posted on 18 August inside a 7-day window, because its link had
+// been scanned yesterday — checked against the video itself. A date we do not
+// have is not evidence of recency.
+check('  the found side is scoped by the posting date alone',
+      /if \(since\) conds\.push\(`c\.posted_at >= \$\{since\}`\)/.test(db), true)
+check('  undated rows are held out, and counted', /undated: number/.test(db), true)
+check('  the page says how many', /have no posting date yet and are/.test(ui), true)
+// AND IT CAN FILL THEM. There is nothing to migrate — the date was never
+// stored and cannot be derived from anything we hold, so it has to come from
+// TikTok: the same extract, aimed at exactly the links that would gain from it.
+check('  there is a button for it', /Get missing dates/.test(ui), true)
+check('  driving its own endpoint', /links\/comment-dates/.test(ui), true)
+check('  which reads the oldest scans first', /ORDER BY s\.scanned_at NULLS FIRST/.test(db), true)
+check('  in batches, to a deadline', /BUDGET_MS/.test(read('app/api/admin/links/comment-dates/route.ts')), true)
+check('  resumably', /remaining: left\.links/.test(read('app/api/admin/links/comment-dates/route.ts')), true)
+check('  and stoppably', /stopDating\.current = true/.test(ui), true)
+// A BAR NEEDS A LENGTH BEFORE IT STARTS, so the route answers a GET with the
+// size of the job, taken over the same scope the work will use.
+check('  the job is measured first', /export async function GET/.test(read('app/api/admin/links/comment-dates/route.ts')), true)
+check('  over one shared scope', /async function scopeUrls/.test(read('app/api/admin/links/comment-dates/route.ts')), true)
+check('  there is a bar', /dateProg\.total > 0/.test(ui), true)
+check('  counted in links, not comments', /COUNTED IN LINKS, NOT COMMENTS/.test(ui), true)
+check('  and it cannot run past its end', /Math\.min\(100, \(100 \* dateProg\.done\)/.test(ui), true)
+// The expanded list is the evidence for the count above it, so it obeys the same
+// window — it used to show every link that ever carried the text.
+check('  the expansion takes the window too', /getLinksForComment\(one, 200, oneDays\)/.test(route), true)
+check('  and each link shows its own date', /l\.postedAt/.test(ui), true)
+check('  the reader parses create_time', /create_time\?: unknown/.test(read('lib/linkStats.ts')), true)
+check('  guarded against a nonsense value', /secs > 1_000_000_000 && secs < 4_000_000_000/.test(read('lib/linkStats.ts')), true)
+check('  the scan carries it', /postedAt: c\.postedAt/.test(read('lib/commentScan.ts')), true)
+check('  the column exists', /ADD COLUMN IF NOT EXISTS posted_at TIMESTAMPTZ/.test(db), true)
+check('  written by the scan', /posted_at\)\n       SELECT \$1, p, r, l, u, t, d::timestamptz/.test(db), true)
+// A read that came back without a date must not erase one an earlier read got.
+check('  and never erased by a dateless re-read',
+      /posted_at = COALESCE\(EXCLUDED\.posted_at, link_product_comment\.posted_at\)/.test(db), true)
+check('  the row shows it', /r\.lastPosted/.test(ui), true)
+check('  marking the fallback as approximate', /` · ~\$\{when\(r\.lastSeen\)\}`/.test(ui), true)
+check('  the served side by the click date', /k\.clicked_at >= \$\{since\}/.test(db), true)
+// LEFT, not inner: a comment with its own date must not be dropped because its
+// link has no scan row.
+check('  the totals are scoped too',
+      /\$\{since \? 'LEFT JOIN link_comment_scan s ON s\.url = c\.url' : ''\}/.test(db), true)
+check('  and clamped', /Math\.min\(3650/.test(db), true)
+// A comment row has no date of its own — a scan writes it, the next scan replaces
+// it — so the only honest reading of "found recently" is "on a link read recently".
+check('  what the window means is written down',
+      /WHAT "FOUND IN THE LAST 30 DAYS" MEANS/.test(db), true)
+check('  and that old rows fall back to the scan date',
+      /fall back to the date their link was last\n \* scanned/.test(db), true)
+check('  the route passes it', /days=N narrows both halves/.test(route), true)
+check('  and reports it in the scope line', /last \$\{days\} days/.test(route), true)
+check('  the modal offers the windows', /<option value=\{50\}>50 days<\/option>/.test(ui), true)
+check('  refetches when it changes', /\[query, all, days, reload\]/.test(ui), true)
+check('  and an empty window says why', /Nothing of ours was posted in the last/.test(ui), true)
 
 // ── the real tally, which is the argument for the feature ───────────────────
 const { Pool } = await import('pg')

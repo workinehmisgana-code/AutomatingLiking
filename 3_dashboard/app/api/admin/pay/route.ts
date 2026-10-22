@@ -15,12 +15,6 @@ import {
 
 export const dynamic = 'force-dynamic'
 
-/** Birr with thousands separators and no trailing .00 — as the dashboard shows it. */
-function fmtBirr(n: number): string {
-  const r = Math.round(n * 100) / 100
-  return Number.isInteger(r) ? r.toLocaleString() : r.toLocaleString(undefined, { minimumFractionDigits: 2 })
-}
-
 // POST { userId, action, undo? }
 //   approve    → mark pending pay approved (user sees "Approved")
 //   unapprove  → undo of approve
@@ -66,10 +60,16 @@ export async function POST(req: NextRequest) {
       // Tell them. Sent AFTER the payment is recorded, so a failure here can
       // never leave a user told about a payment that did not happen — and never
       // blocks the payment itself, which is the part that matters.
+      // NO FIGURE IN THE MESSAGE. It used to name the amount, which reads as a
+      // statement of account from the one side that cannot be questioned: a
+      // worker who disagrees with it has nothing to do but argue, and a number
+      // sent into an inbox outlives whatever was actually transferred. The fact
+      // they need is that it has gone; the amount is a conversation to have with
+      // the bank slip in front of you.
       const messageId = await addAdminMessage(
         userId,
-        `Your payment of ${fmtBirr(amount)} birr has been sent to the bank account on your ` +
-          `profile. Thank you for your work — your balance starts again from zero.`
+        `Your payment has been processed and sent to the bank account on your profile. ` +
+          `Thank you for your work — your balance starts again from zero.`
       ).catch(() => 0)
 
       return NextResponse.json({ ok: true, amount, undo: { ...undo, messageId } })

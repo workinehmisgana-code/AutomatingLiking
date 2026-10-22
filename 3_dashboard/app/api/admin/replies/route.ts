@@ -1,7 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { isAdminEmail } from '@/lib/config'
+import { adminGenreUrlTest } from '@/lib/adminGenre'
+import { isAdminEmail, productsInGenre } from '@/lib/config'
 import {
   getLinksNeedingReplies,
   saveReplyDrafts,
@@ -34,8 +35,10 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   const sp = req.nextUrl.searchParams
+  // The master switch: this genre's links and this genre's drafts only.
+  const inGenre = await adminGenreUrlTest()
   if (sp.get('pending') === '1') {
-    const [list, band, unrelated] = await Promise.all([
+    const [all, band, unrelated] = await Promise.all([
       getLinksNeedingReplies(500).catch(() => []),
       getReplyWordBand({ min: REPLY_WORD_MIN, max: REPLY_WORD_MAX }).catch(() => ({
         min: REPLY_WORD_MIN,
@@ -43,13 +46,14 @@ export async function GET(req: NextRequest) {
       })),
       countReplySkips().catch(() => 0),
     ])
+    const list = all.filter((t) => inGenre.has(t.url))
     return NextResponse.json({ pending: list.length, band, unrelated })
   }
   const offset = Math.max(0, Number(sp.get('offset')) || 0)
   const limit = Math.min(200, Math.max(1, Number(sp.get('limit')) || 50))
   const q = sp.get('q') ?? ''
   try {
-    const page = await getReplyDrafts({ offset, limit, q })
+    const page = await getReplyDrafts({ offset, limit, q, products: productsInGenre(inGenre.genre) })
     return NextResponse.json({ ...page, offset, limit })
   } catch (e) {
     return NextResponse.json({ error: `Could not load: ${String(e)}` }, { status: 500 })
@@ -97,7 +101,8 @@ export async function POST(req: NextRequest) {
   // reply yet. Ordered by top-comment likes, so the most-read comments on the
   // most-engaged videos get a draft first.
   try {
-    const targets = await getLinksNeedingReplies(200)
+    const inGenre = await adminGenreUrlTest()
+    const targets = (await getLinksNeedingReplies(500)).filter((t) => inGenre.has(t.url)).slice(0, 200)
     if (targets.length === 0) {
       return NextResponse.json({ ok: true, generated: 0, remaining: 0, done: true })
     }
@@ -119,7 +124,7 @@ export async function POST(req: NextRequest) {
         const i = next++
         if (i >= chunks.length) return
         attempted += chunks[i].length
-        const { drafts, skips } = await draftReplies(chunks[i], band)
+        const { drafts, skips } = await draftReplies(chunks[i], band, inGenre.genre)
         if (drafts.length > 0) generated += await saveReplyDrafts(drafts).catch(() => 0)
         // Recorded so an unrelated comment is judged once, not on every run.
         if (skips.length > 0) skipped += await saveReplySkips(skips).catch(() => 0)
@@ -127,7 +132,7 @@ export async function POST(req: NextRequest) {
     }
     await Promise.all(Array.from({ length: CONCURRENCY }, worker))
 
-    const left = await getLinksNeedingReplies(500).catch(() => [])
+    const left = (await getLinksNeedingReplies(500).catch(() => [])).filter((t) => inGenre.has(t.url))
     return NextResponse.json({
       ok: true,
       band,

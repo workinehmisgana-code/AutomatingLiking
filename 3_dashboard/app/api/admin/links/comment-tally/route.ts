@@ -1,7 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { isAdminEmail } from '@/lib/config'
+import { getAdminGenre, adminGenreUrlTest } from '@/lib/adminGenre'
+import { isAdminEmail, productsInGenre } from '@/lib/config'
 import { buildAdminLinks, filterAdminLinks, parseLinkQuery } from '@/lib/adminLinks'
 import { getProductCommentTally, getLinksForComment } from '@/lib/db'
 
@@ -30,11 +31,18 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   const sp = req.nextUrl.searchParams
+  // The master switch: only this genre's products are tallied, served or
+  // listed, so a website session never reads humanizer comments.
+  const genre = await getAdminGenre()
+  const products = productsInGenre(genre)
 
   // ── one comment's links, for the row that was expanded ──────────────────
   const one = (sp.get('text') ?? '').trim()
   if (one) {
-    const links = await getLinksForComment(one).catch(() => [])
+    // The same window the list was built with, or the rows would not be the
+    // evidence for the count they hang under.
+    const oneDays = Math.max(0, Math.min(3650, Number(sp.get('days')) || 0))
+    const links = await getLinksForComment(one, 200, oneDays, products).catch(() => [])
     return NextResponse.json({ ok: true, text: one, links })
   }
 
@@ -44,7 +52,7 @@ export async function GET(req: NextRequest) {
     let urls: string[] | undefined
     let label = 'every scanned link'
     if (sp.get('scope') !== 'all') {
-      const qy = parseLinkQuery(sp)
+      const qy = { ...parseLinkQuery(sp), genre }
       const narrowed =
         (qy.clusters?.length ?? 0) > 0 ||
         !!qy.platform ||
@@ -73,8 +81,16 @@ export async function GET(req: NextRequest) {
         }
       }
     }
-    const t = await getProductCommentTally({ urls, limit: 1000 })
-    return NextResponse.json({ ok: true, scope: label, ...t })
+    // ?days=N narrows both halves in time — links scanned inside the window, and
+    // comments served inside it. Absent or 0 is all time.
+    const days = Math.max(0, Math.min(3650, Number(sp.get('days')) || 0))
+    const t = await getProductCommentTally({ urls, limit: 1000, days, products })
+    return NextResponse.json({
+      ok: true,
+      scope: label + (days ? `, last ${days} days` : ''),
+      days,
+      ...t,
+    })
   } catch (e) {
     return NextResponse.json(
       { error: `Could not tally the comments: ${String(e)}` },

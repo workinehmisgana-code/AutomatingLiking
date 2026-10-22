@@ -3,6 +3,7 @@ import { put } from '@vercel/blob'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { isAdminEmail } from '@/lib/config'
+import { DEFAULT_GENRE, isGenre } from '@/lib/config'
 import { loadVideosJson } from '@/lib/videos'
 import {
   getBlockedLinksPage,
@@ -55,7 +56,7 @@ function videoId(url: string): string | null {
  * Returns how many were added. Writes videos.json only when there is something
  * to add: it is a 24 MB blob.
  */
-async function restoreToPool(urls: string[]): Promise<number> {
+async function restoreToPool(urls: string[], genre: string = DEFAULT_GENRE): Promise<number> {
   const tiktok = urls.filter((u) => videoId(u))
   if (tiktok.length === 0) return 0
   if (!process.env.BLOB_READ_WRITE_TOKEN) return 0
@@ -83,6 +84,13 @@ async function restoreToPool(urls: string[]): Promise<number> {
       // No rank, so it belongs to the posted-date clusters only — the same
       // shape a channel-merged link has.
       date_only: true,
+      // Restored rows are TikTok links that were blocked and have since been
+      // unblocked; the pool row they are replacing is gone, so its genre is
+      // gone with it. The default is the honest guess — everything blocked so
+      // far predates genres — and the admin can re-file it from the Links page.
+      // Now the genre the lifted block was for: that is the pool it is
+      // being let back into.
+      genre,
     })
   }
   await put('videos.json', JSON.stringify(videos), {
@@ -100,12 +108,16 @@ export async function GET(req: NextRequest) {
   }
   const sp = req.nextUrl.searchParams
   const q = sp.get('q') ?? ''
+  // The master genre switch: the block list is one genre's, like every other
+  // list. Blank (an older page) is every genre.
+  const genreParam = sp.get('genre') ?? ''
+  const genre = isGenre(genreParam) ? genreParam : undefined
 
   // count=1 → just the size of the block list. Used for the button label, so it
   // must not pay the 24 MB pool read that a full page does.
   if (sp.get('count') === '1') {
     try {
-      const { matched } = await getBlockedLinksPage({ offset: 0, limit: 1, q })
+      const { matched } = await getBlockedLinksPage({ offset: 0, limit: 1, q, genre })
       return NextResponse.json({ matched })
     } catch (e) {
       return NextResponse.json({ error: `Could not count: ${String(e)}` }, { status: 500 })
@@ -120,7 +132,7 @@ export async function GET(req: NextRequest) {
     const sortRaw = sp.get('sort')
     const sort: BlockedSort = sortRaw === 'oldest' || sortRaw === 'url' ? sortRaw : 'recent'
     try {
-      const page = await getBlockedChannels({ offset, limit, q, sort })
+      const page = await getBlockedChannels({ offset, limit, q, sort, genre })
       return NextResponse.json({ ...page, offset, limit })
     } catch (e) {
       return NextResponse.json({ error: `Could not group by channel: ${String(e)}` }, { status: 500 })
@@ -130,7 +142,7 @@ export async function GET(req: NextRequest) {
   // urls=1 → every matching URL, for "select all matching". No pool load needed.
   if (sp.get('urls') === '1') {
     try {
-      return NextResponse.json({ urls: await getBlockedLinkUrls(q) })
+      return NextResponse.json({ urls: await getBlockedLinkUrls(q, genre) })
     } catch (e) {
       return NextResponse.json({ error: `Could not list: ${String(e)}` }, { status: 500 })
     }
@@ -144,7 +156,7 @@ export async function GET(req: NextRequest) {
 
   try {
     const [page, videos] = await Promise.all([
-      getBlockedLinksPage({ offset, limit, q, sort }),
+      getBlockedLinksPage({ offset, limit, q, sort, genre }),
       loadVideosJson().catch(() => []),
     ])
     const inPool = new Set(videos.map((v) => String(v.url ?? '')))
@@ -168,13 +180,17 @@ export async function POST(req: NextRequest) {
     action?: unknown
     urls?: unknown
     handles?: unknown
+    genre?: unknown
   }
   const action = String(body.action ?? '')
+  // WHICH GENRE'S BLOCK. Blocks are per genre: unblocking under Website lifts
+  // the website block and leaves a humanizer block on the same link alone.
+  const genre = isGenre(body.genre) ? body.genre : DEFAULT_GENRE
   // `handles` unblocks whole channels — a block is usually a judgement about a
   // channel, so undoing one link at a time would be the wrong unit of work.
   const handles = Array.isArray(body.handles) ? body.handles.map((h) => String(h)) : []
   const urls = handles.length > 0
-    ? await getBlockedUrlsForChannels(handles).catch(() => [] as string[])
+    ? await getBlockedUrlsForChannels(handles, genre).catch(() => [] as string[])
     : Array.isArray(body.urls) ? body.urls.map((u) => String(u)) : []
   if (urls.length === 0) {
     return NextResponse.json({ error: 'No links given.' }, { status: 400 })
@@ -186,13 +202,13 @@ export async function POST(req: NextRequest) {
     // block is here so an accidental unblock can be undone in one click, from
     // the same screen, without hunting the links down again.
     if (action === 'block') {
-      const n = await blockLinks(urls)
+      const n = await blockLinks(urls, genre)
       return NextResponse.json({ ok: true, action, changed: n })
     }
-    const n = await unblockLinks(urls)
+    const n = await unblockLinks(urls, genre)
     // Restore AFTER the block is lifted, so a link can never be back in the pool
     // while still filtered out of every serve path.
-    const restored = await restoreToPool(urls).catch(() => 0)
+    const restored = await restoreToPool(urls, genre).catch(() => 0)
     return NextResponse.json({ ok: true, action, changed: n, restored })
   } catch (e) {
     return NextResponse.json({ error: `Could not ${action}: ${String(e)}` }, { status: 500 })

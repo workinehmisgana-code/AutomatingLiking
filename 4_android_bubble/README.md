@@ -66,3 +66,36 @@ Android SDK). No AndroidX / third-party libraries.
   bubble survives battery savers.
 - The older static `/api/links/export` + `LINKS_EXPORT_TOKEN` are no longer used by
   the app (superseded by per-user auth); you can leave or remove them.
+
+## Comment liker (Zefoy), on the phone
+
+Dashboard > **Comment liker**. Press Start and the phone works through the link
+list, sending Comments Hearts the way `2_comment_automation/automate.py` does on
+the PC.
+
+**Nothing is configured in the app.** The clusters, platform, products, margin,
+rounds, floor and ceiling are set on the dashboard at `/admin/liker`, and the app
+asks for them on every Start, so a change there is what the next run uses. The
+dashboard also decides WHICH links: clusters are relative — assigned by splitting
+the sorted pool per platform — so they exist nowhere in the database and only the
+dashboard can produce the same numbers the Links page shows. Links that carry
+none of our comments are dropped before the list is sent.
+
+**You type the captcha.** The PC's runner sends the image to Gemini; the phone
+does not, because an API key on a handset is a key that leaves the building. The
+engine stops, says so, and waits for it to be typed into the Browser tab — which
+is why that tab exists and why the screen is held awake while a run is going.
+
+Why there are two implementations of the heart rules: Playwright cannot run on
+Android and a WebView cannot run Python. What stops them drifting is that the
+NUMBERS come from one place (the dashboard) and that `LikerRulesTest` and
+`LikerPickTest` assert the same cases as `check_to_top.py` on the Python side.
+
+| file | what it is |
+| --- | --- |
+| `LikerApi.kt` | what the dashboard sends: settings + links |
+| `LikerRules.kt` | how many hearts, and which of our comments gets them |
+| `ZefoyScript.kt` | every Zefoy selector, injected into the WebView |
+| `ZefoyWeb.kt` | the WebView driven one blocking call at a time |
+| `ZefoyEngine.kt` | the run: search, cooldown, scan, submit, watch |
+| `LikerActivity.kt` | Start/Stop, the browser tab and the log |

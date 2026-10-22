@@ -37,26 +37,6 @@ export function clusterCountForDimension(dim: 'rank' | 'date' | 'combined'): num
 // same instant. It is now a probability per served link, set on the admin Links
 // page and stored in app_kv; see lib/clusterMix.ts.
 
-/**
- * Links the comment scan will read in one go.
- *
- * Reading a video's comments takes 1–5 seconds, so this is the only thing that
- * decides how long a scan runs — 4,000 links is several hours, and the whole
- * pool would be days.
- *
- * The limit used to be on CLUSTERS, which was a poor proxy: a cluster is a
- * relative slice, so "5 clusters" is ~900 links on one filter and tens of
- * thousands on another, and it blocked small deliberate selections that had no
- * clusters ticked at all. Counting the links counts the actual cost.
- *
- * Both the button and the route enforce this, from here, so they cannot
- * disagree.
- *
- * Lives in config rather than the route because a Next.js route file may only
- * export handlers and its own framework settings — exporting anything else fails
- * the production build with "not a valid Route export field".
- */
-export const SCAN_MAX_LINKS = 4000
 
 // ── Link audience categories ─────────────────────────────────────────────────
 // Every link is sorted into ONE audience, from its caption and its channel's bio.
@@ -88,6 +68,43 @@ export const DEFAULT_LINK_CATEGORY: LinkCategory = 'generic'
  * video we scraped from these keywords.
  */
 export const FALLBACK_COMMENT_CATEGORY: LinkCategory = 'competitors'
+
+/**
+ * The audience to serve for a link of this genre that has no category.
+ *
+ * 'competitors' is the right guess for a humanizer link, for the reasons above:
+ * three quarters of the classified pool landed there and its comments assume
+ * only that the viewer is shopping for a tool like ours.
+ *
+ * THE OTHER GENRES START ON 'generic', and the classifier is not run on them at
+ * all. The three audiences were drawn for humanizers — 'ai_detector' means
+ * nothing to a slide maker — and their links all arrive from genre-specific
+ * searches anyway, so splitting them by audience buys very little on day one.
+ * When it does, this is the function to change and the categoriser is the other.
+ */
+export function fallbackCategory(genre: string): LinkCategory {
+  return genre === DEFAULT_GENRE ? FALLBACK_COMMENT_CATEGORY : 'generic'
+}
+
+/**
+ * The audiences a genre's comments are written for.
+ *
+ * Three for humanizers, one for the rest — the same reasoning as
+ * fallbackCategory: the classifier is not run on those genres, so every link in
+ * them is 'generic' and a set written for 'ai_detector' would never be served.
+ *
+ * Used by the admin page, so it shows one panel instead of three empty ones, and
+ * by the regeneration so it does not spend an LLM call per audience per product
+ * writing comments nothing will ask for.
+ */
+export function audiencesForGenre(genre: string): readonly LinkCategory[] {
+  return genre === DEFAULT_GENRE ? LINK_CATEGORIES : (['generic'] as const)
+}
+
+/** The audiences one product's comments are written for. */
+export function audiencesForProduct(product: string): readonly LinkCategory[] {
+  return audiencesForGenre(genreOfProduct(product))
+}
 
 export function isLinkCategory(v: unknown): v is LinkCategory {
   return typeof v === 'string' && (LINK_CATEGORIES as readonly string[]).includes(v)
@@ -248,6 +265,26 @@ export function isAppOutdated(
 // Override with NEXT_PUBLIC_ADMIN_TELEGRAM.
 export const ADMIN_TELEGRAM = (process.env.NEXT_PUBLIC_ADMIN_TELEGRAM || 'YourAdminHandle').replace(/^@/, '')
 
+/**
+ * TEST ACCOUNTS: the owner's own accounts, used to try the app as a worker.
+ *
+ * Never restricted by the machinery that protects the pool from workers: not
+ * auto-blocked by comment checks, not held by the TikTok account-age gate, and
+ * not stopped by the hourly link limits. Everything else (pay, records, the
+ * screens) behaves exactly as for anyone, which is the point of testing with
+ * them. Extend with TEST_EMAILS (comma-separated).
+ */
+const TEST_EMAILS = [
+  'kirubelman3@gmail.com',
+  ...String(process.env.TEST_EMAILS ?? '').split(','),
+]
+  .map((e) => e.trim().toLowerCase())
+  .filter(Boolean)
+
+export function isTestEmail(email: string | null | undefined): boolean {
+  return !!email && TEST_EMAILS.includes(email.trim().toLowerCase())
+}
+
 export function isAdminEmail(email: string | null | undefined): boolean {
   if (!email) return false
   const e = email.toLowerCase()
@@ -285,6 +322,91 @@ export function validateProfileLink(
   return null
 }
 
+// ── The TikTok profile link, exactly ────────────────────────────────────
+//
+// IT HAS TO BE THE @USERNAME FORM: https://www.tiktok.com/@username.
+//
+// A host check is not enough, and that is not a tidiness preference. Everything
+// downstream reads the @username straight out of this string — the verification
+// gate looks for that handle in a video's commenters, the comment-presence scan
+// judges a user's work by it, and `handleFromProfile` in lib/commentPresence.ts
+// is a single `/@([^/?#\s]+)/`. A link with no @ in it returns null there, so the
+// person can never be verified and their work can never be credited: they sit at
+// the gate forever with nothing visibly wrong.
+//
+// So these are all rejected, each for a reason that cannot be worked around:
+//
+//   tiktok.com/username            no @ — not a handle we can look for
+//   tiktok.com/@user/video/123     a video, not the account that posted it
+//   vm.tiktok.com/ZMabc123         a short link; the username is behind a
+//                                  redirect and is not in the text at all
+//   tiktok.com/t/ZTabc123          the same, in TikTok's other share form
+//
+// What IS accepted is the same link written casually: no https://, no www., a
+// trailing slash, TikTok's own `?_t=…&_r=1` share parameters, or odd case.
+// Those name the right account unambiguously, so they are tidied rather than
+// bounced — refusing somebody over a trailing slash is a support message, not a
+// data problem.
+export const TIKTOK_PROFILE_EXAMPLE = 'https://www.tiktok.com/@username'
+
+// TikTok's own rule for a username: letters, digits, underscores and periods.
+const TIKTOK_HANDLE_RE = /^[a-zA-Z0-9._]{2,24}$/
+
+/**
+ * The canonical form of a TikTok profile link, or null if it is not one.
+ *
+ * Returns both, because callers need both: `url` is what gets stored so every
+ * row looks the same, and `handle` (lowercased) is what the verifier and the
+ * presence scan actually search for.
+ */
+export function canonicalTiktokProfile(
+  raw: string | null | undefined
+): { url: string; handle: string } | null {
+  const v = String(raw ?? '').trim()
+  if (!v) return null
+  let url: URL
+  try {
+    url = new URL(/^https?:\/\//i.test(v) ? v : `https://${v}`)
+  } catch {
+    return null
+  }
+  const host = url.hostname.replace(/^www\./i, '').toLowerCase()
+  if (host !== 'tiktok.com' && !host.endsWith('.tiktok.com')) return null
+  // One path segment and it must be the handle. Two or more is a video, a photo
+  // or a /t/ share link; none at all is tiktok.com itself.
+  const parts = url.pathname.split('/').filter(Boolean)
+  if (parts.length !== 1) return null
+  const first = decodeURIComponent(parts[0])
+  if (!first.startsWith('@')) return null
+  const handle = first.slice(1)
+  if (!TIKTOK_HANDLE_RE.test(handle)) return null
+  // The handle keeps the case it was typed in — it is what the person sees on
+  // their own profile. Matching is done on the lowercased copy.
+  return { url: `https://www.tiktok.com/@${handle}`, handle: handle.toLowerCase() }
+}
+
+/** True when a stored link is not in the @username form (and is not empty). */
+export function isTiktokProfileMisformatted(raw: string | null | undefined): boolean {
+  const v = String(raw ?? '').trim()
+  return v.length > 0 && canonicalTiktokProfile(v) === null
+}
+
+/**
+ * The error a person sees. One error string, in their words, saying what to
+ * paste — a message that only says "invalid" sends them to ask somebody.
+ */
+export function validateTiktokProfile(value: string | null | undefined): string | null {
+  const v = String(value ?? '').trim()
+  if (!v) return 'Your TikTok profile link is required.'
+  if (canonicalTiktokProfile(v)) return null
+  return (
+    'That is not a TikTok profile link. It has to be your own profile, in this form: ' +
+    `${TIKTOK_PROFILE_EXAMPLE} — open your profile in the TikTok app, tap the arrow or ` +
+    'the three dots, choose "Copy link", and paste it here. A link to one of your ' +
+    'videos, a vm.tiktok.com short link, or a link without the @ in it cannot be used.'
+  )
+}
+
 // Validate the links. TikTok is required; YouTube/Instagram are optional but must
 // be valid if provided. Returns the first error, or null if all valid.
 export function validateAllProfileLinks(links: {
@@ -292,7 +414,13 @@ export function validateAllProfileLinks(links: {
   youtube_url?: string | null
   instagram_url?: string | null
 }): string | null {
+  // TikTok is held to the @username form rather than to its host, for the
+  // reasons above. The other two are only checked for being the right site:
+  // nothing reads a handle out of them.
+  const tiktokErr = validateTiktokProfile(links.tiktok_url)
+  if (tiktokErr) return tiktokErr
   for (const { field, label, hosts, required } of PROFILE_LINKS) {
+    if (field === 'tiktok_url') continue
     const err = validateProfileLink(label, hosts, String(links[field as keyof typeof links] ?? ''), required)
     if (err) return err
   }
@@ -300,7 +428,9 @@ export function validateAllProfileLinks(links: {
 }
 
 // Platforms users report commented-video counts and screenshots for.
-export const COMMENT_PLATFORMS = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram'] as const
+// Reddit included: workers comment on Reddit posts, report them on the Finish
+// form and are paid the same COMMENT_PAY_RATE as on every other platform.
+export const COMMENT_PLATFORMS = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram', 'reddit'] as const
 
 // How many links one app fetch may return.
 //
@@ -331,7 +461,20 @@ export const SITE_URL = (
 // Overridable without a redeploy so the video can be rotated.
 export const VERIFY_VIDEO_URL =
   process.env.VERIFY_VIDEO_URL ||
-  'https://www.tiktok.com/@drnardime/video/7596784835159444767'
+  'https://www.tiktok.com/@mypeople334/video/7678712885559692562'
+
+/**
+ * How old a TikTok account must be, in days, before it may be used.
+ *
+ * THE DEFAULT ONLY. The live value is a setting an admin moves without a
+ * deploy (getMinAccountAgeDays in lib/db); this is what applies when nothing
+ * has been set, and what a nonsensical stored value falls back to.
+ *
+ * Three months, because a brand-new account is the cheapest thing in this
+ * business and its comments are the first TikTok filters away — so work done
+ * from one is work that mostly disappears.
+ */
+export const VERIFY_MIN_AGE_DAYS = Number(process.env.VERIFY_MIN_AGE_DAYS || 90)
 
 // How long one successful check lasts before it must be re-done.
 export const VERIFY_VALID_DAYS = Number(process.env.VERIFY_VALID_DAYS || 7)
@@ -345,15 +488,162 @@ export const VERIFY_GATE_ENABLED = envBool(process.env.VERIFY_GATE_ENABLED, fals
 
 // Products a user can be assigned to advertise. The admin picks one per user,
 // and the user's /comments page shows that product's comments.
-export const PRODUCTS = [
+// MUTABLE ON PURPOSE: lib/genreRegistry.ts appends the products of genres added
+// in the admin. Everything reads this array, so they are products everywhere.
+export const PRODUCTS: string[] = [
   'purifytext',
   'acoustictext',
   'prohumanly',
   'humlexic',
   'kinprose',
   'tintfolio',
-] as const
-export type Product = (typeof PRODUCTS)[number]
+  // Not humanizers. See GENRES below — these two advertise different things to
+  // different people, and almost nothing about a humanizer comment transfers.
+  'cocodly',
+  'pptera',
+]
+// A plain string, not a union of the names above: products can be added at
+// runtime with a new genre (Admin → Genres, lib/genreRegistry.ts), and a type
+// that lists them would be wrong the moment one is.
+export type Product = string
+
+// ── Genres ───────────────────────────────────────────────────
+//
+// WHAT A GENRE IS: the kind of thing a product is, and therefore the kind of
+// video it belongs under. Every product used to be an AI humanizer, so the
+// distinction had nowhere to show itself — one pool of links served all six and
+// whichever product already led a video's comment section kept it.
+//
+// cocodly builds websites and pptera builds slide decks. A humanizer comment
+// under a website-builder video is not a weaker advert, it is a stranger talking
+// about something else, and the video's own audience is not ours. So a genre
+// owns its own links, its own comments and its own share of what workers are
+// served, and nothing crosses between them.
+//
+// THE SIX HUMANIZERS STAY ONE GENRE between themselves. They are substitutes for
+// each other, which is exactly why "whichever one already leads this video wins
+// it" is the right rule for them and the wrong rule across genres.
+//
+// THE THREE BELOW ARE BUILT IN; MORE CAN BE ADDED IN THE ADMIN (Genres page).
+// lib/genreRegistry.ts appends those to this array and to the tables below at
+// startup and whenever the list changes, so every reader of GENRES, isGenre,
+// genreOfProduct and productsInGenre sees them without knowing they were added.
+export const BUILTIN_GENRES = ['humanizer', 'website', 'slides'] as const
+export const GENRES: string[] = [...BUILTIN_GENRES]
+export type Genre = string
+
+/**
+ * What a link with no genre counts as.
+ *
+ * Every link scraped before genres existed is a humanizer link, and there are
+ * tens of thousands of them in the pool. Reading an absent genre as this is what
+ * lets that pool, the verify-list merge and any older upload stay correct
+ * without being rewritten.
+ */
+export const DEFAULT_GENRE: Genre = 'humanizer'
+
+export const PRODUCT_GENRE: Record<string, Genre> = {
+  purifytext: 'humanizer',
+  acoustictext: 'humanizer',
+  prohumanly: 'humanizer',
+  humlexic: 'humanizer',
+  kinprose: 'humanizer',
+  tintfolio: 'humanizer',
+  cocodly: 'website',
+  pptera: 'slides',
+}
+
+/**
+ * The cookie holding an admin’s master genre switch.
+ *
+ * Here, not in lib/adminGenre, because the SWITCH writes it from the browser
+ * and the browser cannot import a module that reads request headers. One name,
+ * so the writer and the reader cannot drift apart.
+ */
+export const ADMIN_GENRE_COOKIE = 'admin_genre'
+
+/** Human-readable label for the admin tables. */
+export const GENRE_LABELS: Record<string, string> = {
+  humanizer: 'Humanizer',
+  website: 'Website builder',
+  slides: 'Slides',
+}
+
+export function isGenre(v: unknown): v is Genre {
+  return typeof v === 'string' && (GENRES as readonly string[]).includes(v)
+}
+
+/**
+ * The genre a product belongs to.
+ *
+ * An unknown product reads as the default rather than throwing: this is called
+ * on the serving path, and a product name that has drifted out of the table
+ * should cost one mis-grouped comment, not a page.
+ */
+export function genreOfProduct(product: string): Genre {
+  return PRODUCT_GENRE[product] ?? DEFAULT_GENRE
+}
+
+/** Every product in one genre, in PRODUCTS order. */
+export function productsInGenre(genre: string): string[] {
+  return PRODUCTS.filter((p) => genreOfProduct(p) === genre)
+}
+
+/**
+ * The genre of one pool row.
+ *
+ * Takes the whole row rather than a string because the pool is a blob of loosely
+ * typed JSON and `genre` is simply absent on most of it — see DEFAULT_GENRE. Kept
+ * here beside the table so every reader agrees, which is the thing that stops a
+ * link being humanizer on one screen and website on another.
+ */
+export function genreOfRow(row: { genre?: unknown } | null | undefined): Genre {
+  const g = (row as { genre?: unknown } | null)?.genre
+  return isGenre(g) ? g : DEFAULT_GENRE
+}
+
+/** How much of a worker's list each genre should be. */
+export type GenreMix = Record<Genre, number>
+
+/**
+ * Everything humanizer until somebody says otherwise.
+ *
+ * NOT an even split. Two of the three genres have no links and no comments on
+ * the day this ships, and a default of 33/33/33 would cut the working pool to a
+ * third and fill the rest with nothing.
+ */
+// An added genre has no entry here and reads as 0: it gets a share only when the
+// admin gives it one, like website and slides did.
+export const DEFAULT_GENRE_MIX: GenreMix = { humanizer: 100, website: 0, slides: 0 }
+
+/** One share, as a whole number of percent in 0..100. */
+export function clampGenreShare(v: unknown): number {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return 0
+  return Math.max(0, Math.min(100, Math.round(n)))
+}
+
+/**
+ * The shares as WEIGHTS that sum to 1, in GENRES order.
+ *
+ * NORMALISED, NOT VALIDATED. The admin types three numbers; insisting they total
+ * exactly 100 is a box people fight, and 60/20/15 plainly means the same split
+ * as 63/21/16. So the ratio between them is what counts.
+ *
+ * All zero — or a genre list nobody has set — falls back to the default rather
+ * than serving nothing, which is the one outcome worse than a wrong ratio.
+ */
+export function genreWeights(mix: Partial<GenreMix> | null | undefined): GenreMix {
+  const raw = GENRES.map((g) => clampGenreShare(mix?.[g]))
+  const total = raw.reduce((a, b) => a + b, 0)
+  const use = total > 0 ? raw : GENRES.map((g) => DEFAULT_GENRE_MIX[g] ?? 0)
+  const sum = use.reduce((a, b) => a + b, 0) || 1
+  const out = {} as GenreMix
+  GENRES.forEach((g, i) => {
+    out[g] = use[i] / sum
+  })
+  return out
+}
 
 /**
  * NO LONGER USED to choose a product — kept only so nothing importing it breaks.
@@ -509,6 +799,143 @@ export function productMention(product: string, style: CommentStyle = DEFAULT_CO
   return productWords(product, style.splitBrand).toLowerCase()
 }
 
+// ── AUTO-BLOCK RULES, as settings rather than as constants ────────────────
+//
+// Two rules decide whether the comment check blocks somebody, and both of their
+// numbers were baked into the code:
+//
+//   nothing found on N judged links                (N was 50)
+//   under P% of their last M judged links carry one (P was 10, M was 200)
+//
+// They are judgements about people, made nightly, so they belong to whoever is
+// answerable for them. Kept here — not in commentPresence — because this file is
+// the one both the browser and the database layer can import.
+//
+// THE BOUNDS ARE NOT DECORATION. Each one guards against a setting that would
+// quietly make the rule meaningless or vicious:
+//
+//   sample 20-80     below 20 an honest worker who hit a run of hidden comments
+//                    is blocked on a handful of links. Above ~80 the search runs
+//                    out of candidates — finding N judgeable links needs roughly
+//                    6N recent ones and getRecentClickedLinks stops at 500 — so
+//                    the count stalls short of the target for ever and the rule
+//                    silently never fires.
+//   ratio 1-50%      at 0 it can never fire; above 50 it blocks the median
+//                    worker, who on the real data sits around 20%.
+//   window 50-300    the denominator is read from verdicts the sweeps have
+//                    already made. Past 300 most people do not have that many
+//                    judged links and the rule cannot speak at all.
+export interface BlockRules {
+  /** Master switch. Off means no check blocks anybody, by any rule. */
+  on: boolean
+  /** Judged links with NOTHING found before the first rule may block. */
+  sample: number
+  /** Judged links the rate rule needs before it may speak. */
+  ratioSample: number
+  /** Below this percentage found, the rate rule blocks. */
+  ratioMinPct: number
+}
+
+export const BLOCK_RULE_DEFAULTS: BlockRules = {
+  on: true,
+  sample: 50,
+  ratioSample: 200,
+  ratioMinPct: 10,
+}
+
+export const BLOCK_RULE_BOUNDS = {
+  sample: { min: 20, max: 80 },
+  ratioSample: { min: 50, max: 300 },
+  ratioMinPct: { min: 1, max: 50 },
+} as const
+
+/**
+ * Pull a number into range, keeping the default when there is nothing to read.
+ *
+ * NOTHING MEANS UNCHANGED, not the floor. Number('') is 0, so clamping an empty
+ * field straight away turned "I cleared the box to retype" into the harshest
+ * setting there is — which is how a sweep once nearly blocked people on twenty
+ * links.
+ */
+export function clampRule(v: unknown, key: keyof typeof BLOCK_RULE_BOUNDS): number {
+  const dflt = BLOCK_RULE_DEFAULTS[key]
+  if (v === null || v === undefined) return dflt
+  if (typeof v === 'string' && v.trim() === '') return dflt
+  const n = Number(v)
+  if (!Number.isFinite(n)) return n === Infinity ? BLOCK_RULE_BOUNDS[key].max : dflt
+  const b = BLOCK_RULE_BOUNDS[key]
+  return Math.max(b.min, Math.min(b.max, Math.round(n)))
+}
+
+// ── SERVE THE COMMENTS THAT ACTUALLY LANDED ───────────────────────────────
+//
+// The bank is what somebody WROTE for a product; link_product_comment is what
+// turned out to be on the videos, and clicked_link says how often each was handed
+// out to get there. With this on, a click is answered from the top few of a
+// product's own comments over a recent window instead of from the bank.
+//
+// WHAT IT COSTS, and the page says so: the bank is written per AUDIENCE and this
+// list is not. Turning it on trades matching the comment to the video for
+// serving what measurably worked.
+export type TopListRank = 'links' | 'ratio' | 'balanced'
+
+export interface TopListSetting {
+  /** Serve from the measured top list instead of the written bank. */
+  enabled: boolean
+  /** How many of the best to draw from. */
+  count: number
+  /** links = reach, ratio = yield, balanced = half of each. */
+  rank: TopListRank
+  /** How far back the measurement looks, in days. */
+  days: number
+}
+
+export const DEFAULT_TOP_LIST: TopListSetting = {
+  enabled: false,
+  count: 20,
+  rank: 'balanced',
+  days: 30,
+}
+
+export const TOP_LIST_BOUNDS = {
+  // Below about five the same sentence goes under every video, which is the
+  // pattern one search finds. Above a couple of hundred it is not a top list.
+  count: { min: 5, max: 200 },
+  // A week is the shortest window with enough scanned links to rank on; beyond a
+  // year "recent" means nothing.
+  days: { min: 7, max: 365 },
+} as const
+
+export function isTopListRank(v: unknown): v is TopListRank {
+  return v === 'links' || v === 'ratio' || v === 'balanced'
+}
+
+/**
+ * Pull a stored or posted setting into range, keeping the defaults for gaps.
+ *
+ * The input is deliberately untyped per field: it arrives as a query string, as
+ * a JSON body, or as a database row, and the whole point of this function is to
+ * be the one place that turns any of those into a usable setting.
+ */
+export function clampTopList(
+  v: Partial<Record<keyof TopListSetting, unknown>> | null | undefined
+): TopListSetting {
+  const n = (x: unknown, key: keyof typeof TOP_LIST_BOUNDS): number => {
+    const b = TOP_LIST_BOUNDS[key]
+    const d = DEFAULT_TOP_LIST[key]
+    if (x === null || x === undefined || (typeof x === 'string' && x.trim() === '')) return d
+    const num = Number(x)
+    if (!Number.isFinite(num)) return d
+    return Math.max(b.min, Math.min(b.max, Math.round(num)))
+  }
+  return {
+    enabled: typeof v?.enabled === 'boolean' ? v.enabled : DEFAULT_TOP_LIST.enabled,
+    count: n(v?.count, 'count'),
+    rank: isTopListRank(v?.rank) ? v.rank : DEFAULT_TOP_LIST.rank,
+    days: n(v?.days, 'days'),
+  }
+}
+
 export function isProduct(v: unknown): v is Product {
   return typeof v === 'string' && (PRODUCTS as readonly string[]).includes(v)
 }
@@ -518,6 +945,50 @@ export function isProduct(v: unknown): v is Product {
 // product here to switch it off; remove it to re-enable. Currently none are off:
 // every product in PRODUCTS is live.
 export const DEACTIVATED_PRODUCTS: readonly Product[] = []
+
+/**
+ * The banks a worker can pick when they give their account number.
+ *
+ * Ethiopia's licensed commercial banks, plus the two mobile-money wallets
+ * workers are paid into. Not exhaustive by design — banks open and merge — so
+ * the form always offers "Other" with a box to type the name in.
+ */
+export const ETHIOPIAN_BANKS: readonly string[] = [
+  'Commercial Bank of Ethiopia',
+  'Awash Bank',
+  'Bank of Abyssinia',
+  'Dashen Bank',
+  'Cooperative Bank of Oromia',
+  'Wegagen Bank',
+  'Hibret Bank',
+  'Nib International Bank',
+  'Oromia Bank',
+  'Zemen Bank',
+  'Bunna Bank',
+  'Berhan Bank',
+  'Abay Bank',
+  'Lion International Bank',
+  'Enat Bank',
+  'Addis International Bank',
+  'Debub Global Bank',
+  'Global Bank Ethiopia',
+  'Amhara Bank',
+  'Tsehay Bank',
+  'Siinqee Bank',
+  'ZamZam Bank',
+  'Hijra Bank',
+  'Shabelle Bank',
+  'Ahadu Bank',
+  'Gadaa Bank',
+  'Goh Betoch Bank',
+  'Tsedey Bank',
+  'Sidama Bank',
+  'Omo Bank',
+  'Rammis Bank',
+  'Development Bank of Ethiopia',
+  'telebirr',
+  'M-PESA',
+]
 
 // Payment (birr) a user earns per approved 30s–1min video they submit.
 export const VIDEO_PAYMENT_BIRR = 150
@@ -711,7 +1182,19 @@ export const HOURLY_LINK_LIMIT = 20
 export const HOURLY_WINDOW_MS = 60 * 60 * 1000 // 1 hour
 
 // The link platforms whose quota + wait window are individually configurable.
-export const CLICK_PLATFORMS = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram'] as const
+// REDDIT IS HERE SO THAT A REDDIT LINK IS CALLED A REDDIT LINK.
+//
+// platformFromUrl falls back to 'tiktok' for a host it does not know, and the
+// search scraper can now collect Reddit posts — so every one of them uploaded
+// would have been filed as TikTok: counted against the TikTok quota, shown to
+// workers as TikTok work, and impossible to filter out of the pool afterwards.
+// The same fallback did this to the verify list once before.
+//
+// It is a full platform: served in the web dashboard and the app with its own
+// tab and its own hourly quota, and reported and paid as comment work
+// (COMMENT_PLATFORMS). The liker still does not offer it — it only knows how to
+// press TikTok's heart.
+export const CLICK_PLATFORMS = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram', 'reddit'] as const
 export type ClickPlatform = (typeof CLICK_PLATFORMS)[number]
 
 /**
@@ -733,7 +1216,31 @@ export function platformFromUrl(url: string): ClickPlatform {
   if (u.includes('youtube.com') || u.includes('youtu.be')) {
     return u.includes('/shorts/') ? 'youtube_shorts' : 'youtube_videos'
   }
+  if (u.includes('reddit.com')) return 'reddit'
   return 'tiktok'
+}
+
+/**
+ * Repair a pool row's platform in place, from its URL, when the stored one is
+ * not a platform we serve.
+ *
+ * upload.py tagged every Reddit post 'unknown' (its URL parser knew TikTok,
+ * YouTube and Instagram only), so 1,503 Reddit links sat in the pool under a
+ * platform no feed has a tab for and were never served. Every pool loader runs
+ * its rows through this, so those rows are Reddit everywhere at once, and the
+ * next write of the pool file (an upload, a recluster) stores them fixed.
+ *
+ * ONLY for a host we recognise. platformFromUrl answers 'tiktok' for anything
+ * else, and turning an unknown host into TikTok work is the exact mislabel
+ * this exists to undo.
+ */
+export function repairRowPlatform<T extends { url?: unknown; platform?: unknown }>(row: T): T {
+  if (!row || (CLICK_PLATFORMS as readonly string[]).includes(String(row.platform ?? ''))) return row
+  const u = String(row.url ?? '').toLowerCase()
+  if (/tiktok\.com|instagram\.com|youtube\.com|youtu\.be|reddit\.com/.test(u)) {
+    ;(row as { platform?: unknown }).platform = platformFromUrl(u)
+  }
+  return row
 }
 
 export const CLICK_PLATFORM_LABELS: Record<string, string> = {
@@ -741,6 +1248,9 @@ export const CLICK_PLATFORM_LABELS: Record<string, string> = {
   youtube_shorts: 'YT Shorts',
   youtube_videos: 'YT Videos',
   instagram: 'Instagram',
+  // A missing key here renders as an empty cell rather than as an error, which
+  // is how a new platform goes unnoticed on the admin screens.
+  reddit: 'Reddit',
 }
 
 // One platform's rule. TWO independent per-platform switches:
@@ -794,7 +1304,6 @@ export const CHANNEL_SITE_PLATFORMS: Record<string, readonly ClickPlatform[]> = 
 // into fresh, very short variants that keep the same theme but always mention
 // the product. The originals in lib/comments.ts act as the theme source.
 export const COMMENT_REFRESH_MS = 24 * 60 * 60 * 1000 // regenerate every 24 hours
-export const GROQ_MODEL = 'openai/gpt-oss-120b'
 // Models tried in order; on a rate-limit/quota error (HTTP 429) the request
 // automatically falls back to the next one.
 // The models an admin can choose between, and the one used when nothing is
@@ -802,21 +1311,63 @@ export const GROQ_MODEL = 'openai/gpt-oss-120b'
 // previous list carried 'llama-3.3-70b-versatile' and 'qwen/qwen3.6-27b'; the
 // first is not served to this key at all, so as a fallback it could only ever
 // turn a rate limit into a hard error.
-export const LLM_MODELS = ['openai/gpt-oss-120b', 'qwen/qwen3.8-27b'] as const
+export const LLM_MODELS = [
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'openai/gpt-oss-120b',
+  'qwen/qwen3.8-27b',
+] as const
 export type LlmModel = (typeof LLM_MODELS)[number]
-export const DEFAULT_LLM_MODEL: LlmModel = 'openai/gpt-oss-120b'
+export const DEFAULT_LLM_MODEL: LlmModel = 'gemini-3.5-flash-lite'
 
 export function isLlmModel(v: unknown): v is LlmModel {
   return typeof v === 'string' && (LLM_MODELS as readonly string[]).includes(v)
 }
 
-/** Human labels for the picker. */
+/**
+ * Who serves a model, read from its name.
+ *
+ * Read rather than stored beside it: a second list of which model belongs to
+ * which provider is a second list to forget to update, and the names already
+ * say it. Groq is the fallback reading so an id that is neither ends up on the
+ * provider this app had before Gemini existed, rather than nowhere.
+ */
+export type LlmProvider = 'groq' | 'gemini'
+
+export function llmProvider(model: string): LlmProvider {
+  return model.startsWith('gemini') ? 'gemini' : 'groq'
+}
+
+/** Human labels for the picker. The provider is in the label because the two
+ *  need different API keys, and "it stopped working" is usually one of them. */
 export const LLM_MODEL_LABELS: Record<LlmModel, string> = {
-  'openai/gpt-oss-120b': 'GPT-OSS 120B (OpenAI)',
-  'qwen/qwen3.8-27b': 'Qwen3.8 27B',
+  'gemini-3.5-flash-lite': 'Gemini 3.5 Flash-Lite (Google)',
+  'gemini-3.1-flash-lite': 'Gemini 3.1 Flash-Lite (Google)',
+  'openai/gpt-oss-120b': 'GPT-OSS 120B (Groq)',
+  'qwen/qwen3.8-27b': 'Qwen3.8 27B (Groq)',
 }
 
 export const GROQ_BASE_URL = 'https://api.groq.com/openai/v1'
+export const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta'
+
+/**
+ * Title classification: how many titles may go in ONE request, and how many a
+ * caller actually sends.
+ *
+ * THESE WERE THREE SEPARATE NUMBERS AND THE DISAGREEMENT WAS SILENT. The route
+ * took `.slice(0, 120)`; the verify page sent a fifth of its page (100 on a
+ * 500-row page, by coincidence of the page size); the main Links page sent the
+ * whole page in one request — up to 500 titles, of which 380 were dropped
+ * unseen. Dropped titles come back absent from `related`, and "unrelated" is
+ * defined as "not related", so every one of them was ticked as
+ * humanizer-unrelated without being read, ready for the Block button.
+ *
+ * BATCH must stay <= MAX. The route now refuses anything larger than MAX rather
+ * than trimming it, because a silently trimmed batch is indistinguishable from a
+ * classified one.
+ */
+export const CLASSIFY_MAX_ITEMS = 120
+export const CLASSIFY_BATCH = 100
 // Rewrites must be this many words (inclusive) and mention the product name.
 export const COMMENT_WORD_MIN = 3
 export const COMMENT_WORD_MAX = 8

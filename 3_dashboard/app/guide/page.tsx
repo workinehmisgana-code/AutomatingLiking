@@ -7,6 +7,9 @@ import {
   getAccountTaskOpen,
   getAccountTaskPassword,
   getAccountTaskRecovery,
+  getMinAccountAgeDays,
+  getVerifyVideoUrl,
+  AUTO_BLOCKS_BEFORE_FOREVER,
 } from '@/lib/db'
 import {
   COMMENT_PAY_RATE,
@@ -18,6 +21,9 @@ import {
   HOURLY_LINK_LIMIT,
   ACCOUNT_PAY_BIRR,
   SITE_URL,
+  REFERRAL_SHARE,
+  VERIFY_MIN_AGE_DAYS,
+  VERIFY_VIDEO_URL,
 } from '@/lib/config'
 
 export const dynamic = 'force-dynamic'
@@ -40,13 +46,16 @@ export default async function GuidePage() {
   // The guide describes the email task only while it is actually being
   // offered. A guide that explains a task nobody can do is worse than one that
   // does not mention it.
-  const [guideVideos, accountDomain, accountOpen, accountPassword, accountRecovery] =
+  const [guideVideos, accountDomain, accountOpen, accountPassword, accountRecovery, minAgeDays, verifyVideoUrl] =
     await Promise.all([
     getGuideVideos().catch(() => []),
     getAccountTaskDomain().catch(() => ''),
     getAccountTaskOpen().catch(() => false),
     getAccountTaskPassword().catch(() => ''),
     getAccountTaskRecovery().catch(() => ''),
+    // The live verification rules, so the guide states what is actually asked.
+    getMinAccountAgeDays().catch(() => VERIFY_MIN_AGE_DAYS),
+    getVerifyVideoUrl().catch(() => VERIFY_VIDEO_URL),
   ])
 
   return (
@@ -63,6 +72,10 @@ export default async function GuidePage() {
       accountPassword={accountPassword}
       accountRecovery={accountRecovery}
       accountOpen={accountOpen && !!accountDomain}
+      minAgeDays={minAgeDays}
+      verifyVideoUrl={verifyVideoUrl}
+      referralPct={Math.round(REFERRAL_SHARE * 100)}
+      autoPausesAllowed={AUTO_BLOCKS_BEFORE_FOREVER}
       videos={guideVideos}
       signedIn={!!session}
       startUrl={SITE_URL}

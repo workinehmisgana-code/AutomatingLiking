@@ -10,7 +10,7 @@ export async function POST(req: NextRequest) {
   const userId = await userIdFromApp(req)
   if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  if (!(await getPromoTaskEnabled().catch(() => true))) {
+  if (!(await getPromoTaskEnabled().catch(() => false))) {
     return NextResponse.json({ error: 'The repost task is currently turned off' }, { status: 403 })
   }
 
@@ -37,6 +37,16 @@ export async function POST(req: NextRequest) {
     await savePromoAccounts(userId, provided)
     return NextResponse.json({ ok: true })
   } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 500 })
+    // The write refuses while the task is off (requirePromoTaskOn), and that is
+    // a refusal, not a fault — the route above says the same thing with a 403,
+    // so a request that slipped between the two must not look like a crash.
+    const msg = String(e)
+    if (/repost task is turned off/i.test(msg)) {
+      return NextResponse.json(
+        { error: 'The repost task is currently turned off' },
+        { status: 403 }
+      )
+    }
+    return NextResponse.json({ error: msg }, { status: 500 })
   }
 }

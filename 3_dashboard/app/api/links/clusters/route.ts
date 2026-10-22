@@ -59,6 +59,10 @@ export async function GET(req: NextRequest) {
     platform: sp.get('platform') ?? 'tiktok',
     product: sp.get('product') ?? '',
     keyword: sp.get('keyword') ?? '',
+    // NOT built by parseLinkQuery, so every filter has to be listed here as
+    // well. A genre missing from this one would mean the liker worked a mixed
+    // pool while the admin screen showed one genre.
+    genre: sp.get('genre') ?? '',
     category: sp.get('category') ?? '',
     uploadDate: sp.get('uploadDate') ?? '',
     mediaFilter: (sp.get('media') || '') as LinkQuery['mediaFilter'],
@@ -120,6 +124,12 @@ export async function GET(req: NextRequest) {
       // reporting without asking again.
       links: matched.slice(0, limit).map((l) => ({
         url: l.url,
+        // THE VIDEO'S OWN LIKE COUNT. Callers that heart a comment cap it at a
+        // fraction of this — a comment carrying more hearts than the video it
+        // sits under is a comment nobody believes — and without the number that
+        // ceiling simply cannot be computed. It is already loaded here, so
+        // sending it costs nothing and saves the caller a scrape.
+        likes: l.like_count,
         cluster:
           clusterBy === 'rank'
             ? l.rankCluster

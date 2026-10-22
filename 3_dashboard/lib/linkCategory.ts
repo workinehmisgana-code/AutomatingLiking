@@ -12,7 +12,8 @@
 // it looks: a caption like "this saved me 😭" says nothing, while the channel bio
 // ("Cek Plagiasi Turnitin & Parafrase") places the whole account.
 
-import { groqChat } from './groq'
+import { llmChat } from './llm'
+import { CATEGORISE_SYSTEM as SYSTEM } from './prompts'
 import { type LinkCategory, DEFAULT_LINK_CATEGORY, isLinkCategory } from './config'
 
 export interface Categorizable {
@@ -21,23 +22,6 @@ export interface Categorizable {
   bio: string
 }
 
-const SYSTEM =
-  'You sort short social-media videos into ONE audience each, using the caption and the ' +
-  "channel's bio.\n" +
-  'Categories:\n' +
-  '"competitors" — the video promotes, demos, reviews or compares an AI HUMANIZER / ' +
-  'paraphraser / "bypass AI" tool (e.g. GrubbyAI, NaturalWrite, WalterWrites, Undetectable AI, ' +
-  'StealthWriter, Quillbot, HIX Bypass, Humanizer). The viewer is shopping for such a tool.\n' +
-  '"ai_detector" — the video is about AI DETECTION: Turnitin, GPTZero, Originality AI, ' +
-  'Copyleaks, "got flagged for AI", "my essay was detected", plagiarism checkers, how detectors ' +
-  'work. The viewer fears or is fighting detection.\n' +
-  '"generic" — everything else: study tips, essay writing, note-taking, student life, general ' +
-  'AI/ChatGPT use, or anything unclear.\n' +
-  'If a video fits BOTH competitors and ai_detector, choose "competitors" — naming a rival tool ' +
-  'is the stronger signal about what the viewer already wants.\n' +
-  'Return STRICT JSON {"categories":[...]} — a JSON array of strings, ONE PER ITEM IN THE SAME ' +
-  'ORDER, each exactly "competitors", "ai_detector" or "generic", with exactly as many entries ' +
-  'as there are items. Example for 3 items: {"categories":["generic","ai_detector","generic"]}.'
 
 // Deterministic overrides, applied AFTER the model — but ONLY for unambiguous
 // BRAND names.
@@ -120,7 +104,7 @@ export async function categorizeChunk(items: Categorizable[]): Promise<LinkCateg
     .join('\n')
 
   try {
-    const { content } = await groqChat({
+    const { content } = await llmChat({
       temperature: 0,
       jsonObject: true,
       messages: [

@@ -228,7 +228,48 @@ try:
     # is about to run is a panel you cannot check.
     check("  and names the profile", f"--profile {name}" in pv["independent"][0]["cmd"], True)
 
-    # ── two runs over one profile ───────────────────────────────────────────
+        # ── links you can click ────────────────────────────────────────────────
+    #
+    # A TEXTAREA CANNOT HOLD A LINK, so the output pane is a pair: a read-only
+    # div with anchors, and the editable box. Reading is the common case, so the
+    # clickable one shows by default and a button offers the other.
+    print("\nthe output's links are clickable")
+    page_html = (Path(__file__).resolve().parent / "dashboard.html").read_text(encoding="utf-8")
+    check("  there is a pane that can hold anchors", 'id="outlinks"' in page_html, True)
+    check("  and it is the one shown first", "let OUTLINKS = true;" in page_html, True)
+    check("  links open in a new tab",
+          'target="_blank"' in page_html and 'rel="noopener noreferrer"' in page_html, True)
+    check("  the text is escaped before it is linkified",
+          "return esc(text).replace(" in page_html, True)
+    check("  trailing punctuation is left out of the href",
+          "const trail = u.match(" in page_html
+          and "a full stop that is not part of it" in page_html, True)
+    check("  the editable box is still there", 'id="out"' in page_html, True)
+    check("  and Copy takes whichever pane is showing",
+          "OUTLINKS ? $('outlinks').innerText" in page_html, True)
+
+    # ── pressing the same button twice ────────────────────────────
+    #
+    # A job name is reused every time one is pressed, and start() replaces the
+    # old Job with a new one whose line counter begins at 0 — while the page
+    # still remembers the count from last time. Everything the second run
+    # printed up to that count then looked like something already delivered, so
+    # "Its commented links" showed the tail of a listing, or nothing at all when
+    # the second run was the shorter one.
+    print("\npressing the same tool twice still shows its output")
+    here = Path(__file__).resolve().parent
+    dash_src = (here / "dashboard.py").read_text(encoding="utf-8")
+    page_src = (here / "dashboard.html").read_text(encoding="utf-8")
+    check("  a re-run is recognised as a new job", "A RE-RUN IS A NEW JOB UNDER AN OLD NAME" in dash_src, True)
+    check("  a count ahead of the job's own restarts delivery",
+          "if have > job.seq:" in dash_src, True)
+    check("  each run says when it began", '"started": int(job.started)' in dash_src, True)
+    check("  the page drops the previous run's lines",
+          "A JOB NAME IS REUSED EVERY TIME" in page_src, True)
+    check("  and really asks again from the top",
+          "ASK AGAIN FROM THE TOP" in page_src, True)
+
+# ── two runs over one profile ───────────────────────────────────────────
     print("\ntwo runs cannot share a profile")
     # Chromium locks a user data directory, so the second run does not share
     # it — it simply cannot open a browser, and dies having printed nothing.

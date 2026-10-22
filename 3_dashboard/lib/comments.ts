@@ -384,4 +384,94 @@ export const COMMENTS: Record<Product, string[]> = {
     "tintfolio never fails me on detectors",
     "i only trust tintfolio to pass"
   ],
+
+  // ── Not humanizers ───────────────────────────────────────────
+  //
+  // THESE ARE STYLE AND LENGTH REFERENCES, NOT COPY. Every served comment is a
+  // rewrite of one of these (lib/commentGen.ts), so what they carry is a voice:
+  // first person, lowercase, one concrete thing that happened, the product named
+  // inside the sentence rather than announced.
+  //
+  // What changes between genres is the OUTCOME somebody would mention. A
+  // humanizer seed ends in "it came back clean"; there is no detector here, so
+  // these end in a site that went live, a deck that was done before class. A
+  // seed that claimed the wrong kind of win would teach the model to write
+  // comments that make no sense under the video.
+  //
+  // The type is still Record<Product, string[]> on purpose: adding a product to
+  // PRODUCTS without seeds is a COMPILE ERROR here, and it is the only thing
+  // that catches it — a product with no seeds generates nothing at all, in
+  // silence (lib/commentGen.ts:502).
+  cocodly: [
+    "i used cocodly and had the whole site up the same evening",
+    "cocodly did my landing page in minutes, i cannot write a line of code",
+    "honestly just use cocodly, mine looked like i paid someone",
+    "i built my shop on cocodly and nobody believes i did it myself",
+    "cocodly saved me a developer quote i could not afford",
+    "my portfolio is cocodly and it took one afternoon",
+    "i tried wix first, then cocodly, and i kept the cocodly one",
+    "cocodly got my site live before the deadline i had given up on",
+    "i described the business and cocodly just made the pages",
+    "clients ask who designed it, it was cocodly",
+    "i needed something up for a pitch and cocodly handled it that night",
+    "cocodly is what i use now, my old site took weeks",
+    "i had no logo no copy no idea and cocodly still got me a site",
+    "the whole thing is cocodly, i only changed the photos",
+    "i stopped paying monthly for a builder after cocodly",
+    "cocodly wrote the copy too, that was the part i was dreading",
+    "my dad's business is on cocodly and he maintains it himself",
+    "i gave cocodly two sentences and it gave me five pages",
+    "i use cocodly for every side project now, it is quicker than a template",
+    "cocodly made mine mobile friendly without me asking",
+    "i was quoted two thousand for a site, cocodly did it free",
+    "got my freelance page up with cocodly between lectures",
+    "cocodly is the only one where i did not have to touch the layout",
+    "i rebuilt our club site on cocodly in one sitting",
+    "cocodly handled the booking form which is where i always gave up",
+    "my first ever website was cocodly and it still looks fine",
+    "i showed my boss the cocodly site and we launched it that week",
+    "cocodly beat the week i spent fighting a template",
+    "i just type what the page should say and cocodly builds it",
+    "our menu page is cocodly, took ten minutes",
+    "i use cocodly because squarespace kept breaking on mobile for me",
+    "cocodly did a whole multi page site, not just a landing page",
+    "i had a domain sitting unused for a year until cocodly",
+    "cocodly is what i send people who say they cannot build a site",
+  ],
+  pptera: [
+    "i used pptera and had the deck done before the class started",
+    "pptera made my slides while i was still reading the brief",
+    "honestly just use pptera, my professor thought i spent days",
+    "i had thirty slides due and pptera did it in one go",
+    "pptera saved my presentation the night before",
+    "my whole thesis defence deck is pptera",
+    "i gave pptera my notes and it built the slides around them",
+    "pptera is the reason i stopped dreading group presentations",
+    "i used to spend a whole evening on slides, now it is pptera",
+    "pptera picked better layouts than i ever do",
+    "my team asked who made the deck, it was pptera",
+    "i had to present in an hour and pptera got me there",
+    "pptera wrote the speaker notes too which i never bother with",
+    "i pasted my essay in and pptera turned it into a deck",
+    "our pitch deck is pptera and we got the funding meeting",
+    "i stopped buying templates after pptera",
+    "pptera did the charts from my numbers without me formatting anything",
+    "my lecturer asked for my template, it was just pptera",
+    "i use pptera for every seminar now",
+    "pptera gave me a deck that actually matched the topic",
+    "i had no slides and ten minutes, pptera covered it",
+    "pptera is what i use when the deadline is tonight",
+    "i gave pptera a messy outline and it fixed the order",
+    "my internship presentation was pptera and they kept the file",
+    "pptera does the design part i have no eye for",
+    "i was up at two doing slides, never again after pptera",
+    "pptera turned a long report into twelve clean slides",
+    "i use pptera because google slides takes me all night",
+    "pptera matched our brand colours from one screenshot",
+    "my group let me do the deck now because pptera makes it quick",
+    "i had to present someone else's data and pptera made sense of it",
+    "pptera is the only reason my last deck looked finished",
+    "i just tell pptera the topic and how many slides",
+    "our whole module project deck came out of pptera",
+  ],
 }

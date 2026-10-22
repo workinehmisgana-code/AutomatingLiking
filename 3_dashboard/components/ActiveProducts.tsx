@@ -1,7 +1,13 @@
 'use client'
 
-import { useEffect, useState } from 'react'
-import { CLICK_PLATFORMS, CLICK_PLATFORM_LABELS } from '@/lib/config'
+import { Fragment, useEffect, useState } from 'react'
+import {
+  CLICK_PLATFORMS,
+  CLICK_PLATFORM_LABELS,
+  GENRES,
+  GENRE_LABELS,
+  genreOfProduct,
+} from '@/lib/config'
 
 // Admin panel: choose which products' comments feed the app's comment pool, and
 // which PLATFORMS each of those products may be served on.
@@ -16,7 +22,29 @@ import { CLICK_PLATFORMS, CLICK_PLATFORM_LABELS } from '@/lib/config'
 // a list of all four, so the default and the "all of them" case cannot drift
 // apart, and adding a platform later does not silently exclude it from every
 // product.
-export default function ActiveProducts() {
+//
+// GROUPED BY GENRE, with the count of active products per genre on the heading.
+// A genre's serving share is divided between whichever of ITS products are
+// active, and nothing else can take up the slack — so a genre that is given a
+// share here and has nothing active is a share of the feed that serves no
+// comment at all. In a flat list of eight that is invisible; under a heading
+// reading "Slides — none active" it is the first thing you see.
+export default function ActiveProducts({
+  genre,
+}: {
+  /**
+   * Show only this genre's products, from the admin's master switch.
+   *
+   * A FILTER ON WHAT IS DRAWN, NOT ON WHAT IS HELD. `products`, `active` and
+   * `platforms` below still describe every genre, and they must: toggling a
+   * product writes back the whole active set, and changing a platform rebuilds
+   * the whole platform map from `products`. Filtered state would mean that
+   * switching one website product's platforms silently erased every humanizer
+   * product's restrictions — the screen would look right and the stored
+   * setting would be gone.
+   */
+  genre?: string
+} = {}) {
   const [open, setOpen] = useState(false)
   const [products, setProducts] = useState<string[] | null>(null)
   const [active, setActive] = useState<Set<string>>(new Set())
@@ -131,12 +159,46 @@ export default function ActiveProducts() {
             <p className="text-sm text-zinc-500">No active products available.</p>
           ) : (
             <div className="space-y-2">
-              {products.map((p) => {
+              {/* Genre order, then anything whose genre is not one we know —
+                  a product can only be dropped from the config, never from a
+                  list the server already returned. */}
+              {(() => {
+                const known = GENRES.flatMap((g) => products.filter((p) => genreOfProduct(p) === g))
+                const ordered = [...known, ...products.filter((p) => !known.includes(p))]
+                // Narrowed for DRAWING only; see the prop.
+                return genre ? ordered.filter((p) => genreOfProduct(p) === genre) : ordered
+              })().map((p, i, ordered) => {
                 const on = active.has(p)
                 const sites = sitesOf(p)
+                const g = genreOfProduct(p)
+                // First of its genre in the ordered list carries the heading.
+                const first = ordered.findIndex((q) => genreOfProduct(q) === g) === i
+                const inGenre = ordered.filter((q) => genreOfProduct(q) === g)
+                const liveInGenre = inGenre.filter((q) => active.has(q)).length
                 return (
+                  <Fragment key={p}>
+                  {first && (
+                    <div className="flex items-baseline gap-2 pt-1 first:pt-0">
+                      <span className="text-[10px] uppercase tracking-wide text-zinc-500">
+                        {GENRE_LABELS[g] ?? g}
+                      </span>
+                      <span
+                        className={
+                          liveInGenre === 0 ? 'text-[10px] text-amber-400/90' : 'text-[10px] text-zinc-600'
+                        }
+                        title={
+                          liveInGenre === 0
+                            ? "No product in this genre is active, so its share of the feed serves no comment \u2014 set the share to 0 or switch one on."
+                            : `${liveInGenre} of ${inGenre.length} active in this genre`
+                        }
+                      >
+                        {liveInGenre === 0
+                          ? '\u2014 none active'
+                          : `\u2014 ${liveInGenre} of ${inGenre.length} active`}
+                      </span>
+                    </div>
+                  )}
                   <div
-                    key={p}
                     className={`rounded-lg border p-2 transition-colors ${
                       on ? 'border-emerald-600/40 bg-emerald-600/5' : 'border-zinc-800 bg-zinc-900/40'
                     }`}
@@ -190,6 +252,7 @@ export default function ActiveProducts() {
                       </p>
                     )}
                   </div>
+                  </Fragment>
                 )
               })}
             </div>

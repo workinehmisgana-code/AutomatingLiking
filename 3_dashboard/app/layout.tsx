@@ -1,6 +1,8 @@
 import type { Metadata, Viewport } from 'next'
 import './globals.css'
 import PWARegister from '@/components/PWARegister'
+import GenreRegistryClient from '@/components/GenreRegistryClient'
+import { ensureGenreRegistry } from '@/lib/genreStore'
 
 export const metadata: Metadata = {
   applicationName: 'Dashboard',
@@ -26,10 +28,14 @@ export const viewport: Viewport = {
   themeColor: '#059669',
 }
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
+  // The genres added in the admin, applied here on the server and handed to the
+  // browser so both sides agree (see lib/genreRegistry.ts).
+  const genres = await ensureGenreRegistry().catch(() => [])
   return (
     <html lang="en">
       <body>
+        <GenreRegistryClient list={genres} />
         {children}
         <PWARegister />
       </body>

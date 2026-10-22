@@ -1,7 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { isAdminEmail } from '@/lib/config'
+import { getAdminGenre, adminGenreUrlTest } from '@/lib/adminGenre'
+import { isAdminEmail, genreOfRow } from '@/lib/config'
 import { loadVideosJson } from '@/lib/videos'
 import {
   getBrokenLinks,
@@ -48,8 +49,14 @@ export async function GET(req: NextRequest) {
   const limit = Math.min(500, Math.max(1, Number(req.nextUrl.searchParams.get('limit')) || 200))
   const offset = Math.max(0, Number(req.nextUrl.searchParams.get('offset')) || 0)
   try {
-    const { rows, total } = await getBrokenLinks(limit, offset)
-    const confirmed = await getConfirmedBrokenUrls(BROKEN_AFTER_MISSES)
+    // ONE GENRE'S. The table is small (one row per suspect link), so it is
+    // read whole and cut by the pool's genre here, then paged.
+    const inGenre = await adminGenreUrlTest()
+    const all = await getBrokenLinks(100_000, 0)
+    const mine = all.rows.filter((r) => inGenre.has(r.url))
+    const rows = mine.slice(offset, offset + limit)
+    const total = mine.length
+    const confirmed = (await getConfirmedBrokenUrls(BROKEN_AFTER_MISSES)).filter((u) => inGenre.has(u))
     return NextResponse.json({
       ok: true,
       rows,
@@ -120,8 +127,13 @@ export async function POST(req: NextRequest) {
   const offset = Math.max(0, Number(body.offset) || 0)
   const limit = Math.min(MAX_BATCH, Math.max(1, Number(body.limit) || MAX_BATCH))
   try {
-    const videos = (await loadVideosJson()) as { url?: unknown }[]
-    const urls = videos.map((v) => String(v.url ?? '')).filter((u) => u.startsWith('http'))
+    const videos = (await loadVideosJson()) as { url?: unknown; genre?: unknown }[]
+    // The sweep covers the switch's genre only.
+    const genre = await getAdminGenre()
+    const urls = videos
+      .filter((v) => genreOfRow(v) === genre)
+      .map((v) => String(v.url ?? ''))
+      .filter((u) => u.startsWith('http'))
     const total = urls.length
     if (offset >= total) {
       return NextResponse.json({

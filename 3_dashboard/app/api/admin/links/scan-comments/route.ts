@@ -1,8 +1,9 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { isAdminEmail, SCAN_MAX_LINKS } from '@/lib/config'
+import { isAdminEmail } from '@/lib/config'
 import { buildAdminLinks, filterAdminLinks, parseLinkQuery, type LinkQuery } from '@/lib/adminLinks'
+import { getAdminGenre, adminGenreUrlTest } from '@/lib/adminGenre'
 import { saveLinkScan, startScanRun, getScanRunUrls, recordScanRunBatch } from '@/lib/db'
 import { scanLink } from '@/lib/commentScan'
 
@@ -12,11 +13,11 @@ export const maxDuration = 60
 // Read the comments of the links currently filtered on the Links page, recording
 // which of OUR product comments are already on each one and where they sit.
 //
-// SCOPED TO 1–5 CLUSTERS on purpose. Reading a video's comments takes 1–5
-// seconds, so a cluster of ~900 links is already close to an hour; the whole
-// pool would be days. The client refuses to start without a cluster selection,
-// and this refuses too — a filter that accidentally matched everything would
-// otherwise queue an unbounded job.
+// A CLUSTER SELECTION IS REQUIRED, and it is the only thing required. Reading a
+// video's comments takes 1–5 seconds, so a cluster of ~900 links is close to an
+// hour and the whole pool would be days — but a long job is the admin's to start,
+// since it works to a deadline, resumes, and stops when asked. What neither side
+// allows is an unbounded one: a filter that accidentally matched everything.
 //
 // EVERY PRESS IS A FRESH READ. It used to skip links any earlier scan had
 // touched, which made a second press almost free and almost pointless: the
@@ -43,6 +44,9 @@ const CONCURRENCY = 4
 function scopeFor(qy: LinkQuery): { key: string; label: string } {
   const clusters = [...(qy.clusters ?? [])].sort((a, b) => a - b)
   const parts: string[] = [
+    // The genre first: two runs on "TikTok, all clusters" in different genres
+    // scanned different links and must not share a line on the graph.
+    `genre=${qy.genre || 'humanizer'}`,
     `by=${qy.clusterBy ?? 'rank'}`,
     `clusters=${clusters.join('.') || 'all'}`,
     `platform=${qy.platform || 'all'}`,
@@ -56,6 +60,7 @@ function scopeFor(qy: LinkQuery): { key: string; label: string } {
     `q=${qy.q || ''}`,
   ]
   const bits: string[] = []
+  bits.push(qy.genre || 'humanizer')
   bits.push(clusters.length ? `${qy.clusterBy ?? 'rank'} cluster ${clusters.join(', ')}` : 'all clusters')
   if (qy.platform) bits.push(qy.platform)
   if (qy.keyword) bits.push(`"${qy.keyword}"`)
@@ -68,7 +73,7 @@ function scopeFor(qy: LinkQuery): { key: string; label: string } {
 
 /** The filtered URLs this endpoint may scan, in a stable order. */
 async function targetUrls(sp: URLSearchParams): Promise<{ urls: string[]; error?: string }> {
-  const qy = parseLinkQuery(sp)
+  const qy = { ...parseLinkQuery(sp), genre: await getAdminGenre() }
   const { rows, retirePlatforms } = await buildAdminLinks(qy.product ?? '')
   const filtered = filterAdminLinks(rows, qy, retirePlatforms)
   // TikTok only: the comment endpoint has no equivalent elsewhere. Blocked links
@@ -77,15 +82,18 @@ async function targetUrls(sp: URLSearchParams): Promise<{ urls: string[]; error?
     .filter((l) => !l.blocked && /tiktok\.com\/@[^/]+\/(?:video|photo)\/\d+/i.test(l.url))
     .map((l) => l.url)
   urls.sort()
-  // Counted on what will actually be READ, which is at most what the filter
-  // shows: the page disables the button above the same limit, so this can only
-  // ever be the backstop for a request that did not come from the page.
-  if (urls.length > SCAN_MAX_LINKS) {
+  // NO CEILING ON THE SIZE. A big scan is expensive and slow, and it is also
+  // resumable and stoppable — whose evening that is belongs to the admin, not to
+  // this function. What is refused is an UNBOUNDED one: with no cluster selected
+  // the filter can match the entire pool, and nobody presses the button meaning
+  // "read every link we have ever collected". The page enforces the same rule, so
+  // this is the backstop for a request that did not come from it.
+  if ((qy.clusters?.length ?? 0) === 0) {
     return {
       urls: [],
       error:
-        `${urls.length.toLocaleString()} links match — narrow the filter to ` +
-        `${SCAN_MAX_LINKS.toLocaleString()} or fewer. Each one costs a few seconds of reading.`,
+        'Select at least one cluster. Without one this matches the whole pool, which is ' +
+        'not a long scan but an unbounded one.',
     }
   }
   if (urls.length === 0) {
@@ -133,7 +141,7 @@ export async function POST(req: NextRequest) {
 
     // The first request of a press opens the run; the client echoes its id on
     // every request after, so one press is one row in the history.
-    const scope = scopeFor(parseLinkQuery(sp))
+    const scope = scopeFor({ ...parseLinkQuery(sp), genre: await getAdminGenre() })
     const run = runId ?? (await startScanRun(scope.key, scope.label))
 
     // Only what THIS run has read. Links read by an earlier press are read

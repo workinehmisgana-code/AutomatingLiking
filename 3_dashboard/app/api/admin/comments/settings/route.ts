@@ -8,12 +8,19 @@ import {
   COMMENT_WORD_MAX,
   DEFAULT_COMMENT_STYLE,
   isCommentVoice,
+  isTopListRank,
+  clampTopList,
+  DEFAULT_TOP_LIST,
+  TOP_LIST_BOUNDS,
   type CommentStyle,
+  type TopListSetting,
 } from '@/lib/config'
 import {
   getProductCommentSettings,
   setProductWordBand,
   setProductCommentStyle,
+  setProductTopList,
+  getTopCommentsForProduct,
   normaliseWordBand,
 } from '@/lib/db'
 
@@ -26,14 +33,40 @@ async function requireAdmin(): Promise<boolean> {
   return isAdminEmail(session?.user?.email)
 }
 
-// GET ?product=x — that product's comment length band (falls back to defaults).
+// GET ?product=x — that product's settings: length band, writing style, and the
+// "serve the measured top list" setting.
+//
+// With ?list=1 it also returns the list itself. The list is computed from the
+// query's count/rank/days when those are given, NOT only from what is saved, so
+// the page can show what a change would serve BEFORE it is saved. Without them
+// it falls back to the saved setting.
 export async function GET(req: NextRequest) {
   if (!(await requireAdmin())) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   const product = String(req.nextUrl.searchParams.get('product') ?? '').trim()
   if (!isProduct(product)) return NextResponse.json({ error: 'Unknown product' }, { status: 400 })
   try {
-    const { band, style } = await getProductCommentSettings(product, DEFAULTS)
-    return NextResponse.json({ product, ...band, ...style, defaults: DEFAULTS })
+    const { band, style, top } = await getProductCommentSettings(product, DEFAULTS)
+    const sp = req.nextUrl.searchParams
+    const wantList = sp.get('list') === '1'
+    // The preview overrides. Absent ones keep the saved value; 'enabled' is never
+    // taken from the query, because asking to SEE a list is not asking to use it.
+    const preview: TopListSetting = clampTopList({
+      ...top,
+      count: sp.get('count') ?? top.count,
+      rank: isTopListRank(sp.get('rank')) ? (sp.get('rank') as TopListSetting['rank']) : top.rank,
+      days: sp.get('days') ?? top.days,
+    })
+    const list = wantList ? await getTopCommentsForProduct(product, preview).catch(() => []) : null
+    return NextResponse.json({
+      product,
+      ...band,
+      ...style,
+      top,
+      topBounds: TOP_LIST_BOUNDS,
+      topDefaults: DEFAULT_TOP_LIST,
+      ...(wantList ? { list, listFor: preview } : {}),
+      defaults: DEFAULTS,
+    })
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 })
   }
@@ -59,6 +92,7 @@ export async function POST(req: NextRequest) {
   const current = await getProductCommentSettings(product, DEFAULTS).catch(() => ({
     band: DEFAULTS,
     style: DEFAULT_COMMENT_STYLE,
+    top: DEFAULT_TOP_LIST,
   }))
   const flag = (v: unknown, was: boolean): boolean => (typeof v === 'boolean' ? v : was)
   const style: CommentStyle = {
@@ -67,10 +101,22 @@ export async function POST(req: NextRequest) {
     quoteBrand: flag(body?.quoteBrand, current.style.quoteBrand),
     voice: isCommentVoice(body?.voice) ? body.voice : current.style.voice,
   }
+  // Same rule for the top list: only the keys that were sent are changed, so a
+  // save from the length form cannot switch the serving source off.
+  const topIn: Partial<TopListSetting> = {}
+  if (typeof body?.topEnabled === 'boolean') topIn.enabled = body.topEnabled
+  if (body?.topCount !== undefined) topIn.count = Number(body.topCount)
+  if (isTopListRank(body?.topRank)) topIn.rank = body.topRank
+  if (body?.topDays !== undefined) topIn.days = Number(body.topDays)
   try {
     await setProductWordBand(product, band)
     await setProductCommentStyle(product, style)
-    return NextResponse.json({ ok: true, product, ...band, ...style })
+    const top =
+      Object.keys(topIn).length > 0 ? await setProductTopList(product, topIn) : current.top
+    // The saved list comes back with the save, so the page never shows a list
+    // that belongs to the previous setting.
+    const list = top.enabled ? await getTopCommentsForProduct(product, top).catch(() => []) : []
+    return NextResponse.json({ ok: true, product, ...band, ...style, top, list })
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 })
   }

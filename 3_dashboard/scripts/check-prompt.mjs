@@ -20,6 +20,11 @@ const check = (name, got, want) => {
 }
 
 const promptSrc = readFileSync(new URL('../lib/commentPrompt.ts', import.meta.url), 'utf8')
+// The domain-specific half of the prompt — what the product is, the voice, the
+// audience angles, the reject list — moved here when products stopped all being
+// humanizers. commentPrompt.ts holds what is true of every genre; this holds one
+// entry per genre.
+const copySrc = readFileSync(new URL('../lib/genreCopy.ts', import.meta.url), 'utf8')
 const genSrc = readFileSync(new URL('../lib/commentGen.ts', import.meta.url), 'utf8')
 
 /** Every backtick string in a file — roughly, the text that reaches the model. */
@@ -37,15 +42,23 @@ console.log(`   lib/commentPrompt.ts holds ~${text.length} characters of prompt 
 check('  it fits in a reasonable prompt (under 1,200 tokens)', tokens < 1200, true)
 
 console.log('\nsaid once, not twice:')
-// The naive-user rule lived in two places with two different banned lists.
-check('  "WHO YOU ARE" appears exactly once', (promptSrc.match(/WHO YOU ARE/g) || []).length, 1)
+// The naive-user rule lived in two places with two different banned lists, and
+// the two had drifted. It is now stated ONCE PER GENRE in genreCopy.ts and
+// nowhere else — both prompt builders read it through naiveVoice(product), so
+// they cannot describe the voice differently from each other again.
+check('  the voice is not inlined in the builders any more',
+      (promptSrc.match(/WHO YOU ARE/g) || []).length, 0)
+check('  it is stated once per genre, in one file',
+      (copySrc.match(/WHO YOU ARE/g) || []).length, 3)
+check('  and both builders read the same function',
+      (promptSrc.match(/naiveVoice\(product\)/g) || []).length >= 2, true)
 check('  the audience prompt no longer writes its own background',
   /is an AI humanizer website/.test(genSrc), false)
 check('  the audience prompt is assembled in the pure module, not in commentGen',
   /const system = buildAudiencePrompt\(/.test(genSrc), true)
 const audBlock =
   promptSrc.split('export function buildAudiencePrompt')[1]?.split('export function buildSystemPrompt')[0] ?? ''
-for (const piece of ['productBackground(product)', 'NAIVE_VOICE', 'voiceShapeRule(', 'outputRules(']) {
+for (const piece of ['productBackground(product)', 'naiveVoice(product)', 'voiceShapeRule(', 'outputRules(']) {
   check(`  the audience prompt includes ${piece}`, audBlock.includes(piece), true)
 }
 check('  no stray inline separator remains', /'\n\n' \+/.test(promptSrc), false)

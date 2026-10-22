@@ -1,6 +1,7 @@
 import { headers } from 'next/headers'
 import { redirect } from 'next/navigation'
 import { auth } from '@/lib/auth'
+import { getAdminGenre } from '@/lib/adminGenre'
 import {
   isAdminEmail,
   RETIRE_AFTER_USERS,
@@ -31,6 +32,7 @@ export default async function AdminLinksPage() {
       retireCap={RETIRE_AFTER_USERS}
       instagramRetire={INSTAGRAM_RETIRE_AFTER_USERS}
       clusterCount={Math.max(RANK_CLUSTER_COUNT, DATE_CLUSTER_COUNT)}
+      genre={await getAdminGenre()}
     />
   )
 }

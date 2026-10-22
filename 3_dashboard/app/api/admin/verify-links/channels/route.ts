@@ -1,7 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { isAdminEmail } from '@/lib/config'
+import { getAdminGenre } from '@/lib/adminGenre'
+import { DEFAULT_GENRE, isAdminEmail, isGenre } from '@/lib/config'
 import { addExtraChannel, removeExtraChannel, getExtraChannels } from '@/lib/db'
 import { fetchChannelVideos } from '@/lib/linkStats'
 import {
@@ -38,7 +39,10 @@ export async function GET() {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   try {
-    return NextResponse.json({ channels: await getExtraChannels() })
+    // The switch's genre's hand-added channels only.
+    const genre = await getAdminGenre()
+    const all = await getExtraChannels()
+    return NextResponse.json({ channels: all.filter((c) => (c.genre || DEFAULT_GENRE) === genre) })
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 })
   }
@@ -53,6 +57,7 @@ export async function POST(req: NextRequest) {
       input?: unknown
       site?: unknown
       note?: unknown
+      genre?: unknown
     }
     const parsed = parseChannelInput(String(body.input ?? ''))
     // A URL names its own site and wins; the dropdown only settles a bare handle.
@@ -98,10 +103,16 @@ export async function POST(req: NextRequest) {
       listed = (await fetchChannelVideos(parsed.handle).catch(() => [])).length
     }
 
-    const added = await addExtraChannel(site, parsed.handle, String(body.note ?? ''))
+    // WHICH GENRE THIS CHANNEL IS FOR, typed once here rather than per video.
+    // Everything extracted from it inherits this, and the merge files those
+    // links in that genre's pool — so adding a cocodly channel is the whole of
+    // telling the system that its videos are cocodly videos.
+    const genre = isGenre(body.genre) ? body.genre : DEFAULT_GENRE
+    const added = await addExtraChannel(site, parsed.handle, String(body.note ?? ''), genre)
     return NextResponse.json({
       ok: true,
       site,
+      genre,
       handle: parsed.handle,
       // false means it was already on the list — worth saying, because "nothing
       // happened" and "added" look identical otherwise.

@@ -1,5 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { activeProductsForPlatform, getLinkCategory, pickFairProductForUrl } from '@/lib/db'
+import { DEFAULT_GENRE, productsInGenre } from '@/lib/config'
+import { genreOfUrl } from '@/lib/videos'
 import { getFreshCategoryComments } from '@/lib/commentGen'
 import {
   isProduct,
@@ -45,9 +47,15 @@ export async function GET(req: NextRequest) {
   const wanted = String(req.nextUrl.searchParams.get('product') ?? '').trim()
   // Scoped to this link's platform, exactly as the app and the dashboard scope
   // it — the liker posts into the same comment sections.
-  const active = await activeProductsForPlatform(platformFromUrl(url)).catch(
+  const allowed = await activeProductsForPlatform(platformFromUrl(url)).catch(
     () => [] as string[]
   )
+  // Narrowed to the link's own genre, the same wall serveCommentForUrl puts
+  // up: a product from another genre under this video is a stranger talking
+  // about something else. Applied BEFORE the fair pick so a video whose
+  // leader is out of genre gets the next product in line rather than none.
+  const inGenre = new Set(productsInGenre(await genreOfUrl(url).catch(() => DEFAULT_GENRE)))
+  const active = allowed.filter((p) => inGenre.has(p))
 
   // An explicitly named product is honoured even when it is switched off for the
   // workers: the caller asked for that one, and silently substituting another

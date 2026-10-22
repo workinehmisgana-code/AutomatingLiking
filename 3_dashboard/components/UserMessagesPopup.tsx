@@ -1,6 +1,8 @@
 'use client'
 
 import { useCallback, useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
+import { usePathname } from 'next/navigation'
 import type { UnreadReply } from '@/lib/db'
 
 function fmtWhen(iso: string): string {
@@ -34,7 +36,16 @@ function fmtWhen(iso: string): string {
  */
 export default function UserMessagesPopup({ initial }: { initial: UnreadReply[] }) {
   const [replies, setReplies] = useState<UnreadReply[]>(initial)
-  const [open, setOpen] = useState(initial.length > 0)
+  // Opens by itself on the admin home only. It lives in the genre bar on every
+  // admin page now, and springing open on each page visited would be a modal
+  // to dismiss every time the Links page loads.
+  const pathname = usePathname()
+  const [open, setOpen] = useState(initial.length > 0 && pathname === '/admin')
+  // The modal is portalled to <body>: the genre bar it sits in is sticky with a
+  // backdrop blur, which makes it the containing block for anything `fixed`
+  // inside it — the overlay would be clipped to the bar.
+  const [mounted, setMounted] = useState(false)
+  useEffect(() => setMounted(true), [])
   const [busy, setBusy] = useState<number | 'all' | null>(null)
   const [draft, setDraft] = useState<Record<number, string>>({})
   const [err, setErr] = useState('')
@@ -97,24 +108,22 @@ export default function UserMessagesPopup({ initial }: { initial: UnreadReply[] 
 
   if (replies.length === 0) return null
 
-  // Closed but not answered: a small bar to get back in, so the messages are
-  // never more than one press away.
-  if (!open) {
-    return (
-      <button
-        onClick={() => setOpen(true)}
-        className="w-full mb-4 flex items-center gap-2 rounded-xl border border-sky-500/40 bg-sky-500/10 px-3 py-2.5 text-left hover:bg-sky-500/15 transition-colors"
-      >
-        <span className="text-lg">✉️</span>
-        <span className="text-sm text-sky-200 font-medium">
-          {replies.length} unanswered message{replies.length === 1 ? '' : 's'} from users
-        </span>
-        <span className="ml-auto text-xs text-sky-300/80">open</span>
-      </button>
-    )
-  }
+  // Closed but not answered: a chip in the genre bar to get back in, so the
+  // messages are never more than one press away from any admin page.
+  const chip = (
+    <button
+      onClick={() => setOpen(true)}
+      className="flex items-center gap-1.5 rounded-lg border border-sky-500/40 bg-sky-500/10 px-2.5 py-1 text-left hover:bg-sky-500/15 transition-colors"
+    >
+      <span>✉️</span>
+      <span className="text-sm text-sky-200 font-medium tabular-nums">
+        <span className="text-red-500 font-bold">{replies.length}</span> message{replies.length === 1 ? '' : 's'}
+      </span>
+    </button>
+  )
+  if (!open) return chip
 
-  return (
+  const modal = (
     <div
       className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/70 p-0 sm:p-4"
       role="dialog"
@@ -130,7 +139,7 @@ export default function UserMessagesPopup({ initial }: { initial: UnreadReply[] 
         <div className="flex items-center gap-2 px-4 py-3 border-b border-zinc-800">
           <span className="text-lg">✉️</span>
           <h2 className="text-sm font-semibold text-white">
-            {replies.length} message{replies.length === 1 ? '' : 's'} from users
+            <span className="text-red-500 font-bold">{replies.length}</span> message{replies.length === 1 ? '' : 's'} from users
           </h2>
           <button
             onClick={() => setOpen(false)}
@@ -230,5 +239,11 @@ export default function UserMessagesPopup({ initial }: { initial: UnreadReply[] 
         </div>
       </div>
     </div>
+  )
+  return (
+    <>
+      {chip}
+      {mounted ? createPortal(modal, document.body) : null}
+    </>
   )
 }

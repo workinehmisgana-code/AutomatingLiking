@@ -45,6 +45,7 @@
 import { getClickScanByUrl, getProductCommentCounts, getScanCountsByPlatform } from './db'
 import { buildAdminLinks, type AdminLinkRow } from './adminLinks'
 import { siteOf } from './channelRank'
+import { DEFAULT_GENRE } from './config'
 
 /** One of a channel's counted links, with enough to judge it. */
 export interface YieldLink {
@@ -154,8 +155,12 @@ const TITLE_MAX = 140
  * sensible default below which a ratio is meaningful, so the caller chooses and
  * the number is reported back with the rows.
  */
-export async function channelCommentYield(minClicks: number): Promise<YieldReport> {
-  const [links, byProductUrl, scansByPlatform, pool] = await Promise.all([
+export async function channelCommentYield(
+  minClicks: number,
+  /** Only this genre's links (the admin's master switch); every genre when omitted. */
+  genre?: string
+): Promise<YieldReport> {
+  const [allLinks, byProductUrl, scansByPlatform, pool] = await Promise.all([
     getClickScanByUrl().catch(() => []),
     getProductCommentCounts().catch(() => ({}) as Record<string, Record<string, number>>),
     getScanCountsByPlatform().catch(() => ({}) as Record<string, number>),
@@ -173,6 +178,11 @@ export async function channelCommentYield(minClicks: number): Promise<YieldRepor
   // list entirely.
   const poolRow = new Map<string, AdminLinkRow>()
   for (const r of pool.rows) if (r.url) poolRow.set(r.url, r)
+  // One genre's clicked links. A link no longer in the pool has no genre left
+  // to read, and counts as the default — the genre every old link was.
+  const links = genre
+    ? allLinks.filter((l) => (poolRow.get(l.url)?.genre ?? DEFAULT_GENRE) === genre)
+    : allLinks
 
   interface Acc {
     handle: string

@@ -44,15 +44,23 @@ export async function POST(req: NextRequest) {
   let product: string | null = null
   let category: string | null = null
   let append = false
-  // Present only on a recipe edit. Read here with the rest of the body, because
-  // the body is not in scope below.
+  // `voices` carries two different requests and the caller has to say which:
+  //
+  //   recipeOnly    edit the recipe, generate nothing (the × and "rebuild from
+  //                 <voice> only" buttons)
+  //   otherwise     regenerate in exactly these voices — what the page sends when
+  //                 somebody presses Regenerate with a voice selected
+  //
+  // Read here with the rest of the body, because the body is not in scope below.
   let voices: unknown[] | null = null
+  let recipeOnly = false
   try {
     const body = await req.json().catch(() => ({}))
     product = body?.product ? String(body.product) : null
     category = body?.category ? String(body.category) : null
     append = body?.append === true
     voices = Array.isArray(body?.voices) ? (body.voices as unknown[]) : null
+    recipeOnly = body?.recipeOnly === true
   } catch {
     product = null
   }
@@ -60,7 +68,7 @@ export async function POST(req: NextRequest) {
   // Edit the recipe without touching the text. Checked before `append` and
   // before the regenerate paths, because it is the only one that generates
   // nothing at all.
-  if (voices !== null) {
+  if (voices !== null && recipeOnly) {
     if (!product || !isProduct(product)) {
       return NextResponse.json({ error: 'Unknown product' }, { status: 400 })
     }
@@ -113,8 +121,11 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Unknown category' }, { status: 400 })
     }
     try {
-      const count = await regenerateCategory(product, category)
-      return NextResponse.json({ ok: true, product, category, count })
+      // The admin overruling the set's recipe — see regenerateCategory. Absent,
+      // the recipe stands, which is what the cron relies on.
+      const asked = voices ? voices.map((v) => String(v)) : undefined
+      const count = await regenerateCategory(product, category, asked)
+      return NextResponse.json({ ok: true, product, category, count, voices: asked })
     } catch (e) {
       return NextResponse.json({ error: String(e) }, { status: 500 })
     }

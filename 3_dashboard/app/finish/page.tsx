@@ -1,6 +1,6 @@
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { getBlockForEmail, getUserProfile, isProfileComplete } from '@/lib/db'
+import { getBlockForEmail, getUserProfile, isProfileComplete, getVerifyVideoUrl } from '@/lib/db'
 import { redirect } from 'next/navigation'
 import Login from '@/components/Login'
 import Blocked from '@/components/Blocked'
@@ -27,6 +27,7 @@ export default async function FinishPage() {
         reason={block.reason}
         email={session.user.email ?? ''}
         auto={block.auto}
+        videoUrl={await getVerifyVideoUrl().catch(() => '')}
       />
     )
   }

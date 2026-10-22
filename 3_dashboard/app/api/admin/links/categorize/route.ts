@@ -11,7 +11,7 @@ import {
   clearLinkCategories,
   getChannelBios,
   harvestChannelBios,
-  getBlockedUrls,
+  getBlockedPoolUrls,
 } from '@/lib/db'
 import { categorizeChunk, CHUNK, type Categorizable } from '@/lib/linkCategory'
 import { handleOf } from '@/lib/channelRank'
@@ -48,7 +48,7 @@ async function allTargets(): Promise<Categorizable[]> {
     loadVideosJson().catch(() => []),
     getLinkTitles().catch(() => ({}) as Record<string, string>),
     getChannelBios().catch(() => ({}) as Record<string, string>),
-    getBlockedUrls().catch(() => [] as string[]),
+    getBlockedPoolUrls().catch(() => [] as string[]),
   ])
   const blocked = new Set(blockedUrls)
   const out: Categorizable[] = []

@@ -1,8 +1,10 @@
 import { NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
+import { getAdminGenre } from '@/lib/adminGenre'
 import { isAdminEmail } from '@/lib/config'
-import { getBlockedUrls } from '@/lib/db'
+import { getBlockedPairs } from '@/lib/db'
+import { genreOfRow } from '@/lib/config'
 import { loadVideosJson } from '@/lib/videos'
 
 export const dynamic = 'force-dynamic'
@@ -36,10 +38,15 @@ export async function GET() {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   try {
-    const [videos, blockedList] = await Promise.all([
+    // ONE GENRE: its pool links, and the blocks made for it. A channel can be
+    // good for one genre and rejected for another.
+    const genre = await getAdminGenre()
+    const [allVideos, pairs] = await Promise.all([
       loadVideosJson().catch(() => []),
-      getBlockedUrls().catch(() => [] as string[]),
+      getBlockedPairs().catch(() => [] as { url: string; genre: string }[]),
     ])
+    const videos = allVideos.filter((v) => genreOfRow(v) === genre)
+    const blockedList = Array.from(new Set(pairs.filter((p) => p.genre === genre).map((p) => p.url)))
     const blocked = new Set(blockedList)
 
     const stats: Record<string, { active: number; blocked: number }> = {}

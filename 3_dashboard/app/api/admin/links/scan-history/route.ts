@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { isAdminEmail, PRODUCTS } from '@/lib/config'
+import { getAdminGenre, adminGenreUrlTest } from '@/lib/adminGenre'
+import { isAdminEmail, productsInGenre } from '@/lib/config'
 import { getScanRuns, type ScanRun } from '@/lib/db'
 
 export const dynamic = 'force-dynamic'
@@ -22,7 +23,11 @@ export async function GET() {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   try {
-    const runs = await getScanRuns(400)
+    const genre = await getAdminGenre()
+    // A run's genre is in its key; runs from before the switch have none and
+    // were humanizer scans, which is the only genre that existed.
+    const genreOfKey = (k: string) => k.match(/(?:^|\|)genre=([a-z]+)/)?.[1] ?? 'humanizer'
+    const runs = (await getScanRuns(400)).filter((r) => genreOfKey(r.scopeKey) === genre)
 
     const byScope = new Map<string, { key: string; label: string; runs: ScanRun[] }>()
     for (const r of runs) {
@@ -52,7 +57,7 @@ export async function GET() {
       // Most recently scanned scope first — that is the one just run.
       .sort((a, b) => b.latestAt.localeCompare(a.latestAt))
 
-    return NextResponse.json({ scopes, products: PRODUCTS })
+    return NextResponse.json({ scopes, products: productsInGenre(genre) })
   } catch (e) {
     return NextResponse.json({ error: `Could not read scan history: ${String(e)}` }, { status: 500 })
   }

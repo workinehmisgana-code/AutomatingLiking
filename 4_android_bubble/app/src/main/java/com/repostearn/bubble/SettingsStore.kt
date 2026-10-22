@@ -14,6 +14,7 @@ object SettingsStore {
         "YT Shorts" to "youtube_shorts",
         "YT Videos" to "youtube_videos",
         "Instagram" to "instagram",
+        "Reddit" to "reddit",
     )
 
     private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -33,6 +34,7 @@ object SettingsStore {
             "youtube_shorts" -> "Shorts"
             "youtube_videos" -> "YT"
             "instagram" -> "IG"
+            "reddit" -> "Reddit"
             else -> p
         }
     }

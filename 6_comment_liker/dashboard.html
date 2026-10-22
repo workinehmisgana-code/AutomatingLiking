@@ -59,11 +59,22 @@
   .grp { border-top: 1px solid #27272a; padding-top: 8px; margin-top: 8px; }
   .grp:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
   .grp h3 { font-size: 11px; color: #71717a; margin: 0 0 6px; text-transform: uppercase; letter-spacing: .05em; }
-  pre.out {
+  textarea.out {
     background: #09090b; border: 1px solid #27272a; border-radius: 8px;
     padding: 8px; margin: 0; font-size: 11.5px; line-height: 1.35;
-    max-height: 340px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+    height: 340px; width: 100%; box-sizing: border-box; overflow: auto;
+    white-space: pre-wrap; word-break: break-word; resize: vertical;
+    color: inherit; font-family: ui-monospace, Menlo, Consolas, monospace;
   }
+  textarea.out:focus { outline: none; border-color: #3f3f46; }
+  div.out {
+    background: #09090b; border: 1px solid #27272a; border-radius: 8px;
+    padding: 8px; margin: 0; font-size: 11.5px; line-height: 1.35;
+    height: 340px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+  }
+  div.out a { color: #7aa2f7; }
+  div.out a:hover { color: #a5c0ff; }
   .cmd { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px;
          color: #a1a1aa; background: #09090b; border: 1px solid #27272a;
          border-radius: 8px; padding: 7px; overflow-x: auto; white-space: pre-wrap;
@@ -141,7 +152,61 @@
           <button class="small" onclick="tool('sessions','')">Re-scan all sessions</button>
           <button class="small" onclick="tool('emails','')">Find every registered email</button>
         </div>
+        <div class="row" style="margin-top:8px">
+          <label class="sub" for="zefoyClusters" style="align-self:center">
+            Zefoy hearts on the phone — clusters</label>
+          <input id="zefoyClusters" class="small" style="width:90px" value="all"
+            title="Which search-rank clusters to work: 'all', or a list like 1,2. Links are worked best cluster first.">
+          <button class="small" onclick="startZefoy()"
+            title="Give hearts to our comments using the phone's own Chrome over adb, so the session and the IP are the phone's. Needs the phone plugged in with USB debugging on, Chrome open and the screen unlocked — a tab nobody is looking at is not drawn, and the captcha image never arrives. Picks up where the last phone run stopped.">
+            ▶ Start Zefoy on the phone</button>
+        </div>
+        <p class="sub" style="margin:6px 0 0" id="zefoyNote"></p>
         <p class="sub" style="margin:8px 0 0" id="emailsAt"></p>
+      </div>
+
+      <div class="card">
+        <h2>Comments to post</h2>
+        <p class="sub" style="margin:0 0 8px">
+          One comment per line. While there is anything here, these are what the
+          accounts post on videos carrying none of ours — instead of the
+          dashboard's generated set. <b>Empty means nothing changes</b>: the
+          generated comments are used, exactly as before.
+          Lines starting with <code>#</code> are notes, not comments.
+        </p>
+        <textarea id="ownComments" rows="8" spellcheck="false"
+          style="width:100%;box-sizing:border-box;font:inherit;background:#0e1116;
+                 color:inherit;border:1px solid #2a2f3a;border-radius:8px;padding:8px"
+          placeholder="purify text cleared my draft in one go&#10;# the batch for the essay videos"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="small" onclick="saveOwnComments()">Save</button>
+          <span class="sub" id="ownCount"></span>
+        </div>
+        <p class="sub" style="margin:8px 0 0">
+          Only reached when <b>Comment on empty videos</b> is on — that is the
+          setting which lets a run post at all.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Channels to comment under</h2>
+        <p class="sub" style="margin:0 0 8px">
+          One TikTok channel per line — <code>@handle</code>, or a pasted profile
+          or video URL. While there is anything here, comments are only posted
+          under videos <b>by these channels</b>; every other video is still
+          worked and simply not written on.
+          <b>Empty means every channel</b>, as before.
+          The channel comes from the link itself, so a video that is not wanted
+          costs nothing to skip.
+        </p>
+        <textarea id="cmtChannels" rows="5" spellcheck="false"
+          style="width:100%;box-sizing:border-box;font:inherit;background:#0e1116;
+                 color:inherit;border:1px solid #2a2f3a;border-radius:8px;padding:8px"
+          placeholder="@sav.studies&#10;https://www.tiktok.com/@studywjenny4&#10;# anywhere else is left alone"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="small" onclick="saveCmtChannels()">Save</button>
+          <span class="sub" id="cmtChannelsCount"></span>
+        </div>
       </div>
     </div>
 
@@ -164,9 +229,19 @@
           <button class="small ghost" id="copyOne" onclick="copyShown(this)">Copy</button>
           <button class="small ghost" id="copyAll" onclick="copyEveryJob(this)">Copy all jobs</button>
           <button class="small ghost" id="copyLog" onclick="copyWholeLog(this)">Copy the whole log</button>
+          <button class="small ghost" id="outMode" onclick="outToggle()"
+            title="Switch between clickable links and a box you can type in. A textarea cannot hold a link, so it is one or the other.">
+            ✎ Edit</button>
+          <button class="small ghost" onclick="outRefresh()"
+            title="Throw away anything typed into the box below and show the live output again.">
+            Refresh</button>
           <span class="sub" id="copyNote"></span>
         </div>
-        <pre class="out" id="out">nothing running yet.</pre>
+        <div class="out" id="outlinks">nothing running yet.</div>
+        <textarea class="out" id="out" spellcheck="false" style="display:none"
+          oninput="OUTEDIT = true" onblur="outReleased()"
+        >nothing running yet.</textarea>
+        <p class="sub" id="outnote" style="margin:6px 0 0"></p>
       </div>
     </div>
   </div>
@@ -177,9 +252,12 @@ let S = null;                 // last state from the server
 let SEL = new Set();          // selected profile names
 let SEEN = {};                // job -> lines already received
 let BUF = {};                 // job -> the lines themselves
+let STARTED = {};             // job -> when THIS run of it began
 let TAB = null;               // which job's output is shown
 let OPEN = null;              // which profile's configuration panel is open
 let SHOWPRE = false;
+// True once the output box has been typed into, so polling stops overwriting it.
+let OUTEDIT = false;
 let dirty = false;            // unsaved edits in the settings form
 // Which settings the form was built from. Compared on every poll so a setting
 // added while this page was open shows up without a reload.
@@ -196,6 +274,55 @@ async function api(path, body) {
   return r.json().catch(() => ({}));
 }
 
+// ── the comments you wrote yourself ────────────────────────────────────────
+// Read from and written to the same file like.py reads, so the box can never
+// show something a run would not use.
+async function loadOwnComments() {
+  const d = await api('/api/comments');
+  const el = document.getElementById('ownComments');
+  if (el && typeof d.text === 'string' && document.activeElement !== el) el.value = d.text;
+  showOwnCount(d.count);
+}
+
+function showOwnCount(n) {
+  const el = document.getElementById('ownCount');
+  if (!el) return;
+  el.textContent = n > 0
+    ? `${n} comment(s) — these are what gets posted`
+    : 'empty — the generated comments are used';
+  el.style.color = n > 0 ? '#7ee787' : '';
+}
+
+async function loadCmtChannels() {
+  const d = await api('/api/comment-channels');
+  const el = document.getElementById('cmtChannels');
+  if (el && typeof d.text === 'string' && document.activeElement !== el) el.value = d.text;
+  showCmtChannels(d.count);
+}
+
+function showCmtChannels(n) {
+  const el = document.getElementById('cmtChannelsCount');
+  if (!el) return;
+  el.textContent = n > 0
+    ? `${n} channel(s) — comments go under these only`
+    : 'empty — any channel may be commented under';
+  el.style.color = n > 0 ? '#7ee787' : '';
+}
+
+async function saveCmtChannels() {
+  const el = document.getElementById('cmtChannels');
+  const d = await api('/api/comment-channels', { text: el ? el.value : '' });
+  if (d.error) { alert(d.error); return; }
+  showCmtChannels(d.count);
+}
+
+async function saveOwnComments() {
+  const el = document.getElementById('ownComments');
+  const d = await api('/api/comments', { text: el ? el.value : '' });
+  if (d.error) { showOwnCount(0); alert(d.error); return; }
+  showOwnCount(d.count);
+}
+
 // ── polling ────────────────────────────────────────────────────────────────
 async function poll() {
   const st = await api('/api/state?since=' + encodeURIComponent(JSON.stringify(SEEN)));
@@ -203,6 +330,21 @@ async function poll() {
   const first = S === null;
   S = st;
   for (const [name, j] of Object.entries(st.jobs || {})) {
+    // A JOB NAME IS REUSED EVERY TIME THE SAME BUTTON IS PRESSED, so the
+    // buffer under it has to be emptied when a new run begins — otherwise the
+    // new output appears below the old, and the two read as one listing.
+    if (STARTED[name] !== undefined && STARTED[name] !== j.started) {
+      // ASK AGAIN FROM THE TOP, and do not touch SEEN below on the way past:
+      // setting it to this response's seq would put the counter straight back
+      // where it was, and the next poll would ask for lines after the end of a
+      // run that has already finished. The reset only works if the next request
+      // actually carries the 0.
+      BUF[name] = [];
+      SEEN[name] = 0;
+      STARTED[name] = j.started;
+      continue;
+    }
+    STARTED[name] = j.started;
     BUF[name] = (BUF[name] || []).concat(j.new || []).slice(-600);
     SEEN[name] = j.seq;
     if (TAB === null) TAB = name;
@@ -758,6 +900,26 @@ async function stopAll() {
   if (!confirm('Stop every running job?')) return;
   await api('/api/stop', {}); poll();
 }
+// The phone's heart runner. Its "profile" slot carries the cluster selection,
+// which is why it does not go through the profile check in tool().
+async function startZefoy() {
+  const el = document.getElementById('zefoyClusters');
+  const clusters = (el && el.value || 'all').trim() || 'all';
+  const note = document.getElementById('zefoyNote');
+  if (note) note.textContent = 'starting…';
+  const r = await api('/api/tool', { tool: 'zefoy', profile: clusters });
+  if (!r.ok) {
+    if (note) note.textContent = r.note || 'Could not start.';
+    alert(r.note || 'Could not start.');
+    return;
+  }
+  if (note) {
+    note.textContent = 'running — the output pane below follows it. If it stops ' +
+      'at once, check the phone is plugged in with Chrome open and unlocked.';
+  }
+  TAB = r.job; poll();
+}
+
 async function tool(t, forced) {
   const p = forced !== undefined ? forced : [...SEL][0];
   if (p === undefined && forced === undefined) return alert('Select a profile first.');
@@ -802,7 +964,8 @@ function flash(btn, note) {
 // output" — including the command and log path underneath it.
 function copyShown(btn) {
   if (!TAB) { flash(btn, 'no job selected'); return; }
-  copyText($('out').textContent, btn, `${TAB}`);
+  // Whatever is in the box right now, including anything typed into it.
+  copyText(OUTLINKS ? $('outlinks').innerText : $('out').value, btn, `${TAB}`);
 }
 
 // Seventeen profiles is seventeen tabs, and a question about a run is usually a
@@ -847,14 +1010,75 @@ function renderJobs() {
   }).join('');
   const j = S.jobs[TAB];
   const el = $('out');
-  const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
-  el.textContent = (BUF[TAB] || []).join('\n') || '(no output yet)';
-  if (j) el.textContent += `\n\n$ ${j.cmd}\nlog: ${j.log}`;
-  if (stick) el.scrollTop = el.scrollHeight;
+  // EDITABLE, SO IT IS NOT REWRITTEN UNDER YOUR HANDS. The output is a
+  // textarea now — select a line, delete the noise, paste a note beside a link —
+  // and a run that kept printing would undo all of that mid-keystroke. So while
+  // the box has focus, or has been edited at all, the live text is held back
+  // and the note below says so. Clicking away with nothing changed resumes it.
+  const links = $('outlinks');
+  // Which pane is on screen, and the button offering the other one.
+  el.style.display = OUTLINKS ? 'none' : '';
+  links.style.display = OUTLINKS ? '' : 'none';
+  $('outMode').textContent = OUTLINKS ? '✎ Edit' : '🔗 Links';
+  if (document.activeElement === el || OUTEDIT) {
+    $('outnote').textContent = OUTEDIT
+      ? 'Edited — live output is paused for this box. Press Refresh to get it back.'
+      : 'Typing — live output resumes when you click away.';
+    $('outnote').style.color = OUTEDIT ? '#f0b429' : '';
+    return;
+  }
+  $('outnote').textContent = OUTLINKS
+    ? 'Links open in a new tab. Press ✎ Edit to type in this box instead.'
+    : '';
+  const box = OUTLINKS ? links : el;
+  const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  let text = (BUF[TAB] || []).join('\n') || '(no output yet)';
+  if (j) text += `\n\n$ ${j.cmd}\nlog: ${j.log}`;
+  if (OUTLINKS) links.innerHTML = linkify(text);
+  else el.value = text;
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+
+// Clicking away does not by itself throw an edit away: only Refresh does.
+function outReleased() { renderJobs(); }
+
+// A TEXTAREA CANNOT HOLD A LINK, which is the whole reason this is a pair.
+// Reading is the common case, so the clickable pane is what shows by default and
+// the button switches to the one you can type in.
+let OUTLINKS = true;
+
+function outToggle() {
+  OUTLINKS = !OUTLINKS;
+  OUTEDIT = false;
+  renderJobs();
+  if (!OUTLINKS) $('out').focus();
+}
+
+// Escape first, then linkify, so a URL in the output can never carry markup in
+// with it. Trailing punctuation is left out of the href: a link at the end of a
+// sentence is followed by a full stop that is not part of it.
+function linkify(text) {
+  return esc(text).replace(/https?:\/\/[^\s<>"']+/g, (u) => {
+    const trail = u.match(/[.,;:)\]]+$/);
+    const href = trail ? u.slice(0, -trail[0].length) : u;
+    return `<a href="${href}" target="_blank" rel="noopener noreferrer">${href}</a>`
+      + (trail ? trail[0] : '');
+  });
+}
+
+// Put the live output back, whatever was typed over it.
+function outRefresh() {
+  OUTEDIT = false;
+  renderJobs();
 }
 
 poll();
 setInterval(poll, 1500);
+loadCmtChannels();
+// The comment list, once at load and then only on demand: it is a textarea
+// somebody may be typing into, and a poll that overwrote it mid-sentence would
+// be worse than a stale count.
+loadOwnComments();
 // Only while a debounced save is still pending — a second at most. With
 // auto-save there is no draft to lose, and a page that asks 'are you sure'
 // every time it is closed trains somebody to dismiss it.

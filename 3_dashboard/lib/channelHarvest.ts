@@ -44,7 +44,7 @@
 
 import { rankChannels } from './channelRank'
 import { fetchChannelVideos, fetchVideoDetail } from './linkStats'
-import { classifyRelated, type Item } from './titleClassify'
+import { classifyRelatedByGenre, type Item } from './titleClassify'
 import { mergeVerifyLinks } from './verifyMerge'
 import { loadVideosJson } from './videos'
 import {
@@ -55,7 +55,7 @@ import {
   setAppState,
   getHarvestPlatforms,
 } from './db'
-import { CHANNEL_SITE_PLATFORMS } from './config'
+import { CHANNEL_SITE_PLATFORMS, DEFAULT_GENRE } from './config'
 
 /**
  * The share of a channel's links that must still be active for the automatic
@@ -192,6 +192,13 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
   for (const u of staged) add(u)
   for (const u of blocked) add(u)
 
+  // THE CHANNEL'S GENRE, so the rows it stages carry one and the marker below
+  // asks the right question about them. Without it every harvested link was
+  // staged as the default and then judged against the humanizer definition —
+  // which marks a website channel's whole output unrelated and blocks it.
+  const genreOfChannel = new Map<string, string>()
+  for (const c of ranked) genreOfChannel.set(c.handle.toLowerCase(), c.genre)
+
   const rows: Parameters<typeof saveVerifyLinks>[0] = []
   let checked = 0
   let failed = 0
@@ -231,6 +238,7 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
             posted_date: d?.postedDate || '',
             title: d?.title || v.title || '',
             bio: d?.bio || '',
+            genre: genreOfChannel.get(String(handle).toLowerCase()) ?? DEFAULT_GENRE,
           })
         })
       }
@@ -257,14 +265,20 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
   // Only titled links can be judged. An untitled one goes to a person — asking
   // a model to classify an empty string and then merging on its answer would put
   // links in front of users that nobody ever read.
-  const titled: Item[] = rows
+  const titled: (Item & { genre?: string })[] = rows
     .filter((r) => String(r.title ?? '').trim())
-    .map((r) => ({ url: String(r.url), title: String(r.title) }))
+    .map((r) => ({
+      url: String(r.url),
+      title: String(r.title),
+      genre: String((r as { genre?: unknown }).genre ?? ''),
+    }))
   const untitled = rows.length - titled.length
 
   let related: string[] = []
   if (titled.length > 0) {
-    related = await classifyRelated(titled).catch(() => [] as string[])
+    // Each link judged against its own genre: one harvest pass can cover
+    // channels of several genres, and one question would bin the others.
+    related = await classifyRelatedByGenre(titled).catch(() => [] as string[])
   }
 
   let merged = 0

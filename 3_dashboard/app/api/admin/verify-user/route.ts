@@ -111,16 +111,28 @@ export async function POST(req: NextRequest) {
   }
 
   try {
+    // `since` is the instant this check began, and it pins the window as well
+    // as the freshness: the user may well be clicking while the admin watches,
+    // and without the pin their new links push the ones already judged out of
+    // the newest 300 and the check never reports done. It won the race on speed
+    // before — the admin's browser calls this back to back — which is luck, not
+    // a property.
     const r = await scoreUserRecent(
       userId,
       profile!.tiktok_url!,
       RECENT_SAMPLE,
       Date.now() + BUDGET_MS,
+      since,
+      false,
       since
     )
     if (!r) {
       return NextResponse.json(
-        { error: 'This user has never opened a TikTok link, so there is nothing to check.' },
+        {
+          error:
+            'No TikTok links to check: they have not opened one since their TikTok account was last ' +
+            'changed (only links opened with the current account are checked), or never have.',
+        },
         { status: 400 }
       )
     }
@@ -145,6 +157,23 @@ export async function POST(req: NextRequest) {
       | { judged: number; skipped: number; rule?: string; pct?: number | null }
       | undefined
     let blockNote = ''
+    // The thresholds this check ran under. Reported, because they are settable and
+    // a report that quotes the defaults would be wrong the moment somebody
+    // changes one.
+    let rulesUsed = {
+      on: true,
+      sample: BLOCK_SAMPLE,
+      ratioSample: RATIO_SAMPLE,
+      ratioMinPct: RATIO_MIN_PCT,
+    }
+    // THE RATE RULE'S OWN NUMBERS. The percentage at the top of the report is over
+    // whatever this check managed to judge — 24 of 269, say — and the rule reads a
+    // FIXED window, the newest 200 judged. Those are different denominators and
+    // they disagree: one real user showed 9% in the header while the rule saw 20
+    // of 200, exactly 10%, and survived by one comment. Reporting only the header
+    // number leaves "why was this person not blocked" unanswerable on the screen
+    // where it is asked.
+    let ruleRate: { judged: number; found: number; pct: number } | null = null
     if (r.remaining === 0) {
       if (!(await canBlock(userId))) {
         // WHICH ONE, because they mean opposite things to whoever pressed the
@@ -158,12 +187,25 @@ export async function POST(req: NextRequest) {
             ? 'not blocked — they are already blocked'
             : 'not blocked — they are on the auto-block exempt list'
       } else {
+        // No sample argument: the saved rules are the rules. Passing the
+        // constant here is how this route used to ignore the admin's own setting.
         const v = await noCommentVerdict(
           userId,
           profile!.tiktok_url!,
           Date.now() + BUDGET_MS,
-          BLOCK_SAMPLE
+          undefined,
+          since
         ).catch(() => null)
+        // What the verdict was reached under, so the report can name the numbers
+        // rather than repeat the defaults back.
+        const applied = v?.rules ?? {
+          on: true,
+          sample: BLOCK_SAMPLE,
+          ratioSample: RATIO_SAMPLE,
+          ratioMinPct: RATIO_MIN_PCT,
+        }
+        rulesUsed = applied
+        ruleRate = v?.ratio ?? null
         // A HIT NO LONGER ENDS IT. It clears the first rule and the second one
         // still has something to say: a comment on one link in two hundred is a
         // comment, and it is not a day's work.
@@ -202,22 +244,28 @@ export async function POST(req: NextRequest) {
                   : `0 of ${v.judged} judged`
               }) but the block could not be written — try again, or block them from their row`
           }
+        } else if (v && !applied.on) {
+          // OFF IS A SETTING, not a silence. Without this the check reads 0% and
+          // blocks nobody with no explanation, which is what an exempt user used
+          // to look like.
+          blockNote =
+            'not blocked — auto-blocking is switched off in the admin settings'
         } else if (v) {
           // WHY NOT, in the terms of whichever rule came closest. Both have to be
           // answerable, or a 0% report that blocks nobody looks like a bug.
           const rate = v.ratio
           blockNote =
-            rate && rate.judged >= RATIO_SAMPLE
+            rate && rate.judged >= applied.ratioSample
               ? `not blocked — ${rate.pct}% of their last ${rate.judged} judged links carry ` +
-                `their comment, and the rule needs under ${RATIO_MIN_PCT}%`
+                `their comment, and the rule needs under ${applied.ratioMinPct}%`
               : rate && rate.judged > 0
                 ? `not blocked — ${v.found} found on ${v.judged} judged recently, and only ` +
-                  `${rate.judged} of the ${RATIO_SAMPLE} judged links the rate rule needs ` +
-                  'have been read'
+                  `${rate.judged} of the ${applied.ratioSample} judged links the rate rule ` +
+                  'needs have been read'
                 : v.found > 0
                   ? `not blocked — a comment turned up on ${v.found} link(s) further back`
-                  : `not blocked — only ${v.judged} of the ${BLOCK_SAMPLE} links needed could ` +
-                    `be judged${v.skipped ? ` (${v.skipped} unreadable)` : ''}`
+                  : `not blocked — only ${v.judged} of the ${applied.sample} links needed ` +
+                    `could be judged${v.skipped ? ` (${v.skipped} unreadable)` : ''}`
         }
       }
     }
@@ -244,9 +292,11 @@ export async function POST(req: NextRequest) {
       comments,
       // What the auto-block rule did, and when it did nothing, why — a button
       // that can block somebody must never be silent about not having.
-      blockSample: BLOCK_SAMPLE,
-      ratioSample: RATIO_SAMPLE,
-      ratioMinPct: RATIO_MIN_PCT,
+      ruleRate,
+      blockSample: rulesUsed.sample,
+      ratioSample: rulesUsed.ratioSample,
+      ratioMinPct: rulesUsed.ratioMinPct,
+      autoBlockOn: rulesUsed.on,
       blocked,
       blockNote,
     })

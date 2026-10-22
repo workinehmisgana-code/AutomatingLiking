@@ -40,6 +40,19 @@ function fmtWhen(iso: string): string {
 // APPROVING IS THE PAYMENT — a submission is worth nothing until it is approved
 // here, and it cannot be un-approved afterwards. So the button says what it
 // costs, and a rejection has to carry a reason the worker can act on.
+/** One worker's mailbox money, as the page settles it. */
+interface PayRow {
+  userId: string
+  name: string
+  email: string
+  phone: string | null
+  telegram: string | null
+  owed: number
+  owedBirr: number
+  paidCount: number
+  pendingCount: number
+}
+
 export default function AdminAccountTasks() {
   const [rows, setRows] = useState<Row[] | null>(null)
   const [domain, setDomain] = useState('')
@@ -60,6 +73,22 @@ export default function AdminAccountTasks() {
   // because the filter is broken.
   const [justReviewed, setJustReviewed] = useState<Set<number>>(new Set())
   const [savingSetting, setSavingSetting] = useState(false)
+  /**
+   * What is owed for mailboxes, per worker, settled from this page.
+   *
+   * APPROVING IS NOT PAYING. Approving says the address is real and the work
+   * counts; paying says the money has left. They happen days apart and the
+   * second one used to be possible only from the user card, mixed in with
+   * comment, video and repost pay — so somebody checking mailboxes had to go
+   * somewhere else, find the person, and work out which part of one balance was
+   * for this.
+   *
+   * Marked here, a mailbox leaves the main balance by itself: the pending total
+   * counts approved-and-unpaid, so there is one fact in one place and no way to
+   * pay the same address from two screens.
+   */
+  const [pay, setPay] = useState<PayRow[]>([])
+  const [payBusy, setPayBusy] = useState('')
 
   const load = useCallback(async () => {
     setErr('')
@@ -78,6 +107,7 @@ export default function AdminAccountTasks() {
       setRecoveryBox(d.recovery ?? '')
       setOpen(!!d.open)
       setRate(Number(d.rate) || 0)
+      setPay(Array.isArray(d.pay) ? d.pay : [])
     } catch {
       setErr('Network error.')
     }
@@ -103,6 +133,62 @@ export default function AdminAccountTasks() {
       setErr('Network error.')
       return false
     }
+  }
+
+  /**
+   * Mark one worker's approved mailboxes as paid.
+   *
+   * Confirmed with the name and the amount, because this is the step that says
+   * money changed hands and nothing downstream asks again. It is reversible —
+   * `unpay` below — but a mistake here is a mistake in somebody's wages, so it
+   * costs one sentence to be sure.
+   */
+  async function payUser(p: PayRow) {
+    if (p.owed === 0) return
+    if (!confirm(
+      `Mark ${p.owed} mailbox(es) as PAID for ${p.name || p.email}?\n\n` +
+        `${fmtBirr(p.owedBirr)} birr — ${p.owed} × ${fmtBirr(rate)}.\n\n` +
+        'This records the payment for the EMAIL TASK only. It leaves their main ' +
+        'balance (comments, videos, reposts) untouched, and removes these ' +
+        'mailboxes from it.'
+    )) return
+    setPayBusy(p.userId)
+    setMsg('')
+    const ok = await post({ payUser: p.userId })
+    if (ok) {
+      setMsg(`${p.name || p.email}: ${fmtBirr(p.owedBirr)} birr marked paid for ${p.owed} mailbox(es).`)
+      await load()
+    }
+    setPayBusy('')
+  }
+
+  /** Pay for exactly one address, from its own row. */
+  async function payOne(r: Row) {
+    if (!confirm(
+      `Mark ${r.email} as paid?\n\n` +
+        `${fmtBirr(rate)} birr to ${r.userName || r.userEmail}. Email task only.`
+    )) return
+    setBusyId(r.id)
+    setMsg('')
+    const ok = await post({ payIds: [r.id] })
+    if (ok) {
+      setMsg(`${r.email}: ${fmtBirr(rate)} birr marked paid.`)
+      await load()
+    }
+    setBusyId(0)
+  }
+
+  /** Undo a payment mark that was pressed on the wrong row. */
+  async function unpay(r: Row) {
+    if (!confirm(`Undo the payment mark on ${r.email}?\n\nIt goes back to owed.`)) return
+    setBusyId(r.id)
+    setMsg('')
+    const ok = await post({ unpayId: r.id })
+    if (ok) {
+      setMsg(`${r.email}: back to unpaid.`)
+      await load()
+    }
+    setBusyId(0)
   }
 
   async function review(r: Row, approve: boolean) {
@@ -191,7 +277,11 @@ export default function AdminAccountTasks() {
   return (
     <div className="max-w-3xl mx-auto px-4 py-6 sm:py-8">
       <div className="flex items-start justify-between gap-4 mb-1">
-        <h1 className="text-lg font-semibold text-white">Company email task</h1>
+        <h1 className="text-lg font-semibold text-white">
+          Company email task
+          {/* Accounts for people, not work for a product: no genre to narrow by. */}
+          <span className="text-[11px] font-normal text-zinc-500"> · all genres</span>
+        </h1>
         <Link
           href="/admin"
           className="shrink-0 text-xs text-zinc-400 hover:text-white border border-zinc-700 rounded-lg px-2.5 py-1.5 hover:bg-zinc-800 transition-colors"
@@ -366,6 +456,62 @@ export default function AdminAccountTasks() {
         <p className="text-sm text-zinc-600 py-10 text-center">Nothing here.</p>
       ) : (
         <ul className="space-y-2">
+          {/* WHO IS OWED FOR MAILBOXES. The list below is addresses; this is
+              money, which is a different question and used to be answerable only
+              from the user card with four other kinds of pay mixed into it. */}
+          {pay.length > 0 && (
+            <li className="rounded-xl border border-amber-500/25 bg-amber-500/5 p-3 mb-3 list-none">
+              <div className="flex flex-wrap items-baseline gap-2 mb-2">
+                <span className="text-xs uppercase tracking-wide text-zinc-400">
+                  Owed for mailboxes
+                </span>
+                <span className="text-[11px] text-zinc-500">
+                  {pay.filter((x) => x.owed > 0).length} worker(s) ·{' '}
+                  {fmtBirr(pay.reduce((n, x) => n + x.owedBirr, 0))} birr
+                </span>
+                <span className="ml-auto text-[11px] text-zinc-600">
+                  email task only — their comment, video and repost pay is settled on the user
+                  card
+                </span>
+              </div>
+              <div className="divide-y divide-amber-500/10">
+                {pay.map((x) => (
+                  <div
+                    key={x.userId}
+                    className="flex flex-wrap items-center gap-x-3 gap-y-1 py-1.5 text-xs"
+                  >
+                    <span className="text-zinc-200 min-w-0 flex-1 truncate">
+                      {x.name || x.email || '(no name)'}
+                    </span>
+                    {x.pendingCount > 0 && (
+                      <span
+                        className="text-[11px] text-zinc-500"
+                        title="Submitted, nobody has checked them yet. Not owed until approved."
+                      >
+                        {x.pendingCount} to check
+                      </span>
+                    )}
+                    {x.paidCount > 0 && (
+                      <span className="text-[11px] text-zinc-600">{x.paidCount} paid</span>
+                    )}
+                    <span className="tabular-nums text-zinc-400">
+                      {x.owed} × {fmtBirr(rate)}
+                    </span>
+                    <span className="tabular-nums font-semibold text-amber-300 w-20 text-right">
+                      {fmtBirr(x.owedBirr)}
+                    </span>
+                    <button
+                      onClick={() => payUser(x)}
+                      disabled={payBusy === x.userId || x.owed === 0}
+                      className="text-xs text-white bg-amber-600 hover:bg-amber-500 rounded-lg px-2.5 py-1 disabled:opacity-30"
+                    >
+                      {payBusy === x.userId ? '…' : 'Mark paid'}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </li>
+          )}
           {rows.map((r) => (
             <li key={r.id} className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
               <div className="flex flex-wrap items-center gap-2">
@@ -400,6 +546,29 @@ export default function AdminAccountTasks() {
                     >
                       {r.status === 'approved' ? (r.paid ? 'Approved · paid' : 'Approved') : 'Rejected'}
                     </span>
+                    {/* PAYING, one address at a time. The admin is usually looking
+                        at the mailbox they just checked, so the button is on the
+                        row rather than only in the summary above. */}
+                    {r.status === 'approved' && !r.paid && (
+                      <button
+                        onClick={() => payOne(r)}
+                        disabled={busyId === r.id}
+                        title={`Record ${fmtBirr(rate)} birr paid for this address. Email task only — it leaves their other pay alone.`}
+                        className="text-xs text-amber-200 bg-amber-600/20 border border-amber-500/40 hover:bg-amber-600/30 rounded-lg px-2.5 py-1 disabled:opacity-40"
+                      >
+                        {busyId === r.id ? '…' : `Mark paid · ${fmtBirr(rate)}`}
+                      </button>
+                    )}
+                    {r.status === 'approved' && r.paid && (
+                      <button
+                        onClick={() => unpay(r)}
+                        disabled={busyId === r.id}
+                        title="Pressed by mistake? This puts it back to owed."
+                        className="text-[11px] text-zinc-500 hover:text-amber-300 underline decoration-dotted disabled:opacity-40"
+                      >
+                        undo
+                      </button>
+                    )}
                     {justReviewed.has(r.id) && (
                       <span
                         className="text-[10px] text-zinc-500"

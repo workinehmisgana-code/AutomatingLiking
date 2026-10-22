@@ -44,6 +44,12 @@ Usage:
 Requires in .env (same directory as this script):
     DASHBOARD_URL=https://your-project.vercel.app
     UPLOAD_SECRET=your-secret-key
+
+  --genre <humanizer|website|slides>
+      Which product genre's link pool this CSV belongs to. Defaults to
+      humanizer, which is what every link scraped before genres existed is.
+      A link already in the pool keeps its genre unless this says otherwise.
+
 """
 
 import csv
@@ -72,7 +78,7 @@ RESULTS_DIR   = _BASE.parent / "1_tiktok_search_scraper" / "results"
 def parse_url(url: str) -> tuple[str, str, str]:
     """Return (platform, author, video_id) from a TikTok or YouTube URL.
 
-    Platform is one of: tiktok, youtube_shorts, youtube_videos, unknown.
+    Platform is one of: tiktok, youtube_shorts, youtube_videos, instagram, reddit, unknown.
     """
     if "tiktok.com" in url:
         m = re.search(r"tiktok\.com/@([^/]+)/video/(\d+)", url)
@@ -91,10 +97,14 @@ def parse_url(url: str) -> tuple[str, str, str]:
     if "instagram.com" in url:
         m = re.search(r"instagram\.com/(?:p|reel)/([^/?#]+)", url)
         return "instagram", "", (m.group(1) if m else "")
+    if "reddit.com" in url:
+        # /r/<sub>/comments/<post id>/<slug>/ — the sub stands in for an author.
+        m = re.search(r"reddit\.com/r/([^/]+)/comments/([a-z0-9]+)", url, re.I)
+        return "reddit", (m.group(1) if m else ""), (m.group(2) if m else "")
     return "unknown", "", ""
 
 
-VALID_PLATFORMS = {"tiktok", "youtube_shorts", "youtube_videos", "instagram"}
+VALID_PLATFORMS = {"tiktok", "youtube_shorts", "youtube_videos", "instagram", "reddit"}
 
 
 def parse_query(filename: str) -> str:
@@ -161,7 +171,14 @@ def read_csv(path: Path, platform_override: str | None = None) -> list[dict]:
 def collect_csvs(args: list[str]) -> list[Path]:
     """Return list of CSV paths to process based on CLI args."""
     flags = {a for a in args if a.startswith("--")}
-    files = [a for a in args if not a.startswith("--")]
+    # THE VALUE AFTER A VALUE-TAKING FLAG IS NOT A FILENAME. Without this,
+    # `--genre website` looked for a CSV called "website" and reported it
+    # missing - a flag that reads as a broken path rather than as a flag.
+    files = [
+        a
+        for i, a in enumerate(args)
+        if not a.startswith("--") and not (i > 0 and args[i - 1] in ("--platform", "--genre"))
+    ]
 
     # Specific file(s) named explicitly
     if files:
@@ -205,7 +222,44 @@ def _report_protected(data: dict) -> None:
               "(no search rank — an upload never edits or drops these)")
 
 
-def upload(videos: list[dict], mode: str = "replace") -> None:
+# WHICH GENRE'S POOL AN UPLOAD IS FOR.
+#
+# Carried as a query param, not as a CSV column: one search run has exactly one
+# genre, so a column would repeat the same word on every row of the file and
+# would have to be threaded through four duplicated DictWriter field lists in
+# the scraper to say it. The scraper stays genre-agnostic — it takes keywords
+# and writes links.
+#
+# Kept in step with GENRES in 3_dashboard/lib/config.ts by hand. The server
+# validates anyway and reads anything it does not recognise as the default, so
+# the cost of this list drifting is an upload filed under humanizer, not a lost
+# scrape.
+GENRES = ("humanizer", "website", "slides")
+DEFAULT_GENRE = "humanizer"
+
+
+def dashboard_genres() -> tuple[str, ...]:
+    """Every genre the dashboard knows, including ones added in Admin → Genres.
+
+    Falls back to the built-in three when the dashboard cannot be asked, so an
+    upload of a built-in genre still works offline.
+    """
+    if not DASHBOARD_URL or not UPLOAD_SECRET:
+        return GENRES
+    try:
+        r = requests.get(
+            f"{DASHBOARD_URL}/api/genres",
+            headers={"Authorization": f"Bearer {UPLOAD_SECRET}"},
+            timeout=20,
+        )
+        data = r.json() if r.ok else {}
+        ids = tuple(str(g["id"]) for g in data.get("genres") or [] if g.get("id"))
+        return ids or GENRES
+    except Exception:  # noqa: BLE001
+        return GENRES
+
+
+def upload(videos: list[dict], mode: str = "replace", genre: str = DEFAULT_GENRE) -> None:
     if not DASHBOARD_URL:
         print("[!] DASHBOARD_URL not set in .env – cannot upload.")
         sys.exit(1)
@@ -213,8 +267,8 @@ def upload(videos: list[dict], mode: str = "replace") -> None:
         print("[!] UPLOAD_SECRET not set in .env – cannot upload.")
         sys.exit(1)
 
-    url = f"{DASHBOARD_URL}/api/upload?mode={mode}"
-    print(f"[*] Uploading {len(videos)} videos to {url} ({mode}) ...")
+    url = f"{DASHBOARD_URL}/api/upload?mode={mode}&genre={genre}"
+    print(f"[*] Uploading {len(videos)} videos to {url} ({mode}, genre {genre}) ...")
     r = requests.post(
         url,
         json=videos,
@@ -269,23 +323,38 @@ def main():
         return
     known = {
         "--all", "--tiktok", "--youtube", "--append", "--replace", "--dedupe",
-        "--platform",
+        "--platform", "--genre",
     }
     unknown = [
         a
         for i, a in enumerate(args)
         if a.startswith("-")
         and a not in known
-        # the value after --platform is not a flag
-        and not (i > 0 and args[i - 1] == "--platform")
+        # the value after --platform / --genre is not a flag
+        and not (i > 0 and args[i - 1] in ("--platform", "--genre"))
     ]
     if unknown:
         print(f"[!] Unknown option(s): {', '.join(unknown)}")
         print("    Run `python upload.py --help` to see what is accepted.")
         sys.exit(2)
 
+    # Which pool this CSV belongs to. An unknown name is refused HERE rather
+    # than quietly filed under humanizer: on this side it is a typo in a command
+    # somebody just typed and can fix, and a few hundred website links landing in
+    # the humanizer pool is tedious to undo.
+    genre = DEFAULT_GENRE
+    if "--genre" in args:
+        i = args.index("--genre")
+        value = args[i + 1].strip().lower() if i + 1 < len(args) else ""
+        known = dashboard_genres()
+        if value not in known:
+            print(f"[!] --genre must be one of: {', '.join(known)}")
+            sys.exit(2)
+        genre = value
+
     # --dedupe cleans the stored data in place (no CSV needed): removes any
-    # duplicate links so only one row per URL remains.
+    # duplicate links so only one row per URL remains. No genre: it touches every
+    # pool at once and adds nothing.
     if "--dedupe" in args:
         print("[*] Deduplicating dashboard links (removing duplicate URLs)...")
         upload([], mode="dedupe")
@@ -361,7 +430,7 @@ def main():
     else:
         print("[*] Append mode: new links are added, existing ones refreshed; nothing is deleted.")
 
-    upload(videos, mode=mode)
+    upload(videos, mode=mode, genre=genre)
 
 
 if __name__ == "__main__":

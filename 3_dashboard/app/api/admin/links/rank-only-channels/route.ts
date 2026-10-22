@@ -3,6 +3,7 @@ import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { isAdminEmail } from '@/lib/config'
 import { buildAdminLinks, type AdminLinkRow } from '@/lib/adminLinks'
+import { getAdminGenre } from '@/lib/adminGenre'
 import { channelOf } from '@/lib/dateScore'
 
 export const dynamic = 'force-dynamic'
@@ -108,8 +109,12 @@ export async function GET(req: NextRequest) {
 
   try {
     const { rows } = await buildAdminLinks(String(sp.get('product') ?? ''))
+    const genre = await getAdminGenre()
     const pool = rows.filter(
-      (l) => (!platform || l.platform === platform) && (includeBlocked || !l.blocked)
+      (l) =>
+        l.genre === genre &&
+        (!platform || l.platform === platform) &&
+        (includeBlocked || !l.blocked)
     )
     const wanted = clusters.length ? new Set(clusters) : null
 

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { isTiktokVerified } from '@/lib/profileGate'
 import { userIdFromApp } from '@/lib/appAuth'
 import {
   countRecentClicks,
@@ -6,9 +7,10 @@ import {
   recordCleanSessionClick,
   getServeOnlyClean,
   getEffectivePlatformLimit,
-  isUserVerified,
+
+  isTestUser,
 } from '@/lib/db'
-import { isProduct, VERIFY_VIDEO_URL, VERIFY_GATE_ENABLED } from '@/lib/config'
+import { isProduct, platformFromUrl, CLICK_PLATFORMS, VERIFY_VIDEO_URL, VERIFY_GATE_ENABLED } from '@/lib/config'
 import { serveCommentForUrl } from '@/lib/serveComment'
 
 export const dynamic = 'force-dynamic'
@@ -21,7 +23,11 @@ export async function POST(req: NextRequest) {
   const userId = await userIdFromApp(req)
   if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  if (VERIFY_GATE_ENABLED && !(await isUserVerified(userId).catch(() => false))) {
+  // THE ACCOUNT-AGE VERIFICATION (tiktok_verification), the same check the web
+  // dashboard and userIdFromApp use. This read the OLD comment-validity table
+  // (user_validity), which nobody is written to any more, so once the gate was
+  // switched on it refused every worker — verified or not — links and clicks.
+  if (VERIFY_GATE_ENABLED && !(await isTiktokVerified(userId).catch(() => false))) {
     return NextResponse.json(
       { error: 'Comment on the verification video first', verifyRequired: true, verifyUrl: VERIFY_VIDEO_URL },
       { status: 403 }
@@ -36,7 +42,11 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
   }
   const url = String(b?.url ?? '').trim()
-  const platform = String(b?.platform ?? '').trim() || 'unknown'
+  // A platform the server does not know (an older app build sends '' for a
+  // Reddit link) is read from the URL instead, so the click lands in the
+  // right tab and the right quota rather than in 'unknown'.
+  const sent = String(b?.platform ?? '').trim()
+  const platform = (CLICK_PLATFORMS as readonly string[]).includes(sent) ? sent : platformFromUrl(url)
   const searchQuery = b?.search_query ? String(b.search_query) : null
   // Which product's comment to serve for this link.
   //
@@ -54,7 +64,10 @@ export async function POST(req: NextRequest) {
   try {
     // Quota enforcement is skipped when THIS platform's own Hourly switch is off
     // — each platform is enforced independently, and there is no master switch.
-    const { limit, windowMs, enforced } = await getEffectivePlatformLimit(platform)
+    const lim = await getEffectivePlatformLimit(platform)
+    // A test account is never held by the hourly limits.
+    const enforced = lim.enforced && !(await isTestUser(userId).catch(() => false))
+    const { limit, windowMs } = lim
     let recent = 0
     if (enforced) {
       recent = await countRecentClicks(userId, platform, windowMs)

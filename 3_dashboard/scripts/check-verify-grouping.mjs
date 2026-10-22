@@ -20,6 +20,50 @@ const check = (name, got, want) => {
   console.log(`   ${ok ? 'ok  ' : 'FAIL'} ${name}: ${JSON.stringify(got)}${ok ? '' : ` (want ${JSON.stringify(want)})`}`)
 }
 
+// ── the order the page puts them in, on top of that query ────────────────
+//
+// Two rules, both of which were bugs:
+//
+// THE ORDER MUST NOT DEPEND ON THE SELECTION. displayRows used to partition on
+// `selected`, so ticking any box moved that row into the pinned block and the
+// whole list re-flowed under the cursor — going to select a second link jumped
+// the page to the channel's already-selected ones. Reviewing is exactly when
+// somebody ticks and unticks a lot, so the order has to hold still. It is a
+// frozen snapshot taken by Mark, and `selected` must not be in the deps.
+//
+// AND UNTITLED LINKS COME BEFORE TITLED ONES. Mark only classifies rows that
+// have a title, so an untitled link has had no verdict at all and is the one
+// still needing a human; mixed in among hundreds of judged rows they were
+// missed.
+const page = readFileSync(new URL('../components/VerifyLinks.tsx', import.meta.url), 'utf8')
+// The pinned block comes from the snapshot; the untitled-first ordering is
+// keyed on classifiedThisPage, which survives a block so those links stay at
+// the top once the unrelated ones are gone.
+const deps = /}, \[rows, pinnedUrls, classifiedThisPage\]\)/.test(page)
+
+console.log('\nthe page order holds still while it is reviewed:')
+check('  the pinned set is a frozen snapshot, not a flag',
+      /const \[pinnedUrls, setPinnedUrls\] = useState<Set<string>>/.test(page), true)
+check('  taken by Mark, from what it found unrelated',
+      /setPinnedUrls\(new Set\(unrelated\)\)/.test(page), true)
+check('  the display order depends on rows and the snapshot', deps, true)
+// THE REGRESSION. If `selected` goes back into those deps, the jump returns.
+check('  and NOT on the live selection',
+      /}, \[rows, pinSelected, selected\]\)/.test(page) || /}, \[rows, selected\]\)/.test(page),
+      false)
+check('  cleared on a new page, a block and a clean',
+      (page.match(/setPinnedUrls\(new Set\(\)\)/g) ?? []).length, 3)
+
+console.log('\nand untitled links are reviewed first:')
+check('  three blocks: pinned, untitled, titled',
+      /return \[\.\.\.pinned, \.\.\.untitled, \.\.\.titled\]/.test(page), true)
+check('  an untitled row is one with no title text',
+      /else if \(!r\.title \|\| !r\.title\.trim\(\)\) untitled\.push\(r\)/.test(page), true)
+// Mark can only judge a row that HAS a title - which is why the untitled ones
+// are the ones left to do.
+check('  because Mark only ever classified titled rows',
+      /rows\.filter\(\(r\) => r\.title\)\.map/.test(page), true)
+
 const { Pool } = await import('pg')
 const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
 

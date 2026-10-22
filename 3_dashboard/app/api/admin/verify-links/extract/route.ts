@@ -1,12 +1,14 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
+import { getAdminGenre } from '@/lib/adminGenre'
 import { isAdminEmail } from '@/lib/config'
 import { isAdminRequest } from '@/lib/machineAuth'
 import { loadVideosJson } from '@/lib/videos'
 import { saveVerifyLinks, getAllVerifyLinkUrls, getBlockedUrls } from '@/lib/db'
 import { rankChannels, handleOf, unattributedLinks } from '@/lib/channelRank'
-import { fetchChannelVideos, fetchVideoDetail } from '@/lib/linkStats'
+import { fetchChannelListing, fetchVideoDetail } from '@/lib/linkStats'
+import { DEFAULT_GENRE } from '@/lib/config'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
@@ -43,7 +45,13 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   try {
-    const channels = await rankChannels()
+    // AN ADMIN IN THE BROWSER sees the switch's genre only. The local
+    // harvester reads this with a token and no session; it asks for every
+    // genre and filters by its own --genre, so it gets the whole ranking.
+    const session = await auth.api.getSession({ headers: await headers() }).catch(() => null)
+    const genre = session ? await getAdminGenre() : null
+    const ranked = await rankChannels()
+    const channels = genre ? ranked.filter((c) => c.genre === genre) : ranked
     // Links whose channel cannot be read at all. Sent so the table can say so:
     // a list that silently omits them looks like it is missing channels.
     return NextResponse.json({
@@ -59,7 +67,12 @@ export async function GET(req: NextRequest) {
 /** Leave room to write rows and respond inside maxDuration. */
 const BUDGET_MS = 40_000
 /** Channels whose listings are fetched at once. */
-const CHANNEL_CONCURRENCY = 6
+// SIX AT ONCE IS WHAT TRIPS THE THROTTLE. TikTok answers a burst to
+// /embed/@handle with HTTP 503 "overload-protect triggered", and every one of
+// those used to be recorded as a channel with no new videos. Three is slower per
+// batch and finishes more of them, because a retried request costs a second and
+// a thrown-away one costs the whole channel.
+const CHANNEL_CONCURRENCY = 3
 /** Detail fetches per new video, in parallel within one channel. */
 const DETAIL_CONCURRENCY = 4
 const MAX_CHANNELS = 200
@@ -85,7 +98,10 @@ export async function POST(req: NextRequest) {
     ? body.handles.map((h) => String(h).replace(/^@/, '').trim().toLowerCase()).filter(Boolean)
     : []
 
-  let channels: { handle: string }[]
+  // Carries the genre too, since the rows staged from these channels inherit
+  // it. Widening this from { handle } is what lets genreOfChannel below be
+  // built from the ranking rather than from the hand-added list alone.
+  let channels: { handle: string; genre: string }[]
   /** Channels dropped because this route can only fetch from TikTok. */
   let skippedOtherSites = 0
   let known: Set<string>
@@ -112,7 +128,9 @@ export async function POST(req: NextRequest) {
       )
       channels = only.map((h) => known.get(h)).filter((c): c is (typeof ranked)[number] => !!c)
     } else {
-      channels = ranked
+      // "Extract everything" means every channel OF THE SWITCH'S GENRE.
+      const genre = await getAdminGenre()
+      channels = ranked.filter((c) => c.genre === genre)
     }
     // TikTok only: everything below reads a TikTok snowflake id out of the URL
     // to decide what is new, and fetches listings from tiktok.com/embed/@handle.
@@ -166,6 +184,17 @@ export async function POST(req: NextRequest) {
     })
   }
 
+  // The genre of each channel, so the rows staged below inherit it.
+  //
+  // FROM THE RANKING, which now carries a genre per channel: a hand-added
+  // channel's stated genre, else the genre most of its existing links hold.
+  // This used to read the hand-added list only, so a channel reached by an
+  // ordinary ranked extraction always staged as the default — which would
+  // have filed new videos from a website channel into the humanizer pool the
+  // first time one existed. Built once for the whole run.
+  const genreOfChannel = new Map<string, string>()
+  for (const c of channels) genreOfChannel.set(c.handle.toLowerCase(), c.genre)
+
   const slice = channels.slice(offset, offset + limit)
   const deadline = Date.now() + BUDGET_MS
 
@@ -182,6 +211,18 @@ export async function POST(req: NextRequest) {
    * a handle typo, a deleted account, or the embed endpoint throttling us.
    */
   const failedHandles: string[] = []
+  /**
+   * Channels TikTok refused to answer for, even after the retries.
+   *
+   * COUNTED APART FROM `failed`. The two call for opposite responses: a channel
+   * that answered with nothing has nothing new and is finished with, while a
+   * throttled one has not been checked at all and the run should simply be
+   * pressed again. Reporting them together is why "Extract from the added
+   * channel(s) (2)" could stage nothing and look broken — both channels had
+   * been refused, and the screen said they had no new videos.
+   */
+  let throttled = 0
+  const throttledHandles: string[] = []
   /** Listed videos passed over for being older than what we already hold. */
   let olderSkipped = 0
   let next = 0
@@ -192,8 +233,13 @@ export async function POST(req: NextRequest) {
       const i = next++
       if (i >= slice.length) return
       const handle = slice[i].handle
-      const listed = await fetchChannelVideos(handle)
+      const { videos: listed, throttled: refused } = await fetchChannelListing(handle)
       consumed = Math.max(consumed, i + 1)
+      if (refused) {
+        throttled++
+        if (throttledHandles.length < 40) throttledHandles.push(handle)
+        continue
+      }
       if (listed.length === 0) {
         failed++
         // Capped: this is a diagnostic, not a second copy of the request.
@@ -246,6 +292,14 @@ export async function POST(req: NextRequest) {
             posted_date: d?.postedDate || '',
             title: d?.title || v.title || '',
             bio: d?.bio || '',
+            // THE CHANNEL'S GENRE, inherited by every video of it. This is the
+            // only place a staged link gets one: nobody types a genre per
+            // video, they pick it once when adding the channel.
+            //
+            // A channel nobody stated a genre for takes the genre its own
+            // links already hold, and only a channel with neither reads as the
+            // default — which is every channel from before genres existed.
+            genre: genreOfChannel.get(handle.toLowerCase()) ?? DEFAULT_GENRE,
           })
         })
       }
@@ -276,6 +330,10 @@ export async function POST(req: NextRequest) {
     staged: written,
     failed,
     failedHandles,
+    // Refused, not empty. The client needs these apart so it can say "press it
+    // again" rather than "these channels have nothing new".
+    throttled,
+    throttledHandles,
     done: nextOffset >= total,
   })
 }

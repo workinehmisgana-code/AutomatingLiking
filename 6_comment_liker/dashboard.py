@@ -44,6 +44,7 @@ from urllib.parse import urlparse, parse_qs
 
 import busy
 import dashboard_settings as ds
+import like
 from login import SITE_PREFIX, profile_dir  # noqa: F401  (profile_dir used below)
 
 import console
@@ -566,12 +567,28 @@ class Runner:
         out = {}
         for name, job in self.jobs.items():
             have = int(since.get(name, 0) or 0)
+            # A RE-RUN IS A NEW JOB UNDER AN OLD NAME, and that swallowed its
+            # output. start() replaces jobs[name] with a fresh Job whose line
+            # counter begins at 0, while the page still remembers the count from
+            # last time — 70, say. Everything the new run printed up to line 70
+            # then looked like something the page had already been sent, so
+            # pressing "Its commented links" a second time showed the tail of a
+            # listing, or nothing at all when the new run was the shorter one.
+            #
+            # A count ahead of the job's own is impossible within one job, so it
+            # can only mean this is a different one. Start again from the top.
+            if have > job.seq:
+                have = 0
             new = list(job.lines)[max(0, have - (job.seq - len(job.lines))):] if job.seq > have else []
             out[name] = {
                 "kind": job.kind,
                 "state": job.state(),
                 "code": job.code,
                 "seq": job.seq,
+                # When this run began. The page drops whatever it was holding
+                # under this name when the number changes, so a new run's output
+                # never appears underneath the last one's.
+                "started": int(job.started),
                 "seconds": int((job.finished or time.time()) - job.started),
                 "cmd": " ".join(job.cmd),
                 "log": str(job.log),
@@ -884,9 +901,48 @@ def start_run(mode: str, names: list[str]) -> tuple[bool, str]:
 # DIRECTORY. "Sign in" from an Instagram page that ran login.py with no --site
 # would open TikTok, sign the person in there, and leave the Instagram profile
 # exactly as empty as it was — with a green tick next to it.
+# The Zefoy heart runner lives in the project next door. It is driven from here
+# because it is the same job seen from the other end: this project writes the
+# comments, that one gets them to the top of the section they are in.
+ZEFOY_DIR = HERE.parent / "2_comment_automation"
+ZEFOY_SCRIPT = ZEFOY_DIR / "automate.py"
+
+
+def zefoy_command(clusters: str = "all", cluster_by: str = "rank",
+                  cdp: str = "http://127.0.0.1:9222") -> list[str]:
+    """Hearts for our comments, given on the PHONE's Chrome over adb.
+
+    --cdp is what makes it the phone: Playwright attaches to the browser already
+    running there instead of opening one here, so the session, the IP and the
+    captcha are the phone's. The run puts a dropped adb forward back by itself;
+    what it cannot do is plug the cable in.
+
+    --tag phone keeps its own record, because a desktop run of the same clusters
+    writes one too and sharing it means each skips links the other did.
+    """
+    return [
+        sys.executable, "-u", str(ZEFOY_SCRIPT),
+        "--service", "zefoy",
+        "--cdp", cdp,
+        "--from-dashboard",
+        "--cluster-by", cluster_by,
+        "--clusters", clusters,
+        "--to-top",
+        "--resume",
+        "--no-loop",
+        "--tag", "phone",
+    ]
+
+
 TOOLS = {
     # name -> (job name template, argv builder). Everything the project can do
     # from a terminal, reachable from the page.
+    # The phone's heart runner. `p` carries the cluster selection from the page
+    # rather than a profile name — this one is not about a profile.
+    "zefoy": lambda p, site="tiktok": (
+        f"zefoy-phone-{(p or 'all')}",
+        zefoy_command(clusters=(p or "all")),
+    ),
     "sessions": lambda p, site="tiktok": (
         f"sessions-scan@{site}",
         [sys.executable, "-u", str(HERE / "sessions.py"), "--site", site]
@@ -996,6 +1052,24 @@ class Handler(BaseHTTPRequestHandler):
                 since = {}
             self._json(build_state(since if isinstance(since, dict) else {}))
             return
+        if u.path == "/api/comment-channels":
+            try:
+                raw = like.COMMENT_CHANNELS.read_text(encoding="utf-8")
+            except OSError:
+                raw = ""
+            self._json({"text": raw, "count": len(like.read_comment_channels()),
+                        "path": str(like.COMMENT_CHANNELS)})
+            return
+        if u.path == "/api/comments":
+            # The comments to post, as typed. Read from the same file like.py
+            # reads, so the page can never show something a run would not use.
+            try:
+                raw = like.OWN_COMMENTS.read_text(encoding="utf-8")
+            except OSError:
+                raw = ""
+            self._json({"text": raw, "count": len(like.read_own_comments()),
+                        "path": str(like.OWN_COMMENTS)})
+            return
         if u.path == "/api/log":
             # THE PARAMETER IS A JOB NAME, NEVER A PATH.
             #
@@ -1055,6 +1129,36 @@ class Handler(BaseHTTPRequestHandler):
                 store["profiles"][name] = cur
             save_store(store)
             self._json({"ok": True})
+            return
+
+        if u.path == "/api/comment-channels":
+            text = str(body.get("text") or "")
+            if len(text) > 50_000:
+                self._json({"error": "that is more text than a list of channels"}, 400)
+                return
+            try:
+                like.write_comment_channels(text.splitlines())
+            except OSError as e:
+                self._json({"error": f"could not save: {e}"}, 500)
+                return
+            self._json({"ok": True, "count": len(like.read_comment_channels())})
+            return
+
+        if u.path == "/api/comments":
+            # SAVED AS TYPED, and the count comes back from re-reading the file
+            # rather than from counting what was sent: what matters is what a run
+            # will find there, and blank lines and # notes are not comments.
+            text = str(body.get("text") or "")
+            if len(text) > 200_000:
+                self._json({"error": "that is more text than a comment list"}, 400)
+                return
+            try:
+                like.write_own_comments(text.splitlines())
+            except OSError as e:
+                self._json({"error": f"could not save: {e}"}, 500)
+                return
+            kept = like.read_own_comments()
+            self._json({"ok": True, "count": len(kept)})
             return
 
         if u.path == "/api/profile":

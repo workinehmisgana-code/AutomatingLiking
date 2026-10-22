@@ -18,6 +18,7 @@ import random
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -39,6 +40,11 @@ MAX_SCROLL_ATTEMPTS  = int(os.getenv("MAX_SCROLL_ATTEMPTS", "120"))
 MAX_STALE_SCROLLS    = int(os.getenv("MAX_STALE_SCROLLS", "6"))
 SCROLL_STEP_PX       = int(os.getenv("SCROLL_STEP_PX", "600"))
 REQUIRE_LOGIN        = os.getenv("REQUIRE_LOGIN", "false").lower() in ("true", "yes", "1", "on")
+# --no-login-wait (the Control Center always sends it): never stop for "log in,
+# then press Enter". The browser profile keeps the session, so a run starts
+# searching straight away; Instagram, which needs a login, checks for one itself
+# and only waits when it is actually signed out.
+NO_LOGIN_WAIT        = False
 BROWSER_PROFILE_DIR  = os.getenv("BROWSER_PROFILE_DIR", "./browser_profile")
 # Platform: "tiktok" (default) or "youtube"
 DEFAULT_PLATFORM     = os.getenv("PLATFORM", "tiktok").lower()
@@ -58,20 +64,48 @@ VIDEO_URL_RE        = re.compile(r"https://www\.tiktok\.com/@[^/]+/video/\d+")
 # TikTok image/slideshow posts (the "Photo" search tab) use /@user/photo/<id>.
 PHOTO_LINK_SELECTOR = "a[href*='/@'][href*='/photo/']"
 PHOTO_URL_RE        = re.compile(r"https://www\.tiktok\.com/@[^/]+/photo/\d+")
+# The "Top" tab is a BLEND of both kinds, not a third kind of post: TikTok mixes
+# videos and photo posts there and orders them by its own relevance. So it needs
+# both selectors, and it is the only tab where one feed yields both /video/ and
+# /photo/ URLs.
+#
+# IT IS ALSO THE TAB A PERSON ACTUALLY SEES. Searching TikTok lands on Top; the
+# Videos and Photo tabs are a deliberate second click. That is why it is
+# collected FIRST below — see the ordering note there.
+TOP_LINK_SELECTOR   = "a[href*='/@'][href*='/video/'], a[href*='/@'][href*='/photo/']"
+TOP_URL_RE          = re.compile(r"https://www\.tiktok\.com/@[^/]+/(?:video|photo)/\d+")
 
 
-def click_search_tab(page, label: str) -> bool:
-    """Click one of TikTok's search result tabs (Top/Users/Videos/LIVE/Photo)
-    by its visible text. Returns True if the tab was found and clicked."""
-    try:
-        tab = page.get_by_test_id("tux-web-text").filter(
-            has_text=re.compile(rf"^{re.escape(label)}$", re.IGNORECASE)
-        ).first
-        tab.wait_for(state="visible", timeout=8000)
-        tab.click()
-        return True
-    except Exception:
-        return False
+# EVERY SEARCH TAB HAS ITS OWN URL, so none of them is reached by clicking.
+#
+#   Top     https://www.tiktok.com/search?q=<q>
+#   Videos  https://www.tiktok.com/search/video?q=<q>
+#   Photo   https://www.tiktok.com/search/photo?q=<q>
+#   Users   https://www.tiktok.com/search/user?q=<q>     (never opened)
+#
+# There used to be a click_search_tab() here that found a tab by its visible
+# text — every element carrying the `tux-web-text` test id, filtered to the one
+# reading "Photo", first match wins — and clicked it. It was seen landing on the
+# USERS tab instead, and that could not be reproduced on either search page: the
+# strip renders five unambiguous labels at fixed positions, one match each. An
+# intermittent fault in a click that cannot be reproduced is not a fault to
+# narrow down; it is a step to remove. The Photo tab's URL was discovered by
+# watching where that click navigated to, so the click was never needed.
+#
+# Nothing about which tab is active is in the DOM either — no aria-selected, and
+# every item carries the same class whichever one is showing — so the URL is also
+# the only way to CONFIRM a tab, which open_search_tab below does.
+TIKTOK_TAB_PATHS = {
+    "Top": "/search",
+    "Videos": "/search/video",
+    "Photo": "/search/photo",
+}
+
+
+def tiktok_tab_url(label: str, query: str) -> str:
+    """The address of one TikTok search tab for a query."""
+    return (f"https://www.tiktok.com{TIKTOK_TAB_PATHS[label]}"
+            f"?q={query.replace(' ', '%20')}")
 
 # ── YouTube ───────────────────────────────────────────────────────────────────
 # YouTube A/B-tests the title anchor id between `video-title-link` and
@@ -132,7 +166,12 @@ def get_card_details(anchor) -> tuple[str, str, str]:
             for (let i = 0; i < 20; i++) {
                 node = node.parentElement;
                 if (!node) break;
-                const hasOther = Array.from(node.querySelectorAll('a[href*="/video/"]'))
+                // PHOTO POSTS ARE CARDS TOO. This used to look for /video/
+                // links only, so a /photo/ card never met a neighbour and the
+                // walk climbed to the whole results grid — and every photo post
+                // was given the first caption in the grid (one title on 188
+                // different photo links in one run).
+                const hasOther = Array.from(node.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]'))
                     .some(a => { const h = (a.href || '').split('?')[0]; return h && h !== myUrl; });
                 if (hasOther) break;
                 card = node;
@@ -255,6 +294,41 @@ def get_yt_shorts_details(anchor) -> tuple[str, str, str]:
         return "", "", ""
 
 
+def goto_search(page, url: str, tries: int = 3) -> bool:
+    """Open a search-results page. False means "skip this query", not "stop".
+
+    ONE SLOW NAVIGATION USED TO END THE WHOLE RUN. A plain page.goto() raises on
+    timeout, nothing caught it, and the exception climbed out of the query loop
+    and out of main():
+
+        Query 9/16: 'paperbleach humanizer'  [YouTube - shorts]
+        [*] Navigating to: https://www.youtube.com/results?search_query=...
+        playwright._impl._errors.TimeoutError: Page.goto: Timeout 60000ms exceeded.
+
+    Eight queries had already produced 380 URLs. The seven after it never ran,
+    the process exited non-zero, and the uploader treats a failed run as one with
+    nothing worth sending. All of that for one page that was slow once.
+
+    A search page that will not open is worth retrying and then worth skipping:
+    the next keyword is a different URL and usually fine.
+    """
+    for attempt in range(1, tries + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            return True
+        except Exception as e:  # noqa: BLE001 - any failure to open is the same answer
+            why = str(e).splitlines()[0]
+            if attempt == tries:
+                print(f"[!] Could not open the results page after {tries} tries "
+                      f"({why}) - skipping this query and carrying on.")
+                return False
+            wait = 5 * attempt
+            print(f"[!] Could not open the results page ({why}) - retrying in "
+                  f"{wait}s ({attempt}/{tries - 1})...")
+            time.sleep(wait)
+    return False
+
+
 def scrape_youtube_search(queries: list[str], min_videos: int, max_videos: int,
                           output_file: str, content: str = "all"):
     """Search YouTube for each query and save video/Shorts URLs + view counts to CSV.
@@ -331,7 +405,8 @@ def scrape_youtube_search(queries: list[str], min_videos: int, max_videos: int,
             rank_counter = 0              # position in this keyword's result feed
             search_url = f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}"
             print(f"[*] Navigating to: {search_url}")
-            page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+            if not goto_search(page, search_url):
+                continue
             time.sleep(POPUP_WAIT)
 
             # Dismiss cookie/consent dialog if shown
@@ -559,7 +634,7 @@ def scrape_tiktok_search(queries: list[str], min_videos: int, max_videos: int, o
                 except Exception:
                     pass
 
-        if REQUIRE_LOGIN:
+        if REQUIRE_LOGIN and not NO_LOGIN_WAIT:
             print("[*] Opening TikTok for manual login...")
             print(f"[*] Navigating to https://www.tiktok.com ...")
             page.bring_to_front()
@@ -597,9 +672,10 @@ def scrape_tiktok_search(queries: list[str], min_videos: int, max_videos: int, o
             print(f"  Target: min={min_videos}  max={max_videos}")
             print(f"{'=' * 60}")
 
-            search_url = f"https://www.tiktok.com/search/video?q={query.replace(' ', '%20')}"
-            print(f"[*] Navigating to: {search_url}")
-            page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+            top_url = tiktok_tab_url("Top", query)
+            print(f"[*] Navigating to: {top_url}")
+            if not goto_search(page, top_url):
+                continue
             time.sleep(POPUP_WAIT)
 
             def dismiss_login_popup():
@@ -625,9 +701,10 @@ def scrape_tiktok_search(queries: list[str], min_videos: int, max_videos: int, o
 
             def collect_tab(tab_label: str, link_selector: str, url_re) -> list[dict]:
                 """Wait for the current tab's cards, then scroll-and-harvest up to
-                max_videos links matching url_re. Each tab (Videos, Photo) is its
-                own result feed, so search_rank restarts at 1 per tab. Returns the
-                entries collected for this tab."""
+                max_videos links matching url_re. Each tab (Top, Videos, Photo) is
+                its own result feed, so search_rank restarts at 1 per tab, and a
+                URL already taken by an earlier tab leaves a rank gap here.
+                Returns the entries collected for this tab."""
                 collected: list[dict] = []    # URLs saved in this tab (for counting)
                 positioned: set[str] = set()  # feed slots already counted this tab
                 rank_counter = 0              # position in this tab's result feed
@@ -800,41 +877,70 @@ def scrape_tiktok_search(queries: list[str], min_videos: int, max_videos: int, o
                 save_progress()  # capture any data filled in by the refill pass
                 return collected
 
-            # 1) Videos tab (we navigated straight to it).
-            video_entries = collect_tab("Videos", VIDEO_LINK_SELECTOR, VIDEO_URL_RE)
+            def open_search_tab(label: str) -> bool:
+                """Open one search tab by its URL and confirm we are on it.
 
-            # 2) Photo tab — click it, then scrape image/slideshow posts the same way.
-            print("[*] Switching to the Photo tab...")
-            switched = click_search_tab(page, "Photo")
-            if not switched:
-                # Fallback: the general search page always shows the full tab bar.
-                gen_url = f"https://www.tiktok.com/search?q={query.replace(' ', '%20')}"
-                print(f"[*] Photo tab not found here – trying general search: {gen_url}")
-                try:
-                    page.goto(gen_url, wait_until="domcontentloaded", timeout=60000)
-                    time.sleep(POPUP_WAIT)
-                    dismiss_login_popup()
-                    switched = click_search_tab(page, "Photo")
-                except Exception:
-                    switched = False
-            if switched:
-                time.sleep(2)
+                THE CONFIRMATION IS THE POINT. Landing somewhere else used to be
+                invisible: the harvest would simply wait sixty seconds for cards
+                that were never going to appear and report "no cards – skipping",
+                which reads as "TikTok had no photos for this query" rather than
+                "we are on the wrong tab". The path is checked exactly, so a
+                redirect to /search/user or back to /search is caught and named.
+                """
+                url = tiktok_tab_url(label, query)
+                print(f"[*] Opening the {label} tab: {url}")
+                if not goto_search(page, url):
+                    print(f"[!] Could not load the {label} tab – skipping it for "
+                          f"this query.")
+                    return False
+                time.sleep(POPUP_WAIT)
                 dismiss_login_popup()
-                photo_entries = collect_tab("Photo", PHOTO_LINK_SELECTOR, PHOTO_URL_RE)
-            else:
-                print("[!] Could not open the Photo tab – skipping photos for this query.")
-                photo_entries = []
+                here = urlsplit(page.url).path.rstrip("/") or "/"
+                want = TIKTOK_TAB_PATHS[label]
+                if here != want:
+                    print(f"[!] Asked for the {label} tab ({want}) and landed on "
+                          f"{here} – skipping it rather than harvesting the wrong "
+                          f"feed.")
+                    return False
+                return True
 
-            collected_q = len(video_entries) + len(photo_entries)
+            # ── WHY TOP GOES FIRST ────────────────────────────────────────
+            #
+            # Not for tidiness: a URL already collected is skipped, and the rank
+            # it would have had is left as a gap. Top is a blend of the best
+            # videos and the best photo posts for the query, so run LAST it would
+            # be almost entirely duplicates — a tab that collected four links out
+            # of fifty and looked broken.
+            #
+            # Run FIRST it gets a clean 1..N, and that ranking is the one worth
+            # having: it is the order a person searching TikTok is shown, which is
+            # what the dashboard's search-rank clustering is trying to model. The
+            # Videos and Photo tabs then add their long tails, with gaps where Top
+            # already took something.
+            #
+            # 1) Top tab (we navigated straight to it).
+            top_entries = collect_tab("Top", TOP_LINK_SELECTOR, TOP_URL_RE)
+
+            # 2) Videos tab.
+            video_entries = (collect_tab("Videos", VIDEO_LINK_SELECTOR, VIDEO_URL_RE)
+                             if open_search_tab("Videos") else [])
+
+            # 3) Photo tab — the image/slideshow posts.
+            photo_entries = (collect_tab("Photo", PHOTO_LINK_SELECTOR, PHOTO_URL_RE)
+                             if open_search_tab("Photo") else [])
+
+            collected_q = len(top_entries) + len(video_entries) + len(photo_entries)
+            # Named per tab, because the split is the only way to see a tab that
+            # silently stopped working — a total on its own cannot.
+            split = (f"{len(top_entries)} top + {len(video_entries)} video "
+                     f"+ {len(photo_entries)} photo")
             if collected_q < min_videos:
                 print(
                     f"\n[!] Warning: collected {collected_q} URLs for '{query}' "
-                    f"({len(video_entries)} video + {len(photo_entries)} photo) "
-                    f"but minimum target was {min_videos}."
+                    f"({split}) but minimum target was {min_videos}."
                 )
             else:
-                print(f"[*] Query '{query}': {collected_q} URLs collected "
-                      f"({len(video_entries)} video + {len(photo_entries)} photo).")
+                print(f"[*] Query '{query}': {collected_q} URLs collected ({split}).")
 
         context.close()
 
@@ -859,6 +965,39 @@ def get_instagram_title(anchor) -> str:
         return clean_title(raw)
     except Exception:
         return ""
+
+
+def _await_instagram_session(context, timeout_s: int = 600) -> None:
+    """Start at once when the saved profile is signed in to Instagram; otherwise
+    wait — with no Enter to press — until a login appears.
+
+    Signed in means Instagram's `sessionid` cookie is set, which is what the site
+    itself checks; it is there the moment a login completes.
+    """
+    def signed_in() -> bool:
+        try:
+            return any(
+                c.get("name") == "sessionid" and c.get("value") and "instagram.com" in c.get("domain", "")
+                for c in context.cookies()
+            )
+        except Exception:
+            return False
+
+    if signed_in():
+        print("[+] Already logged in to Instagram – starting search...")
+        return
+    print("\n" + "=" * 60)
+    print("  Not logged in to Instagram — log in in the browser window.")
+    print("  The search starts by itself as soon as you are in.")
+    print("=" * 60)
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        time.sleep(3)
+        if signed_in():
+            print("[+] Login detected – starting search...")
+            return
+    print("[!] Still not logged in to Instagram after "
+          f"{timeout_s // 60} min — searching anyway (results may be empty).")
 
 
 def scrape_instagram_search(queries: list[str], min_videos: int, max_videos: int, output_file: str):
@@ -930,14 +1069,17 @@ def scrape_instagram_search(queries: list[str], min_videos: int, max_videos: int
         except Exception as e:
             print(f"[!] Navigation error: {e}")
             raise
-        print("\n" + "=" * 60)
-        print("  Please log in to Instagram in the browser window.")
-        print("")
-        print("  Once you are logged in and your home feed is visible,")
-        print("  press Enter here to continue...")
-        print("=" * 60)
-        input()
-        print("[+] Login confirmed – starting search...")
+        if NO_LOGIN_WAIT:
+            _await_instagram_session(context)
+        else:
+            print("\n" + "=" * 60)
+            print("  Please log in to Instagram in the browser window.")
+            print("")
+            print("  Once you are logged in and your home feed is visible,")
+            print("  press Enter here to continue...")
+            print("=" * 60)
+            input()
+            print("[+] Login confirmed – starting search...")
 
         # Block fonts/media for speed, but keep images so the post grid renders.
         page.route(
@@ -961,7 +1103,8 @@ def scrape_instagram_search(queries: list[str], min_videos: int, max_videos: int
             # Hashtag search: only the end keyword changes; %23 is the leading '#'.
             search_url = f"https://www.instagram.com/explore/search/keyword/?q={query.replace(' ', '%20')}"
             print(f"[*] Navigating to: {search_url}")
-            page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+            if not goto_search(page, search_url):
+                continue
             time.sleep(POPUP_WAIT)
 
             # Dismiss "Save login info?" / "Turn on notifications" dialogs.
@@ -1111,29 +1254,108 @@ def scrape_instagram_search(queries: list[str], min_videos: int, max_videos: int
     return output_path
 
 
+# How Reddit writes a post's age on a search card: "2mo ago", "5d ago",
+# "3 hr. ago", "just now". Normalised to the handful of spellings
+# parse_posted_date understands on the other side (which has "mo" before "m",
+# so "2mo ago" must not become "2m ago").
+_REDDIT_AGE_RE = re.compile(
+    r"\b(\d+)\s*(mo|mon|month|yr|year|sec|second|min|minute|hr|hour|day|wk|week|[smhdwy])s?\.?\s*ago\b",
+    re.IGNORECASE,
+)
+_REDDIT_AGE_UNIT = {
+    "sec": "s", "second": "s", "s": "s",
+    "min": "m", "minute": "m", "m": "m",
+    "hr": "h", "hour": "h", "h": "h",
+    "day": "d", "d": "d",
+    "wk": "w", "week": "w", "w": "w",
+    "mo": "mo", "mon": "mo", "month": "mo",
+    "yr": "y", "year": "y", "y": "y",
+}
+# "11 votes", "1.2K votes", "834 upvotes".
+_REDDIT_VOTES_RE = re.compile(r"([\d][\d.,]*\s*[KM]?)\s*(?:up)?votes?\b", re.IGNORECASE)
+
+
+def _reddit_age_to_relative(text: str) -> str:
+    """The post's age from a card's text, in a spelling parse_posted_date knows."""
+    if re.search(r"\bjust now\b", text, re.IGNORECASE):
+        return "just now"
+    m = _REDDIT_AGE_RE.search(text)
+    if not m:
+        return ""
+    unit = _REDDIT_AGE_UNIT.get(m.group(2).lower(), "")
+    return f"{m.group(1)}{unit} ago" if unit else ""
+
+
 def get_reddit_details(anchor) -> tuple[str, str, str]:
-    """Best-effort (score, created_date, title) for a Reddit post. Reddit renders posts
-    as <shreddit-post> custom elements whose attributes carry the data; walk up
-    (across shadow boundaries) to find it. Returns ('', '') if unavailable."""
+    """Best-effort (score, posted_date, title) for a Reddit post.
+
+    THERE IS NO <shreddit-post> ON THE SEARCH PAGE. This walked up from the
+    result link looking for one and reading its `score` and `created-timestamp`
+    attributes — which is right on a post's own page and finds nothing here. The
+    tree above a search result is `a > h2 > search-telemetry-tracker > div`, and
+    the walk fell through to its last resort every single time: every Reddit row
+    was written with like_count 0 and an empty posted_date, so the heart ceiling
+    had no like count to work from and the date clustering had no date. The
+    titles looked right only because the fallback is the link's own text, which
+    on a search result happens to BE the title.
+
+    So the card is read instead. It renders everything in plain text:
+
+        Best 3 AI Humanizers (Tested Against GPTZero & Turnitin)
+        r/humanizing
+        2mo ago
+        ...
+        11 votes•88 comments
+
+    The card is found by LOOKING for that text rather than by its classes — the
+    container is `div.flex.justify-between.items-center.p-md`, which is Tailwind
+    output and will be different the next time Reddit rebuilds its front end. An
+    element that says "N votes" and "... ago" is the card whatever it is called.
+
+    `shreddit-post` is still preferred when it IS there, because its attributes
+    are exact and dated to the second; that is the path taken when this is
+    pointed at a post page rather than a search result.
+    """
     try:
-        result = anchor.evaluate("""el => {
+        # A RAW STRING. The regexes below are JavaScript's, and in an ordinary
+        # Python string `` is a backspace character and `\d` is a warning: the
+        # test never matched, so every card fell through to "no score, no date"
+        # exactly as the <shreddit-post> walk had.
+        result = anchor.evaluate(r"""el => {
             let node = el;
-            for (let i = 0; i < 25; i++) {
-                if (!node) break;
-                if ((node.tagName || '').toLowerCase() === 'shreddit-post') {
-                    return [
-                        node.getAttribute('score') || '',
-                        node.getAttribute('created-timestamp') || '',
-                        node.getAttribute('post-title') || (el.innerText || ''),
-                    ];
+            for (let i = 0; i < 14 && node; i++) {
+                const tag = (node.tagName || '').toLowerCase();
+                // A post's own page: exact, and dated to the second.
+                if (tag === 'shreddit-post') {
+                    return {
+                        kind: 'attr',
+                        score: node.getAttribute('score') || '',
+                        date: node.getAttribute('created-timestamp') || '',
+                        title: node.getAttribute('post-title') || (el.innerText || ''),
+                    };
                 }
-                node = node.parentElement || (node.getRootNode && node.getRootNode().host) || null;
+                const t = String(node.innerText || '');
+                // The search card, recognised by what it says.
+                if (/\d\s*(?:up)?votes?\b/i.test(t) && /(?:ago|just now)\b/i.test(t)) {
+                    return { kind: 'card', text: t, title: el.innerText || '' };
+                }
+                node = node.parentElement
+                    || (node.getRootNode && node.getRootNode().host)
+                    || null;
             }
-            return ['', '', el.innerText || ''];
+            return { kind: 'none', title: el.innerText || '' };
         }""")
-        score, ts = result[0], result[1]
-        # keep just the YYYY-MM-DD date
-        return score, (ts[:10] if ts else ""), clean_title(result[2])
+
+        kind = (result or {}).get("kind", "none")
+        if kind == "attr":
+            ts = result.get("date") or ""
+            return (result.get("score") or "", ts[:10], clean_title(result.get("title") or ""))
+        if kind == "card":
+            text = result.get("text") or ""
+            m = _REDDIT_VOTES_RE.search(text)
+            score = m.group(1).strip() if m else ""
+            return score, _reddit_age_to_relative(text), clean_title(result.get("title") or "")
+        return "", "", clean_title((result or {}).get("title") or "")
     except Exception:
         return "", "", ""
 
@@ -1206,7 +1428,8 @@ def scrape_reddit_search(queries: list[str], min_videos: int, max_videos: int, o
 
             search_url = f"https://www.reddit.com/search/?q={query.replace(' ', '%20')}&type=posts"
             print(f"[*] Navigating to: {search_url}")
-            page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+            if not goto_search(page, search_url):
+                continue
             time.sleep(POPUP_WAIT)
 
             # Dismiss common cookie / "continue" nags if present.
@@ -1384,7 +1607,14 @@ def main():
         choices=["all", "videos", "shorts"], default=DEFAULT_YT_CONTENT,
         help="YouTube content type: all (default), videos, or shorts",
     )
+    parser.add_argument(
+        "--no-login-wait", action="store_true",
+        help="Start searching at once instead of waiting for a login + Enter "
+             "(Instagram still waits, by itself, if it is signed out)",
+    )
     args = parser.parse_args()
+    global NO_LOGIN_WAIT
+    NO_LOGIN_WAIT = args.no_login_wait
 
     queries = args.query if isinstance(args.query, list) else [args.query]
     queries = [q.strip() for q in queries if q.strip()]

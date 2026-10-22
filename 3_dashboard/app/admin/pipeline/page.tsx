@@ -32,6 +32,9 @@ export default async function PipelinePage() {
             Every six hours: look for new videos on the best channels, read comments on the
             clusters that matter, sort the new links, and rescore the pool.
           </p>
+          {/* Not narrowed by the genre switch: one cycle works every genre's
+              channels and rescores the whole pool, so its numbers are too. */}
+          <p className="text-[11px] text-zinc-500 mt-1">Runs over every genre at once — the genre switch does not narrow it.</p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <Link

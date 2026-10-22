@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { signOut } from '@/lib/auth-client'
-import { validateAllProfileLinks, REFERRAL_SHARE } from '@/lib/config'
+import { validateAllProfileLinks, REFERRAL_SHARE, ETHIOPIAN_BANKS } from '@/lib/config'
 import { normalizeReferralCode } from '@/lib/referrals'
 import type { UserProfile } from '@/lib/db'
 
@@ -15,7 +15,11 @@ export default function Onboarding({
   suggestedName,
   canEnterReferral,
   contactOnly = false,
+  tiktokOnly = false,
+  bankNameOnly = false,
 }: {
+  /** True when an existing worker only lacks the bank name. */
+  bankNameOnly?: boolean
   initial: UserProfile | null
   email: string
   suggestedName: string
@@ -26,11 +30,28 @@ export default function Onboarding({
   /** True when everything else is already filled in and only the phone or
    *  Telegram is missing — an existing worker, not a new registration. */
   contactOnly?: boolean
+  /** True when the only thing wrong is a TikTok link that does not name an
+   *  account. Also an existing worker, and the same reasoning: say which one
+   *  field is being asked for rather than presenting the whole form again. */
+  tiktokOnly?: boolean
 }) {
   const router = useRouter()
   const [name, setName] = useState(initial?.name ?? suggestedName ?? '')
   const [bank, setBank] = useState(initial?.bank_account ?? '')
-  const [tiktok, setTiktok] = useState(initial?.tiktok_url ?? '')
+  // The bank: one of the list, or "Other" with the name typed in. A stored name
+  // that is not on the list opens as Other with it filled in.
+  const storedBank = initial?.bank_name ?? ''
+  const [bankPick, setBankPick] = useState(
+    storedBank ? (ETHIOPIAN_BANKS.includes(storedBank) ? storedBank : '__other') : ''
+  )
+  const [bankOther, setBankOther] = useState(
+    storedBank && !ETHIOPIAN_BANKS.includes(storedBank) ? storedBank : ''
+  )
+  const bankName = bankPick === '__other' ? bankOther.trim() : bankPick
+  // CLEARED when it is the link being replaced. A box holding the very text
+  // that was refused invites pressing Save on it unchanged, and then reading
+  // the same error as a bug.
+  const [tiktok, setTiktok] = useState(tiktokOnly ? '' : initial?.tiktok_url ?? '')
   const [youtube, setYoutube] = useState(initial?.youtube_url ?? '')
   const [instagram, setInstagram] = useState(initial?.instagram_url ?? '')
   const [phone, setPhone] = useState(initial?.phone ?? '')
@@ -44,6 +65,9 @@ export default function Onboarding({
     setError('')
     if (!name.trim()) return setError('Please enter your name.')
     if (!bank.trim()) return setError('Please enter your bank account number.')
+    if (!bankName) {
+      return setError(bankPick === '__other' ? 'Type the name of your bank.' : 'Choose your bank.')
+    }
     if (!tiktok.trim()) return setError('Please enter your TikTok profile link.')
     const linkError = validateAllProfileLinks({
       tiktok_url: tiktok,
@@ -64,6 +88,7 @@ export default function Onboarding({
         body: JSON.stringify({
           name,
           bank_account: bank,
+          bank_name: bankName,
           tiktok_url: tiktok,
           youtube_url: youtube,
           instagram_url: instagram,
@@ -95,7 +120,13 @@ export default function Onboarding({
       <form onSubmit={submit} className="w-full max-w-md">
         <div className="flex items-start justify-between gap-4 mb-1">
           <h1 className="text-xl font-bold text-white">
-            {contactOnly ? 'Add your phone or Telegram' : 'Complete your profile'}
+            {tiktokOnly
+              ? 'Send your TikTok link again'
+              : bankNameOnly
+                ? 'Add your bank'
+                : contactOnly
+                ? 'Add your phone or Telegram'
+                : 'Complete your profile'}
           </h1>
           <button
             type="button"
@@ -108,7 +139,24 @@ export default function Onboarding({
             Sign out
           </button>
         </div>
-        {contactOnly ? (
+        {tiktokOnly ? (
+          // Sent here by the TikTok gate. Everything else is already filled in
+          // below, and saying so is what keeps the form from reading as a demand
+          // to register all over again.
+          <p className="text-sm text-zinc-400 mb-6 leading-relaxed">
+            Everything else is already filled in. Paste your{' '}
+            <b className="text-zinc-200">TikTok profile link</b> below — the one with
+            your <b className="text-zinc-200">@username</b> in it, like{' '}
+            <span className="font-mono text-zinc-300">tiktok.com/@yourusername</span> — and
+            press Save. Your work and your pay are untouched.
+          </p>
+        ) : bankNameOnly ? (
+          <p className="text-sm text-zinc-400 mb-6 leading-relaxed">
+            Everything else is already filled in. Choose the{' '}
+            <b className="text-zinc-200">bank your account is at</b> below — or type it if it
+            is not in the list — and press Save. Your work and your pay are untouched.
+          </p>
+        ) : contactOnly ? (
           // An existing worker, sent here by the gate. Everything else is
           // already filled in below; without saying so, the form reads as a
           // demand to register all over again.
@@ -141,6 +189,30 @@ export default function Onboarding({
               inputMode="numeric"
               autoComplete="off"
             />
+          </div>
+
+          <div>
+            <label className={labelCls}>Bank <span className="text-emerald-500">*</span></label>
+            <select
+              className={inputCls}
+              value={bankPick}
+              onChange={(e) => setBankPick(e.target.value)}
+            >
+              <option value="">Choose your bank…</option>
+              {ETHIOPIAN_BANKS.map((b) => (
+                <option key={b} value={b}>{b}</option>
+              ))}
+              <option value="__other">Other — type it</option>
+            </select>
+            {bankPick === '__other' && (
+              <input
+                className={inputCls + ' mt-2'}
+                value={bankOther}
+                onChange={(e) => setBankOther(e.target.value)}
+                placeholder="Your bank's name"
+                autoComplete="off"
+              />
+            )}
           </div>
 
           <div className="pt-2">
@@ -193,13 +265,18 @@ export default function Onboarding({
               Accounts you comment from
             </p>
             <p className="text-xs text-zinc-500 mb-3">
-              TikTok is required to start; YouTube and Instagram are optional. Enter each account&apos;s
-              profile link (a valid platform URL). Each link can only be registered by one person.
+              TikTok is required to start; YouTube and Instagram are optional. Each link can only be
+              registered by one person.
             </p>
             <div className="space-y-4">
               <div>
                 <label className={labelCls}>TikTok profile link <span className="text-emerald-500">*</span></label>
                 <input className={inputCls} value={tiktok} onChange={(e) => setTiktok(e.target.value)} placeholder="https://www.tiktok.com/@you" inputMode="url" />
+                <p className="text-xs text-zinc-500 mt-1">
+                  Must show your @username, like{' '}
+                  <span className="font-mono text-zinc-400">tiktok.com/@yourusername</span>. A video
+                  link or a short vm.tiktok.com link will not work.
+                </p>
               </div>
               <div>
                 <label className={labelCls}>YouTube channel link <span className="text-zinc-600">(optional)</span></label>

@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { isAdminEmail } from '@/lib/config'
+import { getAdminGenre } from '@/lib/adminGenre'
+import { isAdminEmail, productsInGenre } from '@/lib/config'
 import { getUserClicks, removeAllUserClicks } from '@/lib/db'
 
 export const dynamic = 'force-dynamic'
@@ -16,7 +17,8 @@ export async function GET(req: NextRequest) {
   const userId = (req.nextUrl.searchParams.get('userId') || '').trim()
   if (!userId) return NextResponse.json({ error: 'Missing userId' }, { status: 400 })
   try {
-    const clicks = await getUserClicks(userId)
+    // The switch's genre only.
+    const clicks = await getUserClicks(userId, productsInGenre(await getAdminGenre()))
     return NextResponse.json({ clicks })
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 })

@@ -36,7 +36,7 @@ function fmtBirr(n: number): string {
   return n.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 })
 }
 
-export type Platform = 'tiktok' | 'youtube_shorts' | 'youtube_videos' | 'instagram'
+export type Platform = 'tiktok' | 'youtube_shorts' | 'youtube_videos' | 'instagram' | 'reddit'
 
 export interface Video {
   url: string
@@ -80,11 +80,11 @@ const PLATFORMS: { key: Platform; label: string; dot: string; text: string }[] =
   { key: 'youtube_shorts', label: 'YT Shorts', dot: 'bg-orange-500', text: 'text-orange-400' },
   { key: 'youtube_videos', label: 'YT Videos', dot: 'bg-red-500', text: 'text-red-400' },
   { key: 'instagram', label: 'Instagram', dot: 'bg-fuchsia-500', text: 'text-fuchsia-400' },
+  { key: 'reddit', label: 'Reddit', dot: 'bg-amber-600', text: 'text-amber-400' },
 ]
 
 // Future platforms — shown as disabled tabs (not yet wired up). Work in progress.
 const COMING_SOON_PLATFORMS: { label: string }[] = [
-  { label: 'Reddit' },
   { label: 'X' },
   { label: 'Blog Post' },
 ]
@@ -786,7 +786,7 @@ export default function Dashboard({
   )
 
   const availableByPlatform = useMemo(() => {
-    const m: Record<string, number> = { tiktok: 0, youtube_shorts: 0, youtube_videos: 0, instagram: 0 }
+    const m: Record<string, number> = { tiktok: 0, youtube_shorts: 0, youtube_videos: 0, instagram: 0, reddit: 0 }
     if (remainingByPlatform) {
       for (const [k, n] of Object.entries(remainingByPlatform)) m[k] = n
       for (const v of videos) {

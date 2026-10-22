@@ -52,6 +52,29 @@ export function accountCreatedAt(uid: string | number | null | undefined): Date 
 }
 
 /** "2 years, 4 months", from a creation date. Empty when the date is unusable. */
+/**
+ * The age in words, for the admin's user row: "12 days", "4 months",
+ * "1 year", "2 years and 7 months". Calendar months, not 30-day blocks, so an
+ * account made on the 3rd turns a month older on the 3rd.
+ */
+export function accountAgeWords(created: Date | null): string {
+  if (!created) return ''
+  const now = new Date()
+  if (now.getTime() < created.getTime()) return ''
+  let months =
+    (now.getFullYear() - created.getFullYear()) * 12 + (now.getMonth() - created.getMonth())
+  if (now.getDate() < created.getDate()) months--
+  const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`
+  if (months < 1) {
+    const days = Math.floor((now.getTime() - created.getTime()) / 86_400_000)
+    return days < 1 ? 'today' : plural(days, 'day')
+  }
+  const years = Math.floor(months / 12)
+  const rem = months % 12
+  if (years === 0) return plural(rem, 'month')
+  return rem === 0 ? plural(years, 'year') : `${plural(years, 'year')} and ${plural(rem, 'month')}`
+}
+
 export function accountAge(created: Date | null): string {
   if (!created) return ''
   const now = Date.now()

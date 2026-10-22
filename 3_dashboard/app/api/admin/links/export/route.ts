@@ -1,15 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { isAdminEmail, RANK_CLUSTER_COUNT, DATE_CLUSTER_COUNT, retireThreshold } from '@/lib/config'
+import { getAdminGenre } from '@/lib/adminGenre'
+import { isAdminEmail, genreOfRow, RANK_CLUSTER_COUNT, DATE_CLUSTER_COUNT, retireThreshold } from '@/lib/config'
 import { loadVideosJson } from '@/lib/videos'
-import { getClickCountsByProductAndUrl, getBlockedUrls, getEffectivePlatformLimits } from '@/lib/db'
+import { getClickCountsByProductAndUrl, getBlockedPoolUrls, getEffectivePlatformLimits } from '@/lib/db'
 import { parsePostedDate } from '@/lib/cluster'
 
 export const dynamic = 'force-dynamic'
 
 const COLUMNS = [
   'platform',
+  'genre',
   'rank_cluster',
   'date_cluster',
   'combined_cluster',
@@ -34,7 +36,7 @@ const NUMERIC_COLUMNS = new Set([
   'retire_at',
 ])
 
-const PLATFORM_ORDER = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram', 'unknown']
+const PLATFORM_ORDER = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram', 'reddit', 'unknown']
 
 type Row = Record<string, unknown>
 
@@ -171,7 +173,7 @@ export async function GET(req: NextRequest) {
   const [all, clicksByProduct, blockedUrls, effective] = await Promise.all([
     loadVideosJson().then((v) => v as unknown as Row[]),
     getClickCountsByProductAndUrl().catch(() => ({}) as Record<string, Record<string, number>>),
-    getBlockedUrls().catch(() => [] as string[]),
+    getBlockedPoolUrls().catch(() => [] as string[]),
     getEffectivePlatformLimits().catch(() => ({ retirePlatforms: new Set<string>() })),
   ])
   const blockedSet = new Set(blockedUrls)
@@ -189,7 +191,11 @@ export async function GET(req: NextRequest) {
   }
   // Annotate + cluster over the full pool first, then apply platform/retired
   // filters (so cluster numbers stay correct regardless of the platform filter).
+  // ONE GENRE: the switch's. Each genre's pool is clustered on its own (the
+  // feeds do the same), so the genre is cut BEFORE the clusters are assigned.
+  const genre = await getAdminGenre()
   const httpAll: Row[] = all
+    .filter((v) => genreOfRow(v as { genre?: unknown }) === genre)
     // Blocked links are never exported (mirrors the admin list, which hides them).
     .filter((v) => String(v.url ?? '').startsWith('http') && !blockedSet.has(String(v.url)))
     .map((v) => {

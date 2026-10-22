@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 /**
  * Our comments, ordered by how many links carry them.
@@ -31,9 +31,19 @@ interface Row {
   bestRank: number | null
   likes: number
   accounts: number
+  /** How many of those accounts are our own workers. */
+  ourAccounts: number
+  /** Rows posted by one of our workers, out of `hits`. */
+  byWorkers: number
   lastSeen: string | null
-  /** How many times this comment was handed to a worker. */
+  /** When it was posted, from TikTok. Null for rows scanned before we kept it. */
+  lastPosted: string | null
+  /** How many times this comment was handed to a worker, inside the window. */
   served: number
+  /** The same with no time limit — "none this window" is not "never". */
+  servedEver: number
+  /** When it was last handed out, at any time. */
+  servedLast: string | null
   /** links / served, as a percentage. null when it was never served. */
   ratio: number | null
 }
@@ -44,6 +54,8 @@ interface LinkRow {
   rank: number
   likes: number
   username: string
+  /** When that copy was posted, from TikTok. Null where we have not read it yet. */
+  postedAt: string | null
 }
 
 const TAG: Record<string, string> = {
@@ -73,25 +85,60 @@ export default function CommentFrequency({
 }) {
   const [rows, setRows] = useState<Row[]>([])
   const [scope, setScope] = useState('')
-  const [totals, setTotals] = useState({ distinct: 0, hits: 0, links: 0, served: 0 })
+  const [totals, setTotals] = useState({
+    distinct: 0,
+    hits: 0,
+    links: 0,
+    served: 0,
+    byWorkers: 0,
+    undated: 0,
+  })
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(true)
   // Whether to obey the page's filter. Both are worth asking, so both are one
   // click away rather than a page reload.
   const [all, setAll] = useState(false)
   const [find, setFind] = useState('')
+  /**
+   * How far back to look, in days. 0 is all time.
+   *
+   * It narrows BOTH halves: comments found on links scanned inside the window,
+   * and comments served inside it. Anything else would divide this month's
+   * findings by a year of serving and call the result a yield.
+   *
+   * A comment row carries no date of its own — a scan writes it and the next scan
+   * replaces it — so "found in the last 30 days" means "links read in the last 30
+   * days, and what was on them". That is the more useful question anyway: a link
+   * nobody has looked at since August says nothing about today.
+   */
+  const [days, setDays] = useState(0)
+  /** Running the date backfill, and what it has done so far. */
+  const [dating, setDating] = useState(false)
+  const [dateNote, setDateNote] = useState('')
+  /**
+   * Links read and links to read, for the bar.
+   *
+   * COUNTED IN LINKS, NOT COMMENTS. A link carries several comments, so a bar
+   * measured in rows jumps in uneven steps and lands past its own end; the work
+   * is one read per link, which is what the bar should show.
+   */
+  const [dateProg, setDateProg] = useState({ done: 0, total: 0 })
+  const stopDating = useRef(false)
   // Which question is being asked of the list. Ordering by links answers "what is
   // most repeated"; by ratio, "what are we handing out and getting nothing for".
-  const [sort, setSort] = useState<'links' | 'served' | 'ratio'>('links')
+  const [sort, setSort] = useState<'links' | 'served' | 'ratio' | 'balanced'>('links')
   // Which comment's links are open, and what they are.
   const [open, setOpen] = useState('')
   const [links, setLinks] = useState<LinkRow[]>([])
+  /** Bumped to refetch the tally after something changed underneath it. */
+  const [reload, setReload] = useState(0)
 
   useEffect(() => {
     let live = true
     setLoading(true)
     setErr('')
-    const qs = all ? 'scope=all' : query
+    const base = all ? 'scope=all' : query
+    const qs = [base, days ? `days=${days}` : ''].filter(Boolean).join('&')
     fetch(`/api/admin/links/comment-tally${qs ? `?${qs}` : ''}`)
       .then((r) => r.json())
       .then((d) => {
@@ -107,6 +154,8 @@ export default function CommentFrequency({
           hits: Number(d.hits) || 0,
           links: Number(d.links) || 0,
           served: Number(d.served) || 0,
+          byWorkers: Number(d.byWorkers) || 0,
+          undated: Number(d.undated) || 0,
         })
       })
       .catch(() => live && setErr('Could not load the comment tally.'))
@@ -114,7 +163,79 @@ export default function CommentFrequency({
     return () => {
       live = false
     }
-  }, [query, all])
+  }, [query, all, days, reload])
+
+  /**
+   * Read the links whose comments have no posting date, until none are left.
+   *
+   * WHY A BUTTON AND NOT A MIGRATION. There is nothing to migrate: the date was
+   * never stored, and it cannot be derived from anything we hold. It has to come
+   * from TikTok, which means reading those links again — the same extract, aimed
+   * at exactly the ones that would gain from it.
+   *
+   * Batched to a deadline and resumed, like every other reader here: a few
+   * seconds a link, 2,380 links to go at the time this was written. Stoppable,
+   * and everything read before you stop is saved.
+   */
+  async function fillDates() {
+    if (dating) {
+      stopDating.current = true
+      setDateNote('Stopping…')
+      return
+    }
+    const scope = all ? 'scope=all' : query
+    stopDating.current = false
+    setDating(true)
+    setDateNote('Counting the links…')
+    setDateProg({ done: 0, total: 0 })
+    let done = 0
+    try {
+      // The length of the job before any of it is done, so the bar is honest
+      // from the first frame rather than growing a denominator as it goes.
+      const head = await fetch(
+        `/api/admin/links/comment-dates${scope ? `?${scope}` : ''}`
+      ).then((r) => r.json()).catch(() => null)
+      const total = Number(head?.links) || 0
+      setDateProg({ done: 0, total })
+      setDateNote(total ? `${total.toLocaleString()} link(s) to read` : 'Nothing to read.')
+      if (!total) {
+        setDating(false)
+        return
+      }
+      for (;;) {
+        if (stopDating.current) break
+        const res = await fetch(
+          `/api/admin/links/comment-dates${scope ? `?${scope}` : ''}`,
+          { method: 'POST' }
+        )
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok) {
+          setDateNote(d?.error || 'Could not read those links.')
+          break
+        }
+        done += Number(d.scanned) || 0
+        const left = Number(d.links) || 0
+        // Measured against the count taken at the start, but never allowed to
+        // exceed it: a link can gain a dateless comment while this runs.
+        setDateProg((p) => ({ done: Math.min(done, p.total || done), total: p.total || done }))
+        setDateNote(
+          d.done
+            ? `Done — ${done} link(s) read, every comment now has its date.`
+            : `${done} read · ${left.toLocaleString()} link(s) left`
+        )
+        if (d.done) break
+        // A batch that read nothing is not progress; stop rather than spin.
+        if (!Number(d.scanned)) break
+      }
+    } catch {
+      setDateNote('Network error.')
+    } finally {
+      setDating(false)
+      // Whatever it managed, the list is now out of date with the database.
+      setDays((v) => v)
+      setReload((n) => n + 1)
+    }
+  }
 
   async function showLinks(text: string) {
     if (open === text) {
@@ -124,7 +245,10 @@ export default function CommentFrequency({
     setOpen(text)
     setLinks([])
     try {
-      const r = await fetch(`/api/admin/links/comment-tally?text=${encodeURIComponent(text)}`)
+      const r = await fetch(
+        `/api/admin/links/comment-tally?text=${encodeURIComponent(text)}` +
+          (days ? `&days=${days}` : '')
+      )
       const d = await r.json()
       setLinks(Array.isArray(d?.links) ? d.links : [])
     } catch {
@@ -132,21 +256,54 @@ export default function CommentFrequency({
     }
   }
 
+  /**
+   * A comment only counts as having a RATIO once it has been handed out enough
+   * times to mean something. Two servings and one find is 50% and says nothing;
+   * a comment never served has no ratio at all, and treating that as 0% would
+   * bury the liker's own work under comments that simply failed.
+   */
+  const RATIO_MIN_SERVED = 20
+  const hasRatio = (r: Row) => r.served >= RATIO_MIN_SERVED && r.ratio !== null
+
+  /**
+   * Links and ratio, weighted equally.
+   *
+   * WHY NORMALISE RATHER THAN ADD. The two numbers are on different scales — one
+   * is a count that runs to 208, the other a percentage that mostly sits under 30
+   * — so adding them is a reach count with a rounding error on top. Each is
+   * scored against the BEST IN THE CURRENT LIST, which puts both on 0..1 and
+   * makes the weights mean what they say: half the score for how far a comment
+   * reached, half for how well it converted.
+   *
+   * Relative to the list, not to an absolute, because the list is what is being
+   * ranked — and after a filter or a time window the best available is a
+   * different number.
+   */
+  const balancedScore = useMemo(() => {
+    const scored = rows.filter(hasRatio)
+    const maxLinks = Math.max(1, ...scored.map((r) => r.links))
+    const maxPct = Math.max(1, ...scored.map((r) => r.ratio ?? 0))
+    return (r: Row) => 0.5 * (r.links / maxLinks) + 0.5 * ((r.ratio ?? 0) / maxPct)
+  }, [rows])
+
   const shown = useMemo(() => {
     const q = find.trim().toLowerCase()
     const list = q ? rows.filter((r) => r.text.toLowerCase().includes(q)) : rows.slice()
     if (sort === 'served') return list.sort((a, b) => b.served - a.served)
-    if (sort === 'ratio') {
-      // WORST FIRST, and only among comments that were actually served — a comment
-      // handed out twice and found once is 50% and means nothing. Never-served
-      // comments have no ratio and go last rather than counting as 0%.
-      const scored = list.filter((r) => r.served >= 20 && r.ratio !== null)
-      const rest = list.filter((r) => !(r.served >= 20 && r.ratio !== null))
-      scored.sort((a, b) => (a.ratio ?? 0) - (b.ratio ?? 0) || b.served - a.served)
+    if (sort === 'ratio' || sort === 'balanced') {
+      // Both of these rank on the ratio, so both need one: anything without goes
+      // last, in link order, rather than being scored as if it had failed.
+      const scored = list.filter(hasRatio)
+      const rest = list.filter((r) => !hasRatio(r)).sort((a, b) => b.links - a.links)
+      scored.sort((a, b) =>
+        sort === 'ratio'
+          ? (b.ratio ?? 0) - (a.ratio ?? 0) || b.links - a.links
+          : balancedScore(b) - balancedScore(a) || b.links - a.links
+      )
       return [...scored, ...rest]
     }
     return list.sort((a, b) => b.links - a.links)
-  }, [rows, find, sort])
+  }, [rows, find, sort, balancedScore])
 
   // The widest bar in the list, so the bars are comparable to each other rather
   // than to an arbitrary maximum.
@@ -166,11 +323,11 @@ export default function CommentFrequency({
 
   return (
     <div
-      className="fixed inset-0 z-[80] flex items-start justify-center bg-black/70 p-4 overflow-y-auto"
+      className="fixed inset-0 z-[80] flex items-start justify-center bg-black/70 p-0 sm:p-4 overflow-y-auto"
       onClick={onClose}
     >
       <div
-        className="bg-zinc-900 border border-zinc-700 rounded-xl w-full max-w-4xl my-8"
+        className="bg-zinc-900 border border-zinc-700 rounded-none sm:rounded-xl w-full max-w-4xl my-0 sm:my-8 min-h-[100dvh] sm:min-h-0"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-4 border-b border-zinc-800">
@@ -209,6 +366,49 @@ export default function CommentFrequency({
                   </span>
                 </div>
               )}
+              {/* WHO TYPED THEM, which is the answer to "how can this say never
+                  served when everyone uses the app". A row is in this table
+                  because its TEXT names a product — that is all productsIn()
+                  checks — so the table holds comments by our workers, by the
+                  liker's own accounts, and by strangers, and only the first kind
+                  can ever match something the app served. */}
+              {!loading && totals.hits > 0 && (
+                <div className="text-[11px] mt-1">
+                  <span className="text-zinc-500">Posted by </span>
+                  <span className="text-emerald-300">
+                    {totals.byWorkers.toLocaleString()} by your workers
+                  </span>
+                  <span className="text-zinc-500"> · </span>
+                  <span className="text-zinc-300">
+                    {(totals.hits - totals.byWorkers).toLocaleString()} by other accounts
+                  </span>
+                  <span className="text-zinc-600">
+                    {' '}
+                    — a comment counts here because it NAMES a product, whoever typed it, so
+                    the liker&apos;s own posts and strangers&apos; are in too. Only what the app
+                    handed out can have a yield.
+                  </span>
+                </div>
+              )}
+              {/* A WINDOW NOW MEANS THE COMMENT'S OWN DATE. Rows whose date we
+                  have never read are held out rather than judged by when their
+                  link was last scanned — which is what put an 18 August comment
+                  inside a 7-day view. Saying how many, because a count that
+                  silently shrinks is a count nobody can trust. */}
+              {!loading && days > 0 && totals.undated > 0 && (
+                <div className="text-[11px] text-amber-400/90 mt-1">
+                  {totals.undated.toLocaleString()} comment(s) have no posting date yet and are
+                  left out of this window.{' '}
+                  <button
+                    type="button"
+                    onClick={() => void fillDates()}
+                    className="underline decoration-dotted hover:text-amber-200"
+                  >
+                    {dating ? 'Stop reading' : 'Read those links now'}
+                  </button>
+                  {dateNote && <span className="text-zinc-500"> · {dateNote}</span>}
+                </div>
+              )}
               <div className="text-[11px] text-zinc-600 mt-1">
                 From what 💬 Extract comments recorded, against the comments the app handed
                 out — {scope || '…'}. Nothing is read from TikTok here, so these numbers are
@@ -227,8 +427,28 @@ export default function CommentFrequency({
               value={find}
               onChange={(e) => setFind(e.target.value)}
               placeholder="Find a comment…"
-              className="flex-1 min-w-[12rem] bg-zinc-950 border border-zinc-700 rounded-lg px-2.5 py-1.5 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-emerald-500"
+              className="flex-1 basis-full sm:basis-auto min-w-0 sm:min-w-[12rem] bg-zinc-950 border border-zinc-700 rounded-lg px-2.5 py-1.5 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-emerald-500"
             />
+            <label
+              className="flex items-center gap-1.5 text-xs text-zinc-400"
+              title="Comments POSTED inside this window (from TikTok's own date), and comments served to workers inside it. Rows extracted before we started keeping the posting date fall back to when their link was last read."
+            >
+              Last
+              <select
+                value={days}
+                onChange={(e) => setDays(Number(e.target.value))}
+                className="bg-zinc-950 border border-zinc-700 rounded px-1.5 py-1 text-xs text-zinc-200 focus:outline-none focus:border-emerald-500"
+              >
+                <option value={0}>all time</option>
+                <option value={7}>7 days</option>
+                <option value={14}>14 days</option>
+                <option value={30}>30 days</option>
+                <option value={40}>40 days</option>
+                <option value={50}>50 days</option>
+                <option value={60}>60 days</option>
+                <option value={90}>90 days</option>
+              </select>
+            </label>
             <label
               className="flex items-center gap-1.5 text-xs text-zinc-400"
               title="Ignore the page's filter and count every link that has ever been scanned."
@@ -245,17 +465,20 @@ export default function CommentFrequency({
               {([
                 ['links', 'Most links'],
                 ['served', 'Most served'],
-                ['ratio', 'Worst ratio'],
+                ['ratio', 'Best ratio'],
+                ['balanced', 'Reach + ratio'],
               ] as const).map(([k, label]) => (
                 <button
                   key={k}
                   onClick={() => setSort(k)}
                   title={
                     k === 'ratio'
-                      ? 'Lowest yield first, among comments served at least 20 times — a comment handed out twice tells you nothing.'
-                      : k === 'served'
-                        ? 'The comments workers were given most often.'
-                        : 'The comments on the most links.'
+                      ? 'Highest yield first, among comments served at least 20 times — a comment handed out twice tells you nothing.'
+                      : k === 'balanced'
+                        ? 'Half the score for how many links carry it, half for how well it converted, each measured against the best in this list. The comments that both reached far and landed.'
+                        : k === 'served'
+                          ? 'The comments workers were given most often.'
+                          : 'The comments on the most links.'
                   }
                   className={`px-2.5 py-1.5 text-xs transition-colors ${
                     sort === k ? 'bg-teal-600 text-white' : 'bg-zinc-900 text-zinc-400 hover:bg-zinc-800'
@@ -265,6 +488,22 @@ export default function CommentFrequency({
                 </button>
               ))}
             </div>
+            {/* Also here, because the dates are worth filling whether or not a
+                window is on — an all-time view gives no hint that half the rows
+                cannot be placed in time. */}
+            {totals.undated > 0 && (
+              <button
+                onClick={() => void fillDates()}
+                title={`${totals.undated.toLocaleString()} comment(s) were extracted before the posting date was kept. This reads those links again — a few seconds each — and fills the real date from TikTok. Resumable and stoppable.`}
+                className={`text-xs rounded-lg px-2.5 py-1.5 border transition-colors ${
+                  dating
+                    ? 'text-amber-200 bg-amber-600/20 border-amber-500/40'
+                    : 'text-zinc-300 bg-zinc-800 hover:bg-zinc-700 border-zinc-700'
+                }`}
+              >
+                {dating ? '■ Stop' : `🕑 Get missing dates (${totals.undated.toLocaleString()})`}
+              </button>
+            )}
             <button
               onClick={copyAll}
               title="Copy the list as found, served, ratio and comment, one per line"
@@ -275,6 +514,33 @@ export default function CommentFrequency({
           </div>
         </div>
 
+        {/* THE BAR, while the dates are being filled. It sits under the controls
+            rather than inside the notice, because the job outlives the notice:
+            the window can be switched off while it runs. */}
+        {dating && (
+          <div className="px-4 pb-3">
+            <div className="flex items-baseline justify-between gap-2 mb-1">
+              <span className="text-[11px] text-zinc-400">{dateNote}</span>
+              <span className="text-[11px] text-zinc-500 tabular-nums">
+                {dateProg.total > 0
+                  ? `${dateProg.done.toLocaleString()} / ${dateProg.total.toLocaleString()}`
+                  : ''}
+              </span>
+            </div>
+            <div className="h-1.5 rounded bg-zinc-800 overflow-hidden">
+              <div
+                className="h-full bg-amber-500 transition-all"
+                style={{
+                  width:
+                    dateProg.total > 0
+                      ? `${Math.min(100, (100 * dateProg.done) / dateProg.total)}%`
+                      : '0%',
+                }}
+              />
+            </div>
+          </div>
+        )}
+
         {err ? (
           <div className="p-6 text-center text-sm text-rose-300">{err}</div>
         ) : loading ? (
@@ -282,14 +548,17 @@ export default function CommentFrequency({
         ) : shown.length === 0 ? (
           <div className="p-6 text-center text-sm text-zinc-500">
             {rows.length === 0
-              ? 'No comments of ours have been recorded for these links. Press 💬 Extract comments first.'
+              ? days
+                ? `Nothing of ours was posted in the last ${days} days, so there is nothing to ` +
+                  'count. Widen the window, or press 💬 Extract comments.'
+                : 'No comments of ours have been recorded for these links. Press 💬 Extract comments first.'
               : 'No comment matches that search.'}
           </div>
         ) : (
           <div className="max-h-[65vh] overflow-y-auto divide-y divide-zinc-800/60">
             {shown.map((r) => (
               <div key={r.text}>
-                <div className="flex items-baseline gap-3 px-4 py-2">
+                <div className="flex flex-wrap sm:flex-nowrap items-baseline gap-x-3 gap-y-1 px-3 sm:px-4 py-2">
                   {/* The count, and a bar so the shape of the distribution is
                       readable without comparing numbers one by one. */}
                   <div className="shrink-0 w-20">
@@ -297,7 +566,14 @@ export default function CommentFrequency({
                       className={`text-xs tabular-nums font-medium ${
                         r.links >= 10 ? 'text-amber-300' : 'text-zinc-300'
                       }`}
-                      title={`On ${r.links} link(s)${r.hits !== r.links ? `, ${r.hits} row(s)` : ''}`}
+                      title={
+                        `On ${r.links} link(s)${r.hits !== r.links ? `, ${r.hits} row(s)` : ''}` +
+                        // Why this row sits where it does, when the order is not
+                        // simply the number being shown.
+                        (sort === 'balanced' && hasRatio(r)
+                          ? ` · reach+ratio score ${(balancedScore(r) * 100).toFixed(0)}/100`
+                          : '')
+                      }
                     >
                       ×{r.links.toLocaleString()}
                     </div>
@@ -310,12 +586,12 @@ export default function CommentFrequency({
                   </div>
                   <button
                     onClick={() => void showLinks(r.text)}
-                    className="flex-1 min-w-0 text-left text-xs text-zinc-200 hover:text-white break-words"
+                    className="order-last sm:order-none basis-full sm:basis-auto flex-1 min-w-0 text-left text-xs text-zinc-200 hover:text-white break-words"
                     title="Show the links carrying this comment"
                   >
                     {r.text}
                   </button>
-                  <div className="shrink-0 flex items-center gap-1.5">
+                  <div className="shrink-0 flex flex-wrap items-center gap-1.5">
                     {r.products.map((p) => (
                       <span
                         key={p}
@@ -330,15 +606,31 @@ export default function CommentFrequency({
                   <span
                     className="shrink-0 w-28 text-right tabular-nums"
                     title={
-                      r.served === 0
-                        ? 'Never handed to a worker — this one was posted by the liker, so it has no yield to report.'
-                        : (r.ratio ?? 0) > 100
-                          ? `Handed out ${r.served} time(s) and found on ${r.links} link(s) — more links than servings, because the liker posts from the same bank and its own posts are counted as found.`
-                          : `Handed out ${r.served} time(s), found on ${r.links} link(s)`
+                      r.served === 0 && r.servedEver > 0
+                        ? `Handed out ${r.servedEver} time(s), but none inside this window — ` +
+                          `the last was ${r.servedLast ? new Date(r.servedLast).toLocaleDateString() : 'earlier'}. ` +
+                          'A yield needs both halves from the same period, so there is none to show.'
+                        : r.served === 0
+                          ? 'Never handed to a worker. The liker posts comments of its own from the same bank, and those have no serving to divide by.'
+                          : (r.ratio ?? 0) > 100
+                            ? `Handed out ${r.served} time(s) and found on ${r.links} link(s) — more links than servings, because the liker posts from the same bank and its own posts are counted as found.`
+                            : `Handed out ${r.served} time(s), found on ${r.links} link(s)`
                     }
                   >
-                    {r.served === 0 ? (
-                      <span className="text-[11px] text-zinc-600">not served</span>
+                    {/* THREE STATES, NOT TWO. "0 served" inside a window means
+                        either "never handed out" — the liker's own posts — or
+                        "handed out, but before this window", and on a 7-day view
+                        722 of the 2,146 zero rows are the second kind. Calling
+                        those "not served" is false. */}
+                    {r.served === 0 && r.servedEver > 0 ? (
+                      <span className="text-[11px] text-sky-300/80">
+                        served earlier
+                        <span className="block text-[10px] text-zinc-600">
+                          {r.servedEver.toLocaleString()} before this window
+                        </span>
+                      </span>
+                    ) : r.served === 0 ? (
+                      <span className="text-[11px] text-zinc-600">never served</span>
                     ) : (
                       <>
                         <span
@@ -364,14 +656,26 @@ export default function CommentFrequency({
                     )}
                   </span>
                   <span
-                    className="shrink-0 text-[11px] text-zinc-600 tabular-nums w-24 text-right"
+                    className="hidden sm:inline-block shrink-0 text-[11px] text-zinc-600 tabular-nums w-24 text-right"
                     title={
                       `Best position ${r.bestRank === null ? 'unknown' : `#${r.bestRank + 1}`}` +
-                      ` · ${r.likes} like(s) · ${r.accounts} account(s)`
+                      ` · ${r.likes} like(s) · posted by ${r.accounts} account(s), ` +
+                      `${r.ourAccounts} of them your workers` +
+                      (r.lastPosted
+                        ? ` · newest copy posted ${new Date(r.lastPosted).toLocaleString()}`
+                        : r.lastSeen
+                          ? ` · no posting date; the ~ is when the link was last read`
+                          : '')
                     }
                   >
                     {r.bestRank === null ? '' : `#${r.bestRank + 1}`}
-                    {r.lastSeen ? ` · ${when(r.lastSeen)}` : ''}
+                    {/* POSTED, where TikTok told us; otherwise the last time we
+                        read the link, which is all we used to have. */}
+                    {r.lastPosted
+                      ? ` · ${when(r.lastPosted)}`
+                      : r.lastSeen
+                        ? ` · ~${when(r.lastSeen)}`
+                        : ''}
                   </span>
                 </div>
                 {open === r.text && (
@@ -381,7 +685,7 @@ export default function CommentFrequency({
                         <div className="px-3 py-2 text-[11px] text-zinc-500">Loading links…</div>
                       ) : (
                         links.map((l) => (
-                          <div key={l.url + l.rank} className="flex items-center gap-2 px-3 py-1.5">
+                          <div key={l.url + l.rank} className="flex flex-wrap sm:flex-nowrap items-center gap-x-2 gap-y-0.5 px-3 py-1.5">
                             <span className="shrink-0 text-[11px] text-zinc-600 tabular-nums w-10 text-right">
                               #{l.rank + 1}
                             </span>
@@ -395,6 +699,16 @@ export default function CommentFrequency({
                             </a>
                             <span className="shrink-0 text-[11px] text-zinc-500">
                               @{l.username}
+                            </span>
+                            {/* The date of THAT copy, so a row that looks out of
+                                place can be checked against the video itself. */}
+                            <span className="shrink-0 text-[11px] text-zinc-600 tabular-nums">
+                              {l.postedAt
+                                ? new Date(l.postedAt).toLocaleDateString(undefined, {
+                                    month: 'short',
+                                    day: 'numeric',
+                                  })
+                                : 'no date'}
                             </span>
                           </div>
                         ))

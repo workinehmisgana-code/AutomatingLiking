@@ -453,19 +453,73 @@ export function canListChannel(site: string): boolean {
   return LISTABLE_SITES.has(String(site ?? '').toLowerCase())
 }
 
+/** What a channel listing attempt came back with. */
+export interface ChannelListing {
+  videos: ChannelVideo[]
+  /**
+   * TikTok refused the request rather than answering it.
+   *
+   * THE DISTINCTION THAT WAS MISSING. This function returned an empty array for
+   * every kind of failure, and its own docstring called that fine because "a
+   * channel that is gone, renamed or rate-limited must not abort a sweep". It
+   * must not abort one — but a throttled channel is not an empty one, and
+   * conflating them is why pressing Extract on two freshly added channels staged
+   * nothing and reported them as having no new videos.
+   *
+   * TikTok answers a throttle with HTTP 503 and the body "overload-protect
+   * triggered". Measured: three requests to /embed/@tiktok in twelve seconds
+   * gave 503, 503, then 200 with the real page. So it is worth waiting for.
+   */
+  throttled: boolean
+}
+
+/** How long to wait before each retry of a throttled listing, in ms. */
+const LISTING_BACKOFF_MS = [700, 1800, 4000]
+
+/** HTTP codes that mean "ask again", not "there is nothing here". */
+const RETRYABLE = new Set([429, 500, 502, 503, 504])
+
 /**
- * The channel's ten most recent videos, newest first. Empty on any failure —
- * a channel that is gone, renamed or rate-limited must not abort a sweep.
+ * The channel's ten most recent videos, newest first, with whether TikTok
+ * refused to answer.
+ *
+ * Retries a refusal a few times with a growing wait — see ChannelListing.
+ * Anything else (a gone channel, a renamed one, a page with no video list)
+ * comes back as no videos and not throttled, which is the honest answer.
  *
  * TikTok only; see LISTABLE_SITES. Callers must check canListChannel() first,
  * or an Instagram channel looks exactly like a TikTok one that has vanished.
+ */
+export async function fetchChannelListing(
+  handle: string,
+  timeoutMs = 15000
+): Promise<ChannelListing> {
+  const clean = handle.replace(/^@/, '').trim()
+  if (!/^[A-Za-z0-9._]{1,80}$/.test(clean)) return { videos: [], throttled: false }
+
+  for (let attempt = 0; ; attempt++) {
+    const got = await listOnce(clean, timeoutMs)
+    if (!got.throttled || attempt >= LISTING_BACKOFF_MS.length) return got
+    await new Promise((r) => setTimeout(r, LISTING_BACKOFF_MS[attempt]))
+  }
+}
+
+/**
+ * The channel's ten most recent videos, newest first. Empty on any failure.
+ *
+ * Kept for callers that only want the videos and have nothing useful to do with
+ * a throttle. Anything that REPORTS a result to somebody should use
+ * fetchChannelListing instead, so "TikTok would not answer" does not reach the
+ * screen as "this channel has nothing new".
  */
 export async function fetchChannelVideos(
   handle: string,
   timeoutMs = 15000
 ): Promise<ChannelVideo[]> {
-  const clean = handle.replace(/^@/, '').trim()
-  if (!/^[A-Za-z0-9._]{1,80}$/.test(clean)) return []
+  return (await fetchChannelListing(handle, timeoutMs)).videos
+}
+
+async function listOnce(clean: string, timeoutMs: number): Promise<ChannelListing> {
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), timeoutMs)
   try {
@@ -474,9 +528,11 @@ export async function fetchChannelVideos(
       signal: ctl.signal,
       cache: 'no-store',
     })
-    if (!res.ok) return []
+    if (!res.ok) return { videos: [], throttled: RETRYABLE.has(res.status) }
     const m = CHANNEL_STATE_RE.exec(await res.text())
-    if (!m) return []
+    // A 200 with no state blob is the anti-bot shell, not an empty channel —
+    // worth asking again for the same reason a 503 is.
+    if (!m) return { videos: [], throttled: true }
     const state = JSON.parse(m[1]) as {
       source?: { data?: Record<string, { videoList?: unknown }> }
     }
@@ -484,7 +540,7 @@ export async function fetchChannelVideos(
     // The page keys its payload by its own path, so find it rather than guess.
     const key = Object.keys(data).find((k) => k.toLowerCase().startsWith('/embed/@'))
     const list = key ? data[key]?.videoList : null
-    if (!Array.isArray(list)) return []
+    if (!Array.isArray(list)) return { videos: [], throttled: false }
     const out: ChannelVideo[] = []
     for (const v of list) {
       const row = v as { id?: unknown; desc?: unknown; playCount?: unknown }
@@ -498,9 +554,10 @@ export async function fetchChannelVideos(
         views: Number.isFinite(views) && views >= 0 ? views : null,
       })
     }
-    return out
+    return { videos: out, throttled: false }
   } catch {
-    return []
+    // A timeout or a dropped connection is worth one more go.
+    return { videos: [], throttled: true }
   } finally {
     clearTimeout(timer)
   }
@@ -644,6 +701,19 @@ export interface VideoComment {
    * created. See accountCreatedAt in lib/tiktokId.
    */
   uid: string
+  /**
+   * When the comment was POSTED, as ISO, or null when TikTok did not say.
+   *
+   * It is in `create_time` on every comment object, a unix timestamp, and it has
+   * been in the bytes we already fetch all along — the parse simply threw it
+   * away with the other forty fields. It costs no extra request.
+   *
+   * Worth having because every date we had until now was OUR clock: when a scan
+   * happened to read the link. "Comments from the last 30 days" could only mean
+   * "links we looked at in the last 30 days", which is a different question and
+   * quietly the wrong one.
+   */
+  postedAt: string | null
 }
 
 export interface CommentRead {
@@ -702,6 +772,7 @@ export async function fetchComments(
           cid?: unknown
           text?: unknown
           digg_count?: unknown
+          create_time?: unknown
           user?: { unique_id?: unknown; uid?: unknown }
         }[]
         has_more?: unknown
@@ -716,11 +787,19 @@ export async function fetchComments(
         if (cid) seen.add(cid)
         const username = String(c.user?.unique_id ?? '').trim().toLowerCase()
         if (!username) continue
+        // Seconds, not milliseconds — and guarded, because a zero or a wild
+        // value would be worse than no date at all.
+        const secs = Number(c.create_time)
+        const postedAt =
+          Number.isFinite(secs) && secs > 1_000_000_000 && secs < 4_000_000_000
+            ? new Date(secs * 1000).toISOString()
+            : null
         out.push({
           username,
           text: String(c.text ?? ''),
           likes: Number(c.digg_count) || 0,
           uid: String(c.user?.uid ?? '').trim(),
+          postedAt,
         })
       }
       if (!data.has_more || list.length === 0) {

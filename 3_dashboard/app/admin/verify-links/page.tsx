@@ -1,6 +1,7 @@
 import { headers } from 'next/headers'
 import { redirect } from 'next/navigation'
 import { auth } from '@/lib/auth'
+import { getAdminGenre } from '@/lib/adminGenre'
 import { isAdminEmail } from '@/lib/config'
 import Login from '@/components/Login'
 import VerifyLinks from '@/components/VerifyLinks'
@@ -18,5 +19,5 @@ export default async function VerifyLinksPage() {
   }
   if (!session) return <Login />
   if (!isAdminEmail(session.user.email)) redirect('/')
-  return <VerifyLinks />
+  return <VerifyLinks genre={await getAdminGenre()} />
 }

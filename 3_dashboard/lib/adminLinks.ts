@@ -10,7 +10,10 @@
 // "clicks" (per selected product). Anything else would quietly change what the
 // admin sees.
 
+import { cached, TTL } from './poolCache'
 import {
+  GENRES,
+  genreOfRow,
   RANK_CLUSTER_COUNT,
   DATE_CLUSTER_COUNT,
   PRODUCTS,
@@ -24,6 +27,7 @@ import {
   getClickCountsByProductAndUrl,
   getUnrelatedCountsByUrl,
   getBlockedUrls,
+  getBlockedPoolUrls,
   getLinkTitles,
   getEffectivePlatformLimits,
   getLinkStats,
@@ -63,6 +67,14 @@ export interface AdminLinkRow {
   /** Composite posted-date score (recency + video + hearts) written to the pool
    *  at upload / recluster. null for links scored before it existed. */
   date_score: number | null
+  /**
+   * Which product genre's pool this link belongs to.
+   *
+   * Never '' - genreOfRow reads an absent genre as the default, so every row has
+   * one whether the blob says so or not. That is what lets the filter be a plain
+   * equality test across tens of thousands of pre-genre rows.
+   */
+  genre: string
   /** Audience the link was categorised into, or '' if not categorised yet. */
   category: string
   /**
@@ -131,6 +143,8 @@ export interface LinkQuery {
   unrelatedOnly?: boolean
   blockedOnly?: boolean
   keyword?: string
+  /** humanizer | website | slides; '' = any. */
+  genre?: string
   /** competitors | ai_detector | generic; '' = any. */
   category?: string
   uploadDate?: string
@@ -175,6 +189,10 @@ export interface LinkQuery {
   q?: string
   /** Which fields `q` looks in. Null/empty = DEFAULT_SEARCH_FIELDS. */
   searchIn?: SearchField[] | null
+  /** Match the needle as a whole word: "human" stops matching "humanizer". */
+  wholeWord?: boolean | null
+  /** Match capitals exactly. Off by default, as every search here has been. */
+  caseSensitive?: boolean | null
   sortCol?: 'cluster' | 'clicked_by' | 'unrelated' | 'ours' | 'pos' | 'rank' | null
   sortDir?: 'asc' | 'desc'
   offset?: number
@@ -289,21 +307,52 @@ function assignClusters<T>(
  * clustering is relative, so computing it over a subset would give each request
  * a different answer.
  */
-export async function buildAdminLinks(product: string): Promise<{
+/**
+ * The whole link pool, assembled.
+ *
+ * CACHED FOR HALF A MINUTE, and the reason is in lib/poolCache: this runs a
+ * dozen whole-table reads and then joins ~170k rows in JavaScript, and it sits on
+ * the path of every worker fetching links as well as every admin view. It was
+ * measured doing that 74,000 times against a 368 MB database.
+ *
+ * The loaders underneath are cached too, so a miss here is cheap; this second
+ * layer is for the CPU, which the first one does nothing about.
+ *
+ * Keyed by product, because the click counts and the retirement threshold are
+ * scoped to it. Single-flighted, so twenty workers arriving together build once.
+ */
+export function buildAdminLinks(product: string): Promise<{
   rows: AdminLinkRow[]
   counts: LinkCounts
   keywords: string[]
+  genres: string[]
   uploadDays: string[]
   products: string[]
   retirePlatforms: string[]
 }> {
-  const [videos, clicksByProduct, unrelatedCounts, blockedUrls, titles, effective] = await Promise.all([
+  return cached(`adminLinks:${product}`, TTL.build, () => buildAdminLinksUncached(product))
+}
+
+async function buildAdminLinksUncached(product: string): Promise<{
+  rows: AdminLinkRow[]
+  counts: LinkCounts
+  keywords: string[]
+  genres: string[]
+  uploadDays: string[]
+  products: string[]
+  retirePlatforms: string[]
+}> {
+  const [videos, clicksByProduct, unrelatedCounts, blockedUrls, titles, effective, blockedPool] = await Promise.all([
     loadVideosJson().catch(() => []),
     getClickCountsByProductAndUrl().catch(() => ({}) as Record<string, Record<string, number>>),
     getUnrelatedCountsByUrl().catch(() => ({}) as Record<string, number>),
     getBlockedUrls().catch(() => [] as string[]),
     getLinkTitles().catch(() => ({}) as Record<string, string>),
     getEffectivePlatformLimits().catch(() => ({ retirePlatforms: new Set<string>() })),
+    // Blocked FOR THIS LINK'S GENRE — what the serve paths withhold. The
+    // any-genre list above is for the channel counts, which are about having
+    // rejected a channel's videos at all.
+    getBlockedPoolUrls().catch(() => [] as string[]),
   ])
   // What the extraction found on each link, per product. Fetched for the whole
   // pool in one query rather than per row: the table renders thousands of rows
@@ -330,7 +379,7 @@ export async function buildAdminLinks(product: string): Promise<{
   // the cluster scores all see the same number.
   const linkStats = await getLinkStats().catch(() => ({}) as Record<string, LinkStat>)
   overlayStats(videos as unknown as { url?: unknown }[], linkStats)
-  const blockedSet = new Set(blockedUrls)
+  const blockedSet = new Set(blockedPool)
   const productKeys = Object.keys(clicksByProduct)
   const products = Array.from(new Set([...PRODUCTS, ...productKeys].filter(Boolean))) as string[]
   const active = product && productKeys.includes(product) ? product : product || products[0] || ''
@@ -370,6 +419,7 @@ export async function buildAdminLinks(product: string): Promise<{
       datePos: 0,
       combinedCluster: 0,
       date_only: Boolean((v as { date_only?: unknown }).date_only),
+      genre: genreOfRow(v),
       category: categories[url] ?? '',
       date_score: typeof v.date_score === 'number' ? v.date_score : null,
       dsRecency: typeof v.ds_r === 'number' ? v.ds_r : null,
@@ -392,12 +442,16 @@ export async function buildAdminLinks(product: string): Promise<{
     })
   }
 
-  // Cluster within each platform, for both dimensions.
+  // Cluster within each platform AND GENRE, for both dimensions. The feeds
+  // order each genre over its own pool (lib/userFeed.ts), so a website link's
+  // cluster here must be its place among website links — clustered across
+  // genres, the number on this page would not be the one the worker is served.
   const byPlatform = new Map<string, AdminLinkRow[]>()
   for (const r of rows) {
-    const list = byPlatform.get(r.platform) ?? []
+    const key = `${r.platform}|${r.genre}`
+    const list = byPlatform.get(key) ?? []
     list.push(r)
-    byPlatform.set(r.platform, list)
+    byPlatform.set(key, list)
   }
   const rankKey = (l: AdminLinkRow) => (l.search_rank > 0 ? l.search_rank : Number.MAX_SAFE_INTEGER)
   // Best-first (assignClusters sorts ascending, so smaller = earlier cluster).
@@ -478,11 +532,15 @@ export async function buildAdminLinks(product: string): Promise<{
   const uploadDays = Array.from(
     new Set(rows.map((l) => uploadDayOf(l.scraped_at)).filter(Boolean))
   ).sort((a, b) => b.localeCompare(a))
+  // In GENRES order rather than alphabetically, so the dropdown reads the same
+  // way every time regardless of which pools happen to have links today.
+  const genres = GENRES.filter((g) => rows.some((l) => l.genre === g)) as string[]
 
   return {
     rows,
     counts,
     keywords,
+    genres,
     uploadDays,
     products,
     retirePlatforms: Array.from(effective.retirePlatforms),
@@ -527,6 +585,7 @@ export function parseLinkQuery(sp: URLSearchParams): LinkQuery {
       : '',
     // A specific product's comment on the video, rather than "any of ours".
     oursProduct: String(sp.get('oursProduct') ?? '').trim(),
+    genre: sp.get('genre') ?? '',
     category: sp.get('category') ?? '',
     uploadDate: sp.get('uploadDate') ?? sp.get('uploadDay') ?? '',
     titleFilter: tf === 'has' || tf === 'none' ? tf : '',
@@ -552,6 +611,10 @@ export function parseLinkQuery(sp: URLSearchParams): LinkQuery {
       .split(',')
       .map((x) => x.trim())
       .filter(isSearchField),
+    // Both default to off, which is how this search has always behaved — a
+    // saved or shared link from before these existed keeps its old results.
+    wholeWord: sp.get('wholeWord') === '1',
+    caseSensitive: sp.get('caseSensitive') === '1',
     sortCol:
       sortCol === 'cluster' ||
       sortCol === 'clicked_by' ||
@@ -565,20 +628,62 @@ export function parseLinkQuery(sp: URLSearchParams): LinkQuery {
   }
 }
 
-/** The text one search field offers, already lowercased. */
+/**
+ * The raw text of one field. Case is folded by the caller, not here.
+ *
+ * It used to lowercase four of the five and leave `channel` alone — which was
+ * harmless while every search was case-insensitive and is a bug the moment one
+ * is not: a case-sensitive search would have been exact on channel names and
+ * blind to capitals everywhere else.
+ */
 function searchText(l: AdminLinkRow, field: SearchField): string {
   switch (field) {
     case 'url':
-      return l.url.toLowerCase()
+      return l.url
     case 'keyword':
-      return l.search_query.toLowerCase()
+      return l.search_query
     case 'title':
-      return l.title.toLowerCase()
+      return l.title
     case 'channel':
       return l.channel
     case 'bio':
-      return l.bio.toLowerCase()
+      return l.bio
   }
+}
+
+/** Everything a regex would read as syntax, made literal. */
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * The test one search runs against one field.
+ *
+ * WHOLE WORD uses \b, which breaks on anything outside [A-Za-z0-9_] — so
+ * "human" matches "human text", "a human." and "/human/", and does not match
+ * "humanizer". That is the distinction somebody searching for a product name
+ * actually wants, and a plain substring cannot make it.
+ *
+ * Built once per search rather than per row: a pool of forty thousand links
+ * would otherwise compile the same regex forty thousand times.
+ */
+function makeMatcher(
+  needle: string,
+  wholeWord: boolean,
+  caseSensitive: boolean
+): (hay: string) => boolean {
+  if (!wholeWord) {
+    const n = caseSensitive ? needle : needle.toLowerCase()
+    return (hay) => (caseSensitive ? hay : hay.toLowerCase()).includes(n)
+  }
+  // \b is wrong at an edge that is not a word character — searching "@me" or
+  // "c++" would never match. Anchoring on the needle's own first and last
+  // characters keeps those working.
+  const body = escapeRe(needle)
+  const left = /^[A-Za-z0-9_]/.test(needle) ? '\\b' : ''
+  const right = /[A-Za-z0-9_]$/.test(needle) ? '\\b' : ''
+  const re = new RegExp(left + body + right, caseSensitive ? '' : 'i')
+  return (hay) => re.test(hay)
 }
 
 /** Apply the page's filters. A faithful port of the component's `filtered`. */
@@ -588,7 +693,10 @@ export function filterAdminLinks(
   retirePlatforms: string[]
 ): AdminLinkRow[] {
   const retireSet = new Set(retirePlatforms)
-  const needle = (qy.q ?? '').toLowerCase().trim()
+  const rawNeedle = (qy.q ?? '').trim()
+  const matches = rawNeedle
+    ? makeMatcher(rawNeedle, Boolean(qy.wholeWord), Boolean(qy.caseSensitive))
+    : null
   // Empty or unrecognised picks fall back to the default rather than matching
   // nothing: a search box that silently returns zero results is worse than one
   // that searches the obvious fields.
@@ -613,6 +721,10 @@ export function filterAdminLinks(
     // Blocked links are hidden from the normal list — only shown via "Blocked only".
     if (qy.blockedOnly ? !l.blocked : l.blocked) return false
     if (qy.keyword && l.search_query !== qy.keyword) return false
+    // THE POOLS ARE SEPARATE, and this is the line that lets anybody see that.
+    // A humanizer link and a cocodly link have nothing to do with each other:
+    // different videos, different audience, different comments.
+    if (qy.genre && l.genre !== qy.genre) return false
     if (qy.category && l.category !== qy.category) return false
     if (qy.uploadDate && uploadDayOf(l.scraped_at) !== qy.uploadDate) return false
     if (qy.titleFilter === 'has' && !l.title) return false
@@ -651,7 +763,7 @@ export function filterAdminLinks(
     // ''.includes(needle) is false for any real needle. So an untitled link
     // cannot be found by title, and a link whose channel we never learned
     // cannot be found by channel — which is the honest answer, not a bug.
-    if (needle && !fields.some((f) => searchText(l, f).includes(needle))) return false
+    if (matches && !fields.some((f) => matches(searchText(l, f)))) return false
     return true
   })
 }

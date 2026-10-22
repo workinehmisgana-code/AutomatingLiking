@@ -12,8 +12,11 @@ export default function BlockedRemediation({
   reason,
   email,
   auto = false,
+  videoUrl = '',
 }: {
   reason: 'bank' | 'tiktok'
+  /** The verification video the NEW TikTok account must comment on first. */
+  videoUrl?: string
   email?: string
   /** Blocked by the nightly presence check rather than by a person. */
   auto?: boolean
@@ -28,7 +31,7 @@ export default function BlockedRemediation({
   const explain = isBank
     ? 'Your account was blocked because the bank account number you gave appears to be incorrect. Enter a new, correct bank account number to continue.'
     : auto
-      ? 'We checked the videos you opened and could not find your comments on them. That usually means the account you registered is restricted, so nobody can see what you post. Enter a different TikTok account below and you are back in straight away — or sign in again with another account.'
+      ? 'We checked the videos you opened and could not find your comments on them. That usually means the account you registered is restricted, so nobody can see what you post. Switch to a different TikTok account below — or sign in again with another account.'
       : 'Your account was blocked because your TikTok account’s visibility is restricted. Enter a different TikTok profile link (a public account) to continue.'
   const label = isBank ? 'New bank account number' : 'New TikTok profile link'
   const placeholder = isBank ? 'Correct account number' : 'https://www.tiktok.com/@you'
@@ -69,6 +72,30 @@ export default function BlockedRemediation({
         <h1 className="text-xl font-bold text-white text-center">{title}</h1>
         <p className="text-sm text-zinc-400 mt-3">{explain}</p>
 
+        {/* A NEW TIKTOK ACCOUNT IS CHECKED BEFORE IT IS ACCEPTED, the same way
+            as at registration: it comments on the verification video, which
+            proves it is theirs and tells us how old it is. */}
+        {!isBank && videoUrl && (
+          <div className="mt-5 rounded-lg border border-sky-500/30 bg-sky-500/10 p-3 text-sm text-zinc-300 space-y-2">
+            <p>
+              <b className="text-white">1.</b> From the <b className="text-white">new</b> TikTok account,
+              comment anything on this video:
+            </p>
+            <a
+              href={videoUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="block text-sky-300 hover:text-sky-200 underline break-all"
+            >
+              {videoUrl}
+            </a>
+            <p>
+              <b className="text-white">2.</b> Paste that account&apos;s profile link below and press
+              Check. The account has to be old enough, and the comment has to be from it.
+            </p>
+          </div>
+        )}
+
         <div className="mt-6">
           <label className="block text-sm text-zinc-300 mb-1">
             {label} <span className="text-emerald-500">*</span>
@@ -90,7 +117,7 @@ export default function BlockedRemediation({
           disabled={saving}
           className="mt-6 w-full bg-emerald-600 text-white font-medium rounded-lg px-4 py-2.5 hover:bg-emerald-500 transition-colors disabled:opacity-50"
         >
-          {saving ? 'Saving…' : 'Save and continue'}
+          {saving ? (isBank ? 'Saving…' : 'Checking…') : isBank ? 'Save and continue' : 'Check and continue'}
         </button>
 
         {/* A second way out, for someone whose whole sign-in is the wrong one.

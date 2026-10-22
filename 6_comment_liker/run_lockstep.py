@@ -4,9 +4,19 @@ All accounts on the SAME link at the same time.
 
 run_parallel.py splits the work — each video goes to one account, and the point
 is coverage. This does the opposite: every account works the same video at once,
-so a comment collects one like per account before anyone moves on. That is what
-actually lifts a comment up the ranking, and it keeps the accounts together
-instead of letting one run ahead.
+so a comment collects its likes before anyone moves on. That is what actually
+lifts a comment up the ranking, and it keeps the accounts together instead of
+letting one run ahead.
+
+ONE LIKE PER ACCOUNT PER COMMENT, but never two of our comments on the same
+number: a group of comments already sharing a like count gets exactly one like,
+to the top of the group (tie_filter in like.py). So the counts come out ragged
+without anybody giving up a like.
+
+--spread is the older answer to the same problem and is off by default: it
+divides each video's comments between the accounts — the first gets the whole
+roster, the next about three quarters, and so on — which works, and costs a like
+on most videos.
 
 How it stays in step: one process, one thread and one browser per account, and a
 barrier between videos. Nobody starts video N+1 until everyone has finished N.
@@ -58,6 +68,10 @@ from like import (
     from_dashboard,
     norm,
     read_links,
+    spread_hash,
+    spread_keep,
+    spread_targets,
+    tie_filter,
     video_id,
     wanted,
 )
@@ -98,6 +112,9 @@ def load_done(path: Path) -> set[str]:
 
 def account(profile, videos, targets, args, barrier, tally, width):
     """One account's whole run, in step with the others."""
+    # The whole roster, which is what makes the spread computable here without
+    # asking the other threads anything.
+    roster = [x.strip() for x in args.profiles.split(",") if x.strip()]
     ledger = done_path(profile)
     # Same rule as like.py: last run's failures come out of the ledger before
     # it is read as a skip list, so a comment that failed on a slow page is
@@ -154,9 +171,22 @@ def account(profile, videos, targets, args, barrier, tally, width):
             sync("ready")
 
             for i, (aweme, url) in enumerate(videos, 1):
-                wants = [c for c in targets.get(aweme, []) if c["cid"] not in already]
+                # MY SHARE of this video's comments, not all of them. Every
+                # account computes this for itself and they agree without
+                # talking, because the answer is a hash of the comment id
+                # against the roster. See spread_keep in like.py.
+                here = targets.get(aweme, [])
+                mine = spread_keep(aweme, here, profile, roster) if args.spread else here
+                wants = [c for c in mine if c["cid"] not in already]
                 if not wants:
-                    say(profile, f"[{i}/{len(videos)}] {aweme}: nothing left for me", width)
+                    left = len(here) - len(mine)
+                    say(
+                        profile,
+                        f"[{i}/{len(videos)}] {aweme}: "
+                        + (f"all {left} left to the other accounts" if left == len(here) and left
+                           else "nothing left for me"),
+                        width,
+                    )
                     sync(f"video {i}")
                     continue
 
@@ -256,6 +286,16 @@ def main() -> int:
                     help="seconds each account waits before a video, 'min,max'. 0,0 = same instant")
     ap.add_argument("--users", default="")
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--like-ties", action="store_true",
+                    help="like every comment in a tied group. By default only the "
+                         "top comment of each like-count is liked, so a like of "
+                         "ours never puts two of our comments on the same number")
+    ap.add_argument("--spread", action="store_true",
+                    help="DIVIDE each video's comments between the accounts "
+                         "instead of every account liking every one. Off by "
+                         "default: it costs a like on most videos, and the tie "
+                         "rule already stops our comments landing on the same "
+                         "like count")
     ap.add_argument("--headed", action="store_true",
                     help="show each browser window")
     ap.add_argument("--dry-run", action="store_true")
@@ -309,9 +349,21 @@ def main() -> int:
         picks = [c for c in fetch_comments(aweme, args.pages) if wanted(c, products, users, args.all)]
         if not picks:
             continue
+        # ONE LIKE PER LIKE COUNT. Read once here, centrally, which is the right
+        # place for it: every account is about to work this same video at the
+        # same moment, and they must all hold back the same comments or the rule
+        # means nothing.
+        tied = 0
+        if not args.like_ties:
+            picks, tied = tie_filter(picks, products=products)
+        if not picks:
+            continue
         videos.append((aweme, u))
         targets[aweme] = picks
-        print(f"  {aweme}: {len(picks)} comment(s) to like")
+        print(
+            f"  {aweme}: {len(picks)} comment(s) to like"
+            + (f", {tied} tied on likes and left alone" if tied else "")
+        )
         if args.limit and len(videos) >= args.limit:
             break
 
@@ -320,7 +372,26 @@ def main() -> int:
         return 0
     total = sum(len(v) for v in targets.values())
     print(f"\n{len(videos)} video(s), {total} comment(s), {len(profiles)} account(s) in lockstep")
-    print(f"→ up to {total * len(profiles)} likes, {len(profiles)} per comment\n")
+    if not args.spread or len(profiles) < 2:
+        print(f"→ up to {total * len(profiles)} likes, {len(profiles)} per comment\n")
+    else:
+        # The real figure, per video, rather than one multiplication that stopped
+        # being true: a video's comments get different numbers of likes now, and
+        # the run should say which numbers before it starts.
+        each = sum(
+            sum(spread_targets(len(profiles), len(v), spread_hash(a)))
+            for a, v in targets.items()
+        )
+        rows = " or ".join(
+            ", ".join(str(k) for k in spread_targets(len(profiles), 3, st))
+            for st in range(3)
+        )
+        print(
+            f"→ up to {each} likes. Our comments on one video get {rows} of "
+            f"the {len(profiles)} accounts — which shares, and which comment "
+            f"takes which, both follow the video — so neither the counts on "
+            f"one video nor the highest across videos repeat.\n"
+        )
 
     if args.dry_run:
         for aweme, url in videos[:10]:

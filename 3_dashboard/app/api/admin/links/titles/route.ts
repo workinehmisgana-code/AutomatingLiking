@@ -133,7 +133,17 @@ async function titleFor(url: string, platform: string): Promise<string | null> {
       // oEmbed only accepts /video/ URLs; photo (slideshow) posts share the id.
       const tkUrl = url.replace('/photo/', '/video/')
       const t = await oembedTitle(`https://www.tiktok.com/oembed?url=${encodeURIComponent(tkUrl)}`)
-      if (t) return t
+      // NO HTML FALLBACK FOR TIKTOK, and no title is better than another
+      // video's. oEmbed answers for one item id and cannot confuse two; the page
+      // fetch cannot promise that from here. TikTok blocks this server's IP, and
+      // what it serves instead is not this video — 3,788 distinct captions ended
+      // up stored against links from more than five different accounts each, one
+      // of them across 148 accounts, which is not how captions are written.
+      //
+      // Nothing is lost by stopping: the Links page fetches TikTok titles in the
+      // BROWSER, from a residential IP oEmbed answers, and that is the path that
+      // produced every title we can show is right.
+      return t ?? null
     }
     // Instagram (and any fallback): read og:title from the page HTML.
     return await ogTitle(url)

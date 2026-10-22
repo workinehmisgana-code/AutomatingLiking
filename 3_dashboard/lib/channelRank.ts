@@ -17,12 +17,26 @@
 // and link_stat — so the button answers immediately.
 
 import { loadVideosJson } from './videos'
+import { DEFAULT_GENRE, genreOfRow, isGenre } from './config'
 import { getBlockedUrls, getLinkStats, getExtraChannels, type LinkStat } from './db'
 import { overlayStats } from './linkStats'
 import { parsePostedDate } from './cluster'
 
 export interface ChannelRow {
   handle: string
+  /**
+   * Which product genre this channel belongs to.
+   *
+   * INFERRED FROM ITS OWN LINKS, with a hand-added channel's stated genre
+   * winning over the inference — explicit beats guessed. A channel whose pool
+   * links are all website links is a website channel, and new videos taken from
+   * it belong in that pool; staging them as the default was only ever right
+   * because every link was the default.
+   *
+   * A channel with no links and no stated genre reads as the default, which is
+   * the same answer as before genres existed.
+   */
+  genre: string
   /** Which site it is on — a handle alone does not say. */
   platform: 'tiktok' | 'instagram' | 'youtube'
   /** Links of this channel still in the pool (blocked ones are removed from it). */
@@ -122,6 +136,10 @@ interface Acc {
   hearts: number[]
   times: number[]
   added: boolean
+  /** How many of its pool links carry each genre, for the majority reading. */
+  genres: Record<string, number>
+  /** The genre somebody stated when adding the channel by hand, if any. */
+  statedGenre: string
 }
 
 /**
@@ -208,9 +226,13 @@ export async function rankChannels(): Promise<ChannelRow[]> {
     const s = siteOf(url)
     const key = channelKey(s, handle)
     const a =
-      acc.get(key) ?? { handle, site: s, links: 0, active: 0, hearts: [], times: [], added: false }
+      acc.get(key) ?? { handle, site: s, links: 0, active: 0, hearts: [], times: [], added: false, genres: {}, statedGenre: '' }
     a.links++
     if (!blocked.has(url)) a.active++
+    // Tallied here because this loop already visits every row; a second pass
+    // over the pool to ask the same question would double the cost of the page.
+    const vg = genreOfRow(v as { genre?: unknown })
+    a.genres[vg] = (a.genres[vg] ?? 0) + 1
     const h = Number((v as { heart_count?: unknown }).heart_count ?? v.like_count)
     if (Number.isFinite(h) && h >= 0) a.hearts.push(h)
     const t = parsePostedDate(
@@ -232,8 +254,12 @@ export async function rankChannels(): Promise<ChannelRow[]> {
     if (!handle) continue
     const key = channelKey(site, handle)
     const a =
-      acc.get(key) ?? { handle, site, links: 0, active: 0, hearts: [], times: [], added: false }
+      acc.get(key) ?? { handle, site, links: 0, active: 0, hearts: [], times: [], added: false, genres: {}, statedGenre: '' }
     a.added = true
+    // Stated when the channel was added, and it wins: somebody chose it for
+    // this channel's future videos, which is a different claim from what its
+    // past links happen to hold.
+    if (isGenre(e.genre)) a.statedGenre = e.genre
     acc.set(key, a)
   }
 
@@ -281,8 +307,20 @@ export async function rankChannels(): Promise<ChannelRow[]> {
     const canAttributeBlocks = a.site !== 'instagram'
     const blockedTotal = canAttributeBlocks ? (blockedByChannel.get(key) ?? 0) : 0
     const judged = a.active + blockedTotal
+    // Explicit first, then the genre most of its links carry, then the
+    // default. Ties go to whichever the pool returned first, which is stable
+    // for a given pool and is only reachable when a channel's links are split
+    // evenly between two genres - something one genre per link makes rare.
+    let genre = a.statedGenre
+    if (!genre) {
+      let best = 0
+      for (const [g, n] of Object.entries(a.genres)) {
+        if (n > best) { best = n; genre = g }
+      }
+    }
     rows.push({
       handle,
+      genre: genre || DEFAULT_GENRE,
       platform: a.site,
       links: a.links,
       active: a.active,

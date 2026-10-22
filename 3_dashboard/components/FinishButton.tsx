@@ -9,6 +9,7 @@ const PLATFORMS: { key: string; label: string; dot: string }[] = [
   { key: 'youtube_shorts', label: 'YT Shorts', dot: 'bg-orange-500' },
   { key: 'youtube_videos', label: 'YT Videos', dot: 'bg-red-500' },
   { key: 'instagram', label: 'Instagram', dot: 'bg-fuchsia-500' },
+  { key: 'reddit', label: 'Reddit', dot: 'bg-amber-600' },
 ]
 
 export default function FinishButton({ className = '' }: { className?: string }) {

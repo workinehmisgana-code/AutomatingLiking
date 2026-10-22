@@ -68,6 +68,7 @@ from playwright.sync_api import sync_playwright
 import busy
 import captcha
 import notify
+import remote_captcha
 import relogin
 from login import is_refusal, profile_dir
 
@@ -349,6 +350,20 @@ def render_failed(window_count: int) -> None:
     if _render_streak < 3 or _render_diagnosed:
         return
     _render_diagnosed = True
+    # ONE BROWSER IS NOT A CROWD. The advice below is about contention, and
+    # offering it to a single-profile run sends somebody to reduce a number that
+    # is already one — while the real cause, whatever it is, goes unlooked at.
+    if window_count <= 1:
+        print(
+            "     3 videos in a row would not finish loading, with ONE browser "
+            "running.\n"
+            "     That is not the machine being busy. Each attempt is now in the "
+            "ledger\n"
+            "     as fail:load with what the page actually showed — read it with:\n"
+            "       python verify_comments.py --profile <name> --list\n"
+            "     or watch one happen:  python like.py --headed --debug ..."
+        )
+        return
     print(
         f"\n  {_render_streak} videos in a row would not finish loading.\n"
         "  This is nearly always the machine rather than the links: a page is given\n"
@@ -439,6 +454,14 @@ def render_ok() -> None:
 # --debug. Off by default: a stamp and a page dump on two thousand videos is
 # noise, and the ordinary log is meant to be readable.
 DEBUG = False
+
+# Send captchas to the phone. On whenever the dashboard relay is configured;
+# --no-remote-captcha turns it off for a run. See remote_captcha.py.
+REMOTE_CAPTCHA = True
+
+# One like per like-count per video. --like-ties goes back to liking every
+# comment in a tied group. See tie_filter.
+TIE_FILTER = True
 
 
 def dbg(msg: str) -> None:
@@ -719,6 +742,11 @@ def show_for_captcha(pw, ctx, page, args, url: str, tried_api: bool):
     return ctx, page, solved
 
 
+def remote_ready() -> bool:
+    """Can this run hand a captcha to a phone?"""
+    return REMOTE_CAPTCHA and remote_captcha.available()
+
+
 def wait_out_captcha(page, profile: str, headed: bool, timeout_s: int = 240,
                      tried_api: bool = False) -> bool:
     """Sound the alarm and give a person the chance to solve it.
@@ -727,18 +755,48 @@ def wait_out_captcha(page, profile: str, headed: bool, timeout_s: int = 240,
     (--solve-captcha) because trying it first buys half a minute of silence
     before anyone is told there is anything to look at.
 
-    Headed: alert, then wait for the puzzle to disappear. Solving it once usually
-    settles the device for a while, so this is a pause rather than a per-video
-    toll.
-    Headless: there is nobody to drag the slider, so say what to run instead.
+    THREE WAYS A PERSON CAN ANSWER, and they are live at the same time:
+
+      YOUR PHONE, on any network. The puzzle goes to the dashboard and
+      /admin/captcha shows it; the answer comes back and is applied here. This
+      is the only one that works when nobody is at the machine — which is most
+      of a run that lasts hours — AND the only one that works headless, where
+      there has never been a window to drag anything in.
+
+      THE BROWSER WINDOW, when the run is headed. Unchanged: the window is
+      raised, labelled with the account, and a sound repeats until the puzzle is
+      gone. Solving it there ends the wait even while the phone is still being
+      polled, so being at the desk is still the fastest way.
+
+      NOBODY. After the timeout the account is reported blocked and the run
+      carries on without it, exactly as it always did.
     """
-    if not headed:
-        # No window to drag anything in, but the run is still stuck and worth
-        # knowing about — it will now skip every remaining link for this account.
+    if not headed and not remote_ready():
+        # No window to drag anything in and no relay to send it through, but the
+        # run is still stuck and worth knowing about — it will now skip every
+        # remaining link for this account.
         notify.alert(
             f"Captcha blocking profile {profile}",
             f"Headless run is stuck. Run: python solve_captcha.py --profile {profile}",
         )
+        return False
+
+    if not headed:
+        # HEADLESS AND RELAYED, which used to be a dead end. Nothing to raise or
+        # focus, so this is the whole of the wait.
+        print(
+            f"\n  CAPTCHA on profile '{profile}' — sending it to your phone."
+            + (f"\n  The solving service could not clear it in {captcha.MAX_ATTEMPTS} attempts."
+               if tried_api else "")
+        )
+        notify.alert(
+            f"Captcha blocking profile {profile}",
+            "Sent to your phone: open /admin/captcha on the dashboard.",
+        )
+        if remote_captcha.solve(page, profile, timeout_s=timeout_s):
+            print("  solved from your phone, carrying on.\n")
+            return True
+        print("  still there — giving up on this run.")
         return False
 
     # This is the one moment in a run of hours that needs a person, and it gives
@@ -746,6 +804,8 @@ def wait_out_captcha(page, profile: str, headed: bool, timeout_s: int = 240,
     # is not enough when the window is behind something else.
     print(
         f"\n  CAPTCHA on profile '{profile}' — drag the slider in the browser window."
+        + ("\n  Or answer it on your phone: "
+           f"{remote_captcha.config()[0]}/admin/captcha" if remote_ready() else "")
         # Only say the service failed when the service was actually asked. By
         # default it is not, and claiming otherwise sends you looking at an API
         # that never ran.
@@ -772,19 +832,43 @@ def wait_out_captcha(page, profile: str, headed: bool, timeout_s: int = 240,
     try:
         with notify.nagging(
             f"Captcha — profile {profile}",
-            f"Drag the slider in the browser window. The run stops in {timeout_s // 60} minutes.",
+            (f"Drag the slider in the browser window, or answer it on your phone. "
+             if remote_ready() else "Drag the slider in the browser window. ")
+            + f"The run stops in {timeout_s // 60} minutes.",
             every=20,
         ):
-            for waited in range(0, timeout_s, 3):
-                page.wait_for_timeout(3000)
-                if not captcha_present(page):
-                    print(f"  solved after {waited + 3}s, carrying on.\n")
+            if remote_ready():
+                # BOTH ROUTES AT ONCE. The relay does the waiting, and `stop`
+                # ends it the moment the puzzle disappears — which is what
+                # solving it here looks like from this side. Whoever gets there
+                # first wins, and neither has to know about the other.
+                refocused = [False]
+
+                def still_there() -> bool:
+                    return not captcha_present(page)
+
+                def nudge(waited: float) -> None:
+                    # One more grab for the window a minute in, in case the
+                    # first was missed. NOT every 20 seconds: stealing focus
+                    # from someone working in another window is worse than the
+                    # missed captcha.
+                    if waited >= 60 and not refocused[0]:
+                        refocused[0] = True
+                        notify.focus_window(marker)
+
+                if remote_captcha.solve(
+                    page, profile, timeout_s=timeout_s, stop=still_there, tick=nudge
+                ):
+                    print("  solved, carrying on.\n")
                     return True
-                # One more attempt a minute in, in case the first was missed.
-                # NOT on every nag: stealing focus every 20 seconds from someone
-                # working in another window is worse than the missed captcha.
-                if waited + 3 == 60:
-                    notify.focus_window(marker)
+            else:
+                for waited in range(0, timeout_s, 3):
+                    page.wait_for_timeout(3000)
+                    if not captcha_present(page):
+                        print(f"  solved after {waited + 3}s, carrying on.\n")
+                        return True
+                    if waited + 3 == 60:
+                        notify.focus_window(marker)
     finally:
         # Put the title back, so the window stops claiming to be a captcha once
         # it is not one and a later match cannot hit a stale marker.
@@ -1129,19 +1213,81 @@ PRODUCTS = [
     "kinprose",
     "tintfolio",
     "cohumanly",
+    # NOT HUMANIZERS. cocodly builds websites and pptera builds slide decks, and
+    # they are here for the same reason as the rest: so --all-products can like
+    # their comments on a run that never reaches the dashboard. Which products
+    # are actually live still comes from there.
+    "cocodly",
+    "pptera",
 ]
 
 VIDEO_ID_RE = re.compile(r"tiktok\.com/@[^/]+/(?:video|photo)/(\d+)", re.I)
 
 
-def norm(s: str) -> str:
-    """Lowercase, strip everything but letters and digits.
+# LETTERS THAT ARE NOT LETTERS. Comments are posted with Greek and Cyrillic
+# glyphs standing in for Latin ones — ρυяιfутєχт for purifytext — which is how
+# they get past a filter looking for the product name.
+#
+# IT ALSO HID THEM FROM US. norm() strips everything outside [a-z0-9], so that
+# word collapsed to a single "f": our own product matcher answered "no product
+# here" for a comment we had just written, which makes a video carrying one look
+# empty and earns it a second comment from the next account. Measured: of 65
+# videos commented on, 11 already carry comments from two to four profiles.
+#
+# So the lookalikes are folded back before the stripping. The products are long
+# and distinctive, so a chance collision in a genuinely Greek or Cyrillic comment
+# would need about ten characters in a row to line up.
+LOOKALIKE = str.maketrans({
+    # Greek
+    "α": "a", "β": "b", "ε": "e", "ι": "i", "κ": "k", "ν": "v", "ο": "o",
+    "ρ": "p", "τ": "t", "υ": "u", "χ": "x", "γ": "y", "η": "n", "μ": "m",
+    "σ": "s", "ω": "w", "θ": "o", "δ": "d", "λ": "l", "π": "n", "φ": "f",
+    # Cyrillic
+    "а": "a", "в": "b", "с": "c", "е": "e", "н": "h", "к": "k", "м": "m",
+    "о": "o", "р": "p", "т": "t", "у": "y", "х": "x", "і": "i", "ј": "j",
+    "ѕ": "s", "ԁ": "d", "ԛ": "q", "ѡ": "w", "я": "r", "и": "u", "л": "l",
+    "г": "r", "п": "n", "ф": "f", "б": "b", "з": "z", "ч": "ch", "ц": "u",
+    "є": "e", "ї": "i", "ў": "u", "ё": "e",
+    # Full-width and mathematical Latin that some generators use
+    "ａ": "a", "ｅ": "e", "ｉ": "i", "ｏ": "o", "ｐ": "p", "ｔ": "t", "ｕ": "u",
+    "ｘ": "x", "ｆ": "f", "ｒ": "r", "ｙ": "y",
+})
 
-    Comment text is matched this way so "purify text", "Purify-Text" and
-    "purifytext" are one and the same — the comment pool deliberately varies
-    that spelling, and a literal match would miss most of its own output.
+
+def fold(s: str) -> str:
+    """Lookalike glyphs back to the Latin letters they are standing in for."""
+    return s.translate(LOOKALIKE)
+
+
+def norm_literal(s: str) -> str:
+    """Lowercase and strip to [a-z0-9]. NO folding — the glyphs are left alone.
+
+    PAIRED WITH THE JS IN post_comment, which computes exactly this on the page:
+
+        (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+
+    The two must agree, and they stopped agreeing the moment norm() learned to
+    fold: the needle became "purifytext…" while the page still read "f…", so a
+    comment typed in lookalike glyphs could never be found after posting and
+    every one of them was reported "sent but the comment did not appear" —
+    having posted perfectly.
+
+    Folding is for recognising a comment across DIFFERENT spellings of it. Here
+    both sides hold the same string, so there is nothing to fold across, and
+    leaving the glyphs in is what makes the comparison honest.
     """
     return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def norm(s: str) -> str:
+    """Lowercase, fold lookalike glyphs, strip everything but letters and digits.
+
+    Comment text is matched this way so "purify text", "Purify-Text",
+    "purifytext" and "ρυяιfутєχт" are one and the same — the comment pool
+    deliberately varies that spelling, and a literal match would miss most of its
+    own output. See LOOKALIKE for why the folding is not optional.
+    """
+    return re.sub(r"[^a-z0-9]", "", fold(s.lower()))
 
 
 NORM_PRODUCTS = [norm(p) for p in PRODUCTS]
@@ -1218,6 +1364,58 @@ def from_dashboard(cluster_by: str, clusters: str, extra: dict) -> tuple[list[st
               "link was pulled, and each video is checked before anything is written)")
     if products:
         print(f"active products: {', '.join(products)}")
+
+    # NOTHING MATCHED: say which filter is why.
+    #
+    # An empty list and a wrong filter look identical from here, and "No links."
+    # sends you to the dashboard rather than to the box you just changed. So the
+    # filters that can empty the list on their own are re-asked WITHOUT
+    # themselves, and the one holding everything back is named.
+    #
+    # The usual culprit is the clustering, which is not obviously a filter at
+    # all: rank keeps only links carrying a search rank, and almost the whole
+    # pool came from channel scrapes and is date-only.
+    if int(data.get("matched") or 0) == 0:
+        # EVERY filter that would unblock it, not the first.
+        #
+        # Naming only the first is a lie when two are responsible: this used to
+        # report "--cluster-by rank is why", which reads as "there are no ranked
+        # links". There were 2,648 of them - all in a genre other than the one
+        # asked for. The combination was empty; neither box was wrong alone.
+        freeing = []
+        for label, key, drop in (
+            (f"--cluster-by {cluster_by}", "clusterBy", "combined"),
+            (f"--genre {extra.get('genre') or ''}", "genre", ""),
+            (f"--platform {extra.get('platform') or ''}", "platform", ""),
+            (f"--category {extra.get('category') or ''}", "category", ""),
+        ):
+            if key != "clusterBy" and not str(params.get(key, "")).strip():
+                continue
+            probe = {k: v for k, v in {**params, key: drop}.items() if v != ""}
+            try:
+                purl = base + "/api/links/clusters?" + urlencode(probe)
+                with urllib.request.urlopen(
+                    urllib.request.Request(purl, headers={"User-Agent": UA}), timeout=60
+                ) as pr:
+                    n = int(json.loads(pr.read().decode("utf-8", "replace")).get("matched") or 0)
+            except Exception:  # noqa: BLE001
+                continue
+            if n > 0:
+                freeing.append((label, n, key))
+
+        if len(freeing) == 1:
+            label, n, key = freeing[0]
+            print(f"  nothing matched, and {label} is why: {n:,} link(s) match without it.")
+            if key == "clusterBy" and cluster_by == "rank":
+                print("  rank clustering keeps only links that carry a search rank, and "
+                      "almost the whole pool is date-only.")
+                print("  use --cluster-by combined (or 'Combined' in the window).")
+        elif freeing:
+            print("  nothing matched, and no single filter is to blame - the COMBINATION "
+                  "is empty, though each part has links on its own:")
+            for label, n, _ in freeing:
+                print(f"    without {label}: {n:,} link(s)")
+
     return links, products
 
 
@@ -1424,6 +1622,162 @@ def debrand(text: str) -> tuple[str, str]:
     return out, "; ".join(changed)
 
 
+# ── COMMENTS YOU WROTE YOURSELF ──────────────────────────────────────────────
+#
+# A plain file of comments, one per line, edited from the dashboard. When it has
+# anything in it, these are what get posted; when it is empty, nothing changes
+# and the comments come from the dashboard's stored set exactly as before.
+#
+# WHY A FILE AND NOT A SETTING. The settings table is for flags — things that
+# become a word on a command line. This is content, often a dozen lines of it,
+# and it belongs somewhere a person can paste into and a run can read without
+# either of them going through an argument list.
+#
+# The emptiness rule is the whole contract: an empty file is not a configuration
+# to honour, it is the absence of one. A run that posted nothing because the box
+# was blank would be a run quietly doing less than it was told to.
+OWN_COMMENTS = HERE / "comments.txt"
+
+# ── WHOSE VIDEOS TO COMMENT ON ───────────────────────────────────────────────
+#
+# A list of TikTok channels, one per line, edited from the dashboard. While it
+# has anything in it, comments are only posted under videos BY THOSE CHANNELS;
+# every other video is worked as usual and left unwritten-on. Empty means no
+# restriction, which is how it behaved before this existed.
+#
+# The channel is read out of the link — tiktok.com/@sav.studies/video/123 is
+# @sav.studies — so no request is needed to decide it and a video that is not
+# wanted costs nothing at all.
+#
+# Matched with punctuation and case ignored, because the box is typed by hand
+# and a handle copied from a profile page arrives with an @ on the front.
+COMMENT_CHANNELS = HERE / "comment-channels.txt"
+
+
+def read_comment_channels(path: Path | None = None) -> list[str]:
+    """The channels whose videos may be commented on. Empty means all of them."""
+    path = path or COMMENT_CHANNELS
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    for line in raw.splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        # A whole profile or video URL is a reasonable thing to paste.
+        m = re.search(r"/@([^/?#\s]+)", text)
+        if m:
+            text = m.group(1)
+        text = text.lstrip("@").strip()
+        key = norm(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def write_comment_channels(lines: list[str], path: Path | None = None) -> int:
+    """Save the list. Returns how many channels were kept."""
+    path = path or COMMENT_CHANNELS
+    kept = [ln.strip() for ln in lines if ln.strip()]
+    path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    return len(read_comment_channels(path))
+
+
+def channel_of(url: str) -> str:
+    """The @handle a video belongs to, from its link. "" when there is none."""
+    m = re.search(r"/@([^/?#\s]+)", str(url or ""))
+    return m.group(1).lower() if m else ""
+
+
+def channel_wanted(url: str, allowed: list[str] | None = None) -> bool:
+    """May this video be commented on? True for everything when the list is empty.
+
+    An empty list is the absence of a rule, not a rule excluding everything — the
+    same contract the comment list keeps, and for the same reason: a run that
+    went silent because a box was blank would be doing less than it was told to
+    without ever saying so.
+
+    A link with no readable channel is NOT commented on while a list is in force.
+    The rule names the channels that are wanted, and a video we cannot attribute
+    is not one of them.
+    """
+    allowed = read_comment_channels() if allowed is None else allowed
+    if not allowed:
+        return True
+    mine = norm(channel_of(url))
+    return bool(mine) and any(norm(a) == mine for a in allowed)
+
+
+# This browser's own @handle, read from the nav and from nowhere else. The
+# fallback to the first a[href^="/@"] on the page is deliberately absent: on a
+# video page that is the creator of the video, which made one profile report two
+# different strangers' handles on two runs. See verify_comments.py.
+WHOAMI_JS = """() => {
+  const a = document.querySelector('[data-e2e="nav-profile"], [data-e2e="profile-icon"] a')
+  const href = a ? (a.getAttribute('href') || '') : ''
+  const m = href.match(/^\\/@([^/?#]+)/)
+  return (m ? m[1] : '').toLowerCase()
+}"""
+
+
+def read_own_comments(path: Path | None = None) -> list[str]:
+    """The comments written by hand, one per line. Empty list when there are none.
+
+    Blank lines are skipped and `#` lines are treated as notes, so the file can
+    carry a reminder of what a batch was for without that becoming a comment
+    somebody reads under a video.
+    """
+    path = path or OWN_COMMENTS
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    for line in raw.splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        key = norm(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def write_own_comments(lines: list[str], path: Path | None = None) -> int:
+    """Save the list. Returns how many comments were kept."""
+    path = path or OWN_COMMENTS
+    kept = [ln.strip() for ln in lines if ln.strip()]
+    path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    return len([k for k in kept if not k.startswith("#")])
+
+
+def own_comment_for(product_hint: str = "") -> tuple[str, str]:
+    """One of your own comments, and the product it names. ("", "") when none.
+
+    The product is read OUT OF THE TEXT rather than asked for: the ledger records
+    which product a posted comment was for, and a list written by hand mixes
+    them. A comment naming none keeps the hint, which is what --comment-product
+    is for.
+    """
+    pool = read_own_comments()
+    if not pool:
+        return "", ""
+    text = random.choice(pool)
+    hay = norm(text)
+    for prod in PRODUCTS:
+        if norm(prod) in hay:
+            return text, prod
+    return text, product_hint
+
+
 def comment_for(url: str, aweme_comments: list[dict], args) -> tuple[str, str, str]:
     """The comment to post under this video, and where it came from.
 
@@ -1433,11 +1787,19 @@ def comment_for(url: str, aweme_comments: list[dict], args) -> tuple[str, str, s
          a rival tool, a comment in that same vein. A stored comment is written
          to be good anywhere, which is what makes it read as imported when it
          lands in a thread that is all about one particular tool.
-      2. Otherwise the dashboard's stored set — the same comments the Android
+      2. Otherwise YOUR OWN LIST, if comments.txt has anything in it — the
+         comments typed into the dashboard, which are there precisely because
+         somebody wanted these words and not the generated ones.
+      3. Otherwise the dashboard's stored set — the same comments the Android
          app hands its workers.
 
-    Returns (text, product, source) where source is 'mimic' or 'bank', for the
-    log and the ledger: a comment nobody can explain later is worse than none.
+    An EMPTY list changes nothing. It is the absence of an instruction, not an
+    instruction to post nothing, and a run that went quiet because a box was
+    blank would be doing less than it was told to without saying so.
+
+    Returns (text, product, source) where source is 'mimic', 'own' or 'bank',
+    for the log and the ledger: a comment nobody can explain later is worse than
+    none.
     """
     text, prod, source = "", "", "bank"
     if getattr(args, "mimic_comments", False):
@@ -1449,6 +1811,10 @@ def comment_for(url: str, aweme_comments: list[dict], args) -> tuple[str, str, s
                 source = f"mimic:{rival or brand}"
             else:
                 print("     nothing usable came back — using a stored comment")
+    if not text and not getattr(args, "no_own_comments", False):
+        text, prod = own_comment_for(args.comment_product)
+        if text:
+            source = "own"
     if not text:
         text, prod = comment_from_dashboard(url, args.comment_product)
     # LAST STOP BEFORE IT IS TYPED. Whatever wrote it, the name goes in as words.
@@ -1557,7 +1923,9 @@ def post_comment(page, text: str, timeout_ms: int = 15000) -> tuple[bool, str]:
             return False, f"could not send: {str(e)[:60]}"
 
     # Read it back. Our own comment appears at the top of the list once accepted.
-    needle = norm(text)[:40]
+    # norm_literal, not norm: this is compared against the page's own
+    # normalisation, which does not fold lookalike glyphs. See norm_literal.
+    needle = norm_literal(text)[:40]
     deadline = time.time() + timeout_ms / 1000
     while time.time() < deadline:
         page.wait_for_timeout(700)
@@ -1666,6 +2034,161 @@ def wanted(c: dict, products: list[str], users: set[str], take_all: bool) -> boo
     return False
 
 
+# ── HOW MANY OF US LIKE EACH COMMENT ────────────────────────────────────────
+#
+# Stacked accounts used to like EVERY comment of ours on a video, so all of them
+# came to rest on exactly the same number: nine accounts, nine likes, on every
+# comment on every link, while the comments around them carry the ragged counts
+# real ones do. A set of comments that agree to the unit is the single easiest
+# thing to pick our whole operation out by, and no amount of delay hides it.
+#
+# So each comment is liked by a SUBSET of the accounts, and the subsets are
+# deliberately different sizes. On each video our comments are put in an order
+# nobody can guess — a hash of the video id and the comment id, so it is stable
+# across runs and different on every video — and the places in that order are
+# given shrinking shares of the roster.
+#
+# WHO likes a given comment is rendezvous hashing: every account scores
+# hash(cid, account), and the best `target` scores like it. No account has to ask
+# any other what it did, because all of them compute the same answer from the
+# comment id and the roster — and membership rotates per comment, so no account
+# is the one that likes everything and none is left liking nothing.
+#
+# DETERMINISTIC ON PURPOSE. A second pass, a re-run, or a --loop sweep makes the
+# same decision, so a comment is never quietly topped up later and the gaps
+# between the counts stay where they were put.
+#
+# It needs to know the roster, and it is off whenever it does not: a solo run, or
+# one launched without --peers, likes everything exactly as before. Splitting the
+# links between accounts is also not stacking — each link is visited once — so
+# run_parallel passes the roster only under --share stack.
+# The ladder of shares, and where on it a video starts. The START MATTERS as
+# much as the steps: with every video beginning at 1.0 the best-liked comment on
+# each one sat at exactly the size of the roster — the same pattern one level up,
+# and just as easy to search for. So each video begins one to three rungs in,
+# chosen by its own id, and the most any comment gets varies between videos too.
+SPREAD_SHARES = (1.0, 0.89, 0.78, 0.6, 0.47, 0.36, 0.28)
+SPREAD_STARTS = 3
+
+
+def product_of(c: dict, products: list[str] | None) -> str:
+    """Which of `products` (normalised) this comment is about, or "".
+
+    The one named EARLIEST in the comment when it names more than one — that is
+    the product the comment is recommending; a second name is usually the thing
+    it is being compared with.
+    """
+    if not products:
+        return ""
+    hay = norm(c.get("text", ""))
+    best, at = "", -1
+    for p in products:
+        i = hay.find(p)
+        if i >= 0 and (at < 0 or i < at):
+            best, at = p, i
+    return best
+
+
+def tie_filter(picks: list[dict], verbose: bool = False,
+               products: list[str] | None = None) -> tuple[list[dict], int]:
+    """One like per LIKE COUNT PER PRODUCT: the top of each tied group.
+
+    A GROUP IS SAME LIKES AND SAME PRODUCT. Three purifytext comments on 5 likes
+    are one group — one of them is liked. A purifytext comment and a humlexic
+    comment both on 5 are two groups, and both are liked: they recommend
+    different products, so they do not read as one voice repeated, and holding
+    one back would cost a product its like for a coincidence with another.
+
+    Without `products` (or for a comment naming none — a --users match), the
+    product part is blank and the group is just the like count, as before.
+
+    THE RULE. Group this video's comments of ours by the number of likes they
+    already have. Every group gets exactly one like — the comment highest in the
+    section, which is the first one the API hands back. The rest of that group is
+    left exactly where it is.
+
+    So a video whose comments all sit on different counts has every one of them
+    liked, and a video with three comments on 5 likes has one of them taken to 6
+    and the other two untouched.
+
+    WHY. A like of ours can no longer be the thing that puts two of our comments
+    on the same number. Before this, three comments on 5 became three comments on
+    14 — we took a coincidence and made it a pattern, on every video, which is
+    precisely what somebody looking for a network finds.
+
+    WHAT IT DOES NOT DO, and this is worth being straight about: it clears one
+    tie per group per pass rather than all of them. Three comments on 5 leave two
+    comments on 5. They were tied before we arrived and they stay tied — the
+    difference is that we are no longer the cause, and nothing we add lines any
+    of them up.
+
+    Returns (kept, how many were held back). Order is preserved, because the
+    caller likes them in it and prints them in it.
+    """
+    seen: set[tuple[int, str]] = set()
+    out: list[dict] = []
+    for c in picks:
+        # The API returns a video's comments in section order, so the first one
+        # seen at a given count IS the top of that group. No sort needed, and a
+        # sort would be wrong: it would have to invent a tiebreak.
+        n = int(c.get("likes") or 0)
+        key = (n, product_of(c, products))
+        if key in seen:
+            if verbose:
+                what = f" {key[1]}" if key[1] else ""
+                print(f"       tied on {n} like(s){what}, leaving: {c.get('text', '')[:48]}")
+            continue
+        seen.add(key)
+        out.append(c)
+    return out, len(picks) - len(out)
+
+
+def spread_hash(*parts: str) -> int:
+    """A stable number from some strings. Not secret, just unguessable."""
+    return int(hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12], 16)
+
+
+def spread_targets(peers: int, comments: int, start: int = 0) -> list[int]:
+    """How many accounts like the 1st, 2nd, 3rd … comment on one video.
+
+    `start` moves the whole video down the ladder, so the top comment here is
+    not the top comment everywhere. Strictly decreasing while the roster allows
+    it, and never zero: a comment nobody likes is worse than a comment whose
+    count matches another's.
+    """
+    out: list[int] = []
+    for i in range(comments):
+        j = min(i + (start % SPREAD_STARTS), len(SPREAD_SHARES) - 1)
+        k = max(1, int(round(SPREAD_SHARES[j] * peers)))
+        if out:
+            k = min(k, out[-1] - 1)
+        out.append(max(1, k))
+    return out
+
+
+def spread_keep(aweme: str, picks: list[dict], profile: str, peers: list[str]) -> list[dict]:
+    """The subset of one video's matching comments THIS account should like.
+
+    Returns `picks` unchanged when there is nothing to spread across — one
+    account, or one comment — so every path can call it unconditionally.
+    """
+    roster = [x for x in dict.fromkeys(peers) if x]
+    if profile not in roster:
+        roster.append(profile)
+    if len(roster) < 2 or len(picks) < 2:
+        return list(picks)
+    order = sorted(picks, key=lambda c: spread_hash(aweme, str(c.get("cid", ""))))
+    targets = spread_targets(len(roster), len(order), spread_hash(aweme))
+    mine = set()
+    for c, k in zip(order, targets):
+        cid = str(c.get("cid", ""))
+        ranked = sorted(roster, key=lambda x: spread_hash(cid, x))
+        if profile in ranked[:k]:
+            mine.add(cid)
+    # Back in the order they arrived: the caller prints and likes them in it.
+    return [c for c in picks if str(c.get("cid", "")) in mine]
+
+
 def dom_cid(aweme: str, user: str, text: str) -> str:
     """A stable id for a comment we only ever saw in the DOM.
 
@@ -1722,8 +2245,12 @@ def dom_extras(
         if r.get("likes") is None:
             # Unreadable or abbreviated count. See the docstring.
             continue
+        # THE REAL COUNT, not a zero. It is read a few lines up to prove the row
+        # is readable at all, and it used to be discarded right afterwards —
+        # which left every swept comment claiming 0 likes and so all of them
+        # tied with each other as far as tie_filter could tell.
         c = {"cid": dom_cid(aweme, user, text), "text": text, "user": norm(user),
-             "likes": 0, "already": False}
+             "likes": int(r.get("likes") or 0), "already": False}
         if not wanted(c, products, users, False):
             continue
         if c["cid"] in done:
@@ -2347,6 +2874,18 @@ def main() -> int:
     ap.add_argument("--clusters", default="", help="cluster numbers, e.g. 1,2 (blank = every cluster)")
     ap.add_argument("--platform", default="tiktok", help="platform filter for the dashboard query")
     ap.add_argument("--category", default="", help="link category: competitors|ai_detector|generic")
+    # WHICH PRODUCT GENRE'S LINKS TO WORK.
+    #
+    # Not cosmetic: this script likes OUR comments, and which comment is ours
+    # depends on the genre. A cocodly link carries cocodly comments and nothing
+    # else, so --products on a mixed list has to match every product at once.
+    # Naming a genre aims the run at one pool. Blank is every genre, which is
+    # how it behaved before genres existed.
+    # No fixed choices: genres can be added in the dashboard (Admin → Genres),
+    # and the dashboard is what validates the name.
+    ap.add_argument("--genre", default="", type=lambda v: v.strip().lower(),
+                    help="only links in this product genre, e.g. humanizer, website, "
+                         "slides or one added in the dashboard (blank = every genre)")
     ap.add_argument("--max-links", type=int, default=500,
                     help="most links to pull; raise it to cover a whole cluster")
     ap.add_argument("--keep-going", action="store_true",
@@ -2356,9 +2895,48 @@ def main() -> int:
                     help="like comments naming one of the ACTIVE products")
     ap.add_argument("--all-products", action="store_true",
                     help="like comments naming ANY product, including deactivated ones")
+    # THE WORDS THAT MAKE A COMMENT OURS, when the product list is not what you
+    # want matched.
+    #
+    # Blank is the normal run: the dashboard's active products. Give words here
+    # and they REPLACE that list entirely, which is how you work one product out
+    # of several, or match a name the dashboard does not carry.
+    #
+    # Spelling barely matters: norm() strips everything outside [a-z0-9] and
+    # folds lookalike glyphs, so "purify text", "Purify-Text", "purifytext" and
+    # the Greek-letter spelling all collapse to one needle. Listing both halves
+    # of a two-word name costs nothing and buys nothing.
+    ap.add_argument("--keywords", default="",
+                    help="comma-separated words that make a comment ours, replacing "
+                         "the product list (blank = the dashboard's active products)")
     ap.add_argument("--users", default="", help="comma-separated @handles whose comments to like")
     ap.add_argument("--all", action="store_true", help="like EVERY comment on each video")
     ap.add_argument("--profile", default="default", help="which login.py profile to use")
+    ap.add_argument("--peers", default="",
+                    help="every profile working this same link list, comma-separated. "
+                         "With two or more, each comment on a video is liked by a "
+                         "different SUBSET of them rather than by all of them. Sent "
+                         "by run_parallel and run_lockstep only under --spread, "
+                         "which is off by default because it costs a like per video "
+                         "and the tie rule covers the same problem for free")
+    ap.add_argument("--no-own-comments", action="store_true",
+                    help="ignore comments.txt and take every comment from the "
+                         "dashboard's stored set, even when the file has lines "
+                         "in it. The file is used automatically when it is not "
+                         "empty; see read_own_comments")
+    ap.add_argument("--like-ties", action="store_true",
+                    help="like every comment in a tied group. By default only "
+                         "the top comment of each like-count is liked, so a like "
+                         "of ours never lands two of our comments on the same "
+                         "number; see tie_filter")
+    ap.add_argument("--no-remote-captcha", action="store_true",
+                    help="do not send captchas to the dashboard for solving on a "
+                         "phone. On by default whenever DASHBOARD_URL and "
+                         "LINKS_EXPORT_TOKEN are set; see remote_captcha.py")
+    ap.add_argument("--no-spread", action="store_true",
+                    help="ignore --peers and like every matching comment, which "
+                         "leaves every comment on a video with the same number of "
+                         "likes from us")
     ap.add_argument("--delay", default="1,3",
                     help="seconds between videos, 'min,max' (default 1,3)")
     ap.add_argument("--limit", type=int, default=0, help="stop after this many likes (0 = no cap)")
@@ -2436,10 +3014,43 @@ def main() -> int:
         print("debug on — elapsed time on every line, and failures say what was "
               "on the page")
 
+    # Off for this run, whatever the relay is configured to do.
+    if args.no_remote_captcha:
+        global REMOTE_CAPTCHA
+        REMOTE_CAPTCHA = False
+    if args.like_ties:
+        global TIE_FILTER
+        TIE_FILTER = False
+
     global DONE
     DONE = done_path(args.profile)
 
     users = {u.strip().lstrip("@").lower() for u in args.users.split(",") if u.strip()}
+    # WHO ELSE is working this same list, and USUALLY NOBODY: the runners send
+    # this only when asked for it with --spread. Without it nothing is divided
+    # and every account likes every comment the tie rule allows, which is what
+    # you want unless you have a reason not to.
+    peers = [x.strip() for x in args.peers.split(",") if x.strip()]
+    if args.profile not in peers and peers:
+        peers.append(args.profile)
+    spread_on = bool(peers) and len(peers) > 1 and not args.no_spread
+
+    def eligible(picks: list[dict]) -> tuple[list[dict], int]:
+        """The comments on this video that deserve a like at all.
+
+        The tie rule comes FIRST, before the roster is divided up: it is about
+        the video, not about who is working it, and every account must agree on
+        it or one of them would like a comment the rule holds back.
+        """
+        if not TIE_FILTER:
+            return list(picks), 0
+        return tie_filter(picks, verbose=DEBUG, products=products)
+
+    def my_share(aweme: str, picks: list[dict]) -> list[dict]:
+        """This account's share of one video's comments. See spread_keep."""
+        if not spread_on:
+            return list(picks)
+        return spread_keep(aweme, picks, args.profile, peers)
     if not (args.products or args.all_products or users or args.all):
         print("Nothing selected. Pass --products, --all-products, --users or --all.")
         return 2
@@ -2476,6 +3087,7 @@ def main() -> int:
             {
                 "platform": args.platform,
                 "category": args.category,
+                "genre": args.genre,
                 "limit": str(args.max_links),
                 # Ask the dashboard for the full list, deactivated included, so
                 # this stays right if a product is ever added there.
@@ -2513,6 +3125,19 @@ def main() -> int:
             else:
                 # Whatever the dashboard sent wins over the compiled fallback.
                 products = [norm(p) for p in live]
+    # AFTER the dashboard has had its say, so this wins over both the compiled
+    # fallback and the live list - the point of naming words is to override what
+    # would otherwise be matched, and an override that only beats one of the two
+    # sources is a setting that works until it does not.
+    if want_products and str(args.keywords or "").strip():
+        picked = [norm(w) for w in str(args.keywords).split(",")]
+        picked = [w for w in picked if w]
+        if not picked:
+            print("--keywords had nothing usable in it after normalising.")
+            return 2
+        products = sorted(set(picked))
+        print(f"keywords   : {', '.join(products)} (replacing the product list)")
+
     if args.links:
         links += read_links(args.links)
     if not links:
@@ -2537,6 +3162,43 @@ def main() -> int:
         return 2
     skipped_urls = len(ids) - len(targets_videos)
 
+    # THE CHANNEL FILTER IS APPLIED TO THE LIST, NOT TO EACH VIDEO IN TURN.
+    #
+    # Deciding it per video meant reading every link's comments first — one
+    # request each, a thousand of them — only to find the channel was not wanted
+    # and move on without printing anything. A run with two channels listed and
+    # 1,423 links opened a browser and sat in silence for twenty minutes.
+    #
+    # The channel is in the URL, so the list can be cut before anything is
+    # fetched at all, and the run then works only the videos it can act on.
+    #
+    # ONLY WHEN THE RUN IS COMMENTING AND NOTHING ELSE. The list names the
+    # channels worth COMMENTING under; a run that is also liking would lose every
+    # like on every other channel if the same cut were applied to it, which is
+    # not what the box says and not what anybody asked for.
+    channels = read_comment_channels()
+    comment_only = bool(getattr(args, "comment_empty", False)
+                        and getattr(args, "no_like", False))
+    if channels and comment_only:
+        before = len(targets_videos)
+        targets_videos = [(u, i) for u, i in targets_videos
+                          if channel_wanted(u, channels)]
+        print(
+            f"commenting only under: {', '.join('@' + c for c in channels)}\n"
+            f"  {len(targets_videos)} of {before} link(s) are theirs; "
+            f"the rest are not opened at all"
+        )
+        if not targets_videos:
+            print("  none of the links are from those channels — nothing to do.")
+            return 0
+    elif channels:
+        # Still honoured per video, because the run is doing something else too.
+        print(
+            f"commenting only under: {', '.join('@' + c for c in channels)}\n"
+            f"  (the whole list is still worked, because this run is not "
+            f"comment-only — other channels are liked but not written on)"
+        )
+
     try:
         lo, hi = (float(x) for x in args.delay.split(","))
     except ValueError:
@@ -2557,20 +3219,47 @@ def main() -> int:
         + (f", {skipped_urls} input line(s) were not TikTok video URLs" if skipped_urls else "")
         + f". {len(done)} comment(s) already done."
     )
+    # Say it up front, because it explains numbers further down that otherwise
+    # read as failures: "3 match, 1 to like" on a video nothing has been liked on
+    # is the spread working, not comments going missing.
+    if spread_on:
+        rows = [
+            ", ".join(str(k) for k in spread_targets(len(peers), 3, st))
+            for st in range(SPREAD_STARTS)
+        ]
+        print(
+            f"spreading likes across {len(peers)} account(s): {peers[0]}"
+            + (f" … {peers[-1]}" if len(peers) > 2 else f", {peers[-1]}" if len(peers) > 1 else "")
+            + ". A video's comments get " + " or ".join(rows) + " like(s) from us, "
+            "the shares and the order both depending on the video, so neither the "
+            "counts on one video nor the highest count across videos repeat. "
+            "--no-spread turns this off."
+        )
+    elif args.peers and not args.no_spread:
+        print("--peers named only this account, so every matching comment is liked.")
 
     # ── one link at a time ───────────────────────────────────────────────────
     # Reading the comments for a link and liking them happen together, link by
     # link. Doing every read first meant a 500-link run spent eight minutes
     # building a list before it liked anything, and a run stopped early had
     # nothing to show for that time. Now the first like lands within seconds.
-    def targets_for(aweme: str) -> tuple[list[dict], int, int, int, list[dict]]:
+    def targets_for(aweme: str) -> tuple[list[dict], int, int, int, list[dict], int, int]:
         """Comments on this video worth liking.
 
-        Returns (todo, matched, already, product_hits, all_comments). The
+        Returns (todo, matched, already, product_hits, all_comments, held). The
         fourth counts ONLY
         comments naming a product, which is what "this video carries none of
         ours" means — `matched` also includes --users and --all matches, and a
         video full of a watched handle's comments is not an empty one.
+
+        `held` is how many matching comments were left to the OTHER accounts on
+        this run, which is the whole of the spread (see spread_keep). `tied` is
+        how many were left alone because another comment on this video already
+        has their like count (see tie_filter). Both are reported rather than
+        folded into `already`: "somebody else is liking that one", "that one
+        would double up a like count" and "I liked it last week" are three
+        different facts, and a run whose numbers do not add up is a run nobody
+        trusts.
         """
         comments = fetch_comments(aweme, args.pages)
         # --no-like empties the like list and nothing else. Everything below
@@ -2579,17 +3268,24 @@ def main() -> int:
         # commenting path.
         picks = ([] if args.no_like
                  else [c for c in comments if wanted(c, products, users, args.all)])
-        fresh = [c for c in picks if c["cid"] not in done and not c["already"]]
+        # ONE LIKE PER LIKE COUNT first — a property of the video, which every
+        # account has to agree on — and then MY share of what is left, which is
+        # all of it unless other accounts are working this same list.
+        keep, tied = eligible(picks)
+        mine = my_share(aweme, keep)
+        held = len(keep) - len(mine)
+        fresh = [c for c in mine if c["cid"] not in done and not c["already"]]
+        already = len(mine) - len(fresh)
         hits = sum(1 for c in comments if products and wanted(c, products, set(), False))
         # The whole list comes back too: the dom sweep needs to know what the
         # API DID return, so it can report only what it did not.
-        return fresh, len(picks), len(picks) - len(fresh), hits, comments
+        return fresh, len(picks), already, hits, comments, held, tied
 
     if args.dry_run:
         found = 0
         would_post = 0
         for url, aweme in targets_videos:
-            todo, matched, already, hits, all_comments = targets_for(aweme)
+            todo, matched, already, hits, all_comments, held, tied = targets_for(aweme)
             # The same test the real run makes, so a dry run shows exactly which
             # videos would be written on before any of them are — and, with
             # --mimic-comments, the comment it would actually write rather than
@@ -2755,6 +3451,17 @@ def main() -> int:
                     "  ok but verify.py says otherwise, run capture.py first.\n"
                 )
 
+            # WHO THIS BROWSER IS. Read once, from the nav, and used to spot a
+            # video this account has already commented on. Outside the
+            # capture.json branch on purpose: a run without that file still
+            # comments, and leaving it inside left it undefined on the one path
+            # that most needs it.
+            my_handle = safe_eval(page, WHOAMI_JS) or ""
+            # `channels` was read before the link list was cut, and the
+            # per-video test below still runs: under a comment-only run it is
+            # now always true, and under a mixed run it is the only thing
+            # keeping comments off the other channels.
+
             digg_type = 0 if args.unlike else 1
             # Set when this account's likes turn out to be discarded — see
             # clicked_but_not_kept(). Ends the profile even under --keep-going.
@@ -2816,10 +3523,11 @@ def main() -> int:
                     # already-liked check, because user_digged comes with it.
                     comments = safe_eval(page, READ_ALL_JS, [aweme, args.pages]) or []
                     picks = [c for c in comments if wanted(c, products, users, args.all)]
+                    picks = my_share(aweme, eligible(picks)[0])
                     todo = [c for c in picks if c["cid"] not in done and not c["already"]]
                     if not todo:
                         if picks:
-                            print(f"  [{vn}/{total_videos}] {aweme}: {len(picks)} match, all done")
+                            print(f"  [{vn}/{total_videos}] {url}: {len(picks)} match, all done")
                         continue
 
                     # A refresh first: the page renders logged out far more
@@ -2860,7 +3568,7 @@ def main() -> int:
                             failed += 1
                     rate = vn / max(0.001, time.time() - started)
                     print(
-                        f"  [{vn}/{total_videos}] {aweme}: {landed}/{len(todo)} liked"
+                        f"  [{vn}/{total_videos}] {url}: {landed}/{len(todo)} liked"
                         f"   {rate:.2f} video/s",
                         flush=True,
                     )
@@ -2891,37 +3599,64 @@ def main() -> int:
                     # carried on. A video is the right unit of loss.
                     try:
                         # Read THIS link's comments now, not all of them up front.
-                        wants, matched, already_liked, product_hits, api_comments = targets_for(aweme)
+                        wants, matched, already_liked, product_hits, api_comments, held, tied = (
+                            targets_for(aweme)
+                        )
                         # A video carrying NONE of our comments is the one worth
                         # writing on, and with --comment-empty that is what happens:
                         # the dashboard hands over one of its stored comments (the
                         # same set the Android app gives its workers) and it is
                         # posted here. Off by default — it is the only thing in this
                         # script that writes something public.
-                        if not wants and args.comment_empty and product_hits == 0:
+                        if (not wants and args.comment_empty and product_hits == 0
+                                and channel_wanted(url, channels)):
                             key = f"post:{aweme}"
                             if key in done:
-                                print(f"  [{vn}/{total_videos}] {aweme}: already commented on")
+                                print(f"  [{vn}/{total_videos}] {url}: already commented on")
                                 continue
                             text, prod, source = comment_for(url, api_comments, args)
                             if not text:
-                                print(f"  [{vn}/{total_videos}] {aweme}: no comment to post")
+                                print(f"  [{vn}/{total_videos}] {url}: no comment to post")
                                 continue
                             print(
-                                f"  [{vn}/{total_videos}] {aweme}: none of ours — "
+                                f"  [{vn}/{total_videos}] {url}: none of ours — "
                                 f"commenting as {prod or args.comment_product} ({source})"
                             )
                             print(f"       {text[:70]}")
+                            # A COMMENT ANNOUNCED AND NEVER WRITTEN DOWN.
+                            #
+                            # These three paths each gave up on the video and
+                            # recorded nothing — so a run could print "commenting
+                            # as purifytext" eight times, post none of them, and
+                            # leave a ledger that looks like it was never asked
+                            # to. "It is not saving the comments" is exactly what
+                            # that looks like from outside, and the run's own
+                            # output was the only place the attempt existed.
+                            #
+                            # The like path has always written fail:load for a
+                            # page that would not render. This is the same rule.
+                            # The rows are cleared by purge_failures at the start
+                            # of the next run, so recording one costs nothing and
+                            # the video is tried again.
                             if not open_video(page, url):
+                                why = why_stuck(page)
                                 render_failed(args.window_count)
+                                record_post(url, aweme, key, prod, text, "fail:load",
+                                            f"{source} — page did not render"
+                                            + (f": {why}" if why else ""))
                                 time.sleep(random.uniform(lo, hi))
                                 continue
                             if not recover_session(page, url):
                                 print("     logged out — skipping the comment")
+                                record_post(url, aweme, key, prod, text, "fail:load",
+                                            f"{source} — signed out when the comment "
+                                            f"was about to be posted")
                                 continue
                             if captcha_present(page):
                                 if not wait_out_captcha(page, args.profile, args.headed,
                                                         tried_api=args.solve_captcha):
+                                    record_post(url, aweme, key, prod, text, "fail:load",
+                                                f"{source} — a captcha was in the way")
                                     break
                             if not open_comments(page):
                                 record_post(url, aweme, key, prod, text,
@@ -2929,9 +3664,56 @@ def main() -> int:
                                 print("     comment panel did not open")
                                 time.sleep(random.uniform(lo, hi))
                                 continue
+                            # THE PANEL IS OPEN, SO LOOK BEFORE WRITING.
+                            #
+                            # Everything up to here decided this video carries
+                            # none of ours from a READ: the public comment list,
+                            # which on most of these videos comes back with one
+                            # or two comments and cannot be trusted to say what
+                            # is absent. The rendered panel is a better witness
+                            # than that read, and it is already on screen.
+                            #
+                            # So if this account's own handle is against a
+                            # comment here, it has commented before and the
+                            # answer is no — whatever the earlier read, and
+                            # whatever the ledger says, which only knows what
+                            # THIS machine recorded.
+                            if my_handle:
+                                rows_now = safe_eval(page, DOM_SCAN_JS) or []
+                                mine_here = next(
+                                    (r for r in rows_now
+                                     if norm(str(r.get("user") or "")) == norm(my_handle)),
+                                    None)
+                                if mine_here:
+                                    said = str(mine_here.get("text") or "")[:60]
+                                    print(f"     already commented here as @{my_handle}"
+                                          + (f": {said}" if said else ""))
+                                    # "ok:already", NOT "ok". The row has to be
+                                    # KEPT — purge_failures clears anything that
+                                    # does not start with "ok", and losing it
+                                    # would send the next run back to re-open a
+                                    # video it has already settled. But it must
+                                    # not be COUNTED: posted_rows takes rows
+                                    # whose status is exactly "ok", and listing
+                                    # this one would put a link in "its
+                                    # commented links" that this account never
+                                    # commented on.
+                                    record_post(url, aweme, key, prod, text,
+                                                "ok:already",
+                                                f"{source} — not posted: @{my_handle} "
+                                                f"already has a comment here")
+                                    done.add(key)
+                                    continue
                             posted, note = post_comment(page, text)
+                            # WHERE THE WORDS CAME FROM, in the ledger with them.
+                            # comment_for already knows — your own list, the
+                            # dashboard's set, or a mimic of the thread — and it
+                            # was being thrown away at the moment it stopped
+                            # being derivable: a month later nothing distinguishes
+                            # a comment you typed from one that was generated.
                             record_post(url, aweme, key, prod, text,
-                                        "ok" if posted else "fail:post", note)
+                                        "ok" if posted else "fail:post",
+                                        f"{source} — {note}" if source else note)
                             done.add(key)
                             commented += 1 if posted else 0
                             print(f"     {'commented' if posted else 'NOT posted'} - {note}")
@@ -2944,11 +3726,20 @@ def main() -> int:
                             # Nothing to do here, so the page is never even loaded —
                             # which is most of the list and costs nothing.
                             if matched:
-                                print(f"  [{vn}/{total_videos}] {aweme}: {matched} match, all done already")
+                                print(
+                                    f"  [{vn}/{total_videos}] {url}: {matched} match, "
+                                    + ("all tied on likes with one of the others"
+                                       if tied == matched
+                                       else "all left to the other accounts"
+                                       if held == matched
+                                       else "all done already")
+                                )
                             continue
                         print(
-                            f"  [{vn}/{total_videos}] {aweme}: {matched} match, {len(wants)} to like"
+                            f"  [{vn}/{total_videos}] {url}: {matched} match, {len(wants)} to like"
                             + (f" ({already_liked} already)" if already_liked else "")
+                            + (f", {tied} tied on likes" if tied else "")
+                            + (f", {held} left to other accounts" if held else "")
                         )
                         if not open_video(page, url):
                             # The page never rendered. That is not the same as the
@@ -3203,6 +3994,16 @@ def main() -> int:
                         if not args.no_dom_sweep and not args.no_like:
                             rows = safe_eval(page, DOM_SCAN_JS) or []
                             extras = dom_extras(rows, aweme, products, users, api_comments, done)
+                            # The sweep finds comments the API list never
+                            # returned, and both rules apply to them for the
+                            # same reasons they apply to the listed ones. The
+                            # tie rule is judged among the EXTRAS alone: the
+                            # listed comments were filtered against each other
+                            # a moment ago, and re-grouping the two sets
+                            # together here would hold back a swept comment
+                            # because a comment we have already liked shares
+                            # its count.
+                            extras = my_share(aweme, eligible(extras)[0])
                             for c in extras:
                                 res = safe_eval(page, DOM_LIKE_JS, [c["user"], c["text"]]) or {}
                                 if not res.get("found"):

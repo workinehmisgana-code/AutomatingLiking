@@ -145,6 +145,43 @@ check('  the page filters its own pick by it', /sites === undefined \|\| sites\.
 check('  including the fallback pools', (dash.match(/allowed\(/g) ?? []).length >= 3, true)
 check('  and the app pool carries it too', /productPlatforms,/.test(appApi), true)
 
+// ── THE GENRE WALL ──────────────────────────────────────────
+//
+// The platform filter above is a preference: a product barred from Instagram
+// just loses its turn there. The genre filter is not. cocodly builds websites;
+// a cocodly comment under a humanizer video is a stranger talking about
+// something else, to an audience that was never ours.
+//
+// What makes that easy to get wrong is the FALLBACK LOOP in serveCommentForUrl:
+// when the product that won a video has nothing written for the video's
+// audience, it tries the other active products. Across genres that hands a
+// humanizer comment to a website-builder video the first time cocodly's bank is
+// thin. So the narrowing has to happen before the pick, which puts it before
+// the loop as well.
+console.log('\nand the genre is a wall, not a preference:')
+const genreSrc = read('lib/config.ts')
+check('  one table of products to genres',
+      (genreSrc.match(/export const PRODUCT_GENRE/g) ?? []).length, 1)
+check('  and one helper that reads it',
+      (genreSrc.match(/export function productsInGenre/g) ?? []).length, 1)
+check('  a link with no genre reads as the default, not undefined',
+      /export function genreOfRow/.test(genreSrc) && /isGenre\(g\) \? g : DEFAULT_GENRE/.test(genreSrc),
+      true)
+check('  serveCommentForUrl narrows to the link\'s genre',
+      /productsInGenre\(genre\)/.test(serve), true)
+check('  BEFORE the fair pick, so the loop cannot escape it',
+      serve.indexOf('productsInGenre') < serve.indexOf('pickFairProductForUrl('), true)
+check('  and the genre is read from the pool, not taken from the client',
+      /genreOfUrl\(url\)/.test(serve), true)
+// The two routes that call the fair pick directly need the same wall.
+check('  the comment endpoint narrows too', /productsInGenre\(/.test(liker), true)
+const mimic = read('app/api/links/mimic/route.ts')
+check('  and the mimic endpoint', /productsInGenre\(/.test(mimic), true)
+// An empty clipboard is the right answer for a genre with nothing written; a
+// wrong-genre comment is not.
+check('  nothing written for a genre serves nothing',
+      /return \{ product: null, comment: null, category \}/.test(serve), true)
+
 console.log('\nthe admin panel can set it, and warns about the dead ends:')
 const ui = read('components/ActiveProducts.tsx')
 check('  a platform row per product', /CLICK_PLATFORMS\.map\(\(plat\) =>/.test(ui), true)

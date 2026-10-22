@@ -14,7 +14,7 @@ export async function POST(req: NextRequest) {
   const userId = await userIdFromApp(req)
   if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  if (!(await getPromoTaskEnabled().catch(() => true))) {
+  if (!(await getPromoTaskEnabled().catch(() => false))) {
     return NextResponse.json({ error: 'The repost task is currently turned off' }, { status: 403 })
   }
 

@@ -6,13 +6,14 @@
 // contains.
 
 import { list, put } from '@vercel/blob'
-import { platformFromUrl } from './config'
+import { invalidatePoolFile } from './videos'
+import { DEFAULT_GENRE, platformFromUrl } from './config'
 import {
   getVerifyLinksByUrls,
   getVerifyLinksByAccounts,
   deleteVerifyLinks,
   saveLinkTitles,
-  getBlockedUrls,
+  getBlockedIndex,
 } from './db'
 
 export type Video = Record<string, unknown> & { url?: unknown }
@@ -52,6 +53,8 @@ export async function loadVideos(): Promise<Video[]> {
 export async function mergeVerifyLinks(opts: {
   urls?: string[]
   accounts?: string[]
+  /** Only staged links of this genre (the admin's switch); all when omitted. */
+  genre?: string
 }): Promise<MergeResult> {
   const urls = (opts.urls ?? []).map((u) => String(u ?? '').trim()).filter(Boolean)
   const accounts = (opts.accounts ?? []).map((a) => String(a ?? '').trim()).filter(Boolean)
@@ -59,9 +62,12 @@ export async function mergeVerifyLinks(opts: {
     return { added: 0, updated: 0, removed: 0, skippedBlocked: 0, count: 0 }
   }
 
-  const allRows = accounts.length
+  const fetched = accounts.length
     ? await getVerifyLinksByAccounts(accounts)
     : await getVerifyLinksByUrls(urls)
+  const allRows = opts.genre
+    ? fetched.filter((r) => (r.genre || DEFAULT_GENRE) === opts.genre)
+    : fetched
   if (allRows.length === 0) {
     return { added: 0, updated: 0, removed: 0, skippedBlocked: 0, count: 0 }
   }
@@ -71,8 +77,12 @@ export async function mergeVerifyLinks(opts: {
   // contradict the Links page, where it already reads as blocked. It still
   // LEAVES the verify list: blocking IS a decision, so it should not come back
   // for judging a second time.
-  const blocked = new Set(await getBlockedUrls().catch(() => [] as string[]))
-  const verifyRows = allRows.filter((r) => !blocked.has(r.url))
+  //
+  // Blocked FOR THE GENRE IT IS BEING MERGED INTO. A link blocked as unrelated
+  // to humanizers, staged again from a website-builder channel, is a website
+  // candidate and merges.
+  const blocked = await getBlockedIndex().catch(() => new Map<string, Set<string>>())
+  const verifyRows = allRows.filter((r) => !blocked.get(r.url)?.has(r.genre || DEFAULT_GENRE))
   const skippedBlocked = allRows.length - verifyRows.length
   const mergedUrls = allRows.map((r) => r.url)
 
@@ -92,6 +102,14 @@ export async function mergeVerifyLinks(opts: {
     posted_date: r.posted_date ?? '',
     scraped_at: now,
     date_only: true, // exclude from rank clusters, keep in date clusters
+    // THE STAGED ROW'S OWN GENRE, inherited from the channel it came from when
+    // that channel was added by hand. It was a constant here while verify_link
+    // had no genre column; it has one now, so a cocodly channel's videos reach
+    // the cocodly pool instead of the humanizer one.
+    //
+    // A row staged before the column existed reads as the default, which is
+    // what every channel harvested so far actually is.
+    genre: r.genre || DEFAULT_GENRE,
   }))
 
   // Append, de-duped by URL. A URL already in the pool keeps its stored row
@@ -136,6 +154,9 @@ export async function mergeVerifyLinks(opts: {
   }
 
   const videos = Array.from(byUrl.values())
+  // The pool file is being replaced, so the cached copy of it is wrong from
+  // this moment; the next reader downloads the new one.
+  invalidatePoolFile()
   await put('videos.json', JSON.stringify(videos), {
     access: 'public',
     addRandomSuffix: false,

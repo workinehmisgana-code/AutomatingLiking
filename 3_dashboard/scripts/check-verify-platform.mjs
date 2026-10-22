@@ -91,8 +91,8 @@ const route = read('app/api/admin/verify-links/route.ts')
 const ui = read('components/VerifyLinks.tsx')
 
 console.log('\nit is applied server-side, where the totals are computed:')
-check('  the predicate takes a platform', /platform = ''\s*\n\): \{ predicate: string/.test(dbSrc), true)
-check('  getVerifyLinks passes it through', /verifyWhere\(filter, accounts, platform\)/.test(dbSrc), true)
+check('  the predicate takes a platform', /function verifyWhere\([\s\S]*?platform = ''/.test(dbSrc), true)
+check('  getVerifyLinks passes it through', /verifyWhere\(filter, accounts, platform/.test(dbSrc), true)
 check('  the route validates it', /CLICK_PLATFORMS\.includes\(platformParam/.test(route), true)
 check('  and sends the counts', /getVerifyPlatformCounts\(\)/.test(route), true)
 
@@ -100,7 +100,11 @@ console.log('\nand the page tells the truth about what it is hiding:')
 check('  the control exists', /onChange=\{\(e\) => changePlatform\(e\.target\.value\)\}/.test(ui), true)
 check('  it resets to the first page', /function changePlatform[\s\S]{0,120}setPage\(0\)/.test(ui), true)
 check('  the heading names the filter', /platform && ` on \$\{CLICK_PLATFORM_LABELS\[platform\]/.test(ui), true)
-check("  'Clean the WHOLE list' warns about it", /\[platform && 'Platform', titleFilter !== 'all' && 'Title'\]/.test(ui), true)
+// The warning now assembles the names of whichever filters are on, so what
+// matters is that Platform is among them and that it is still a condition for
+// warning at all — not the literal two-element array it used to be.
+check("  'Clean the WHOLE list' warns about it", /platform && 'Platform'/.test(ui), true)
+check('  and warns whenever the platform filter is on', /titleFilter !== 'all' \|\| platform/.test(ui), true)
 check('  an empty platform is offered but disabled', /disabled=\{n === 0 && platform !== k\}/.test(ui), true)
 
 console.log(`\n${fails === 0 ? 'all correct' : fails + ' FAILED'}`)

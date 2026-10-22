@@ -2,8 +2,8 @@ import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { list, put } from '@vercel/blob'
 import { auth } from '@/lib/auth'
-import { isAdminEmail, type DateWeights, normalizeDateWeights } from '@/lib/config'
-import { getBlockedUrls, getDateWeights, setDateWeights, getLinkStats, type LinkStat } from '@/lib/db'
+import { isAdminEmail, type DateWeights, normalizeDateWeights, repairRowPlatform } from '@/lib/config'
+import { getBlockedPoolUrls, getDateWeights, setDateWeights, getLinkStats, type LinkStat } from '@/lib/db'
 import { overlayStats } from '@/lib/linkStats'
 import { computeDateScores, type Scorable } from '@/lib/dateScore'
 
@@ -59,7 +59,7 @@ export async function POST(req: NextRequest) {
       cache: 'no-store',
     })
     const data = await res.json()
-    const videos: Video[] = Array.isArray(data) ? data : []
+    const videos: Video[] = Array.isArray(data) ? (data as Video[]).map(repairRowPlatform) : []
     if (videos.length === 0) return NextResponse.json({ ok: true, weights, scored: 0, skippedBlocked: 0, total: 0 })
 
     // Refreshed counts first — otherwise a recluster scores the stale numbers
@@ -67,7 +67,7 @@ export async function POST(req: NextRequest) {
     // decides the video component far more accurately than the URL can.
     const stats = await getLinkStats().catch(() => ({}) as Record<string, LinkStat>)
     overlayStats(videos, stats)
-    const blocked = new Set(await getBlockedUrls().catch(() => [] as string[]))
+    const blocked = new Set(await getBlockedPoolUrls().catch(() => [] as string[]))
     const active = videos.filter((v) => !blocked.has(String(v.url ?? '')))
 
     // Mutates the rows in place, so the untouched blocked entries stay exactly
