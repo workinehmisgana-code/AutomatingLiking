@@ -1,9 +1,9 @@
 {
   "search": {
     "platforms": [
-      "youtube"
+      "tiktok"
     ],
-    "genre": "website",
+    "genre": "slides",
     "queries_by_genre": {
       "humanizer": "humanizer\nai text detector\nparaphraser\nnaturalwrite humanizer\ngrubbyai humanizer\nwalterwritesai humanizer\nwritehuman humanizer\nLegitWriter humanizer\npaperbleach humanizer\nmaskai humanizer\nundetectableai humanizer\nverva humanizer\naihumanizer\nturnitin detector\ngptzero detector\noriginalityai detector\npangram detector",
       "website": "ai website builder\nbuild a website with ai\nno code website\nbase44 website builder\nemergent website builder\nlovable website builder\nwix website builder\nwebador website builder\nshopify website builder\nSquarespace website builder\nHostinger AI website builder\nCatDoes website builder\nManus AI website builder\nFramer AI website builder\nReplit Agent website builder\nv0 AI website builder",
@@ -19,17 +19,17 @@
   "harvest": {
     "limit": 2500,
     "accounts": "",
-    "genre": "",
+    "genre": "humanizer",
     "dry_run": false,
     "upload": true
   },
   "liker": {
     "source": "dashboard",
     "links": "",
-    "cluster_by": "rank",
-    "clusters": "all",
+    "cluster_by": "date",
+    "clusters": "1,2,3,4",
     "platform": "tiktok",
-    "genre": "website",
+    "genre": "humanizer",
     "category": "",
     "max_links": 5000,
     "target": "products",
@@ -52,8 +52,8 @@
     "service": "zefoy",
     "source": "dashboard",
     "csv": "",
-    "cluster_by": "date",
-    "clusters": "1,2",
+    "cluster_by": "rank",
+    "clusters": "all",
     "platform": "tiktok",
     "category": "",
     "genre": "humanizer",
