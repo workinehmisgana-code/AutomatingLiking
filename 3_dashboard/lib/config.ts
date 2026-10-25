@@ -432,6 +432,11 @@ export function validateAllProfileLinks(links: {
 // form and are paid the same COMMENT_PAY_RATE as on every other platform.
 export const COMMENT_PLATFORMS = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram', 'reddit'] as const
 
+/** The most comments one Finish submission may report, per platform. The
+ *  busiest real day on record is ~1,060 opened links; anything far above that
+ *  is a typo or abuse, and refused rather than paid. */
+export const MAX_COMMENTS_PER_SUBMISSION = 2000
+
 // How many links one app fetch may return.
 //
 // The app keeps the whole batch in SharedPreferences and re-parses it on every
@@ -888,6 +893,13 @@ export interface TopListSetting {
   rank: TopListRank
   /** How far back the measurement looks, in days. */
   days: number
+  /**
+   * Spellings to write the product name in when serving from this list - e.g.
+   * ρυrіfуtеxt for purifytext. One is picked at random per serve; empty means
+   * the comment's own spelling. Each must fold back to the product name (see
+   * lib/lookalike.ts), or the scan could no longer tell the comment is ours.
+   */
+  aliases: string[]
 }
 
 export const DEFAULT_TOP_LIST: TopListSetting = {
@@ -895,6 +907,31 @@ export const DEFAULT_TOP_LIST: TopListSetting = {
   count: 20,
   rank: 'balanced',
   days: 30,
+  aliases: [],
+}
+
+/** At most this many name spellings per product, each at most TOP_ALIAS_MAX_LEN. */
+export const TOP_ALIAS_MAX = 20
+export const TOP_ALIAS_MAX_LEN = 40
+
+/**
+ * Each listed comment's chance of being served, in percent, in list order.
+ *
+ * PROPORTIONAL TO ITS RATIO - how often a serving of it actually lands on the
+ * video. A comment at 30% is served three times as often as one at 10%. One
+ * with no ratio yet (too few servings to judge, only possible under "most
+ * links") is weighted at the list's average ratio, so it is neither favoured
+ * nor starved while it earns one. A list with no ratio above zero anywhere is
+ * served evenly.
+ */
+export function topServeChances(rows: { ratio: number | null }[]): number[] {
+  if (rows.length === 0) return []
+  const known = rows.map((r) => r.ratio).filter((x): x is number => x !== null && x > 0)
+  const avg = known.length ? known.reduce((a, b) => a + b, 0) / known.length : 0
+  const w = rows.map((r) => (r.ratio === null ? avg : Math.max(0, r.ratio)))
+  const total = w.reduce((a, b) => a + b, 0)
+  if (total <= 0) return rows.map(() => 100 / rows.length)
+  return w.map((x) => (100 * x) / total)
 }
 
 export const TOP_LIST_BOUNDS = {
@@ -933,6 +970,15 @@ export function clampTopList(
     count: n(v?.count, 'count'),
     rank: isTopListRank(v?.rank) ? v.rank : DEFAULT_TOP_LIST.rank,
     days: n(v?.days, 'days'),
+    aliases: Array.isArray(v?.aliases)
+      ? Array.from(
+          new Set(
+            (v.aliases as unknown[])
+              .map((a) => String(a ?? '').trim())
+              .filter((a) => a && a.length <= TOP_ALIAS_MAX_LEN)
+          )
+        ).slice(0, TOP_ALIAS_MAX)
+      : DEFAULT_TOP_LIST.aliases,
   }
 }
 

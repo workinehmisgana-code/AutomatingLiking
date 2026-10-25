@@ -56,14 +56,41 @@ const BUILTIN_PRODUCTS = [...PRODUCTS]
 /** The genres applied last time, so a re-apply removes what was deleted. */
 let applied: CustomGenre[] = []
 
+// ── ONE LIST FOR THE WHOLE PROCESS ──────────────────────────────────────
+//
+// The server holds SEVERAL copies of lib/config: instrumentation, the page
+// layouts and the API routes are bundled separately, and each bundle gets its
+// own GENRES array. Applying the list to one copy left the others on the three
+// built-in genres — which is how the genre-mix route silently dropped a Study
+// helper share on save (its GENRES had no such genre), and how an upload or a
+// worker feed would have read a study-helper link as humanizer.
+//
+// So every copy of this module registers its applier on globalThis, which the
+// whole process shares; an apply anywhere runs all of them, and a copy loaded
+// later applies the last list the moment it loads.
+type RegistryGlobal = typeof globalThis & {
+  __genreList?: CustomGenre[]
+  __genreAppliers?: Set<(list: CustomGenre[]) => void>
+}
+const shared = globalThis as RegistryGlobal
+const appliers = (shared.__genreAppliers ??= new Set())
+
 /**
- * Write the added genres into the shared tables.
+ * Write the added genres into the shared tables — in EVERY bundle's copy of
+ * them (see above).
  *
  * IDEMPOTENT and complete: every call first takes back what the previous call
  * added and then adds this list, so a deleted genre or a renamed product does
  * not linger. The built-in genres and products are never touched.
  */
 export function applyGenreRegistry(list: CustomGenre[]): void {
+  shared.__genreList = list
+  appliers.add(applyHere)
+  appliers.forEach((apply) => apply(list))
+}
+
+/** applyGenreRegistry for THIS copy of the tables only. */
+function applyHere(list: CustomGenre[]): void {
   for (const g of applied) {
     const gi = GENRES.indexOf(g.id)
     if (gi >= 0 && !(BUILTIN_GENRES as readonly string[]).includes(g.id)) GENRES.splice(gi, 1)
@@ -94,6 +121,10 @@ export function applyGenreRegistry(list: CustomGenre[]): void {
   }
   applied = clean
 }
+
+// This copy joins the process-wide list on load, and catches up with it.
+appliers.add(applyHere)
+if (shared.__genreList) applyHere(shared.__genreList)
 
 /** The genres currently applied (the added ones only). */
 export function appliedGenres(): CustomGenre[] {

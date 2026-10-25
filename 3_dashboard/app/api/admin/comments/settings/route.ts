@@ -108,11 +108,24 @@ export async function POST(req: NextRequest) {
   if (body?.topCount !== undefined) topIn.count = Number(body.topCount)
   if (isTopListRank(body?.topRank)) topIn.rank = body.topRank
   if (body?.topDays !== undefined) topIn.days = Number(body.topDays)
+  // One per line from the page, or an array.
+  if (body?.topAliases !== undefined) {
+    topIn.aliases = Array.isArray(body.topAliases)
+      ? body.topAliases.map(String)
+      : String(body.topAliases ?? '').split(/\r?\n/)
+  }
   try {
     await setProductWordBand(product, band)
     await setProductCommentStyle(product, style)
-    const top =
-      Object.keys(topIn).length > 0 ? await setProductTopList(product, topIn) : current.top
+    let top = current.top
+    if (Object.keys(topIn).length > 0) {
+      try {
+        top = await setProductTopList(product, topIn)
+      } catch (e) {
+        // A spelling that does not fold back to the product: the admin's to fix.
+        return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 })
+      }
+    }
     // The saved list comes back with the save, so the page never shows a list
     // that belongs to the previous setting.
     const list = top.enabled ? await getTopCommentsForProduct(product, top).catch(() => []) : []

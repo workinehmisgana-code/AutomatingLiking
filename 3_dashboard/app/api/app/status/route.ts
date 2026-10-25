@@ -17,7 +17,9 @@ import {
 import { loadVideosJson, retiredUrlSet } from '@/lib/videos'
 import {
   genreOfRow,
+  isGenre,
   genreWeights, HOURLY_LINK_LIMIT, HOURLY_WINDOW_MS, RETIRE_AFTER_USERS, SHOW_CLICKED_TODAY } from '@/lib/config'
+import { ensureGenreRegistry } from '@/lib/genreStore'
 
 export const dynamic = 'force-dynamic'
 
@@ -26,6 +28,8 @@ const KEYS = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram', 'reddit
 // GET — everything the app's Details panel shows: today's clicks per platform,
 // pending pay, and per-platform available link counts + hourly-quota lock state.
 export async function GET(req: NextRequest) {
+  // The added genres, current to the minute, before GENRES is read.
+  await ensureGenreRegistry().catch(() => {})
   const userId = await userIdFromApp(req)
   if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
@@ -69,7 +73,12 @@ export async function GET(req: NextRequest) {
   // weight and never draws from a genre whose share is zero, so counting those
   // links here would promise the app links it is never going to be handed —
   // exactly the mismatch the note above exists to prevent.
-  const genreMix = genreWeights(await getGenreMix().catch(() => null))
+  // ?genre=<g>: the same one-genre view the links route gives (the Comment
+  // Tester), so its counts match what it is actually served.
+  const onlyGenre = req.nextUrl.searchParams.get('genre')
+  const genreMix = onlyGenre && isGenre(onlyGenre)
+    ? { [onlyGenre]: 1 }
+    : genreWeights(await getGenreMix().catch(() => null))
   const avail: Record<string, number> = {}
   for (const v of videos) {
     if (!v.url || !v.url.startsWith('http') || hidden.has(v.url)) continue

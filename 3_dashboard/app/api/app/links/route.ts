@@ -30,6 +30,7 @@ import { mixOrderings, seedFrom, DEFAULT_DATE_SHARE } from '@/lib/clusterMix'
 import {
   GENRES,
   genreOfRow,
+  isGenre,
   genreWeights,
   isAppOutdated,
   VERIFY_VIDEO_URL,
@@ -37,6 +38,7 @@ import {
   APP_LINK_BATCH,
   FALLBACK_COMMENT_CATEGORY,
 } from '@/lib/config'
+import { ensureGenreRegistry } from '@/lib/genreStore'
 
 export const dynamic = 'force-dynamic'
 
@@ -69,6 +71,8 @@ const PLATFORM_ORDER = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram
 // ?platform=X only that platform; otherwise platforms are grouped in order
 // (all of one platform, then the next) so the app can finish one at a time.
 export async function GET(req: NextRequest) {
+  // The added genres, current to the minute, before GENRES is read.
+  await ensureGenreRegistry().catch(() => {})
   const userId = await userIdFromApp(req)
   if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
@@ -191,10 +195,19 @@ export async function GET(req: NextRequest) {
   const dateShare = await getClusterDateShare().catch(() => DEFAULT_DATE_SHARE)
   // The genre shares, normalised. Nothing set reads as all-humanizer, which is
   // what every link in the pool was before genres existed.
-  const genreMix = genreWeights(await getGenreMix().catch(() => null))
+  // ?genre=<g> — ONE genre only, whatever the mix says. The Comment Tester asks
+  // for humanizer links: the rest of the mix is for the workers' feed.
+  const onlyGenre = req.nextUrl.searchParams.get('genre')
+  const genreMix = onlyGenre && isGenre(onlyGenre)
+    ? { [onlyGenre]: 1 }
+    : genreWeights(await getGenreMix().catch(() => null))
   const seed = seedFrom(userId)
 
-  const available = videos.filter((v) => v.url && v.url.startsWith('http') && !hidden.has(v.url))
+  const available = videos.filter(
+    (v) =>
+      v.url && v.url.startsWith('http') && !hidden.has(v.url) &&
+      (!onlyGenre || !isGenre(onlyGenre) || genreOfRow(v) === onlyGenre)
+  )
 
   // Ordering WITHIN each clustering is the score and nothing else — search rank
   // in a rank cluster, date score in a date cluster. Neither what "Extract

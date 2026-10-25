@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import ScrollX from '@/components/ScrollX'
 import {
@@ -433,7 +433,7 @@ export default function VerifyLinks({
    * reordering inside a block rather than across one is what stops a channel
    * being split into several headings.
    *
-   * Depends on `pinnedUrls`, never on `selected`: see that state.
+   * Block 1 follows the live selection; holdScroll keeps the view still as rows move.
    */
   const displayRows = useMemo(() => {
     // Untouched until the page has been through Mark. Before that the query's
@@ -443,7 +443,10 @@ export default function VerifyLinks({
     const untitled: VRow[] = []
     const titled: VRow[] = []
     for (const r of rows) {
-      if (pinnedUrls.has(r.url)) pinned.push(r)
+      // LIVE, not the Mark snapshot: ticking a row moves it into the selected
+      // block and unticking moves it out. The view is held still across the
+      // move by holdScroll (below), which is what the snapshot used to buy.
+      if (selected.has(r.url)) pinned.push(r)
       else if (!r.title || !r.title.trim()) untitled.push(r)
       else titled.push(r)
     }
@@ -453,7 +456,7 @@ export default function VerifyLinks({
     // take the untitled ones back out of the top at the exact moment they
     // become the only thing left to review. classifiedThisPage survives a
     // block and is reset by a fresh page, which is the life this order wants.
-  }, [rows, pinnedUrls, classifiedThisPage])
+  }, [rows, selected, classifiedThisPage])
 
   // Consecutive rows of the same channel, so the table can print one heading per
   // channel instead of repeating the account on every line. The query already
@@ -485,15 +488,55 @@ export default function VerifyLinks({
   const stagedFor = (account: string | null) =>
     accounts.find((a) => a.account.toLowerCase() === (account || '').toLowerCase())?.n ?? null
 
-  const toggle = (url: string) =>
-    setSelected((prev) => {
-      const n = new Set(prev)
-      if (n.has(url)) n.delete(url); else n.add(url)
-      return n
-    })
+  /**
+   * Keep the view still while ticked rows move between the selected and the
+   * unselected block.
+   *
+   * Before the change: the first row on screen that is NOT moving, and where it
+   * sits. After React has re-rendered, but before the browser paints, scroll by
+   * however far that row was pushed — so what is under the cursor stays put and
+   * only the moved rows disappear from view. The table opts out of the browser's
+   * own scroll anchoring (overflow-anchor: none) so the two never both correct.
+   */
+  const anchorRef = useRef<{ url: string; top: number } | null>(null)
+  const holdScroll = (moving: Set<string>) => {
+    anchorRef.current = null
+    const els = document.querySelectorAll<HTMLElement>('[data-vrow]')
+    const vh = window.innerHeight
+    for (let i = 0; i < els.length; i++) {
+      const el = els[i]
+      const url = el.dataset.vrow || ''
+      if (moving.has(url)) continue
+      const top = el.getBoundingClientRect().top
+      if (top >= 0 && top < vh) { anchorRef.current = { url, top }; return }
+    }
+  }
+  useLayoutEffect(() => {
+    const a = anchorRef.current
+    if (!a) return
+    anchorRef.current = null
+    const els = document.querySelectorAll<HTMLElement>('[data-vrow]')
+    for (let i = 0; i < els.length; i++) {
+      if (els[i].dataset.vrow === a.url) {
+        const delta = els[i].getBoundingClientRect().top - a.top
+        if (delta) window.scrollBy(0, delta)
+        return
+      }
+    }
+  }, [displayRows])
+  const changeSelection = (urls: string[], next: Set<string>) => {
+    holdScroll(new Set(urls))
+    setSelected(next)
+  }
+
+  const toggle = (url: string) => {
+    const n = new Set(selected)
+    if (n.has(url)) n.delete(url); else n.add(url)
+    changeSelection([url], n)
+  }
   const allSelected = rows.length > 0 && rows.every((r) => selected.has(r.url))
   const toggleAll = () =>
-    setSelected(allSelected ? new Set() : new Set(rows.map((r) => r.url)))
+    changeSelection(rows.map((r) => r.url), allSelected ? new Set() : new Set(rows.map((r) => r.url)))
 
   // ── Upload a channel_videos CSV (parsed in-browser, sent in chunks) ─────────
   async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
@@ -1930,7 +1973,7 @@ export default function VerifyLinks({
 
 
       {/* Table */}
-      <div className="rounded-xl border border-zinc-800 overflow-hidden">
+      <div className="rounded-xl border border-zinc-800 overflow-hidden" style={{ overflowAnchor: 'none' }}>
       {/* Header and rows in ONE scroller, at a fixed minimum width, so a
           search that narrows the rows cannot take the scroll away. */}
       <ScrollX min={860}>
@@ -1969,13 +2012,11 @@ export default function VerifyLinks({
                 <input
                   type="checkbox"
                   checked={allPicked}
-                  onChange={() =>
-                    setSelected((prev) => {
-                      const n = new Set(prev)
-                      for (const u of groupUrls) allPicked ? n.delete(u) : n.add(u)
-                      return n
-                    })
-                  }
+                  onChange={() => {
+                    const n = new Set(selected)
+                    for (const u of groupUrls) allPicked ? n.delete(u) : n.add(u)
+                    changeSelection(groupUrls, n)
+                  }}
                   title={allPicked ? "Unselect this channel's links on this page" : "Select this channel's links on this page"}
                   className="accent-teal-500 cursor-pointer"
                 />
@@ -2034,7 +2075,7 @@ export default function VerifyLinks({
               )}
             </div>
             {g.rows.map((r) => (
-            <div key={r.url} className={`flex items-center gap-2 px-3 py-2 border-b border-zinc-800/60 text-sm ${selected.has(r.url) ? 'bg-amber-500/15 border-l-4 border-l-amber-400 pl-2' : ''}`}>
+            <div key={r.url} data-vrow={r.url} className={`flex items-center gap-2 px-3 py-2 border-b border-zinc-800/60 text-sm ${selected.has(r.url) ? 'bg-amber-500/15 border-l-4 border-l-amber-400 pl-2' : ''}`}>
               <span className="w-6 shrink-0 flex justify-center">
                 <input type="checkbox" checked={selected.has(r.url)} onChange={() => toggle(r.url)} className="accent-teal-500 cursor-pointer" />
               </span>

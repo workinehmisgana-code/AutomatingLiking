@@ -12,6 +12,7 @@
 //     with us — so a reply can be written that answers IT and mentions a product
 //     in that context, rather than dropping an unrelated ad under it.
 
+import { flatFold } from './lookalike'
 import { fetchComments, type VideoComment } from './linkStats'
 import { PRODUCTS, type Product } from './config'
 
@@ -54,8 +55,9 @@ export interface ScanResult {
  * type "Purify Text" or "purify-text", so punctuation and case are stripped
  * before looking for the name.
  */
+// Lookalike glyphs folded first: a comment served as ρυrіfуtеxt is purifytext.
 function norm(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]/g, '')
+  return flatFold(s)
 }
 
 /**

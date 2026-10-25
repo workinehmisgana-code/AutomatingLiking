@@ -4,7 +4,7 @@ import { put } from '@vercel/blob'
 import { auth } from '@/lib/auth'
 import { profileGate } from '@/lib/profileGate'
 import { addCommentedSubmission, addScreenshot } from '@/lib/db'
-import { COMMENT_PLATFORMS } from '@/lib/config'
+import { COMMENT_PLATFORMS, MAX_COMMENTS_PER_SUBMISSION } from '@/lib/config'
 
 export const dynamic = 'force-dynamic'
 
@@ -44,6 +44,16 @@ export async function POST(req: NextRequest) {
   }
 }
 
+// A count no one could have typed honestly. Refused before ANYTHING is written:
+// one worker sent fourteen of these in seven minutes on 2026-10-23 (up to
+// 1,288,684,288), and their sum overflowed the admin page's totals.
+function tooMany(n: number) {
+  return NextResponse.json(
+    { error: `${n.toLocaleString()} comments is more than one submission can hold (max ${MAX_COMMENTS_PER_SUBMISSION.toLocaleString()}). Enter how many videos you actually commented on.` },
+    { status: 400 }
+  )
+}
+
 // New path — screenshots already uploaded client-side; we get only URLs.
 async function handleJson(req: NextRequest, userId: string) {
   let body: {
@@ -63,6 +73,7 @@ async function handleJson(req: NextRequest, userId: string) {
     if (!(COMMENT_PLATFORMS as readonly string[]).includes(platform)) continue
     const count = parseInt(String(entry?.count ?? '0'), 10)
     const n = Number.isFinite(count) && count > 0 ? count : 0
+    if (n > MAX_COMMENTS_PER_SUBMISSION) return tooMany(n)
     const sampleUrl = String(entry?.sampleUrl ?? '').trim() || null
     const screenshots = (Array.isArray(entry?.screenshots) ? entry!.screenshots : [])
       .map((u) => String(u).trim())
@@ -102,6 +113,7 @@ async function handleMultipart(req: NextRequest, userId: string) {
   for (const platform of COMMENT_PLATFORMS) {
     const count = parseInt(String(form.get(`count_${platform}`) ?? '0'), 10)
     const n = Number.isFinite(count) && count > 0 ? count : 0
+    if (n > MAX_COMMENTS_PER_SUBMISSION) return tooMany(n)
     const sampleUrl = String(form.get(`sample_url_${platform}`) ?? '').trim() || null
     if (n > 0 || sampleUrl) {
       await addCommentedSubmission(userId, platform, n, sampleUrl)

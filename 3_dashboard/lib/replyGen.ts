@@ -15,6 +15,7 @@
 // Drafts only. Nothing is posted from here — the admin reviews them on
 // /admin/replies and copies the ones worth using.
 
+import { flatFold } from './lookalike'
 import { llmChat } from './llm'
 import { PRODUCTS, DEACTIVATED_PRODUCTS, genreOfProduct, type Product } from './config'
 import { REPLY_AFFIRM as AFFIRM, REPLY_RECOMMEND as RECOMMEND } from './prompts'
@@ -53,8 +54,9 @@ export function activeProducts(): Product[] {
   return live.length > 0 ? live : [...PRODUCTS]
 }
 
+// Lookalike glyphs folded first: a comment served as ρυrіfуtеxt is purifytext.
 function norm(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]/g, '')
+  return flatFold(s)
 }
 
 /** The product a comment already names, if any. */

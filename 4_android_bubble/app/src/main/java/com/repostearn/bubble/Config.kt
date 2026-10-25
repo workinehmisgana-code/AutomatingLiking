@@ -22,7 +22,9 @@ object Config {
     val CLICK_URL: String get() = "$DASHBOARD/api/app/click"
     val COMMENTS_URL: String get() = "$DASHBOARD/api/app/comments"
     val UNRELATED_URL: String get() = "$DASHBOARD/api/app/unrelated"
-    val STATUS_URL: String get() = "$DASHBOARD/api/app/status"
+    // The tester's counts are of the humanizer links it is served (see linksUrl).
+    val STATUS_URL: String get() =
+        "$DASHBOARD/api/app/status" + if (BuildConfig.TESTER) "?genre=humanizer" else ""
     val MESSAGES_URL: String get() = "$DASHBOARD/api/app/messages"
     val FINISH_URL: String get() = "$DASHBOARD/finish"
 
@@ -43,6 +45,8 @@ object Config {
         if (platform.isNotBlank()) q += "platform=$platform"
         // The tester is served only links that carry none of our comments.
         if (BuildConfig.TESTER) q += "clean=1"
+        // ...and only humanizer links, whatever the workers' genre mix is.
+        if (BuildConfig.TESTER) q += "genre=humanizer"
         return "$DASHBOARD/api/app/links" + if (q.isEmpty()) "" else "?" + q.joinToString("&")
     }
 }

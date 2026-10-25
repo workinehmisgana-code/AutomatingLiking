@@ -3,7 +3,7 @@
     "platforms": [
       "tiktok"
     ],
-    "genre": "slides",
+    "genre": "website",
     "queries_by_genre": {
       "humanizer": "humanizer\nai text detector\nparaphraser\nnaturalwrite humanizer\ngrubbyai humanizer\nwalterwritesai humanizer\nwritehuman humanizer\nLegitWriter humanizer\npaperbleach humanizer\nmaskai humanizer\nundetectableai humanizer\nverva humanizer\naihumanizer\nturnitin detector\ngptzero detector\noriginalityai detector\npangram detector",
       "website": "ai website builder\nbuild a website with ai\nno code website\nbase44 website builder\nemergent website builder\nlovable website builder\nwix website builder\nwebador website builder\nshopify website builder\nSquarespace website builder\nHostinger AI website builder\nCatDoes website builder\nManus AI website builder\nFramer AI website builder\nReplit Agent website builder\nv0 AI website builder",
@@ -33,9 +33,9 @@
     "category": "",
     "max_links": 5000,
     "target": "products",
-    "users": "cocodly, co codlypurifytext, purify text, \u03c1\u03c5r\u0456f\u0443t\u0435xt, acoustictext, acoustic text, prohumanly,  pro humanly, cohumanly, humlexic",
+    "users": "cocodly, co codly,purifytext, purify text,\u03c1\u03c5r\u0456f\u0443t\u0435xt,\u03c1\u03c5r\u0456f\u0443 t\u0435xt, \u03c1\u03c5r\u0456f\u0443t\u0435xt, acoustictext, acoustic text, prohumanly,  pro humanly, cohumanly, humlexic",
     "profiles": "c,g,h,a,e,b,f,d,j,i,o,n,q,l",
-    "at_once": 7,
+    "at_once": 5,
     "keywords": "",
     "mode": "dom",
     "pages": 4,

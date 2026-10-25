@@ -5,6 +5,7 @@ import { saveLinkTitles, getBlockedIndex, getDateWeights, getLinkStats, type Lin
 import { overlayStats } from '@/lib/linkStats'
 import { computeDateScores } from '@/lib/dateScore'
 import { DEFAULT_DATE_WEIGHTS, DEFAULT_GENRE, genreOfRow, isGenre, repairRowPlatform } from '@/lib/config'
+import { ensureGenreRegistry } from '@/lib/genreStore'
 
 type Video = Record<string, unknown> & {
   url?: unknown
@@ -112,6 +113,8 @@ function dedupeByUrl(rows: Video[]): Video[] {
 }
 
 export async function POST(req: NextRequest) {
+  // The added genres, current to the minute, before GENRES is read.
+  await ensureGenreRegistry().catch(() => {})
   const secret = req.headers.get('x-upload-secret')
   if (!secret || secret !== process.env.UPLOAD_SECRET) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })

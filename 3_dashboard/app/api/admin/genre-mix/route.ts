@@ -3,6 +3,7 @@ import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { GENRES, genreWeights, isAdminEmail } from '@/lib/config'
 import { getGenreMix, saveGenreMix } from '@/lib/db'
+import { ensureGenreRegistry } from '@/lib/genreStore'
 
 export const dynamic = 'force-dynamic'
 
@@ -22,12 +23,16 @@ async function admin() {
 }
 
 export async function GET() {
+  // The added genres, current to the minute, before GENRES is read.
+  await ensureGenreRegistry().catch(() => {})
   if (!(await admin())) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   const mix = await getGenreMix().catch(() => null)
   return NextResponse.json({ mix: mix ?? {}, weights: genreWeights(mix), genres: [...GENRES] })
 }
 
 export async function PATCH(req: NextRequest) {
+  // The added genres, current to the minute, before GENRES is read.
+  await ensureGenreRegistry().catch(() => {})
   if (!(await admin())) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   let body: Record<string, unknown> = {}
   try {

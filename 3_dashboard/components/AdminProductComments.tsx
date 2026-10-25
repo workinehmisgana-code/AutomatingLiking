@@ -19,8 +19,15 @@ import { buildAudiencePrompt } from '@/lib/prompts'
 import LlmModelPicker from '@/components/LlmModelPicker'
 
 /** One row of the measured list, as the settings endpoint returns it. */
+/** The non-empty lines of the "serve the name as" box. */
+function aliasList(v: string): string[] {
+  return v.split(/\r?\n/).map((x) => x.trim()).filter(Boolean)
+}
+
 interface TopRow {
   text: string
+  /** Its chance of being the one served, in percent (proportional to ratio). */
+  chance?: number
   /** Videos this comment is on, inside the window. */
   links: number
   /** Percent of servings that ended up on a link, or null if too few to judge. */
@@ -160,6 +167,8 @@ export default function AdminProductComments({
   const [topCount, setTopCount] = useState(String(top.count))
   const [topRank, setTopRank] = useState<TopListRank>(top.rank)
   const [topDays, setTopDays] = useState(String(top.days))
+  // Spellings of the product name to serve under, one per line.
+  const [topAliases, setTopAliases] = useState((top.aliases ?? []).join('\n'))
   const [savedTop, setSavedTop] = useState<TopListSetting>(top)
   const [topSaving, setTopSaving] = useState(false)
   const [topBusy, setTopBusy] = useState(false)
@@ -207,6 +216,7 @@ export default function AdminProductComments({
     topCount?: number
     topRank?: TopListRank
     topDays?: number
+    topAliases?: string
   }) {
     setTopSaving(true)
     setTopErr('')
@@ -228,6 +238,7 @@ export default function AdminProductComments({
         setTopCount(String(d.top.count))
         setTopRank(d.top.rank)
         setTopDays(String(d.top.days))
+        setTopAliases((d.top.aliases ?? []).join('\n'))
       }
       if (Array.isArray(d?.list) && d.list.length > 0) {
         setTopList(d.list)
@@ -257,6 +268,7 @@ export default function AdminProductComments({
       ? `ranked by ${RANK_LABEL[savedTop.rank]} → ${RANK_LABEL[topRank]}`
       : '',
     Number(topDays) !== savedTop.days ? `last days ${savedTop.days} → ${topDays}` : '',
+    aliasList(topAliases).join('\n') !== (savedTop.aliases ?? []).join('\n') ? 'name spellings' : '',
   ].filter(Boolean)
 
   // Already on when the page opens? Then the list IS what is being served, and
@@ -952,6 +964,7 @@ export default function AdminProductComments({
                   topCount: Number(topCount),
                   topRank,
                   topDays: Number(topDays),
+                  topAliases,
                 })
               }
               disabled={topSaving || topBusy}
@@ -969,7 +982,27 @@ export default function AdminProductComments({
             </button>
           </div>
         </div>
-        <p className="text-[11px] text-zinc-600 mt-2 leading-relaxed">{RANK_HINT[topRank]}</p>
+        <p className="text-[11px] text-zinc-600 mt-2 leading-relaxed">
+          {RANK_HINT[topRank]} Each click draws one comment from the list with a chance
+          proportional to its ratio — the <span className="text-zinc-400">chance</span> column
+          below.
+        </p>
+        {/* How the product's name is written in what this list serves. */}
+        <label className="block mt-3 text-xs text-zinc-400">
+          Serve the name as{' '}
+          <span className="text-zinc-600">
+            — one spelling per line, picked at random for each click; leave empty to keep each
+            comment&apos;s own spelling. Must still read as {product}: lookalike letters
+            (ρυrіfуtеxt), capitals, spaces or hyphens.
+          </span>
+          <textarea
+            value={topAliases}
+            onChange={(e) => setTopAliases(e.target.value)}
+            rows={Math.min(6, Math.max(2, aliasList(topAliases).length + 1))}
+            placeholder={`e.g. ${product === 'purifytext' ? 'ρυrіfуtеxt' : product}`}
+            className="mt-1 block w-full max-w-md bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-sm text-white font-mono focus:outline-none focus:border-emerald-500"
+          />
+        </label>
         {topPending.length > 0 && (
           <p className="text-[11px] text-amber-400/80 mt-1">
             Not saved: {topPending.join(', ')}.{' '}
@@ -993,7 +1026,7 @@ export default function AdminProductComments({
               </div>
               <div className="text-[11px] text-zinc-600">
                 links = videos it is on · ratio = how often a serving lands · served = times
-                handed out
+                handed out · chance = share of clicks it is served on
               </div>
             </div>
             {topBusy && <p className="text-xs text-zinc-500">Measuring…</p>}
@@ -1025,6 +1058,9 @@ export default function AdminProductComments({
                         {r.ratio === null ? 'ratio —' : `${r.ratio}%`}
                       </span>{' '}
                       · {r.served} served
+                      {typeof r.chance === 'number' && (
+                        <span className="text-sky-300/80"> · {r.chance}% chance</span>
+                      )}
                     </span>
                   </li>
                 ))}

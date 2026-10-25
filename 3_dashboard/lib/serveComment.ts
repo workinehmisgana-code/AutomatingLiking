@@ -1,3 +1,4 @@
+import { applyProductAlias } from './lookalike'
 import {
   activeProductsForPlatform,
   getLinkCategory,
@@ -5,7 +6,7 @@ import {
   getProductCommentSettings,
   getTopCommentsForProduct,
 } from './db'
-import { COMMENT_WORD_MIN, COMMENT_WORD_MAX } from './config'
+import { COMMENT_WORD_MIN, COMMENT_WORD_MAX, DEFAULT_TOP_LIST } from './config'
 import { getFreshCategoryComments } from './commentGen'
 import {
   DEFAULT_GENRE,
@@ -111,12 +112,28 @@ export async function serveCommentForUrl(
     const { top } = await getProductCommentSettings(product, {
       min: COMMENT_WORD_MIN,
       max: COMMENT_WORD_MAX,
-    }).catch(() => ({ top: { enabled: false, count: 20, rank: 'balanced' as const, days: 30 } }))
+    }).catch(() => ({ top: DEFAULT_TOP_LIST }))
     if (top.enabled) {
-      const best = await getTopCommentsForProduct(product, top).catch(() => [])
-      const pool = best.map((b) => b.text.trim()).filter(Boolean)
-      if (pool.length > 0) {
-        return { product, comment: pool[Math.floor(Math.random() * pool.length)], category }
+      const best = (await getTopCommentsForProduct(product, top).catch(() => [])).filter((b) =>
+        b.text.trim()
+      )
+      if (best.length > 0) {
+        // DRAWN BY RATIO, not evenly: each comment's chance is the share the
+        // list shows beside it (topServeChances), so what lands more often is
+        // served more often.
+        let r = Math.random() * best.reduce((n, b) => n + b.chance, 0)
+        let pick = best[best.length - 1]
+        for (const b of best) {
+          r -= b.chance
+          if (r < 0) { pick = b; break }
+        }
+        let comment = pick.text.trim()
+        // Written under one of the admin's spellings of the name, when set.
+        if (top.aliases.length > 0) {
+          const alias = top.aliases[Math.floor(Math.random() * top.aliases.length)]
+          comment = applyProductAlias(comment, product, alias)
+        }
+        return { product, comment, category }
       }
       // Nothing measured yet for this product in this window — the bank below.
     }

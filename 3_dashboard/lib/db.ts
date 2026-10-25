@@ -1,5 +1,9 @@
 import { Pool } from 'pg'
 import { cached, invalidate, TTL } from './poolCache'
+import { fold, flatFold, aliasMatchesProduct } from './lookalike'
+// Loaded for its side effect: this bundle's copy of the genre tables joins the
+// process-wide list of added genres (see lib/genreRegistry.ts).
+import './genreRegistry'
 import { del } from '@vercel/blob'
 import { randomBytes } from 'crypto'
 import {
@@ -18,6 +22,7 @@ import {
   isTiktokProfileMisformatted,
   type BlockRules,
   clampTopList,
+  topServeChances,
   isTopListRank,
   DEFAULT_TOP_LIST,
   type TopListSetting,
@@ -2553,7 +2558,7 @@ export async function closeCaptchaRequest(id: string): Promise<void> {
 export async function getTopCommentsForProduct(
   product: string,
   opt: TopListSetting
-): Promise<{ text: string; links: number; ratio: number | null; served: number }[]> {
+): Promise<{ text: string; links: number; ratio: number | null; served: number; chance: number }[]> {
   const key = `topComments:${product}:${opt.rank}:${opt.days}:${opt.count}`
   return cached(key, TTL.scan, async () => {
     const t = await getProductCommentTally({
@@ -2561,7 +2566,29 @@ export async function getTopCommentsForProduct(
       days: opt.days,
       limit: 1000,
     }).catch(() => null)
-    const rows = t?.rows ?? []
+    // ONE COMMENT, HOWEVER ITS NAME WAS SPELLED. Served under an alias, a
+    // comment comes back from the scan as different text (ρυrіfуtеxt, not
+    // purifytext) and the tally counts it as a separate comment - so its
+    // servings and landings would split between two rows and neither would rank.
+    // Merged on the folded text, shown under the plainest spelling.
+    const merged = new Map<string, { text: string; plain: boolean; links: number; served: number }>()
+    for (const r of t?.rows ?? []) {
+      const key = flatFold(r.text)
+      const plain = fold(r.text) === r.text.toLowerCase()
+      const m = merged.get(key)
+      if (!m) merged.set(key, { text: r.text, plain, links: r.links, served: r.served })
+      else {
+        if (plain && !m.plain) { m.text = r.text; m.plain = true }
+        m.links += r.links
+        m.served += r.served
+      }
+    }
+    const rows = Array.from(merged.values()).map((m) => ({
+      text: m.text,
+      links: m.links,
+      served: m.served,
+      ratio: m.served > 0 ? Math.round((100 * m.links) / m.served) : null,
+    }))
     // A ratio needs enough servings to mean anything; below that a comment is
     // ranked on reach alone rather than on a coin toss.
     const RATED = 20
@@ -2582,11 +2609,15 @@ export async function getTopCommentsForProduct(
             )
     // A ranking with nothing in it must not silently serve nothing: the caller
     // falls back to the written bank, which is what an empty list means.
-    return pool.slice(0, opt.count).map((r) => ({
+    const top = pool.slice(0, opt.count)
+    const chances = topServeChances(top)
+    return top.map((r, i) => ({
       text: r.text,
       links: r.links,
       ratio: r.ratio,
       served: r.served,
+      // This comment's share of the servings, in percent (see topServeChances).
+      chance: Math.round(chances[i] * 10) / 10,
     }))
   })
 }
@@ -5957,6 +5988,8 @@ export function ensureAdminTables(): Promise<void> {
         -- links | ratio | balanced — the three orders the frequency modal offers.
         ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS top_rank TEXT NOT NULL DEFAULT 'balanced';
         ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS top_days INT NOT NULL DEFAULT 30;
+        -- Spellings of the product name to serve the top list under.
+        ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS top_aliases TEXT[] NOT NULL DEFAULT '{}';
         -- How a comment is written, per product. Defaults match what the
         -- generator did before these were settable, so an existing row keeps
         -- producing exactly what it produced yesterday.
@@ -6275,9 +6308,10 @@ export async function getProductCommentSettings(
     top_count: number
     top_rank: string
     top_days: number
+    top_aliases: string[] | null
   }>(
     `SELECT word_min, word_max, emoji, split_brand, quote_brand, voice,
-            top_enabled, top_count, top_rank, top_days
+            top_enabled, top_count, top_rank, top_days, top_aliases
        FROM product_comment_setting WHERE product = $1`,
     [product]
   )
@@ -6291,6 +6325,7 @@ export async function getProductCommentSettings(
       count: r.top_count,
       rank: isTopListRank(r.top_rank) ? r.top_rank : undefined,
       days: r.top_days,
+      aliases: r.top_aliases ?? [],
     }),
     band: { min: r.word_min, max: r.word_max },
     style: {
@@ -6354,17 +6389,28 @@ export async function setProductTopList(
     max: COMMENT_WORD_MAX,
   }).catch(() => null))?.top ?? DEFAULT_TOP_LIST
   const next = clampTopList({ ...cur, ...v })
+  // An alias the matchers cannot read back as this product would make every
+  // comment served under it invisible to the scan - refused, not stored.
+  const bad = next.aliases.filter((a) => !aliasMatchesProduct(a, product))
+  if (bad.length) {
+    throw new Error(
+      `Not a spelling of ${product}: ${bad.join(', ')}. Use letters that look like ` +
+        `"${product}" (Greek/Cyrillic lookalikes, capitals, spaces or hyphens are fine).`
+    )
+  }
   await pool.query(
     `INSERT INTO product_comment_setting
-       (product, word_min, word_max, top_enabled, top_count, top_rank, top_days, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+       (product, word_min, word_max, top_enabled, top_count, top_rank, top_days, top_aliases, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
      ON CONFLICT (product) DO UPDATE SET
        top_enabled = EXCLUDED.top_enabled,
        top_count   = EXCLUDED.top_count,
        top_rank    = EXCLUDED.top_rank,
        top_days    = EXCLUDED.top_days,
+       top_aliases = EXCLUDED.top_aliases,
        updated_at  = now()`,
-    [product, COMMENT_WORD_MIN, COMMENT_WORD_MAX, next.enabled, next.count, next.rank, next.days]
+    [product, COMMENT_WORD_MIN, COMMENT_WORD_MAX, next.enabled, next.count, next.rank, next.days,
+     next.aliases]
   )
   // Saving is also the admin's "recompute": the list is cached for a couple of
   // minutes, and a save is exactly when they want to see today's numbers.
@@ -7849,7 +7895,7 @@ export async function getUserPendingPayments(userId: string): Promise<PendingPay
     // Comment pay: counts comments after the effective reset AND after the last
     // time the admin marked this user's comment pay as paid.
     pool.query<{ n: number }>(
-      `SELECT COALESCE(SUM(cs.count), 0)::int AS n
+      `SELECT COALESCE(SUM(cs.count), 0)::float8 AS n
          FROM commented_submission cs
          LEFT JOIN user_reset ur ON ur.user_id = cs.user_id
          LEFT JOIN comment_pay_marker cpm ON cpm.user_id = cs.user_id
@@ -8683,7 +8729,7 @@ export async function getAllPendingPay(): Promise<Record<string, PendingPayments
   const resetAt = await getResetAt()
   const [commented, video, promo, accounts, status, referrals] = await Promise.all([
     pool.query<{ user_id: string; n: number }>(
-      `SELECT cs.user_id, COALESCE(SUM(cs.count), 0)::int AS n
+      `SELECT cs.user_id, COALESCE(SUM(cs.count), 0)::float8 AS n
          FROM commented_submission cs
          LEFT JOIN user_reset ur ON ur.user_id = cs.user_id
          LEFT JOIN comment_pay_marker cpm ON cpm.user_id = cs.user_id
@@ -9659,7 +9705,7 @@ export async function getAdminData(
         [resetAt]
       ),
       pool.query(
-        `SELECT cs.user_id, cs.platform, COALESCE(SUM(cs.count), 0)::int AS n
+        `SELECT cs.user_id, cs.platform, COALESCE(SUM(cs.count), 0)::float8 AS n
          FROM commented_submission cs LEFT JOIN user_reset ur ON ur.user_id = cs.user_id
          WHERE cs.submitted_at >= GREATEST($1::timestamptz, COALESCE(ur.reset_at, $1::timestamptz))
          GROUP BY cs.user_id, cs.platform`,
@@ -9686,7 +9732,7 @@ export async function getAdminData(
            FROM user_profile`
       ),
       pool.query(
-        `SELECT cs.user_id, cs.submitted_at::date::text AS day, COALESCE(SUM(cs.count), 0)::int AS n
+        `SELECT cs.user_id, cs.submitted_at::date::text AS day, COALESCE(SUM(cs.count), 0)::float8 AS n
          FROM commented_submission cs LEFT JOIN user_reset ur ON ur.user_id = cs.user_id
          WHERE cs.submitted_at >= GREATEST($1::timestamptz, COALESCE(ur.reset_at, $1::timestamptz))
          GROUP BY cs.user_id, day ORDER BY day`,
