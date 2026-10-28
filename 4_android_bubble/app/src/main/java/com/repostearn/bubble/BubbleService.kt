@@ -379,7 +379,13 @@ class BubbleService : Service() {
             } catch (e: Exception) {
                 null
             }
-            val commentText = serverComment ?: fallback?.text
+            // The cached pool ONLY when the server could not answer. A server that
+            // answered with no comment means there is none for this video's genre
+            // (its products are switched off) — and the cached pool is other
+            // genres' comments, which is how humanizer lines went under slides
+            // videos. Nothing is copied then, and the bubble says so.
+            val serverDown = code == -1 || code >= 500
+            val commentText = serverComment ?: if (serverDown) fallback?.text else null
             ui.post {
                 when (code) {
                     401 -> { promptSignIn(); unlock() }
@@ -406,6 +412,12 @@ class BubbleService : Service() {
                         urlView?.text = item.url
                         showCheckResult(null) // the old verdict was about the previous link
                         refreshCounter()
+                        if (commentText.isNullOrBlank()) {
+                            // Cleared, so the PREVIOUS video's comment cannot be
+                            // pasted here by mistake.
+                            clearClipboard()
+                            showCheckResult("⚠ No comment for this video — don't comment, tap Next ▶")
+                        }
                         copyCommentThen(commentText) { openUrl(item.url) }
                         // The click is recorded and the link is open: the
                         // operation is over, so the guard comes off immediately.
@@ -981,6 +993,20 @@ class BubbleService : Service() {
     // honored on Android 10+ while our window has focus, so we briefly flip the
     // bubble to focusable, write, revert, and only then continue (the link opens
     // after the comment is set).
+    /** Empty the clipboard (best effort; needs the same brief focus as a write). */
+    private fun clearClipboard() {
+        val v = view ?: return
+        params.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+        runCatching { wm.updateViewLayout(v, params) }
+        runCatching {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            if (android.os.Build.VERSION.SDK_INT >= 28) cm.clearPrimaryClip()
+            else cm.setPrimaryClip(ClipData.newPlainText("comment", ""))
+        }
+        params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        runCatching { wm.updateViewLayout(v, params) }
+    }
+
     private fun copyCommentThen(text: String?, after: () -> Unit) {
         val v = view
         if (text.isNullOrBlank() || v == null) { after(); return }

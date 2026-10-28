@@ -1,3 +1,5 @@
+import { genreOfUrl } from '@/lib/videos'
+import { PRODUCT_GENRE, DEFAULT_GENRE } from '@/lib/config'
 import { NextRequest, NextResponse } from 'next/server'
 import { isTiktokVerified } from '@/lib/profileGate'
 import { userIdFromApp } from '@/lib/appAuth'
@@ -82,8 +84,16 @@ export async function POST(req: NextRequest) {
     }
 
     // Only choose when the client didn't already serve something itself.
+    // A product the CLIENT chose is kept only if it is in the link's own genre.
+    // An older client picked from every active product, so a slides video could
+    // come back "served purifytext"; that attribution is dropped (no product)
+    // rather than counted as humanizer work on a slides link.
+    const sameGenre =
+      !!clientProduct &&
+      (PRODUCT_GENRE[clientProduct] ?? DEFAULT_GENRE) ===
+        (await genreOfUrl(url).catch(() => DEFAULT_GENRE))
     const served: { product: string | null; comment: string | null } = clientProduct
-      ? { product: clientProduct, comment: null }
+      ? { product: sameGenre ? clientProduct : null, comment: null }
       : await serveCommentForUrl(url).catch(() => ({ product: null, comment: null }))
 
     await recordClick(userId, url, searchQuery, platform, served.product, served.comment)

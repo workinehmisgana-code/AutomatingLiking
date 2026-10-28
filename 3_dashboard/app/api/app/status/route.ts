@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { userIdFromApp } from '@/lib/appAuth'
 import {
   getGenreMix,
+  getUserPausedGenres,
   getHourlyClickTimes,
   getTodayClickCountsByPlatform,
   getUserNameEmail,
@@ -18,7 +19,8 @@ import { loadVideosJson, retiredUrlSet } from '@/lib/videos'
 import {
   genreOfRow,
   isGenre,
-  genreWeights, HOURLY_LINK_LIMIT, HOURLY_WINDOW_MS, RETIRE_AFTER_USERS, SHOW_CLICKED_TODAY } from '@/lib/config'
+  genreWeights,
+  withoutGenres, HOURLY_LINK_LIMIT, HOURLY_WINDOW_MS, RETIRE_AFTER_USERS, SHOW_CLICKED_TODAY } from '@/lib/config'
 import { ensureGenreRegistry } from '@/lib/genreStore'
 
 export const dynamic = 'force-dynamic'
@@ -76,9 +78,15 @@ export async function GET(req: NextRequest) {
   // ?genre=<g>: the same one-genre view the links route gives (the Comment
   // Tester), so its counts match what it is actually served.
   const onlyGenre = req.nextUrl.searchParams.get('genre')
-  const genreMix = onlyGenre && isGenre(onlyGenre)
-    ? { [onlyGenre]: 1 }
-    : genreWeights(await getGenreMix().catch(() => null))
+  // MINUS THIS WORKER'S PAUSED GENRES: the comment check found too few of their
+  // comments on those links while another genre's were fine (noCommentVerdict),
+  // so the other genres fill their list instead.
+  const genreMix = withoutGenres(
+    onlyGenre && isGenre(onlyGenre)
+      ? { [onlyGenre]: 1 }
+      : genreWeights(await getGenreMix().catch(() => null)),
+    await getUserPausedGenres(userId).catch(() => [])
+  )
   const avail: Record<string, number> = {}
   for (const v of videos) {
     if (!v.url || !v.url.startsWith('http') || hidden.has(v.url)) continue

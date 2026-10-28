@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { isAdminEmail } from '@/lib/config'
+import { isAdminEmail, BLOCK_RULE_DEFAULTS, type BlockRules } from '@/lib/config'
 import {
   getUserProfile,
   dbNow,
@@ -16,7 +16,9 @@ import {
   RATIO_SAMPLE,
   RECENT_SAMPLE,
   noCommentVerdict,
+  verdictFigures,
   scoreUserRecent,
+  type GenreVerdict,
   handleFromProfile,
   tally,
 } from '@/lib/commentPresence'
@@ -160,12 +162,7 @@ export async function POST(req: NextRequest) {
     // The thresholds this check ran under. Reported, because they are settable and
     // a report that quotes the defaults would be wrong the moment somebody
     // changes one.
-    let rulesUsed = {
-      on: true,
-      sample: BLOCK_SAMPLE,
-      ratioSample: RATIO_SAMPLE,
-      ratioMinPct: RATIO_MIN_PCT,
-    }
+    let rulesUsed: BlockRules = { ...BLOCK_RULE_DEFAULTS }
     // THE RATE RULE'S OWN NUMBERS. The percentage at the top of the report is over
     // whatever this check managed to judge — 24 of 269, say — and the rule reads a
     // FIXED window, the newest 200 judged. Those are different denominators and
@@ -174,6 +171,9 @@ export async function POST(req: NextRequest) {
     // number leaves "why was this person not blocked" unanswerable on the screen
     // where it is asked.
     let ruleRate: { judged: number; found: number; pct: number } | null = null
+    // The genre rule's reading, for the report: each genre's rate and which
+    // genres this check paused (no longer served to them) or lifted.
+    let genres: GenreVerdict | null = null
     if (r.remaining === 0) {
       if (!(await canBlock(userId))) {
         // WHICH ONE, because they mean opposite things to whoever pressed the
@@ -198,14 +198,10 @@ export async function POST(req: NextRequest) {
         ).catch(() => null)
         // What the verdict was reached under, so the report can name the numbers
         // rather than repeat the defaults back.
-        const applied = v?.rules ?? {
-          on: true,
-          sample: BLOCK_SAMPLE,
-          ratioSample: RATIO_SAMPLE,
-          ratioMinPct: RATIO_MIN_PCT,
-        }
+        const applied: BlockRules = v?.rules ?? { ...BLOCK_RULE_DEFAULTS }
         rulesUsed = applied
         ruleRate = v?.ratio ?? null
+        genres = v?.genres ?? null
         // A HIT NO LONGER ENDS IT. It clears the first rule and the second one
         // still has something to say: a comment on one link in two hundred is a
         // comment, and it is not a day's work.
@@ -231,17 +227,17 @@ export async function POST(req: NextRequest) {
               'Your account has been paused. Please contact the admin.'
             ).catch(() => {})
             blocked = {
-              judged: v.rule === 'ratio' ? (v.ratio?.judged ?? 0) : v.judged,
+              judged: verdictFigures(v).judged,
               skipped: v.skipped,
               rule: v.rule,
-              pct: v.ratio?.pct ?? null,
+              pct: verdictFigures(v).pct,
             }
           } else {
             blockNote =
               `the rule says block (${
-                v.rule === 'ratio'
-                  ? `${v.ratio?.pct ?? 0}% of ${v.ratio?.judged ?? 0} judged`
-                  : `0 of ${v.judged} judged`
+                v.rule === 'empty'
+                  ? `0 of ${v.judged} judged`
+                  : `${verdictFigures(v).pct ?? 0}% of ${verdictFigures(v).judged} judged`
               }) but the block could not be written — try again, or block them from their row`
           }
         } else if (v && !applied.on) {
@@ -250,6 +246,21 @@ export async function POST(req: NextRequest) {
           // to look like.
           blockNote =
             'not blocked — auto-blocking is switched off in the admin settings'
+        } else if (v?.genres?.anyPassing) {
+          // KEPT ON THE GENRES THEY DO COMMENT ON. Said in full, because the
+          // header percentage can be low and the admin has to see why nobody
+          // was blocked.
+          const g = v.genres
+          const ok = g.rates.filter((r) => r.scored && !r.below)
+          blockNote =
+            `not blocked — ${ok.map((r) => `${r.genre} ${r.pct}% of ${r.judged}`).join(', ')} ` +
+            `meet the ${applied.genreMinPct}% genre rule` +
+            (g.paused.length
+              ? `; links paused for ${g.rates
+                  .filter((r) => g.paused.includes(r.genre))
+                  .map((r) => `${r.genre} (${r.pct}% of ${r.judged})`)
+                  .join(', ')}`
+              : '')
         } else if (v) {
           // WHY NOT, in the terms of whichever rule came closest. Both have to be
           // answerable, or a 0% report that blocks nobody looks like a bug.
@@ -293,6 +304,9 @@ export async function POST(req: NextRequest) {
       // What the auto-block rule did, and when it did nothing, why — a button
       // that can block somebody must never be silent about not having.
       ruleRate,
+      genres,
+      genreMinPct: rulesUsed.genreMinPct,
+      genreSample: rulesUsed.genreSample,
       blockSample: rulesUsed.sample,
       ratioSample: rulesUsed.ratioSample,
       ratioMinPct: rulesUsed.ratioMinPct,

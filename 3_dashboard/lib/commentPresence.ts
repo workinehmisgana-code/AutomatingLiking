@@ -16,6 +16,7 @@ import {
   BLOCK_RULE_BOUNDS,
   BLOCK_RULE_DEFAULTS,
   clampRule,
+  genreOfProduct,
   type BlockRules,
 } from './config'
 import {
@@ -26,8 +27,11 @@ import {
   getRecentClickedLinks,
   getJudgedVerdicts,
   getRecentJudgedRate,
+  getRecentJudgedByProduct,
+  setGenrePauses,
   recordTiktokAccount,
 } from './db'
+import { ensureGenreRegistry } from './genreStore'
 
 
 /**
@@ -440,14 +444,78 @@ export interface BlockVerdict {
   /**
    * Which rule decided it, so a report can say why rather than just "blocked".
    *
-   *   empty  nothing found on BLOCK_SAMPLE judged links
-   *   ratio  under RATIO_MIN_PCT% of RATIO_SAMPLE judged links
+   *   empty   nothing found on BLOCK_SAMPLE judged links
+   *   ratio   under RATIO_MIN_PCT% of RATIO_SAMPLE judged links
+   *   genres  under genreMinPct% in every genre they have enough judged links in
    */
-  rule?: 'empty' | 'ratio'
+  rule?: 'empty' | 'ratio' | 'genres'
+  /**
+   * The genre rule's reading: each genre's rate over their recent judged links,
+   * and which genres it paused or lifted. A genre under the threshold while
+   * another is above it is paused — not served to them — rather than blocked.
+   */
+  genres?: GenreVerdict
   /** The rate over their last RATIO_SAMPLE judged links, when it could be read. */
   ratio?: { judged: number; found: number; pct: number } | null
   /** The thresholds this verdict was reached under, for the report. */
   rules?: BlockRules
+}
+
+export interface GenreRate {
+  genre: string
+  judged: number
+  found: number
+  pct: number
+  /** Enough judged links for the rule to speak about this genre. */
+  scored: boolean
+  /** Scored and under the threshold. */
+  below: boolean
+}
+
+export interface GenreVerdict {
+  rates: GenreRate[]
+  /** Genres paused by this verdict (not served to the worker from now on). */
+  paused: string[]
+  /** Genres that recovered, so their pause was lifted. */
+  lifted: string[]
+  /** At least one scored genre is at or above the threshold. */
+  anyPassing: boolean
+}
+
+/**
+ * The numbers a block is reported with, by the rule that made it: the rate
+ * rule's window, the genre rule's scored genres together, or the empty rule's
+ * judged count.
+ */
+export function verdictFigures(v: BlockVerdict): { judged: number; pct: number | null } {
+  if (v.rule === 'ratio') return { judged: v.ratio?.judged ?? 0, pct: v.ratio?.pct ?? null }
+  if (v.rule === 'genres') {
+    const s = (v.genres?.rates ?? []).filter((r) => r.scored)
+    const judged = s.reduce((a, r) => a + r.judged, 0)
+    const found = s.reduce((a, r) => a + r.found, 0)
+    return { judged, pct: judged > 0 ? Math.round((100 * found) / judged) : 0 }
+  }
+  return { judged: v.judged, pct: v.ratio?.pct ?? null }
+}
+
+/** This worker's recent rate in each genre, from the ledger (no TikTok reads). */
+async function genreRates(userId: string, rules: BlockRules): Promise<GenreRate[]> {
+  // Custom genres' products have to be known before genreOfProduct can place them.
+  await ensureGenreRegistry().catch(() => {})
+  const rows = await getRecentJudgedByProduct(userId, RATIO_POOL).catch(() => [])
+  const by = new Map<string, { judged: number; found: number }>()
+  for (const r of rows) {
+    const g = genreOfProduct(r.product)
+    const e = by.get(g) ?? { judged: 0, found: 0 }
+    e.judged += r.judged
+    e.found += r.found
+    by.set(g, e)
+  }
+  return Array.from(by.entries()).map(([genre, e]) => {
+    const pct = e.judged > 0 ? Math.round((100 * e.found) / e.judged) : 0
+    const scored = e.judged >= rules.genreSample
+    return { genre, judged: e.judged, found: e.found, pct, scored, below: scored && pct < rules.genreMinPct }
+  })
 }
 
 /**
@@ -484,12 +552,7 @@ export async function noCommentVerdict(
   // caller, so the cron, the manual sweep and the verify button cannot be running
   // three different rules — which is exactly what happened while the sweep took a
   // field for the sample and the other two used the constant.
-  const rules = await getBlockRules().catch(() => ({
-    on: true,
-    sample: BLOCK_SAMPLE,
-    ratioSample: RATIO_SAMPLE,
-    ratioMinPct: RATIO_MIN_PCT,
-  }))
+  const rules = await getBlockRules().catch(() => ({ ...BLOCK_RULE_DEFAULTS }))
   // OFF MEANS OFF, for every rule and every caller. A switch that only stopped
   // the cron would be worse than none.
   if (!rules.on) return { ...empty, rules }
@@ -556,9 +619,36 @@ export async function noCommentVerdict(
     if (verdicts.length < slice.length) break
   }
 
+  // ── the genre rule, read first because it can overrule the other two ───
+  //
+  // ONE GENRE GOOD IS NOT A BLOCK. A worker who comments on the humanizer links
+  // and not on the slides ones is doing the job on humanizer: they stop being
+  // given slides links, and keep the rest. Only when EVERY genre with enough
+  // judged links is under the threshold does the rule block — and then neither
+  // of the older rules is needed to say so.
+  const rates = await genreRates(userId, rules).catch(() => [] as GenreRate[])
+  const scored = rates.filter((r) => r.scored)
+  const anyPassing = scored.some((r) => !r.below)
+  const genres: GenreVerdict = { rates, paused: [], lifted: [], anyPassing }
+  if (scored.length > 0 && !anyPassing) {
+    return { judged, found, skipped, block: true, rule: 'genres', genres, rules }
+  }
+  // Some genre is good: pause the bad ones and lift any that recovered. A
+  // genre too small to score keeps whatever it had — a paused genre gets no new
+  // links, so waiting for fresh evidence on it would wait for ever; the admin
+  // lifts it from the user's row.
+  if (anyPassing) {
+    const pause = scored.filter((r) => r.below)
+    const lift = scored.filter((r) => !r.below).map((r) => r.genre)
+    await setGenrePauses(userId, pause, lift).catch(() => {})
+    genres.paused = pause.map((r) => r.genre)
+    genres.lifted = lift
+  }
+
   // ── rule one: nothing at all on a sample of links ──────────────────────
-  if (judged >= need && found === 0) {
-    return { judged, found, skipped, block: true, rule: 'empty', rules }
+  // Not while a genre passes: the newest links can all be one bad genre's.
+  if (judged >= need && found === 0 && !anyPassing) {
+    return { judged, found, skipped, block: true, rule: 'empty', genres, rules }
   }
 
   // ── rule two: something, but almost nothing ────────────────────────────
@@ -569,8 +659,12 @@ export async function noCommentVerdict(
   const ratio = await getRecentJudgedRate(userId, rules.ratioSample, RATIO_POOL).catch(
     () => null
   )
-  if (ratio && ratio.judged >= rules.ratioSample && ratio.pct < rules.ratioMinPct) {
-    return { judged, found, skipped, block: true, rule: 'ratio', ratio, rules }
+  // Not while a genre passes, for the same reason: the overall rate is dragged
+  // down by the genre that is now paused, and the genre that is fine is work.
+  if (
+    ratio && ratio.judged >= rules.ratioSample && ratio.pct < rules.ratioMinPct && !anyPassing
+  ) {
+    return { judged, found, skipped, block: true, rule: 'ratio', ratio, genres, rules }
   }
-  return { judged, found, skipped, block: false, ratio, rules }
+  return { judged, found, skipped, block: false, ratio, genres, rules }
 }

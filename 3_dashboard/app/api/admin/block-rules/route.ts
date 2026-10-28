@@ -44,6 +44,8 @@ export async function POST(req: NextRequest) {
     sample?: unknown
     ratioSample?: unknown
     ratioMinPct?: unknown
+    genreMinPct?: unknown
+    genreSample?: unknown
   }
   try {
     // Clamping happens in saveBlockRules, and an omitted field means UNCHANGED —
@@ -54,6 +56,8 @@ export async function POST(req: NextRequest) {
       sample: body.sample as number | undefined,
       ratioSample: body.ratioSample as number | undefined,
       ratioMinPct: body.ratioMinPct as number | undefined,
+      genreMinPct: body.genreMinPct as number | undefined,
+      genreSample: body.genreSample as number | undefined,
     })
     return NextResponse.json({ ok: true, rules, bounds: BLOCK_RULE_BOUNDS })
   } catch (e) {

@@ -16,6 +16,7 @@ import {
   scoreUserDay,
   handleFromProfile,
   noCommentVerdict,
+  verdictFigures,
   clampBlockSample,
   BLOCK_SAMPLE,
   MIN_BLOCK_SAMPLE,
@@ -156,9 +157,9 @@ export async function POST(req: NextRequest) {
           // 10% of 200, which catches the person the first rule cannot — one
           // comment anywhere clears it.
           blocked = {
-            judged: v.rule === 'ratio' ? (v.ratio?.judged ?? 0) : v.judged,
+            judged: verdictFigures(v).judged,
             rule: v.rule,
-            pct: v.ratio?.pct ?? null,
+            pct: verdictFigures(v).pct,
           }
         }
       }

@@ -18,8 +18,27 @@ export const maxDuration = 60
 // the same thing without impersonating an admin over HTTP.
 export async function POST(req: NextRequest) {
   const session = await auth.api.getSession({ headers: await headers() })
-  if (!isAdminEmail(session?.user?.email)) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  // TWO DIFFERENT REFUSALS, said differently. A bare "Forbidden" covered both
+  // "this request carried no live sign-in" (a session that ended while the tab
+  // stayed open — fixed by reloading) and "signed in, but not as the admin" —
+  // and the admin could not tell which one they had hit.
+  if (!session) {
+    return NextResponse.json(
+      {
+        error:
+          'Your sign-in was not recognised for this request (the session may have ended while ' +
+          'the page was open). Reload the page — sign in again if asked — then merge again. ' +
+          'Nothing was merged.',
+        signedOut: true,
+      },
+      { status: 401 }
+    )
+  }
+  if (!isAdminEmail(session.user.email)) {
+    return NextResponse.json(
+      { error: `Signed in as ${session.user.email}, which is not the admin account. Nothing was merged.` },
+      { status: 403 }
+    )
   }
   if (!process.env.BLOB_READ_WRITE_TOKEN) {
     return NextResponse.json({ error: 'BLOB_READ_WRITE_TOKEN is not set on the server.' }, { status: 500 })

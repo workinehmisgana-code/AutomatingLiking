@@ -3796,6 +3796,142 @@ export async function getRecentJudgedRate(
 }
 
 /**
+ * Judged links and comments found over the user's newest `pool_` TikTok clicks,
+ * BY PRODUCT — the genre rule folds these into genres (genreOfProduct).
+ *
+ * The same window and the same ledger as getRecentJudgedRate, so the per-genre
+ * numbers add up to the same kind of figure. A click with no product (one made
+ * before products were recorded) has no genre and is left out.
+ */
+export async function getRecentJudgedByProduct(
+  userId: string,
+  pool_ = 500
+): Promise<{ product: string; judged: number; found: number }[]> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ product: string; judged: string; found: string }>(
+    `WITH r AS (
+       SELECT c.url, c.clicked_at::date AS day, c.product,
+              row_number() OVER (ORDER BY c.clicked_at DESC) AS rn
+         FROM clicked_link c
+        WHERE c.user_id = $1 AND c.url ILIKE '%tiktok.com%'
+     )
+     SELECT r.product, count(*) AS judged, count(*) FILTER (WHERE l.found) AS found
+       FROM r
+       JOIN comment_presence_link l
+         ON l.user_id = $1 AND l.url = r.url AND l.day = r.day
+      WHERE r.rn <= $2 AND l.judgeable AND r.product IS NOT NULL AND r.product <> ''
+      GROUP BY r.product`,
+    [userId, Math.max(1, Math.min(2000, pool_))]
+  )
+  return rows.map((r) => ({ product: r.product, judged: Number(r.judged), found: Number(r.found) }))
+}
+
+// ── Genres paused for one worker ──────────────────────────────────────────
+//
+// The genre rule's milder outcome: a worker whose comments are missing on one
+// genre's links but present on another's keeps working, on the genres they do
+// comment on. One row per (user, genre) paused, with the numbers that paused it
+// so the admin can see why. Lifted by the check when the genre recovers, or by
+// the admin from the user's row.
+let ensuredGenrePause: Promise<void> | null = null
+
+export function ensureGenrePauseTable(): Promise<void> {
+  if (!ensuredGenrePause) {
+    ensuredGenrePause = pool
+      .query(`
+        CREATE TABLE IF NOT EXISTS user_genre_pause (
+          user_id   TEXT NOT NULL,
+          genre     TEXT NOT NULL,
+          pct       INTEGER NOT NULL DEFAULT 0,
+          judged    INTEGER NOT NULL DEFAULT 0,
+          found     INTEGER NOT NULL DEFAULT 0,
+          paused_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (user_id, genre)
+        );
+      `)
+      .then(() => undefined)
+      .catch((e) => {
+        ensuredGenrePause = null
+        throw e
+      })
+  }
+  return ensuredGenrePause
+}
+
+export interface GenrePause {
+  genre: string
+  pct: number
+  judged: number
+  found: number
+  pausedAt: string
+}
+
+/**
+ * The genres this worker is not served. A test account is never paused,
+ * whatever the table says — the same guarantee autoBlockStatus gives it.
+ */
+export async function getUserPausedGenres(userId: string): Promise<string[]> {
+  if (await isTestUser(userId).catch(() => false)) return []
+  await ensureGenrePauseTable()
+  const { rows } = await pool.query<{ genre: string }>(
+    'SELECT genre FROM user_genre_pause WHERE user_id = $1',
+    [userId]
+  )
+  return rows.map((r) => r.genre)
+}
+
+/** Every worker's paused genres, for the admin list. */
+export async function getAllGenrePauses(): Promise<Record<string, GenrePause[]>> {
+  await ensureGenrePauseTable()
+  const { rows } = await pool.query<{
+    user_id: string; genre: string; pct: number; judged: number; found: number; paused_at: Date
+  }>('SELECT user_id, genre, pct, judged, found, paused_at FROM user_genre_pause ORDER BY genre')
+  const out: Record<string, GenrePause[]> = {}
+  for (const r of rows) {
+    ;(out[r.user_id] ??= []).push({
+      genre: r.genre, pct: r.pct, judged: r.judged, found: r.found,
+      pausedAt: r.paused_at.toISOString(),
+    })
+  }
+  return out
+}
+
+/** Pause these genres (numbers refreshed if already paused) and lift those. */
+export async function setGenrePauses(
+  userId: string,
+  pause: { genre: string; pct: number; judged: number; found: number }[],
+  lift: string[]
+): Promise<void> {
+  await ensureGenrePauseTable()
+  if (pause.length > 0) {
+    await pool.query(
+      `INSERT INTO user_genre_pause (user_id, genre, pct, judged, found)
+       SELECT $1, g, p, j, f FROM unnest($2::text[], $3::int[], $4::int[], $5::int[]) AS x(g, p, j, f)
+       ON CONFLICT (user_id, genre) DO UPDATE
+         SET pct = EXCLUDED.pct, judged = EXCLUDED.judged, found = EXCLUDED.found`,
+      [userId, pause.map((x) => x.genre), pause.map((x) => x.pct),
+       pause.map((x) => x.judged), pause.map((x) => x.found)]
+    )
+  }
+  if (lift.length > 0) {
+    await pool.query(
+      'DELETE FROM user_genre_pause WHERE user_id = $1 AND genre = ANY($2::text[])',
+      [userId, lift]
+    )
+  }
+}
+
+/** The admin's lift: one genre, or every genre when `genre` is omitted. */
+export async function liftGenrePause(userId: string, genre?: string): Promise<void> {
+  await ensureGenrePauseTable()
+  if (genre) {
+    await pool.query('DELETE FROM user_genre_pause WHERE user_id = $1 AND genre = $2', [userId, genre])
+  } else {
+    await pool.query('DELETE FROM user_genre_pause WHERE user_id = $1', [userId])
+  }
+}
+
+/**
  * Verdicts already in the ledger for these exact (day, url) pairs.
  *
  * `freshSince` drops anything judged before that instant, so a caller can treat
@@ -3827,7 +3963,8 @@ export async function getBlockRules(): Promise<BlockRules> {
   const { rows } = await pool
     .query<{ key: string; value: string }>(
       `SELECT key, value FROM app_kv
-        WHERE key IN ('block_on', 'block_sample', 'block_ratio_sample', 'block_ratio_pct')`
+        WHERE key IN ('block_on', 'block_sample', 'block_ratio_sample', 'block_ratio_pct',
+                      'block_genre_pct', 'block_genre_sample')`
     )
     .catch(() => ({ rows: [] as { key: string; value: string }[] }))
   const kv = new Map(rows.map((r) => [r.key, r.value]))
@@ -3838,6 +3975,8 @@ export async function getBlockRules(): Promise<BlockRules> {
     sample: clampRule(kv.get('block_sample'), 'sample'),
     ratioSample: clampRule(kv.get('block_ratio_sample'), 'ratioSample'),
     ratioMinPct: clampRule(kv.get('block_ratio_pct'), 'ratioMinPct'),
+    genreMinPct: clampRule(kv.get('block_genre_pct'), 'genreMinPct'),
+    genreSample: clampRule(kv.get('block_genre_sample'), 'genreSample'),
   }
 }
 
@@ -3856,12 +3995,22 @@ export async function saveBlockRules(v: Partial<BlockRules>): Promise<BlockRules
       v.ratioMinPct === undefined
         ? current.ratioMinPct
         : clampRule(v.ratioMinPct, 'ratioMinPct'),
+    genreMinPct:
+      v.genreMinPct === undefined
+        ? current.genreMinPct
+        : clampRule(v.genreMinPct, 'genreMinPct'),
+    genreSample:
+      v.genreSample === undefined
+        ? current.genreSample
+        : clampRule(v.genreSample, 'genreSample'),
   }
   const pairs: [string, string][] = [
     ['block_on', next.on ? '1' : '0'],
     ['block_sample', String(next.sample)],
     ['block_ratio_sample', String(next.ratioSample)],
     ['block_ratio_pct', String(next.ratioMinPct)],
+    ['block_genre_pct', String(next.genreMinPct)],
+    ['block_genre_sample', String(next.genreSample)],
   ]
   await pool.query(
     `INSERT INTO app_kv (key, value, updated_at)

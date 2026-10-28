@@ -2,7 +2,9 @@ import { NextResponse, type NextRequest } from 'next/server'
 import {
   buildAdminLinks,
   filterAdminLinks,
-  sortAdminLinks,
+  sortByCluster,
+  clusterOf,
+  clusterPosOf,
   type LinkQuery,
   type ClusterBy,
 } from '@/lib/adminLinks'
@@ -78,7 +80,11 @@ export async function GET(req: NextRequest) {
 
   try {
     const built = await buildAdminLinks(qy.product ?? '')
-    let matched = sortAdminLinks(filterAdminLinks(built.rows, qy, built.retirePlatforms), qy)
+    // CLUSTER, THEN POSITION INSIDE IT — the order the likers work in. The
+    // admin list's own order is not that (it is whatever the page sorted by),
+    // and the cut to `limit` below happens AFTER this, so a capped run takes
+    // the best links rather than an arbitrary slice of them.
+    let matched = sortByCluster(filterAdminLinks(built.rows, qy, built.retirePlatforms), clusterBy)
 
     // withoutOurs=1 — only links that carry NONE of our comments.
     //
@@ -130,12 +136,9 @@ export async function GET(req: NextRequest) {
         // ceiling simply cannot be computed. It is already loaded here, so
         // sending it costs nothing and saves the caller a scrape.
         likes: l.like_count,
-        cluster:
-          clusterBy === 'rank'
-            ? l.rankCluster
-            : clusterBy === 'date'
-              ? l.dateCluster
-              : l.combinedCluster,
+        cluster: clusterOf(l, clusterBy),
+        // Where it sits inside that cluster, 1 = best; the order above.
+        pos: clusterPosOf(l, clusterBy),
         category: l.category,
         clicks: l.clicks,
       })),

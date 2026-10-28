@@ -47,6 +47,7 @@ import {
   getReferralEarnings,
   getReferralOf,
   getGenreMix,
+  getUserPausedGenres,
 } from '@/lib/db'
 import { retiredUrlSet } from '@/lib/videos'
 import { buildUserFeed, FEED_PER_PLATFORM } from '@/lib/userFeed'
@@ -54,8 +55,10 @@ import { BROKEN_AFTER_MISSES } from '@/lib/linkStats'
 import { DEFAULT_DATE_SHARE } from '@/lib/clusterMix'
 import {
   genreWeights,
+  withoutGenres,
   isAdminEmail,
   SHOW_CLICKED_TODAY,
+  SHOW_OTHER_TASKS,
   VERIFY_VIDEO_URL,
   VERIFY_GATE_ENABLED,
   repairRowPlatform,
@@ -277,7 +280,13 @@ export default async function Home() {
   const alreadyOpened = onlyClean ? sessionClicks : clickedUrls
   // How much of this worker's list each genre gets. Read here rather than
   // inside buildUserFeed so the feed stays a pure function of what it is given.
-  const genreMix = genreWeights(await getGenreMix().catch(() => null))
+  // MINUS THIS WORKER'S PAUSED GENRES: the comment check found too few of their
+  // comments on those links while another genre's were fine (noCommentVerdict),
+  // so the other genres fill their list instead.
+  const genreMix = withoutGenres(
+    genreWeights(await getGenreMix().catch(() => null)),
+    await getUserPausedGenres(session.user.id).catch(() => [])
+  )
   const { served, remaining } = buildUserFeed(
     videos,
     new Set([...alreadyOpened, ...retiredUrls]),
@@ -315,6 +324,7 @@ export default async function Home() {
       paidNotice={paidNotice}
       apk={apk}
       showClickedToday={SHOW_CLICKED_TODAY}
+      showOtherTasks={SHOW_OTHER_TASKS}
       user={{
         name: session.user.name ?? '',
         email: session.user.email ?? '',

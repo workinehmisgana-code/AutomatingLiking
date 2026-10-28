@@ -46,6 +46,7 @@ import { rankChannels } from './channelRank'
 import { fetchChannelVideos, fetchVideoDetail } from './linkStats'
 import { classifyRelatedByGenre, type Item } from './titleClassify'
 import { mergeVerifyLinks } from './verifyMerge'
+import { urlsMatchingSpecs } from './autoMerge'
 import { loadVideosJson } from './videos'
 import {
   saveVerifyLinks,
@@ -97,6 +98,12 @@ export interface HarvestResult {
   untitled: number
   /** Channels whose listing came back empty. */
   failed: number
+  /**
+   * Staged links merged because their channel meets the genre's auto-merge
+   * spec (lib/autoMerge.ts) — new ones and ones waiting from before alike,
+   * with no related check.
+   */
+  specMerged: number
   /** Where the next run starts. */
   nextCursor: number
   /** True when this run wrapped past the end of the list. */
@@ -166,10 +173,24 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
     staged: 0,
     untitled: 0,
     failed: 0,
+    specMerged: 0,
     nextCursor: 0,
     wrapped: false,
   }
-  if (eligible.length === 0) return empty
+
+  // THE AUTO-MERGE SPECS. Every staged link of a channel meeting its genre's
+  // spec, whether staged by this pass, an earlier one or the Extract button.
+  // Read here, once, because the ranking is already in hand.
+  const spec = await urlsMatchingSpecs(ranked).catch(() => ({ urls: [] as string[] }))
+  const specUrls = new Set(spec.urls)
+  /** Merge just the spec's links, for the passes that find nothing new. */
+  const specOnly = async (): Promise<number> => {
+    if (specUrls.size === 0) return 0
+    const r = await mergeVerifyLinks({ urls: Array.from(specUrls) }).catch(() => null)
+    return r?.added ?? 0
+  }
+
+  if (eligible.length === 0) return { ...empty, specMerged: await specOnly() }
 
   const cursorRaw = Number(await getAppState(CURSOR_KEY).catch(() => null))
   let cursor = Number.isFinite(cursorRaw) && cursorRaw > 0 ? Math.floor(cursorRaw) : 0
@@ -255,7 +276,7 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
 
   if (rows.length === 0) {
     await setAppState(CURSOR_KEY, String(nextCursor)).catch(() => {})
-    return { ...empty, checked: reached - cursor, failed, nextCursor, wrapped }
+    return { ...empty, checked: reached - cursor, failed, nextCursor, wrapped, specMerged: await specOnly() }
   }
 
   // Stage everything first, exactly as the manual button does, so a crash
@@ -281,10 +302,22 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
     related = await classifyRelatedByGenre(titled).catch(() => [] as string[])
   }
 
+  // ONE MERGE for both reasons: the pool file is rewritten once per pass.
+  // This pass's new rows were staged above, so the spec's links are re-read to
+  // include any of them whose channel meets a spec.
+  const fresh = await urlsMatchingSpecs(ranked).catch(() => ({ urls: [] as string[] }))
+  fresh.urls.forEach((u) => specUrls.add(u))
+  const relatedSet = new Set(related)
+  const bySpec = Array.from(specUrls).filter((u) => !relatedSet.has(u))
   let merged = 0
-  if (related.length > 0) {
-    const res = await mergeVerifyLinks({ urls: related }).catch(() => null)
-    merged = res?.added ?? 0
+  let specMerged = 0
+  if (related.length > 0 || bySpec.length > 0) {
+    const res = await mergeVerifyLinks({ urls: [...related, ...bySpec] }).catch(() => null)
+    const added = res?.added ?? 0
+    // Attributed in proportion: the merge reports one total for the batch.
+    const total = related.length + bySpec.length
+    specMerged = total ? Math.round((added * bySpec.length) / total) : 0
+    merged = added - specMerged
   }
 
   await setAppState(CURSOR_KEY, String(nextCursor)).catch(() => {})
@@ -299,6 +332,7 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
     staged: rows.length - merged,
     untitled,
     failed,
+    specMerged,
     nextCursor,
     wrapped,
   }

@@ -150,6 +150,9 @@ export default function VerifyLinks({
   // Same per-channel active/blocked ratio the main Links page calculates — the
   // verify list is exactly where a bad channel is worth spotting before merging.
   const [channelStats, setChannelStats] = useState<Record<string, { active: number; blocked: number }> | null>(null)
+  // Why the Active % column is empty, when it is: still loading, or the request
+  // failed. It used to fail silently, which read as "no data" on every row.
+  const [statsState, setStatsState] = useState<'loading' | 'ok' | 'failed'>('loading')
 
   // ── Channel ranking + new-video extraction ─────────────────────────────────
   // Two steps on purpose: rank first so the order is visible and checkable, then
@@ -235,12 +238,17 @@ export default function VerifyLinks({
 
   // Loaded once with the page: it is the number that decides whether a channel is
   // worth merging at all, so making it opt-in here would just hide it.
-  useEffect(() => {
+  const loadChannelStats = useCallback(() => {
+    setStatsState('loading')
     fetch('/api/admin/links/channel-stats')
       .then((r) => (r.ok ? r.json() : null))
-      .then((d) => { if (d?.stats) setChannelStats(d.stats) })
-      .catch(() => {})
+      .then((d) => {
+        if (d?.stats) { setChannelStats(d.stats); setStatsState('ok') }
+        else setStatsState('failed')
+      })
+      .catch(() => setStatsState('failed'))
   }, [])
+  useEffect(() => { loadChannelStats() }, [loadChannelStats])
 
   // Channels matching the search box. Matching on the handle only (the counts
   // are not something you search for), case-insensitive substring.
@@ -961,6 +969,101 @@ export default function VerifyLinks({
     if (min !== null && Number.isFinite(min) && v < min) return false
     if (max !== null && Number.isFinite(max) && v > max) return false
     return true
+  }
+
+  // ── Auto-merge spec (lib/autoMerge.ts) ─────────────────────────────────────
+  // The filters above, saved per genre: every staged link of a channel meeting
+  // them is merged into the main links on each hourly harvest pass, with no
+  // related check. Shown and saved from under the ranked table.
+  type AmBound = [number | null, number | null]
+  interface AmSpec {
+    enabled: boolean
+    platform: '' | 'tiktok' | 'instagram' | 'youtube'
+    links: AmBound; hearts: AmBound; rate: AmBound; active: AmBound; last: AmBound; score: AmBound
+  }
+  const [amSpec, setAmSpec] = useState<AmSpec | null>(null)
+  const [amCover, setAmCover] = useState<{ links: number; channels: number } | null>(null)
+  const [amBusy, setAmBusy] = useState('')
+  const loadAutoMerge = useCallback(() => {
+    fetch('/api/admin/verify-links/auto-merge', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!d?.spec) return
+        setAmSpec(d.spec)
+        // Only a preview carries the count; a plain read leaves the last one.
+        if (d.links !== undefined) setAmCover({ links: Number(d.links) || 0, channels: Number(d.channels) || 0 })
+      })
+      .catch(() => {})
+  }, [])
+  const [amCounting, setAmCounting] = useState(false)
+  async function countAutoMerge() {
+    setAmCounting(true)
+    try {
+      const res = await fetch('/api/admin/verify-links/auto-merge?preview=1', { cache: 'no-store' })
+      const d = await res.json().catch(() => ({}))
+      if (res.ok && d?.spec) setAmCover({ links: Number(d.links) || 0, channels: Number(d.channels) || 0 })
+      else alert(d?.error || 'Could not count what the spec covers.')
+    } finally {
+      setAmCounting(false)
+    }
+  }
+  useEffect(() => { loadAutoMerge() }, [loadAutoMerge])
+
+  const toBound = ([lo, hi]: [string, string]): AmBound => [
+    lo.trim() === '' || !Number.isFinite(Number(lo)) ? null : Number(lo),
+    hi.trim() === '' || !Number.isFinite(Number(hi)) ? null : Number(hi),
+  ]
+  const fromBound = (b: AmBound): [string, string] => [b[0] === null ? '' : String(b[0]), b[1] === null ? '' : String(b[1])]
+  const specFromFilters = (enabled: boolean): AmSpec => ({
+    enabled,
+    platform: (rankSite as AmSpec['platform']) || '',
+    links: toBound(fLinks), hearts: toBound(fHearts), rate: toBound(fRate),
+    active: toBound(fActive), last: toBound(fLast), score: toBound(fScore),
+  })
+  const specText = (sp: AmSpec): string => {
+    const part = (label: string, [lo, hi]: AmBound, unit = '') =>
+      lo === null && hi === null ? '' : lo !== null && hi !== null ? `${label} ${lo}–${hi}${unit}`
+        : lo !== null ? `${label} ≥ ${lo}${unit}` : `${label} ≤ ${hi}${unit}`
+    return [
+      sp.platform ? sp.platform : '',
+      part('links', sp.links), part('avg hearts', sp.hearts), part('posts/day', sp.rate),
+      part('active', sp.active, '%'), part('last post', sp.last, 'd'), part('score', sp.score),
+    ].filter(Boolean).join(' · ') || 'no filters'
+  }
+  async function saveAutoMerge(spec: AmSpec, label: string) {
+    setAmBusy(label)
+    try {
+      const res = await fetch('/api/admin/verify-links/auto-merge', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ spec }),
+      })
+      const d = await res.json().catch(() => ({}))
+      if (!res.ok) { alert(d?.error || 'Could not save the auto-merge spec.'); return }
+      setAmSpec(d.spec)
+      setAmCover({ links: Number(d.links) || 0, channels: Number(d.channels) || 0 })
+    } finally {
+      setAmBusy('')
+    }
+  }
+  async function runAutoMerge() {
+    if (!confirm(
+      'Merge every staged link of the channels meeting the auto-merge spec now' +
+      (amCover ? ` (${amCover.links} link(s) from ${amCover.channels} channel(s))` : '') +
+      '? No related check.'
+    )) return
+    setAmBusy('run')
+    try {
+      const res = await fetch('/api/admin/verify-links/auto-merge', { method: 'POST' })
+      const d = await res.json().catch(() => ({}))
+      if (!res.ok) { alert(d?.error || 'Auto-merge failed.'); return }
+      alert(
+        `Merged ${d.added ?? 0} link(s) from ${d.channels ?? 0} channel(s) into the main list` +
+        (d.skippedBlocked ? `, skipped ${d.skippedBlocked} already-blocked` : '') +
+        ` (removed ${d.removed ?? 0} from verify).`
+      )
+      loadAutoMerge(); loadAccounts(); fetchPage(0)
+    } finally {
+      setAmBusy('')
+    }
   }
 
   const needle = rankQuery.trim().replace(/^@/, '').toLowerCase()
@@ -1968,6 +2071,79 @@ export default function VerifyLinks({
               </button>
             )}
           </div>
+          {/* AUTO-MERGE SPEC: these filters, saved for this genre. */}
+          <div className={`px-3 py-2.5 text-xs border-t border-zinc-800 ${amSpec?.enabled ? 'bg-emerald-950/20' : ''}`}>
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="flex items-center gap-1.5 text-zinc-200 font-medium cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="accent-emerald-500"
+                  checked={!!amSpec?.enabled}
+                  disabled={!amSpec || amBusy !== ''}
+                  onChange={(e) => amSpec && saveAutoMerge({ ...amSpec, enabled: e.target.checked }, 'toggle')}
+                />
+                Auto-merge channels meeting the spec
+              </label>
+              <span className="text-zinc-500">
+                ({GENRE_LABELS[genre] ?? genre}) spec: <span className="text-zinc-300">{amSpec ? specText(amSpec) : '…'}</span>
+              </span>
+              {amCover && amSpec ? (
+                <span className="text-zinc-500">
+                  · covers <span className="text-zinc-300 tabular-nums">{amCover.links.toLocaleString()}</span> staged
+                  link(s) from <span className="text-zinc-300 tabular-nums">{amCover.channels.toLocaleString()}</span> channel(s) now
+                </span>
+              ) : amSpec ? (
+                <button
+                  type="button"
+                  onClick={countAutoMerge}
+                  disabled={amCounting}
+                  className="text-zinc-400 hover:text-zinc-200 underline decoration-dotted disabled:opacity-50"
+                >
+                  {amCounting ? 'counting… (ranks every channel, up to a minute)' : 'count what it covers'}
+                </button>
+              ) : null}
+              <span className="ml-auto flex flex-wrap gap-1.5">
+                <button
+                  type="button"
+                  disabled={amBusy !== ''}
+                  onClick={() => saveAutoMerge(specFromFilters(!!amSpec?.enabled), 'save')}
+                  title="Save the site chip and the min/max filters above as this genre's auto-merge spec"
+                  className="text-zinc-200 border border-zinc-700 hover:bg-zinc-800 rounded px-2 py-0.5 disabled:opacity-40"
+                >
+                  {amBusy === 'save' ? 'Saving…' : 'Save filters as spec'}
+                </button>
+                <button
+                  type="button"
+                  disabled={!amSpec}
+                  onClick={() => {
+                    if (!amSpec) return
+                    setRankSite(amSpec.platform)
+                    setFLinks(fromBound(amSpec.links)); setFHearts(fromBound(amSpec.hearts)); setFRate(fromBound(amSpec.rate))
+                    setFActive(fromBound(amSpec.active)); setFLast(fromBound(amSpec.last)); setFScore(fromBound(amSpec.score))
+                  }}
+                  title="Put the saved spec into the filters, to see which channels it covers"
+                  className="text-zinc-400 border border-zinc-700 hover:bg-zinc-800 rounded px-2 py-0.5 disabled:opacity-40"
+                >
+                  Show spec's channels
+                </button>
+                <button
+                  type="button"
+                  disabled={!amSpec?.enabled || amBusy !== '' || (amCover !== null && !amCover.links)}
+                  onClick={runAutoMerge}
+                  title="Merge what the spec covers now instead of waiting for the next hourly harvest"
+                  className="text-white bg-emerald-600 hover:bg-emerald-500 rounded px-2 py-0.5 disabled:opacity-40"
+                >
+                  {amBusy === 'run' ? 'Merging…' : 'Run now'}
+                </button>
+              </span>
+            </div>
+            <p className="mt-1 text-[11px] text-zinc-600 leading-relaxed">
+              On, every staged link of a channel that meets the spec is merged into the main links on each
+              hourly harvest pass — whether the harvest or Extract staged it — <b className="text-zinc-500">without
+              the related check</b>, so off-topic videos from those channels go in too. Instagram has no
+              Active %, so an Active % bound leaves Instagram channels out.
+            </p>
+          </div>
         </div>
       )}
 
@@ -1987,9 +2163,22 @@ export default function VerifyLinks({
           <span className="w-24 shrink-0 text-right">Posted</span>
           <span
             className="w-28 shrink-0 text-right"
-            title="Share of this channel's links that are still active (not blocked), with the active/blocked counts behind it"
+            title="Share of this channel's links that are still active (not blocked), with the active/blocked counts behind it. Instagram has none: its post links do not name the channel, so its blocked links cannot be counted."
           >
-            Active %
+            {statsState === 'loading' ? (
+              'Active % …'
+            ) : statsState === 'failed' ? (
+              <button
+                type="button"
+                onClick={loadChannelStats}
+                title="The Active % numbers could not be loaded. Press to try again."
+                className="text-rose-400 hover:text-rose-300 underline decoration-dotted"
+              >
+                Active % ⚠ retry
+              </button>
+            ) : (
+              'Active %'
+            )}
           </span>
         </div>
         {loading ? (
@@ -2141,7 +2330,13 @@ export default function VerifyLinks({
                         ? `@${r.account}: ${st.active.toLocaleString()} active, ` +
                           `${st.blocked.toLocaleString()} blocked (including links no longer ` +
                           `in the pool) = ${pct}% active`
-                        : 'This channel has no links in the main list yet'
+                        : r.platform === 'instagram'
+                          ? 'Not available for Instagram: its post links do not name the channel, so blocked ones cannot be traced back to it'
+                          : statsState === 'failed'
+                            ? 'The Active % numbers could not be loaded — press retry in the column header'
+                            : statsState === 'loading'
+                              ? 'Loading…'
+                              : 'This channel has no links in the main list yet'
                     }
                   >
                     {pct === null || !st ? (

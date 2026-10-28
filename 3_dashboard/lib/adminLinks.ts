@@ -772,30 +772,55 @@ export function filterAdminLinks(
 const UNRANKED_LAST = Number.MAX_SAFE_INTEGER
 
 /** Apply the page's sort. Unsorted keeps the pool order, as before. */
+/** The link's cluster under this clustering. */
+export function clusterOf(l: AdminLinkRow, clusterBy: ClusterBy): number {
+  return clusterBy === 'rank'
+    ? l.rankCluster
+    : clusterBy === 'date'
+      ? l.dateCluster
+      : l.combinedCluster
+}
+
+/**
+ * Where the link sits INSIDE its cluster (1 = best). Read from the same
+ * dimension that chose the cluster: under 'combined' that is whichever put the
+ * link earliest, so taking the rank position beside a cluster the date
+ * dimension chose would be two different numbers pretending to be one.
+ */
+export function clusterPosOf(l: AdminLinkRow, clusterBy: ClusterBy): number {
+  return clusterBy === 'rank'
+    ? l.rankPos
+    : clusterBy === 'date'
+      ? l.datePos
+      : l.date_only
+        ? l.datePos
+        : l.dateCluster < l.rankCluster
+          ? l.datePos
+          : l.rankPos
+}
+
+/**
+ * Best first: cluster 1 before cluster 2, and inside a cluster position 1
+ * before position 2 — the order a tool should work the links in. A link with
+ * no cluster or position goes last.
+ */
+export function sortByCluster(rows: AdminLinkRow[], clusterBy: ClusterBy): AdminLinkRow[] {
+  const n = (v: number) => (Number.isFinite(v) && v > 0 ? v : Number.MAX_SAFE_INTEGER)
+  return [...rows].sort(
+    (a, b) =>
+      n(clusterOf(a, clusterBy)) - n(clusterOf(b, clusterBy)) ||
+      n(clusterPosOf(a, clusterBy)) - n(clusterPosOf(b, clusterBy))
+  )
+}
+
 export function sortAdminLinks(rows: AdminLinkRow[], qy: LinkQuery): AdminLinkRow[] {
   if (!qy.sortCol) return rows
   const clusterBy: ClusterBy = qy.clusterBy ?? 'rank'
   const val = (l: AdminLinkRow) =>
     qy.sortCol === 'cluster'
-      ? clusterBy === 'rank'
-        ? l.rankCluster
-        : clusterBy === 'date'
-          ? l.dateCluster
-          : l.combinedCluster
+      ? clusterOf(l, clusterBy)
       : qy.sortCol === 'pos'
-        // Where the link sits INSIDE its cluster. Read from the same dimension
-        // that chose the cluster: under 'combined' that is whichever put the
-        // link earliest, so taking the rank position beside a cluster the date
-        // dimension chose would be two different numbers pretending to be one.
-        ? clusterBy === 'rank'
-          ? l.rankPos
-          : clusterBy === 'date'
-            ? l.datePos
-            : l.date_only
-              ? l.datePos
-              : l.dateCluster < l.rankCluster
-                ? l.datePos
-                : l.rankPos
+        ? clusterPosOf(l, clusterBy)
       : qy.sortCol === 'rank'
         // The link's placing in the search results for its keyword. A PLACING,
         // not a quantity: #1 is the best, so ascending is the useful direction

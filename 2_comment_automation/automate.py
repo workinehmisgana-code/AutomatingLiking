@@ -309,6 +309,7 @@ def from_dashboard(cluster_by: str, clusters: str, extra: dict) -> tuple[list[di
             "scraped_at": "",
             # The dashboard's own numbers, kept for the log rather than recomputed.
             "cluster": item.get("cluster"),
+            "pos": item.get("pos"),
             "category": item.get("category") or "",
         })
     # BEST CLUSTER FIRST, and the dashboard does not do this for us. It assigns
@@ -321,7 +322,12 @@ def from_dashboard(cluster_by: str, clusters: str, extra: dict) -> tuple[list[di
     # Sorted, not re-clustered: the numbers are the dashboard's, and the sort is
     # STABLE, so within a cluster the links keep exactly the order it ranked them
     # in. A link with no cluster number goes last rather than first.
-    entries.sort(key=lambda e: (e["cluster"] is None, e["cluster"] or 0))
+    #
+    # And by POSITION inside the cluster, which the dashboard now sends (and
+    # already orders by). An older one sends no position, and the stable sort
+    # then keeps its order inside each cluster as before.
+    entries.sort(key=lambda e: (e["cluster"] is None, e["cluster"] or 0,
+                                e.get("pos") is None, e.get("pos") or 0))
 
     products = [str(x) for x in (data.get("products") or []) if str(x).strip()]
     matched = int(data.get("matched") or 0)
@@ -3671,8 +3677,10 @@ def main():
     # comments and nothing else, so a run aimed at one product's videos has to
     # be able to ask for that pool. Blank is every genre, which is what it did
     # before genres existed.
-    parser.add_argument("--genre", default="",
-                        choices=["", "humanizer", "website", "slides"],
+    # No fixed choices: genres added in Admin → Genres (study-helper, …) are as
+    # valid as the built-in three, and the dashboard is the one that knows them.
+    # An unknown name simply matches no links, and the run says so.
+    parser.add_argument("--genre", default="", type=lambda v: v.strip().lower(),
                         help="--from-dashboard: only links in this product genre "
                              "(blank = every genre)")
     parser.add_argument("--max-links", type=int, default=2000,

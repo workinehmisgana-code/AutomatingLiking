@@ -1347,7 +1347,19 @@ def from_dashboard(cluster_by: str, clusters: str, extra: dict) -> tuple[list[st
 
     if not data.get("ok"):
         raise SystemExit(f"dashboard error: {data.get('error') or data}")
-    links = [str(x.get("url") or "") for x in data.get("links") or []]
+    # BEST FIRST: cluster 1 before cluster 2, and inside a cluster position 1
+    # before position 2. The dashboard sends them in that order already; sorted
+    # here too (stable) so an older dashboard, which did not, is still worked
+    # best-first. No cluster or position sorts last.
+    items = [x for x in (data.get("links") or []) if str(x.get("url") or "")]
+    def _n(v):
+        try:
+            v = int(v)
+            return v if v > 0 else 10 ** 9
+        except (TypeError, ValueError):
+            return 10 ** 9
+    items.sort(key=lambda x: (_n(x.get("cluster")), _n(x.get("pos"))))
+    links = [str(x.get("url")) for x in items]
     products = [str(p) for p in (data.get("products") or []) if str(p).strip()]
     print(
         f"dashboard: {data.get('matched', 0)} link(s) match {cluster_by} "

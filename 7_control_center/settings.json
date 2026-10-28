@@ -1,13 +1,15 @@
 {
   "search": {
     "platforms": [
-      "tiktok"
+      "tiktok",
+      "instagram"
     ],
-    "genre": "website",
+    "genre": "humanizer",
     "queries_by_genre": {
-      "humanizer": "humanizer\nai text detector\nparaphraser\nnaturalwrite humanizer\ngrubbyai humanizer\nwalterwritesai humanizer\nwritehuman humanizer\nLegitWriter humanizer\npaperbleach humanizer\nmaskai humanizer\nundetectableai humanizer\nverva humanizer\naihumanizer\nturnitin detector\ngptzero detector\noriginalityai detector\npangram detector",
+      "humanizer": "humanizer\nAI text humanizer\nbypass AI detector\nai paraphraser\nnaturalwrite humanizer\ngrubbyai humanizer\nwalterwritesai humanizer\nwritehuman humanizer\nLegitWriter humanizer\npaperbleach humanizer\nmaskai humanizer\nundetectableai humanizer\nverva humanizer\naihumanizer\nturnitin detector\ngptzero detector\noriginalityai detector\npangram detector",
       "website": "ai website builder\nbuild a website with ai\nno code website\nbase44 website builder\nemergent website builder\nlovable website builder\nwix website builder\nwebador website builder\nshopify website builder\nSquarespace website builder\nHostinger AI website builder\nCatDoes website builder\nManus AI website builder\nFramer AI website builder\nReplit Agent website builder\nv0 AI website builder",
-      "slides": "ai presentation maker\nai powerpoint generator\nai slides generator\nai deck generator\nmake slides fast\ngamma ai presentation\nkimi ai presentation\nManus AI presentation\nCanva AI presentation"
+      "slides": "ai presentation maker\nai powerpoint generator\nai slides generator\nai deck generator\nmake slides fast\ngamma ai presentation\nkimi ai presentation\nManus AI presentation\nCanva AI presentation",
+      "study-helper": "study tips\nhow to study for exams\nstudy with me\nexam revision tips\nhow to pass exams\nstudy hacks for students\nfinals week study\nhow to study effectively\nlast minute exam study"
     },
     "min": 200,
     "max": 400,
@@ -31,11 +33,11 @@
     "platform": "tiktok",
     "genre": "humanizer",
     "category": "",
-    "max_links": 5000,
+    "max_links": 7000,
     "target": "products",
     "users": "cocodly, co codly,purifytext, purify text,\u03c1\u03c5r\u0456f\u0443t\u0435xt,\u03c1\u03c5r\u0456f\u0443 t\u0435xt, \u03c1\u03c5r\u0456f\u0443t\u0435xt, acoustictext, acoustic text, prohumanly,  pro humanly, cohumanly, humlexic",
     "profiles": "c,g,h,a,e,b,f,d,j,i,o,n,q,l",
-    "at_once": 5,
+    "at_once": 4,
     "keywords": "",
     "mode": "dom",
     "pages": 4,
@@ -57,7 +59,7 @@
     "platform": "tiktok",
     "category": "",
     "genre": "humanizer",
-    "max_links": 5000,
+    "max_links": 1000,
     "keyword": "purifytext, purify text, \u03c1\u03c5r\u0456f\u0443t\u0435xt, acoustictext, acoustic text, prohumanly,  pro humanly, cohumanly,co humanly, humlexic",
     "to_top": true,
     "margin": 9,
@@ -66,7 +68,7 @@
     "watch": 15,
     "workers": 1,
     "delay": 30,
-    "loop": false,
+    "loop": true,
     "loop_delay": 60,
     "resume": false,
     "fresh": true,

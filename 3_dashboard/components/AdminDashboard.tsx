@@ -511,7 +511,13 @@ export default function AdminDashboard({
   presenceHistory,
   tiktokAccounts,
   genre,
+  genrePauses,
 }: {
+  /**
+   * Genres each worker is no longer served, paused by the comment check's genre
+   * rule (their comments missing on that genre while another genre's are fine).
+   */
+  genrePauses: Record<string, { genre: string; pct: number; judged: number; found: number; pausedAt: string }[]>
   /**
    * The admin's master genre. The server has already cut every click in
    * `data` to this genre's products, so most of this page is about it with no
@@ -738,6 +744,15 @@ export default function AdminDashboard({
      * decided, so it belongs on screen beside the other.
      */
     ruleRate: { judged: number; found: number; pct: number } | null
+    /** The genre rule's reading: each genre's rate, and what it paused or lifted. */
+    genres: {
+      rates: { genre: string; judged: number; found: number; pct: number; scored: boolean; below: boolean }[]
+      paused: string[]
+      lifted: string[]
+      anyPassing: boolean
+    } | null
+    genreMinPct: number
+    genreSample: number
     /** Why it did not, when it did not. Empty while the check is unfinished. */
     blockNote: string
   }
@@ -913,15 +928,21 @@ export default function AdminDashboard({
         const why = report?.blocked
           ? report.blocked.rule === 'ratio'
             ? `${report.blocked.pct ?? 0}% of ${report.blocked.judged} judged`
-            : `nothing on ${report.blocked.judged} judged`
+            : report.blocked.rule === 'genres'
+              ? `under ${report.genreMinPct}% in every genre (${report.blocked.pct ?? 0}% of ${report.blocked.judged})`
+              : `nothing on ${report.blocked.judged} judged`
           : ''
+        // Genres paused rather than a block: said in the log, since it changes
+        // what this person is served from now on.
+        const pausedNow = report?.genres?.paused ?? []
         if (report?.blocked) blocked.push(`${who} — ${why}`)
         const text = failed
           ? `not finished: ${failed}`
           : report?.blocked
             ? `🚫 blocked · ${why}`
             : report
-              ? `✓ kept · ${report.found}/${report.checked} carry their comment${report.pct !== null ? ` (${report.pct}%)` : ''}`
+              ? `✓ kept · ${report.found}/${report.checked} carry their comment${report.pct !== null ? ` (${report.pct}%)` : ''}` +
+                (pausedNow.length ? ` · ⏸ paused: ${pausedNow.map((g) => GENRE_LABELS[g] ?? g).join(', ')}` : '')
               : 'stopped'
         setVerifyLog((prev) => [{ who, text, blocked: !!report?.blocked }, ...prev].slice(0, 50))
         router.refresh()
@@ -1201,6 +1222,9 @@ export default function AdminDashboard({
               }
             : null,
         blockNote: String(d.blockNote ?? ''),
+        genres: d.genres && Array.isArray(d.genres.rates) ? d.genres : null,
+        genreMinPct: Number(d.genreMinPct) || 10,
+        genreSample: Number(d.genreSample) || 50,
       }
       const total = Number(d.total) || 0
       onProgress(total - (Number(d.remaining) || 0), total,
@@ -1208,6 +1232,23 @@ export default function AdminDashboard({
       if (d.done) break
     }
     return { report: last, failed }
+  }
+
+  /** Serve a paused genre to this worker again (the check paused it). */
+  async function liftPause(u: AdminUserRow, g: string) {
+    const who = u.profile?.name || u.name || u.email || 'user'
+    if (!confirm(`Serve ${GENRE_LABELS[g] ?? g} links to ${who} again?`)) return
+    const res = await fetch('/api/admin/genre-pause', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: u.id, genre: g }),
+    })
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}))
+      alert(d?.error || 'Could not lift the pause.')
+      return
+    }
+    router.refresh()
   }
 
   async function verifyUser(u: AdminUserRow) {
@@ -2189,6 +2230,8 @@ export default function AdminDashboard({
               verifying={verifyingUser === u.id}
               presence={presence[u.id] ?? null}
               presenceDays={presenceHistory[u.id] ?? []}
+              pausedGenres={genrePauses[u.id] ?? []}
+              onLiftPause={(g) => liftPause(u, g)}
               tiktokAccount={tiktokAccounts[u.id] ?? null}
               onProfileSaved={() => router.refresh()}
               onViewSnapshots={() => openSnapshots(u)}
@@ -2590,8 +2633,8 @@ export default function AdminDashboard({
                 <>
                   <div className="p-4 border-b border-zinc-800">
                     {/* The sweep is the honesty check people are blocked on, so it
-                        reads every genre's links; the per-user presence in the
-                        list below is this genre's. */}
+                        reads every genre's links, and so does the per-user
+                        presence in the list below. */}
                     <div className="text-sm font-semibold text-white">
                       Comment presence <span className="text-[11px] font-normal text-zinc-500">· sweep over all genres</span>
                     </div>
@@ -2635,7 +2678,9 @@ export default function AdminDashboard({
                                 title={
                                   r.blocked.rule === 'ratio'
                                     ? `Auto-blocked by this sweep: only ${r.blocked.pct ?? 0}% of ${r.blocked.judged} judged links carry their comment`
-                                    : `Auto-blocked by this sweep: no comment found on ${r.blocked.judged} judged links`
+                                    : r.blocked.rule === 'genres'
+                                      ? `Auto-blocked by this sweep: under the genre rule in every genre (${r.blocked.pct ?? 0}% of ${r.blocked.judged} judged)`
+                                      : `Auto-blocked by this sweep: no comment found on ${r.blocked.judged} judged links`
                                 }
                                 className="shrink-0 text-[10px] rounded px-1 py-0.5 border border-rose-500/50 bg-rose-500/15 text-rose-300 whitespace-nowrap"
                               >
@@ -3068,8 +3113,10 @@ export default function AdminDashboard({
                       little and claims a full day. */}
                   {verifyReport.blocked.rule === 'ratio'
                     ? `Only ${verifyReport.blocked.pct ?? 0}% of their last ${verifyReport.blocked.judged} judged links carry their comment — under the ${verifyReport.ratioMinPct}% the rule allows.`
-                    : `Their comment was on none of ${verifyReport.blocked.judged} judged link(s)`}
-                  {verifyReport.blocked.rule !== 'ratio' &&
+                    : verifyReport.blocked.rule === 'genres'
+                      ? `Under ${verifyReport.genreMinPct}% in every genre they have ${verifyReport.genreSample}+ judged links in (${verifyReport.blocked.pct ?? 0}% of ${verifyReport.blocked.judged} together).`
+                      : `Their comment was on none of ${verifyReport.blocked.judged} judged link(s)`}
+                  {verifyReport.blocked.rule === 'empty' &&
                     verifyReport.blocked.skipped > 0 &&
                     `, with ${verifyReport.blocked.skipped} that could not be read and were not counted against them`}
                   . Reason shown to them: register a different TikTok account. They have been
@@ -3092,6 +3139,46 @@ export default function AdminDashboard({
                 </div>
               </div>
             ) : null}
+
+            {/* BY GENRE. The genre rule's numbers: a genre under the threshold
+                is paused for them while another genre is fine. */}
+            {verifyReport.genres && verifyReport.genres.rates.length > 0 && (
+              <div className="mx-4 mt-3 rounded-lg border border-zinc-800 px-3 py-2">
+                <div className="text-[11px] text-zinc-500 mb-1">
+                  By genre — needs {verifyReport.genreMinPct}% on {verifyReport.genreSample}+ judged links
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {verifyReport.genres.rates.map((r) => {
+                    const paused = verifyReport.genres!.paused.includes(r.genre)
+                    return (
+                      <span
+                        key={r.genre}
+                        title={
+                          !r.scored
+                            ? `Only ${r.judged} judged link(s) — too few for the genre rule to judge`
+                            : paused
+                              ? 'Paused by this check: this genre is no longer served to them'
+                              : r.below
+                                ? 'Under the threshold'
+                                : 'Meets the threshold'
+                        }
+                        className={`text-[11px] rounded px-1.5 py-0.5 border tabular-nums ${
+                          !r.scored
+                            ? 'border-zinc-700 text-zinc-500'
+                            : r.below
+                              ? 'border-rose-500/50 bg-rose-500/10 text-rose-300'
+                              : 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300'
+                        }`}
+                      >
+                        {GENRE_LABELS[r.genre] ?? r.genre} {r.pct}% · {r.found}/{r.judged}
+                        {paused ? ' · ⏸ paused' : ''}
+                        {verifyReport.genres!.lifted.includes(r.genre) ? ' · ▶ resumed' : ''}
+                      </span>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
 
             {/* Horizontal scroller: these rows carry fixed-width columns that
                 overflow rather than squash on a narrow screen. */}
@@ -3255,6 +3342,8 @@ function UserCard({
   onViewClicks,
   onVerify,
   verifying,
+  pausedGenres,
+  onLiftPause,
   onViewSnapshots,
   onDeductClicks,
   deducting,
@@ -3302,6 +3391,9 @@ function UserCard({
   onViewClicks: () => void
   onVerify: () => void
   verifying: boolean
+  /** Genres the comment check stopped serving them, with its numbers. */
+  pausedGenres: { genre: string; pct: number; judged: number; found: number; pausedAt: string }[]
+  onLiftPause: (genre: string) => void
   /** Mean of this user's daily comment-presence scores, or null if never scored. */
   /** Re-read the server data after a profile edit, so the row shows the new links. */
   onProfileSaved: () => void
@@ -3525,6 +3617,21 @@ function UserCard({
               💬 {presence.pct}%
             </span>
           )}
+          {pausedGenres.map((p) => (
+            <button
+              key={p.genre}
+              type="button"
+              onClick={() => onLiftPause(p.genre)}
+              title={
+                `${GENRE_LABELS[p.genre] ?? p.genre} links are not served to this user: their comment ` +
+                `was on ${p.found} of ${p.judged} judged links (${p.pct}%) in that genre, while another ` +
+                `genre met the rule. Paused ${p.pausedAt.slice(0, 10)}. Click to serve it again.`
+              }
+              className="text-[11px] font-semibold rounded px-1.5 py-0.5 border border-orange-500/50 bg-orange-500/15 text-orange-200 hover:bg-orange-500/25"
+            >
+              ⏸ {GENRE_LABELS[p.genre] ?? p.genre} {p.pct}%
+            </button>
+          ))}
           {u.videoStatus === 'pending' && (
             <span
               title="This user requested video-task access — expand to approve/reject"

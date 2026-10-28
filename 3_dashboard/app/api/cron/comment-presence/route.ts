@@ -3,6 +3,7 @@ import { getClickersOnDay, blockUser, addAdminMessage, canAutoBlock, dbNow } fro
 import {
   scoreUserRecent,
   noCommentVerdict,
+  verdictFigures,
   BLOCK_SAMPLE,
   RECENT_SAMPLE,
 } from '@/lib/commentPresence'
@@ -183,9 +184,9 @@ export async function GET(req: NextRequest) {
           ).catch(() => {})
           blocked.push({
             userId: c.userId,
-            judged: v.rule === 'ratio' ? (v.ratio?.judged ?? 0) : v.judged,
+            judged: verdictFigures(v).judged,
             rule: v.rule,
-            pct: v.ratio?.pct ?? null,
+            pct: verdictFigures(v).pct,
           })
         }
       }

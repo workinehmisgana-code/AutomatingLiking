@@ -28,10 +28,20 @@ export type MachineScope = 'read' | 'write'
 
 function presented(req: Request): string {
   const h = req.headers
+  let query = ''
+  try {
+    // ?token= too, as /api/links/clusters takes it. The control center asks for
+    // /api/genres that way, and a header-only check refused it — so its genre
+    // lists never learned about a genre added in the admin.
+    query = new URL(req.url).searchParams.get('token') || ''
+  } catch {
+    /* no parseable URL: headers only */
+  }
   return (
     h.get('x-upload-secret') ||
     h.get('x-links-token') ||
     (h.get('authorization') || '').replace(/^Bearer\s+/i, '') ||
+    query ||
     ''
   )
 }

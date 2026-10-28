@@ -1098,7 +1098,9 @@ def refresh_genres(max_age: float = 60.0) -> None:
     try:
         req = urllib.request.Request(
             base + "/api/genres?" + urlencode({"token": token}),
-            headers={"User-Agent": "control-center/1.0"},
+            # The token in a header as well as the URL: a dashboard deployed
+            # before it read ?token= on this route accepts only the header.
+            headers={"User-Agent": "control-center/1.0", "x-links-token": token},
         )
         with urllib.request.urlopen(req, timeout=20) as r:
             data = json.loads(r.read().decode("utf-8", errors="replace") or "{}")

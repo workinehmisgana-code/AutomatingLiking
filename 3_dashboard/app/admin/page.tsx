@@ -17,8 +17,9 @@ import {
   getPayAdjustments,
   getAutoBlockCounts,
   getTiktokAccounts,
+  getAllGenrePauses,
 } from '@/lib/db'
-import { isAdminEmail, productsInGenre } from '@/lib/config'
+import { isAdminEmail } from '@/lib/config'
 import { getAdminGenre } from '@/lib/adminGenre'
 import Login from '@/components/Login'
 import AdminDashboard from '@/components/AdminDashboard'
@@ -52,9 +53,13 @@ export default async function AdminPage() {
     getPromoTaskEnabled().catch(() => true),
     // Comment-presence: the badge average, and the last 7 days for the
     // expanded view. Both are cheap aggregate reads.
-    // This genre's links only: presence is rebuilt from the per-link rows.
-    getPresenceAverages(productsInGenre(genre)).catch(() => ({})),
-    getPresenceHistory(7, productsInGenre(genre)).catch(() => ({})),
+    // EVERY GENRE, whichever one the switch is on. Verify, Verify all and the
+    // auto-block rules judge a worker's last links whatever genre they came
+    // from, so the presence shown beside those buttons has to be the same
+    // all-genre measure — cut to one genre it read "Not scored yet" in a genre
+    // the worker had barely touched, right after a check that scored them.
+    getPresenceAverages().catch(() => ({})),
+    getPresenceHistory(7).catch(() => ({})),
     // The numeric TikTok id behind each handle, which dates the account. Picked
     // up for free by presence checks; one small table.
     getTiktokAccounts().catch(() => ({})),
@@ -91,6 +96,7 @@ export default async function AdminPage() {
         minAgeDays={await getMinAccountAgeDays().catch(() => 90)}
         payAdjustments={await getPayAdjustments().catch(() => ({}))}
         autoBlockCounts={await getAutoBlockCounts().catch(() => ({}))}
+        genrePauses={await getAllGenrePauses().catch(() => ({}))}
         genre={genre}
       />
     </>

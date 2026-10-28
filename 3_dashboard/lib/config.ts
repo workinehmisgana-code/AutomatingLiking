@@ -17,6 +17,13 @@ function envBool(v: string | undefined, dflt: boolean): boolean {
 // receive it as a prop / via the app status API, never by importing it.
 export const SHOW_CLICKED_TODAY = envBool(process.env.SHOW_CLICKED_TODAY, true)
 
+// Show the tasks OTHER than links — the video task, Repost & earn and the email
+// task — on the user dashboard and the guide. Env var SHOW_OTHER_TASKS: set it
+// to "false" (or 0/no/off) and workers see links only; the three task pages send
+// them back to their links. Defaults to shown. Pay already earned on those tasks
+// still shows under pending pay. Server code only, like SHOW_CLICKED_TODAY.
+export const SHOW_OTHER_TASKS = envBool(process.env.SHOW_OTHER_TASKS, true)
+
 // How many clusters to split the links into when grouping by search rank or
 // posted date. Controlled here, NOT by the end user. Each dimension has its own
 // count: search rank → RANK_CLUSTER_COUNT, posted date → DATE_CLUSTER_COUNT.
@@ -651,6 +658,25 @@ export function genreWeights(mix: Partial<GenreMix> | null | undefined): GenreMi
 }
 
 /**
+ * The genre weights with this worker's PAUSED genres taken out.
+ *
+ * A genre is paused for one worker when the comment check found too few of
+ * their comments on its links (see noCommentVerdict). Its weight goes to zero,
+ * which the interleave already treats as "never draw from it", so the other
+ * genres fill the list in their own ratio. Every genre paused is an empty
+ * feed — correct, since such a worker is blocked rather than paused.
+ */
+export function withoutGenres(
+  weights: Record<string, number>,
+  paused: string[] | null | undefined
+): Record<string, number> {
+  if (!paused || paused.length === 0) return weights
+  const out: Record<string, number> = {}
+  for (const [g, w] of Object.entries(weights)) out[g] = paused.includes(g) ? 0 : w
+  return out
+}
+
+/**
  * NO LONGER USED to choose a product — kept only so nothing importing it breaks.
  *
  * A video is now owned by ONE product: whichever already leads its comment
@@ -839,6 +865,14 @@ export interface BlockRules {
   ratioSample: number
   /** Below this percentage found, the rate rule blocks. */
   ratioMinPct: number
+  /**
+   * THE GENRE RULE. Below this percentage found on one genre's links, that
+   * genre stops being served to the worker; below it in EVERY genre they have
+   * enough judged links in, they are blocked.
+   */
+  genreMinPct: number
+  /** Judged links a genre needs before the genre rule may judge it. */
+  genreSample: number
 }
 
 export const BLOCK_RULE_DEFAULTS: BlockRules = {
@@ -846,12 +880,18 @@ export const BLOCK_RULE_DEFAULTS: BlockRules = {
   sample: 50,
   ratioSample: 200,
   ratioMinPct: 10,
+  genreMinPct: 10,
+  genreSample: 50,
 }
 
 export const BLOCK_RULE_BOUNDS = {
   sample: { min: 20, max: 80 },
   ratioSample: { min: 50, max: 300 },
   ratioMinPct: { min: 1, max: 50 },
+  // Same range as the rate rule, for the same reasons. The sample floor is the
+  // empty rule's: fewer judged links than that is a run of luck, not a rate.
+  genreMinPct: { min: 1, max: 50 },
+  genreSample: { min: 20, max: 300 },
 } as const
 
 /**

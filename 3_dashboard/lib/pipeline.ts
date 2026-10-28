@@ -303,7 +303,7 @@ async function runStage(stage: Stage, deadline: number, t0: number): Promise<Tic
     const id = Number(await getAppState(CYCLE_ID_KEY).catch(() => null))
     if (Number.isFinite(id) && id > 0) {
       const ADD: Record<string, string[]> = {
-        harvest: ['checked', 'found', 'merged', 'staged', 'untitled', 'failed'],
+        harvest: ['checked', 'found', 'merged', 'staged', 'untitled', 'failed', 'specMerged'],
         extract: ['read', 'withOurs'],
         categorise: ['processed', 'saved'],
         recluster: [],

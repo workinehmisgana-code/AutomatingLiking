@@ -45,6 +45,10 @@ export interface GuideProps {
   verifyVideoUrl: string
   /** Referral commission, as a whole percent (e.g. 20). */
   referralPct: number
+  /** Show the tasks other than links (env SHOW_OTHER_TASKS). Off, the video
+   *  task and Repost & earn are left out; the email task is folded into
+   *  accountOpen by the page. */
+  otherTasks: boolean
   /** Automatic pauses allowed before the next one is permanent. */
   autoPausesAllowed: number
 }
@@ -84,8 +88,12 @@ export function en(p: GuideProps): GuideCopy {
     startHint: 'Sign in with Google, finish the short setup, and your first links are there.',
     rates: [
       { label: 'Per comment', value: `${p.commentRate} birr`, hint: 'on your reported count' },
-      { label: 'Per video you make', value: `${p.videoBirr} birr`, hint: '30s–1min, once approved' },
-      { label: 'Per repost link', value: `${p.promoBirr} birr`, hint: 'one per platform per day' },
+      ...(p.otherTasks
+        ? [
+            { label: 'Per video you make', value: `${p.videoBirr} birr`, hint: '30s–1min, once approved' },
+            { label: 'Per repost link', value: `${p.promoBirr} birr`, hint: 'one per platform per day' },
+          ]
+        : []),
       ...(p.accountOpen
         ? [{
             label: 'Per company email',
@@ -183,17 +191,24 @@ export function en(p: GuideProps): GuideCopy {
         note: 'Report honestly. Your number is checked against the links you actually opened and against your screenshots. Inflated numbers are removed and can get your account blocked.',
       },
       {
-        heading: '8. The other ways to earn',
-        intro: 'All optional, and all on the dashboard.',
+        // With the other tasks hidden, referrals are all that is left here.
+        heading: p.otherTasks ? '8. The other ways to earn' : '8. Referrals',
+        intro: p.otherTasks
+          ? 'All optional, and all on the dashboard.'
+          : 'Optional extra pay on top of your comments.',
         rows: [
-          {
-            k: '🎥 Video task',
-            v: `Make your own 30-second to 1-minute video advertising one of our products, upload it, and earn ${p.videoBirr} birr once the admin approves it.`,
-          },
-          {
-            k: '📢 Repost & earn',
-            v: `Create a dedicated account on each platform, download a ready-made video and caption from the dashboard, post it, then paste the link back. ${p.promoBirr} birr per link. You may download ${p.promoDownloads} video per day and post ${p.promoPerPlatform} per platform per day.`,
-          },
+          ...(p.otherTasks
+            ? [
+                {
+                  k: '🎥 Video task',
+                  v: `Make your own 30-second to 1-minute video advertising one of our products, upload it, and earn ${p.videoBirr} birr once the admin approves it.`,
+                },
+                {
+                  k: '📢 Repost & earn',
+                  v: `Create a dedicated account on each platform, download a ready-made video and caption from the dashboard, post it, then paste the link back. ${p.promoBirr} birr per link. You may download ${p.promoDownloads} video per day and post ${p.promoPerPlatform} per platform per day.`,
+                },
+              ]
+            : []),
           {
             k: '🤝 Referrals',
             v: `Share your referral username (on your dashboard). When someone registers with it, you earn ${p.referralPct}% of their comment pay, on top — nothing is taken from what they earn. You earn only on the people who used YOUR username, not on the people they invite.`,
@@ -227,8 +242,12 @@ export function en(p: GuideProps): GuideCopy {
           { k: 'Links', v: 'Your remaining links, grouped, plus your totals for today. There is a tab per platform: TikTok, YT Shorts, YT Videos, Instagram and Reddit.' },
           { k: 'Pages', v: `Links come a page at a time, best group first — ${p.linksPerPage} on a page, which is about an hour's work. Use Next at the bottom for the following page.` },
           { k: 'Comments', v: 'The comment pool. Tap any comment to copy it manually if you need to.' },
-          { k: 'Video task', v: 'Upload your own video and see whether it was approved.' },
-          { k: 'Repost & earn', v: 'Download promo videos and captions, and submit your reposted links.' },
+          ...(p.otherTasks
+            ? [
+                { k: 'Video task', v: 'Upload your own video and see whether it was approved.' },
+                { k: 'Repost & earn', v: 'Download promo videos and captions, and submit your reposted links.' },
+              ]
+            : []),
           ...(p.accountOpen
             ? [{
                 k: 'Email task',
@@ -275,8 +294,12 @@ export function am(p: GuideProps): GuideCopy {
     startHint: 'በGoogle ይግቡ፣ አጭሩን ዝግጅት ይጨርሱ፤ የመጀመሪያዎቹ ሊንኮችዎ እዚያው ይጠብቁዎታል።',
     rates: [
       { label: 'ለአንድ አስተያየት', value: `${p.commentRate} ብር`, hint: 'ሪፖርት ባደረጉት ብዛት መሠረት' },
-      { label: 'ለሠሩት አንድ ቪዲዮ', value: `${p.videoBirr} ብር`, hint: '30 ሰከንድ–1 ደቂቃ፣ ከጸደቀ በኋላ' },
-      { label: 'ለአንድ ሪፖስት ሊንክ', value: `${p.promoBirr} ብር`, hint: 'በቀን በአንድ መድረክ አንድ' },
+      ...(p.otherTasks
+        ? [
+            { label: 'ለሠሩት አንድ ቪዲዮ', value: `${p.videoBirr} ብር`, hint: '30 ሰከንድ–1 ደቂቃ፣ ከጸደቀ በኋላ' },
+            { label: 'ለአንድ ሪፖስት ሊንክ', value: `${p.promoBirr} ብር`, hint: 'በቀን በአንድ መድረክ አንድ' },
+          ]
+        : []),
       ...(p.accountOpen
         ? [{
             label: 'ለአንድ የኩባንያ ኢሜይል',
@@ -374,17 +397,23 @@ export function am(p: GuideProps): GuideCopy {
         note: 'በሐቀኝነት ሪፖርት ያድርጉ። ያስገቡት ቁጥር በእውነት ከከፈቷቸው ሊንኮች እና ከስክሪንሾቶችዎ ጋር ይመሳከራል። የተጋነኑ ቁጥሮች ይሰረዛሉ፤ አካውንትዎም ሊታገድ ይችላል።',
       },
       {
-        heading: '8. ሌሎቹ የገቢ መንገዶች',
-        intro: 'ሁሉም በፈቃደኝነት ላይ የተመሠረቱ ሲሆኑ በዳሽቦርዱ ላይ ይገኛሉ።',
+        heading: p.otherTasks ? '8. ሌሎቹ የገቢ መንገዶች' : '8. ሪፈራል',
+        intro: p.otherTasks
+          ? 'ሁሉም በፈቃደኝነት ላይ የተመሠረቱ ሲሆኑ በዳሽቦርዱ ላይ ይገኛሉ።'
+          : 'ከአስተያየት ክፍያዎ በተጨማሪ የሚያገኙት በፈቃደኝነት ላይ የተመሠረተ ተጨማሪ ክፍያ።',
         rows: [
-          {
-            k: '🎥 የቪዲዮ ሥራ',
-            v: `ከምርቶቻችን አንዱን የሚያስተዋውቅ ከ30 ሰከንድ እስከ 1 ደቂቃ የሚደርስ የራስዎን ቪዲዮ ሠርተው ይላኩ፤ አስተዳዳሪው ካጸደቀው ${p.videoBirr} ብር ያገኛሉ።`,
-          },
-          {
-            k: '📢 ሪፖስት አድርገው ያግኙ',
-            v: `በእያንዳንዱ መድረክ ላይ የተለየ አካውንት ይክፈቱ፣ ከዳሽቦርዱ ዝግጁ የሆነ ቪዲዮና ጽሑፍ አውርደው ይለጥፉ፣ ከዚያም ሊንኩን መልሰው ይለጥፉ። ለአንድ ሊንክ ${p.promoBirr} ብር። በቀን ${p.promoDownloads} ቪዲዮ ማውረድ እና በአንድ መድረክ በቀን ${p.promoPerPlatform} መለጠፍ ይችላሉ።`,
-          },
+          ...(p.otherTasks
+            ? [
+                {
+                  k: '🎥 የቪዲዮ ሥራ',
+                  v: `ከምርቶቻችን አንዱን የሚያስተዋውቅ ከ30 ሰከንድ እስከ 1 ደቂቃ የሚደርስ የራስዎን ቪዲዮ ሠርተው ይላኩ፤ አስተዳዳሪው ካጸደቀው ${p.videoBirr} ብር ያገኛሉ።`,
+                },
+                {
+                  k: '📢 ሪፖስት አድርገው ያግኙ',
+                  v: `በእያንዳንዱ መድረክ ላይ የተለየ አካውንት ይክፈቱ፣ ከዳሽቦርዱ ዝግጁ የሆነ ቪዲዮና ጽሑፍ አውርደው ይለጥፉ፣ ከዚያም ሊንኩን መልሰው ይለጥፉ። ለአንድ ሊንክ ${p.promoBirr} ብር። በቀን ${p.promoDownloads} ቪዲዮ ማውረድ እና በአንድ መድረክ በቀን ${p.promoPerPlatform} መለጠፍ ይችላሉ።`,
+                },
+              ]
+            : []),
           {
             k: '🤝 ሪፈራል',
             v: `የሪፈራል መለያ ስምዎን (በዳሽቦርድዎ ላይ ያለውን) ያጋሩ። አንድ ሰው በእሱ ሲመዘገብ፣ ከአስተያየት ክፍያው ${p.referralPct}% ተጨማሪ ያገኛሉ — ከእሱ ገቢ ምንም አይቀነስም። የሚያገኙት የእርስዎን መለያ ስም ከተጠቀሙት ሰዎች ብቻ ነው፤ እነሱ ከሚጋብዟቸው ሰዎች አይደለም።`,
@@ -416,8 +445,12 @@ export function am(p: GuideProps): GuideCopy {
           { k: 'ሊንኮች', v: 'የቀሩት ሊንኮችዎ በቡድን ተከፋፍለው፣ እንዲሁም የዛሬው ጠቅላላ ውጤትዎ። ለእያንዳንዱ መድረክ የተለየ ትር አለ፦ TikTok፣ YT Shorts፣ YT Videos፣ Instagram እና Reddit።' },
           { k: 'ገጾች', v: `ሊንኮች በገጽ በገጽ ይቀርባሉ፤ ምርጡ ቡድን መጀመሪያ። በአንድ ገጽ ${p.linksPerPage} ሊንኮች ሲሆኑ ይህም የአንድ ሰዓት ያህል ሥራ ነው። ቀጣዩን ገጽ ለማየት ከታች ያለውን Next ይጠቀሙ።` },
           { k: 'አስተያየቶች', v: 'የአስተያየት ስብስቡ። ካስፈለገዎት ማንኛውንም አስተያየት ነክተው በእጅ ኮፒ ማድረግ ይችላሉ።' },
-          { k: 'የቪዲዮ ሥራ', v: 'የራስዎን ቪዲዮ ይላኩ እና መጽደቁን ይከታተሉ።' },
-          { k: 'ሪፖስት አድርገው ያግኙ', v: 'የማስተዋወቂያ ቪዲዮዎችንና ጽሑፎችን ያውርዱ፣ የለጠፏቸውንም ሊንኮች ይላኩ።' },
+          ...(p.otherTasks
+            ? [
+                { k: 'የቪዲዮ ሥራ', v: 'የራስዎን ቪዲዮ ይላኩ እና መጽደቁን ይከታተሉ።' },
+                { k: 'ሪፖስት አድርገው ያግኙ', v: 'የማስተዋወቂያ ቪዲዮዎችንና ጽሑፎችን ያውርዱ፣ የለጠፏቸውንም ሊንኮች ይላኩ።' },
+              ]
+            : []),
           { k: 'Finish', v: 'ብዛቱንና ስክሪንሾቶችን ሪፖርት ያድርጉ።' },
           { k: 'መልእክቶች', v: 'ከአስተዳዳሪው የሚላኩ መልእክቶች በዳሽቦርዱ ላይኛው ክፍል ይታያሉ፤ እዚያው መመለስ ይችላሉ።' },
         ],

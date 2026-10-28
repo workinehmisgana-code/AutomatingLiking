@@ -12,6 +12,8 @@ import {
   PLATFORM_ROTATE_MS,
   REMINDER_CLICKS,
   FALLBACK_COMMENT_CATEGORY,
+  DEFAULT_GENRE,
+  PRODUCT_GENRE,
   REFERRAL_SHARE,
   REFERRAL_PAY_RATE,
 } from '@/lib/config'
@@ -66,6 +68,8 @@ export interface Video {
    * FALLBACK_COMMENT_CATEGORY at the moment of the pick.
    */
   category?: string | null
+  /** Which genre's pool the link is in; absent reads as the default genre. */
+  genre?: string
 }
 
 interface UserInfo {
@@ -490,6 +494,7 @@ export default function Dashboard({
   paidNotice,
   apk,
   showClickedToday,
+  showOtherTasks = true,
   user,
   profile,
   product,
@@ -518,6 +523,8 @@ export default function Dashboard({
   paidNotice: number | null
   apk: ApkInfo | null
   showClickedToday: boolean
+  /** The video, repost and email tasks (env SHOW_OTHER_TASKS). */
+  showOtherTasks?: boolean
   user: UserInfo
   profile: UserProfile | null
   product: string | null
@@ -531,7 +538,7 @@ export default function Dashboard({
   // Video task / Repost & earn navigates from cache instantly (a full prefetch,
   // not just the loading spinner — important since these routes are dynamic).
   useEffect(() => {
-    for (const href of ['/videos', '/promo']) router.prefetch(href)
+    if (showOtherTasks) for (const href of ['/videos', '/promo']) router.prefetch(href)
   }, [router])
 
   const [search, setSearch] = useState('')
@@ -638,9 +645,17 @@ export default function Dashboard({
     // hold on the video's own audience and quietly lapse the moment that
     // audience was empty.
     const byProduct = productPlatformsRef.current
+    // THE GENRE IS A WALL, as on the server (serveCommentForUrl): a slides
+    // video is only ever given a slides product's comment. Without this the
+    // pool — every ACTIVE product's comments — handed purifytext and cocodly
+    // lines to slides videos whenever pptera was switched off. No comment for
+    // the genre means an empty clipboard, which is the right answer.
+    const genre = v.genre || DEFAULT_GENRE
     const allowed = (entries: { text: string; product: string | null }[]) =>
       entries.filter((e) => {
-        if (!e.product) return true // unattributed: no product to restrict
+        // Unattributed comments predate products; only the default genre's.
+        if (!e.product) return genre === DEFAULT_GENRE
+        if ((PRODUCT_GENRE[e.product] ?? DEFAULT_GENRE) !== genre) return false
         const sites = byProduct[e.product]
         return sites === undefined || sites.includes(v.platform)
       })
@@ -1043,24 +1058,29 @@ export default function Dashboard({
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <Link
-              href="/videos"
-              className="inline-flex items-center gap-1.5 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg px-3 py-1.5 shadow-sm transition-colors"
-            >
-              🎥 Video task
-            </Link>
-            <Link
-              href="/promo"
-              className="inline-flex items-center gap-1.5 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg px-3 py-1.5 shadow-sm transition-colors"
-            >
-              📢 Repost &amp; earn
-            </Link>
-            <Link
-              href="/tasks"
-              className="inline-flex items-center gap-1.5 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg px-3 py-1.5 shadow-sm transition-colors"
-            >
-              ✉️ Email task
-            </Link>
+            {/* The tasks other than links — hidden by SHOW_OTHER_TASKS=false. */}
+            {showOtherTasks && (
+              <>
+                <Link
+                  href="/videos"
+                  className="inline-flex items-center gap-1.5 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg px-3 py-1.5 shadow-sm transition-colors"
+                >
+                  🎥 Video task
+                </Link>
+                <Link
+                  href="/promo"
+                  className="inline-flex items-center gap-1.5 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg px-3 py-1.5 shadow-sm transition-colors"
+                >
+                  📢 Repost &amp; earn
+                </Link>
+                <Link
+                  href="/tasks"
+                  className="inline-flex items-center gap-1.5 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg px-3 py-1.5 shadow-sm transition-colors"
+                >
+                  ✉️ Email task
+                </Link>
+              </>
+            )}
             <Link
               href="/guide"
               title="How everything works — in English and Amharic"
@@ -1165,7 +1185,7 @@ export default function Dashboard({
               address is worth nothing until someone has opened the mailbox. */}
           {pendingPay.accountsAwaiting.count > 0 && (
             <Link
-              href="/tasks"
+              href={showOtherTasks ? '/tasks' : '#'}
               title="Email addresses you have sent that we have not checked yet. Not payable until we do."
               className="flex items-center gap-1.5 text-sm hover:opacity-80 transition-opacity"
             >

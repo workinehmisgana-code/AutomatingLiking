@@ -19,6 +19,8 @@ interface Rules {
   sample: number
   ratioSample: number
   ratioMinPct: number
+  genreMinPct: number
+  genreSample: number
 }
 interface Bound {
   min: number
@@ -28,12 +30,16 @@ interface Bounds {
   sample: Bound
   ratioSample: Bound
   ratioMinPct: Bound
+  genreMinPct: Bound
+  genreSample: Bound
 }
 
 export default function BlockRules() {
   const [rules, setRules] = useState<Rules | null>(null)
   const [bounds, setBounds] = useState<Bounds | null>(null)
-  const [draft, setDraft] = useState({ sample: '', ratioSample: '', ratioMinPct: '' })
+  const [draft, setDraft] = useState({
+    sample: '', ratioSample: '', ratioMinPct: '', genreMinPct: '', genreSample: '',
+  })
   const [busy, setBusy] = useState(false)
   const [note, setNote] = useState('')
   const [err, setErr] = useState('')
@@ -50,6 +56,8 @@ export default function BlockRules() {
           sample: String(d.rules.sample),
           ratioSample: String(d.rules.ratioSample),
           ratioMinPct: String(d.rules.ratioMinPct),
+          genreMinPct: String(d.rules.genreMinPct),
+          genreSample: String(d.rules.genreSample),
         })
       })
       .catch(() => live && setErr('Could not read the block rules.'))
@@ -80,6 +88,8 @@ export default function BlockRules() {
         sample: String(d.rules.sample),
         ratioSample: String(d.rules.ratioSample),
         ratioMinPct: String(d.rules.ratioMinPct),
+        genreMinPct: String(d.rules.genreMinPct),
+        genreSample: String(d.rules.genreSample),
       })
       setNote('Saved — the next check uses this.')
     } finally {
@@ -94,7 +104,9 @@ export default function BlockRules() {
   const changed =
     num('sample') !== rules.sample ||
     num('ratioSample') !== rules.ratioSample ||
-    num('ratioMinPct') !== rules.ratioMinPct
+    num('ratioMinPct') !== rules.ratioMinPct ||
+    num('genreMinPct') !== rules.genreMinPct ||
+    num('genreSample') !== rules.genreSample
 
   return (
     <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
@@ -130,7 +142,8 @@ export default function BlockRules() {
       </div>
 
       <p className="text-[11px] text-zinc-500 mt-1.5">
-        A user is blocked when EITHER rule holds. Unreadable links count toward neither — a
+        A user is blocked when rule 1 or 2 holds — unless rule 3 finds a genre they do comment
+        on, in which case only their weak genres are paused. Unreadable links count toward neither — a
         video that will not load is not a missing comment. Every block is reversible from the
         user&apos;s row, and unblocking re-arms the check.
       </p>
@@ -189,6 +202,40 @@ export default function BlockRules() {
             {bounds.ratioSample.min}–{bounds.ratioSample.max} links)
           </span>
         </label>
+
+        {/* RULE THREE: by genre. */}
+        <label className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-xs text-zinc-300">
+          <span className="text-zinc-500">3.</span>
+          <span>By genre: a genre under</span>
+          <input
+            type="number"
+            inputMode="numeric"
+            min={bounds.genreMinPct.min}
+            max={bounds.genreMinPct.max}
+            value={draft.genreMinPct}
+            onChange={(e) => setDraft({ ...draft, genreMinPct: e.target.value })}
+            disabled={busy || !rules.on}
+            className="w-14 bg-zinc-950 border border-zinc-700 rounded px-1.5 py-0.5 text-center text-zinc-100 tabular-nums disabled:opacity-50"
+          />
+          <span>% average over at least</span>
+          <input
+            type="number"
+            inputMode="numeric"
+            min={bounds.genreSample.min}
+            max={bounds.genreSample.max}
+            step={10}
+            value={draft.genreSample}
+            onChange={(e) => setDraft({ ...draft, genreSample: e.target.value })}
+            disabled={busy || !rules.on}
+            className="w-16 bg-zinc-950 border border-zinc-700 rounded px-1.5 py-0.5 text-center text-zinc-100 tabular-nums disabled:opacity-50"
+          />
+          <span>judged links stops being served to them; under it in every genre blocks them</span>
+          <span className="text-[11px] text-zinc-600">
+            ({bounds.genreMinPct.min}–{bounds.genreMinPct.max}% ·{' '}
+            {bounds.genreSample.min}–{bounds.genreSample.max} links · a paused genre is lifted from
+            the user&apos;s ⏸ chip)
+          </span>
+        </label>
       </div>
 
       {/* WHAT THE NUMBERS MEAN FOR REAL PEOPLE. Measured when the rate rule was
@@ -209,6 +256,8 @@ export default function BlockRules() {
               sample: num('sample'),
               ratioSample: num('ratioSample'),
               ratioMinPct: num('ratioMinPct'),
+              genreMinPct: num('genreMinPct'),
+              genreSample: num('genreSample'),
             })
           }
           disabled={busy || !changed}
@@ -218,7 +267,7 @@ export default function BlockRules() {
         </button>
         <span className="text-[11px] text-zinc-500">
           Now: {rules.on ? '' : 'OFF · '}nothing on {rules.sample}, or under {rules.ratioMinPct}%
-          of {rules.ratioSample}
+          of {rules.ratioSample}; per genre under {rules.genreMinPct}% of {rules.genreSample}
         </span>
         {note && <span className="text-[11px] text-emerald-400">{note}</span>}
         {err && <span className="text-[11px] text-rose-300">{err}</span>}

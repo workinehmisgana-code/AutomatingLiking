@@ -24,6 +24,7 @@ import {
   REFERRAL_SHARE,
   VERIFY_MIN_AGE_DAYS,
   VERIFY_VIDEO_URL,
+  SHOW_OTHER_TASKS,
 } from '@/lib/config'
 
 export const dynamic = 'force-dynamic'
@@ -71,7 +72,8 @@ export default async function GuidePage() {
       accountDomain={accountDomain}
       accountPassword={accountPassword}
       accountRecovery={accountRecovery}
-      accountOpen={accountOpen && !!accountDomain}
+      accountOpen={SHOW_OTHER_TASKS && accountOpen && !!accountDomain}
+      otherTasks={SHOW_OTHER_TASKS}
       minAgeDays={minAgeDays}
       verifyVideoUrl={verifyVideoUrl}
       referralPct={Math.round(REFERRAL_SHARE * 100)}

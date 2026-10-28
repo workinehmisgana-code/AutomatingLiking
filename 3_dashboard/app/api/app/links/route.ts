@@ -14,6 +14,7 @@ import {
   getUnrelatedUrls,
 
   getGenreMix,
+  getUserPausedGenres,
   getUserProfile,
   needsTiktokProfileFix,
   getLinkCategories,
@@ -32,6 +33,7 @@ import {
   genreOfRow,
   isGenre,
   genreWeights,
+  withoutGenres,
   isAppOutdated,
   VERIFY_VIDEO_URL,
   VERIFY_GATE_ENABLED,
@@ -198,9 +200,15 @@ export async function GET(req: NextRequest) {
   // ?genre=<g> — ONE genre only, whatever the mix says. The Comment Tester asks
   // for humanizer links: the rest of the mix is for the workers' feed.
   const onlyGenre = req.nextUrl.searchParams.get('genre')
-  const genreMix = onlyGenre && isGenre(onlyGenre)
-    ? { [onlyGenre]: 1 }
-    : genreWeights(await getGenreMix().catch(() => null))
+  // MINUS THIS WORKER'S PAUSED GENRES: the comment check found too few of their
+  // comments on those links while another genre's were fine (noCommentVerdict),
+  // so the other genres fill their list instead.
+  const genreMix = withoutGenres(
+    onlyGenre && isGenre(onlyGenre)
+      ? { [onlyGenre]: 1 }
+      : genreWeights(await getGenreMix().catch(() => null)),
+    await getUserPausedGenres(userId).catch(() => [])
+  )
   const seed = seedFrom(userId)
 
   const available = videos.filter(
