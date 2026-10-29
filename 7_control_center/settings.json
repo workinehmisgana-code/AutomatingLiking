@@ -1,7 +1,6 @@
 {
   "search": {
     "platforms": [
-      "tiktok",
       "instagram"
     ],
     "genre": "humanizer",
@@ -37,7 +36,7 @@
     "target": "products",
     "users": "cocodly, co codly,purifytext, purify text,\u03c1\u03c5r\u0456f\u0443t\u0435xt,\u03c1\u03c5r\u0456f\u0443 t\u0435xt, \u03c1\u03c5r\u0456f\u0443t\u0435xt, acoustictext, acoustic text, prohumanly,  pro humanly, cohumanly, humlexic",
     "profiles": "c,g,h,a,e,b,f,d,j,i,o,n,q,l",
-    "at_once": 4,
+    "at_once": 5,
     "keywords": "",
     "mode": "dom",
     "pages": 4,

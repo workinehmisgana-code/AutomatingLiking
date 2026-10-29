@@ -312,12 +312,24 @@ def _find_window_once(title_contains: str):
         return None
 
 
-def focus_window(title_contains: str) -> bool:
+def focus_window(title_contains: str, wait_ms: int = 3000) -> bool:
     """Restore and raise the first visible window whose title contains this.
 
     Returns whether a window was actually found and raised. Fails quietly like
     everything else here: a run that is otherwise fine must not end because a
     window could not be focused.
+
+    TWO THINGS KEPT A CAPTCHA WINDOW BEHIND EVERYTHING ELSE:
+
+      * It looked for the window the instant the page was renamed, and Chrome
+        sets the window title a moment later (see _find_window) — so the first
+        try found nothing, and the next one was a minute away. It now waits.
+      * It attached the wrong threads. SetForegroundWindow is judged against
+        the CALLING thread, which is this script's, and it attached the
+        foreground window's thread to Chrome's instead — so Windows refused the
+        call and at most flashed the taskbar button. This thread is attached
+        now, and a tap of Alt (which Windows counts as user input, lifting its
+        foreground lock) goes first.
     """
     if not WINDOWS or not title_contains:
         return False
@@ -325,25 +337,36 @@ def focus_window(title_contains: str) -> bool:
         import ctypes
 
         user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         SW_RESTORE = 9
-        hwnd = _find_window(title_contains)
+        VK_MENU, KEYEVENTF_KEYUP = 0x12, 0x0002
+        HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+        SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW = 0x0002, 0x0001, 0x0040
+        hwnd = _find_window(title_contains, wait_ms=wait_ms)
         if not hwnd:
             return False
         if user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, SW_RESTORE)
-        # Windows refuses SetForegroundWindow from a process that does not own
-        # the foreground. Attaching to the foreground window's input thread for
-        # the call is the documented way round it.
+        # The Alt tap: an empty keystroke, so it does not open a menu anywhere.
+        user32.keybd_event(VK_MENU, 0, 0, 0)
+        user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
         fg = user32.GetForegroundWindow()
-        cur = user32.GetWindowThreadProcessId(fg, None) if fg else 0
-        mine = user32.GetWindowThreadProcessId(hwnd, None)
-        if cur and mine and cur != mine:
-            user32.AttachThreadInput(cur, mine, True)
+        fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        me = kernel32.GetCurrentThreadId()
+        attached = bool(fg_thread and fg_thread != me
+                        and user32.AttachThreadInput(me, fg_thread, True))
+        try:
             user32.SetForegroundWindow(hwnd)
-            user32.AttachThreadInput(cur, mine, False)
-        else:
-            user32.SetForegroundWindow(hwnd)
-        user32.BringWindowToTop(hwnd)
+            user32.BringWindowToTop(hwnd)
+            # Above everything for an instant and straight back: lifts it over
+            # other windows even if the foreground was still refused, without
+            # leaving it pinned on top for the rest of the run.
+            flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags)
+            user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+        finally:
+            if attached:
+                user32.AttachThreadInput(me, fg_thread, False)
         return True
     except Exception:  # noqa: BLE001 - never worth ending a run over
         return False
