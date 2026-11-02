@@ -47,6 +47,7 @@ import {
   getReferralEarnings,
   getReferralOf,
   getGenreMix,
+  ourRatioRetiredSet,
   getUserPausedGenres,
 } from '@/lib/db'
 import { retiredUrlSet } from '@/lib/videos'
@@ -258,7 +259,12 @@ export default async function Home() {
   // applies while quota enforcement is ON; with it OFF no link is ever retired.
   // Retirement applies per platform (master switch AND that platform's own
   // retirement switch) — independent of the hourly quotas.
-  const retiredUrls = Array.from(retiredUrlSet(videos, clickCounts, retirePlatforms))
+  // AND THE TIKTOK LINKS OUR COMMENTS ALREADY CROWD: retired by the ratio
+  // setting (getOurRatioRetirePct), whatever their click count.
+  const retiredUrls = Array.from(new Set([
+    ...Array.from(retiredUrlSet(videos, clickCounts, retirePlatforms)),
+    ...Array.from(await ourRatioRetiredSet(videos).catch(() => new Set<string>())),
+  ]))
 
   // Only this user's slice crosses the wire. The whole pool used to: 129k links,
   // tens of megabytes, re-sent on every load so a phone could render the first

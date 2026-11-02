@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { userIdFromApp } from '@/lib/appAuth'
 import {
   getGenreMix,
+  ourRatioRetiredSet,
   getUserPausedGenres,
   getHourlyClickTimes,
   getTodayClickCountsByPlatform,
@@ -67,6 +68,9 @@ export async function GET(req: NextRequest) {
   // or the app shows a count it can't actually serve. Retirement applies per
   // platform; the hourly quotas below are a separate switch.
   const retired = retiredUrlSet(videos, clickCounts, retirePlatforms)
+  // AND THE TIKTOK LINKS OUR COMMENTS ALREADY CROWD: retired by the ratio
+  // setting (getOurRatioRetirePct), whatever their click count.
+  ;(await ourRatioRetiredSet(videos).catch(() => new Set<string>())).forEach((u) => retired.add(u))
   const hidden = new Set<string>(clicked)
   retired.forEach((u) => hidden.add(u))
   blocked.forEach((u) => hidden.add(u))

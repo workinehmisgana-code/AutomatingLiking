@@ -14,6 +14,7 @@ import {
   getUnrelatedUrls,
 
   getGenreMix,
+  ourRatioRetiredSet,
   getUserPausedGenres,
   getUserProfile,
   needsTiktokProfileFix,
@@ -174,6 +175,9 @@ export async function GET(req: NextRequest) {
   //
   // Retirement applies per platform (hourly quotas are a separate switch).
   const retired = retiredUrlSet(videos, clickCounts, effective.retirePlatforms)
+  // AND THE TIKTOK LINKS OUR COMMENTS ALREADY CROWD: retired by the ratio
+  // setting (getOurRatioRetirePct), whatever their click count.
+  ;(await ourRatioRetiredSet(videos).catch(() => new Set<string>())).forEach((u) => retired.add(u))
   // ALREADY-OPENED LINKS COME BACK when "only links with none of ours" is on.
   //
   // That setting only ever serves a link the extraction has NOT found one of

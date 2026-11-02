@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { CLICK_PLATFORMS, CLICK_PLATFORM_LABELS } from '@/lib/config'
+import OurRatioRetire from '@/components/OurRatioRetire'
 
 type Limits = Record<
   string,
@@ -397,6 +398,7 @@ export default function PlatformLimits() {
               })}
             </div>
           )}
+          <OurRatioRetire />
         </div>
       )}
     </div>

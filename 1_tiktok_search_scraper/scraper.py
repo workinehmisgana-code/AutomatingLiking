@@ -294,6 +294,59 @@ def get_yt_shorts_details(anchor) -> tuple[str, str, str]:
         return "", "", ""
 
 
+# TikTok's puzzle and "slow down" screens. While one is up the results never
+# render, so a tab waited its full minute for cards and gave up — and so did
+# every tab of every query after it, because the screen stays until a person
+# deals with it.
+_TT_CAPTCHA_SEL = (
+    '#captcha-verify-image, #captcha_container, [class*="captcha" i], '
+    '[id*="captcha" i], iframe[src*="captcha" i], [class*="secsdk-captcha" i]'
+)
+
+
+def tiktok_captcha_showing(page) -> bool:
+    try:
+        return page.locator(_TT_CAPTCHA_SEL).first.is_visible(timeout=500)
+    except Exception:  # noqa: BLE001 - mid-navigation: ask again next time
+        return False
+
+
+def wait_out_tiktok_captcha(page, timeout_s: int = 300) -> bool:
+    """Bring the window forward, sound an alert, and wait for a person to solve
+    the puzzle. True once it is gone."""
+    print(f"\n[!] TikTok is showing a captcha — solve it in the browser window "
+          f"(waiting up to {timeout_s // 60} minutes)...")
+    try:
+        page.bring_to_front()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import winsound
+        for _ in range(3):
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            time.sleep(0.4)
+    except Exception:  # noqa: BLE001 - not Windows, or no sound device
+        pass
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        time.sleep(3)
+        if not tiktok_captcha_showing(page):
+            print("[+] Captcha gone – carrying on.")
+            time.sleep(2)
+            return True
+    print("[!] The captcha is still there – skipping this tab.")
+    return False
+
+
+def _navigated_away(err: Exception) -> bool:
+    """The page changed under us (a redirect, a captcha reload) — the tab is
+    lost, not the browser."""
+    msg = str(err).lower()
+    return ("execution context was destroyed" in msg
+            or "most likely because of a navigation" in msg
+            or "frame was detached" in msg)
+
+
 def goto_search(page, url: str, tries: int = 3) -> bool:
     """Open a search-results page. False means "skip this query", not "stop".
 
@@ -712,14 +765,30 @@ def scrape_tiktok_search(queries: list[str], min_videos: int, max_videos: int, o
                 print(f"[*] [{tab_label}] Waiting for first cards to appear...")
                 cards_found = False
                 elapsed_ms = 0
+                captcha_waited = False
                 while elapsed_ms < CARDS_LOAD_TIMEOUT_MS:
                     try:
                         page.wait_for_selector(link_selector, timeout=3000)
                         cards_found = True
                         break
                     except PlaywrightTimeoutError:
-                        # Scroll to trigger TikTok's IntersectionObserver lazy-load
-                        page.evaluate(f"window.scrollBy({{ top: {SCROLL_STEP_PX}, behavior: 'smooth' }})")
+                        # A captcha hides the results until it is solved; wait
+                        # for a person once per tab, then give the cards a
+                        # fresh minute.
+                        if not captcha_waited and tiktok_captcha_showing(page):
+                            captcha_waited = True
+                            if not wait_out_tiktok_captcha(page):
+                                return collected
+                            elapsed_ms = 0
+                            continue
+                        # Scroll to trigger TikTok's IntersectionObserver lazy-load.
+                        # A page that navigates mid-scroll (a redirect, the
+                        # captcha reloading it) is waited on, not fatal.
+                        try:
+                            page.evaluate(f"window.scrollBy({{ top: {SCROLL_STEP_PX}, behavior: 'smooth' }})")
+                        except Exception as e:  # noqa: BLE001
+                            if not _navigated_away(e):
+                                raise
                         time.sleep(1.5)
                         elapsed_ms += 4500  # 3 s wait + 1.5 s sleep
                 if not cards_found:
@@ -918,16 +987,32 @@ def scrape_tiktok_search(queries: list[str], min_videos: int, max_videos: int, o
             # Videos and Photo tabs then add their long tails, with gaps where Top
             # already took something.
             #
+            # ONE TAB LOST IS ONE TAB LOST. The page navigating mid-harvest
+            # ("Execution context was destroyed") used to climb out of the
+            # query loop and end the run, and the control center then refused
+            # to upload anything — even the queries that had already finished.
+            def safe_tab(label: str, run) -> list[dict]:
+                try:
+                    return run()
+                except Exception as e:  # noqa: BLE001
+                    if not _navigated_away(e):
+                        raise
+                    print(f"[!] [{label}] The page navigated away mid-harvest – "
+                          f"keeping what this tab had and moving on.")
+                    return []
+
             # 1) Top tab (we navigated straight to it).
-            top_entries = collect_tab("Top", TOP_LINK_SELECTOR, TOP_URL_RE)
+            top_entries = safe_tab("Top", lambda: collect_tab("Top", TOP_LINK_SELECTOR, TOP_URL_RE))
 
             # 2) Videos tab.
-            video_entries = (collect_tab("Videos", VIDEO_LINK_SELECTOR, VIDEO_URL_RE)
-                             if open_search_tab("Videos") else [])
+            video_entries = safe_tab("Videos", lambda: (
+                collect_tab("Videos", VIDEO_LINK_SELECTOR, VIDEO_URL_RE)
+                if open_search_tab("Videos") else []))
 
             # 3) Photo tab — the image/slideshow posts.
-            photo_entries = (collect_tab("Photo", PHOTO_LINK_SELECTOR, PHOTO_URL_RE)
-                             if open_search_tab("Photo") else [])
+            photo_entries = safe_tab("Photo", lambda: (
+                collect_tab("Photo", PHOTO_LINK_SELECTOR, PHOTO_URL_RE)
+                if open_search_tab("Photo") else []))
 
             collected_q = len(top_entries) + len(video_entries) + len(photo_entries)
             # Named per tab, because the split is the only way to see a tab that

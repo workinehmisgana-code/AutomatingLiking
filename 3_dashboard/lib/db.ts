@@ -55,6 +55,8 @@ import {
   type CommentStyle,
   isCommentVoice,
   DEFAULT_COMMENT_STYLE,
+  OUR_RATIO_RETIRE_DEFAULT,
+  clampOurRatioPct,
 } from './config'
 import { isGenericTitle } from './titleFilter'
 import { normalizeReferralCode, referralCodeFrom, candidateCode } from './referrals'
@@ -3294,6 +3296,54 @@ export async function setServeOnlyClean(on: boolean): Promise<boolean> {
  * Just the URLs — the serving paths only need to know WHETHER, and the full
  * per-product counts are a much larger read for a set membership test.
  */
+/** The ratio retirement setting (see OUR_RATIO_RETIRE_DEFAULT); 0 = off. */
+export async function getOurRatioRetirePct(): Promise<number> {
+  const raw = await getAppState('our_ratio_retire_pct').catch(() => null)
+  return raw === null || raw === undefined ? OUR_RATIO_RETIRE_DEFAULT : clampOurRatioPct(raw)
+}
+
+export async function setOurRatioRetirePct(v: unknown): Promise<number> {
+  const pct = clampOurRatioPct(v)
+  await setAppState('our_ratio_retire_pct', String(pct))
+  return pct
+}
+
+/**
+ * Links whose scanned comments are at least `pct`% ours. The denominator is the
+ * count TikTok reports, or the comments read when it reported none.
+ */
+export function getOurRatioRetiredUrls(pct: number): Promise<string[]> {
+  if (!(pct > 0)) return Promise.resolve([])
+  return cached(`ourRatioRetired:${pct}`, TTL.scan, async () => {
+    await ensureClickedTable()
+    const { rows } = await pool.query<{ url: string }>(
+      `SELECT url FROM link_comment_scan
+        WHERE our_count > 0
+          AND our_count * 100.0 >= $1 * GREATEST(COALESCE(total_count, 0), read_count, our_count, 1)`,
+      [pct]
+    )
+    return rows.map((r) => r.url)
+  })
+}
+
+/**
+ * The pool's TikTok links retired by the ratio rule, for the feeds to add to
+ * the click-quota retirements. Only TikTok: the scan reads TikTok comments.
+ */
+export async function ourRatioRetiredSet(
+  videos: { url?: unknown; platform?: unknown }[]
+): Promise<Set<string>> {
+  const pct = await getOurRatioRetirePct().catch(() => 0)
+  if (!(pct > 0)) return new Set()
+  const hit = new Set(await getOurRatioRetiredUrls(pct).catch(() => [] as string[]))
+  const out = new Set<string>()
+  for (const v of videos) {
+    const url = String(v.url ?? '')
+    if (url && String(v.platform ?? '') === 'tiktok' && hit.has(url)) out.add(url)
+  }
+  return out
+}
+
 export function getUrlsWithProductComments(): Promise<string[]> {
   // Cached: see lib/poolCache. This is a whole-table read and it used to
   // run on every request that touched the link pool.

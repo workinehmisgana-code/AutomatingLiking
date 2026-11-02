@@ -215,6 +215,22 @@ export function retireThreshold(platform: string, engagement: number): number {
   return RETIRE_AFTER_USERS // other/unknown platforms
 }
 
+// ── Retire a TikTok link once OUR comments crowd it ─────────────────────
+//
+// The click quota above retires a link by how many workers opened it. This one
+// retires it by what is actually ON it: once our products' comments make up
+// this percentage of the video's comments, more of them read as a flood, so the
+// link leaves every worker's list. Measured by the comment scan
+// (link_comment_scan: our_count over the comments TikTok reports), so a link
+// nobody has scanned is never retired by it. 0 is off. Set on the admin
+// dashboard beside the platform switches.
+export const OUR_RATIO_RETIRE_DEFAULT = 0
+export function clampOurRatioPct(v: unknown): number {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return OUR_RATIO_RETIRE_DEFAULT
+  return Math.max(0, Math.min(100, Math.round(n * 10) / 10))
+}
+
 // Debug/admin accounts whose clicks must NOT count toward a link's retire quota
 // (these accounts are used to test the system). Lowercased for comparison.
 export const CLICK_EXCLUDED_EMAILS = [

@@ -1428,7 +1428,7 @@ def _captcha_refresh(page) -> None:
     try:
         btn = page.locator(_CAPTCHA_REFRESH).first
         if btn.count() > 0:
-            btn.click()
+            zefoy_click(page, btn)
             page_wait(1.0, 1.8)
             return
     except Exception:  # noqa: BLE001
@@ -1445,7 +1445,7 @@ def _captcha_submit_word(page, word: str, tag: str) -> bool:
     """Fill the captcha input with word, submit, and return True if solved."""
     page.locator(_CAPTCHA_INPUT).first.fill(word)
     page_wait(0.3, 0.6)
-    page.locator(_CAPTCHA_SUBMIT).first.click()
+    zefoy_click(page, page.locator(_CAPTCHA_SUBMIT).first)
     page_wait(1.5, 2.5)
     if page.locator(_CAPTCHA_ERR).is_visible(timeout=2000):
         print(f"{tag} [CAPTCHA] Wrong answer – refreshing image...")
@@ -1474,6 +1474,8 @@ def zefoy_wait_captcha(page):
             "the browser is not reachable. Over --cdp this is almost always "
             "the adb forward. Re-run it and check that adb devices lists the "
             "phone: adb forward tcp:9222 localabstract:chrome_devtools_remote")
+    # An ad over the captcha would hide the image and swallow the typing.
+    zefoy_clear_ad(page)
     try:
         captcha_visible = page.locator(_CAPTCHA_SEL).is_visible(timeout=4000)
     except Exception as e:
@@ -1633,6 +1635,258 @@ def browser_gone(page, err: Exception | None = None) -> bool:
     return False
 
 
+# ── Zefoy's full-screen ads ───────────────────────────────────────────────────
+#
+# Now and then Zefoy covers the page with a Google ad: a full-screen interstitial
+# (the URL gains #google_vignette), or a "watch a short ad" offer whose reward is
+# being let back in. Nothing under it can be clicked while it is up, so every
+# step after it failed on a button it could see in the DOM and could not reach.
+#
+# THE REWARD NEEDS THE VIDEO WATCHED TO THE END. Closing a rewarded ad early asks
+# "close video? you will lose your reward", so the close button is only pressed
+# once no video in any ad frame is still playing — and "Resume video" is pressed
+# if that question ever shows.
+
+# Seen through every frame, nested cross-origin ones included (page.frames).
+_AD_CLOSE_SELECTORS = (
+    "#dismiss-button",
+    "[aria-label='Close ad']",
+    "[aria-label='Close']",
+    "[aria-label*='close' i]",
+    "button:has-text('Close')",
+    "[role='button']:has-text('Close')",
+    "div:text-is('Close')",
+    "button:has-text('Continue')",
+    "[role='button']:has-text('Continue')",
+    "button:has-text('Done')",
+    "button:has-text('Got it')",
+)
+_AD_RESUME_SELECTORS = (
+    "button:has-text('Resume')",
+    "[role='button']:has-text('Resume')",
+    "div:text-is('Resume video')",
+)
+# The "watch an ad for access" offer (Google Funding Choices offerwall).
+_AD_OFFER_SELECTORS = (
+    ".fc-rewarded-ad-button",
+    "button:has-text('View a short ad')",
+    "button:has-text('Watch ad')",
+    "[role='button']:has-text('View a short ad')",
+)
+
+_AD_DETECT_JS = """() => {
+  if ((location.hash || '').includes('google_vignette')) return 'vignette';
+  const vw = innerWidth, vh = innerHeight;
+  const shown = (el) => {
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
+  };
+  for (const el of document.querySelectorAll(
+      '.fc-dialog-container, .fc-monetization-dialog-container, .fc-dialog')) {
+    const r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0 && shown(el)) return 'offer';
+  }
+  // An ad element is one of Google's, or inside one.
+  const isAd = (el) => {
+    for (let e = el; e && e !== document.body; e = e.parentElement) {
+      if (e.matches && e.matches('ins.adsbygoogle, [data-vignette-loaded], [id^="aswift"], [id^="google_ads"]')) return true;
+      if (e.tagName === 'IFRAME' && /google|doubleclick|aswift|syndication/i.test(
+          (e.src || '') + ' ' + (e.id || '') + ' ' + (e.name || ''))) return true;
+    }
+    return false;
+  };
+  // WHAT A CLICK WOULD LAND ON. The vignette outlives its #google_vignette
+  // hash, and fades through opacity 0 while still catching every click — so
+  // the honest test is the one Playwright's click fails on: hit-test the page
+  // and see whether an ad is on top. Five points, most of the viewport.
+  for (const [fx, fy] of [[0.5, 0.5], [0.25, 0.3], [0.75, 0.3], [0.25, 0.7], [0.75, 0.7]]) {
+    const el = document.elementFromPoint(vw * fx, vh * fy);
+    if (el && isAd(el)) {
+      const vg = el.closest && el.closest('[data-vignette-loaded]');
+      return vg ? 'vignette' : 'overlay';
+    }
+  }
+  // A full-screen ad iframe: most of the VISIBLE viewport, not just a big
+  // banner further down the page (Zefoy has a 1200x280 one under the form).
+  // Opacity is NOT a sign of absence: a transparent iframe still takes clicks.
+  for (const f of document.querySelectorAll('iframe')) {
+    const tag = (f.src || '') + ' ' + (f.id || '') + ' ' + (f.name || '');
+    if (!/google|doubleclick|aswift|syndication|ad/i.test(tag)) continue;
+    const r = f.getBoundingClientRect();
+    const w = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+    const h = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+    const cs = getComputedStyle(f);
+    if (w * h >= 0.5 * vw * vh && cs.display !== 'none' && cs.visibility !== 'hidden'
+        && cs.pointerEvents !== 'none') return 'overlay';
+  }
+  return '';
+}"""
+
+# The last resort: take the overlay out of the page. Used only once an ad has
+# had its chance to finish and close — a vignette carries no reward, and an ad
+# that never shows a close button would otherwise stop the run for good.
+_AD_HIDE_JS = """() => {
+  let n = 0;
+  for (const el of document.querySelectorAll(
+      'ins.adsbygoogle[data-vignette-loaded], [data-vignette-loaded], .fc-dialog-container, .fc-monetization-dialog-container')) {
+    el.style.setProperty('display', 'none', 'important'); n++;
+  }
+  const vw = innerWidth, vh = innerHeight;
+  for (const f of document.querySelectorAll('iframe')) {
+    if (!/google|doubleclick|aswift|syndication/i.test((f.src || '') + ' ' + (f.id || '') + ' ' + (f.name || ''))) continue;
+    const r = f.getBoundingClientRect();
+    if (r.width * r.height >= 0.5 * vw * vh) { f.style.setProperty('display', 'none', 'important'); n++; }
+  }
+  if ((location.hash || '').includes('google_vignette'))
+    history.replaceState(null, '', location.pathname + location.search);
+  document.body.style.overflow = '';
+  return n;
+}"""
+
+# Is a video in this frame still to finish? Starts a paused one (muted, which
+# browsers allow without a click), since an ad that never plays never ends.
+# One still LOADING counts as unfinished: it has no duration yet, and reading
+# that as "over" pressed close before the ad had started — measured, thirteen
+# times on one ad, every one of them forfeiting the reward.
+_AD_VIDEO_JS = """() => {
+  let playing = false;
+  for (const v of document.querySelectorAll('video')) {
+    if (v.ended) continue;
+    const loading = v.readyState < 2 || !(v.duration > 0);
+    if (!loading && v.currentTime >= v.duration - 0.3) continue;
+    if (v.paused) { try { v.muted = true; v.play(); } catch (e) {} }
+    playing = true;
+  }
+  return playing;
+}"""
+
+
+def zefoy_ad_showing(page) -> str:
+    """Which kind of full-screen ad covers the page, or '' for none."""
+    try:
+        return page.evaluate(_AD_DETECT_JS) or ""
+    except Exception:  # noqa: BLE001 - mid-navigation; ask again next time
+        return ""
+
+
+def _ad_click_first(page, selectors) -> bool:
+    """Click the first visible match in any frame (the ad's own included)."""
+    for frame in page.frames:
+        for css in selectors:
+            try:
+                loc = frame.locator(css).first
+                if loc.is_visible(timeout=200) and loc.is_enabled(timeout=200):
+                    # A window in the background throttles the animation frames
+                    # Playwright's "stable" check waits on, so a plain click
+                    # times out on a button in plain view. A forced click is no
+                    # better there — measured, it lands on nothing — so the
+                    # fallback is the click event itself, sent to the element.
+                    try:
+                        loc.click(timeout=2000)
+                    except Exception:  # noqa: BLE001
+                        loc.dispatch_event("click")
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+    return False
+
+
+def _ad_video_playing(page) -> bool:
+    for frame in page.frames:
+        try:
+            if frame.evaluate(_AD_VIDEO_JS):
+                return True
+        except Exception:  # noqa: BLE001 - a frame that went away mid-ask
+            continue
+    return False
+
+
+def zefoy_clear_ad(page, timeout_s: float = 180) -> bool:
+    """Watch a full-screen ad to its end and close it. True if none is left.
+
+    Cheap when there is no ad (one evaluate), so it is called at every
+    checkpoint where an ad would otherwise make the next click fail.
+    """
+    kind = zefoy_ad_showing(page)
+    if not kind:
+        return True
+    tag = _pfx()
+    print(f"{tag} [AD] Zefoy is showing an ad ({kind}) — watching it to the end...")
+    if kind == "offer":
+        # Start the ad that the reward is for.
+        if _ad_click_first(page, _AD_OFFER_SELECTORS):
+            page.wait_for_timeout(2000)
+    deadline = time.time() + timeout_s
+    quiet_since = None
+    while time.time() < deadline:
+        if not zefoy_ad_showing(page):
+            print(f"{tag} [AD] Ad closed — reward collected, carrying on.")
+            page_wait(1, 2)
+            return True
+        # Closed too early somehow: go back to the video, or the reward is lost.
+        if _ad_click_first(page, _AD_RESUME_SELECTORS):
+            page.wait_for_timeout(1000)
+            continue
+        if _ad_video_playing(page):
+            quiet_since = None
+            page.wait_for_timeout(1000)
+            continue
+        # No video playing. A non-video ad (or one that just ended) shows its
+        # close button after a countdown: give the button a moment to appear
+        # rather than clicking the first thing that looks like one mid-video.
+        if quiet_since is None:
+            quiet_since = time.time()
+            page.wait_for_timeout(1500)
+            continue
+        if _ad_click_first(page, _AD_CLOSE_SELECTORS):
+            page.wait_for_timeout(1500)
+            continue
+        # Nothing playing and nothing to press for half a minute: it is not
+        # going to close itself.
+        if time.time() - quiet_since > 30:
+            break
+        page.wait_for_timeout(1000)
+    print(f"{tag} [AD] The ad would not close — taking it off the page.")
+    return zefoy_hide_ad(page)
+
+
+def zefoy_hide_ad(page) -> bool:
+    """Remove a stuck overlay from the page. True if nothing covers it now."""
+    try:
+        page.keyboard.press("Escape")
+        page.evaluate(_AD_HIDE_JS)
+        page.wait_for_timeout(500)
+    except Exception:  # noqa: BLE001
+        pass
+    return not zefoy_ad_showing(page)
+
+
+def zefoy_click(page, locator, timeout_ms: int = 30000) -> None:
+    """Click, clearing an ad that steps in front of the button first.
+
+    An ad that arrives between the last check and the click used to cost the
+    whole video: Playwright retried for thirty seconds against an iframe that
+    "intercepts pointer events", and the link was failed for it.
+    """
+    try:
+        locator.click(timeout=timeout_ms)
+        return
+    except Exception as e:  # noqa: BLE001
+        if "intercepts pointer events" not in str(e) and not zefoy_ad_showing(page):
+            raise
+    print(f"{_pfx()} [AD] An ad is covering the button — clearing it.")
+    if not zefoy_clear_ad(page):
+        zefoy_hide_ad(page)
+    try:
+        locator.click(timeout=timeout_ms)
+    except Exception as e:  # noqa: BLE001
+        if "intercepts pointer events" not in str(e):
+            raise
+        # Still covered: hide what is on top and press it once more.
+        zefoy_hide_ad(page)
+        locator.click(timeout=timeout_ms)
+
+
 def zefoy_session_expired(page) -> bool:
     """Return True if the session has expired.
 
@@ -1647,6 +1901,7 @@ def zefoy_session_expired(page) -> bool:
     the Terms and Privacy modals are the only other long text, and neither
     mentions sessions.
     """
+    zefoy_clear_ad(page)
     try:
         if page.locator(_CAPTCHA_SEL).is_visible(timeout=1500):
             return True
@@ -1701,6 +1956,7 @@ def zefoy_open_comments_hearts(page):
     tag = _pfx()
 
     for attempt in range(1, 4):
+        zefoy_clear_ad(page)
         # 1. Wait for the button to render. If it doesn't, a cooldown may be
         #    blocking the dashboard — wait it out and retry.
         try:
@@ -1716,7 +1972,7 @@ def zefoy_open_comments_hearts(page):
 
         # 2. Click it (JS fallback if the normal click fails).
         try:
-            page.locator(ch_btn_sel).first.click()
+            zefoy_click(page, page.locator(ch_btn_sel).first)
         except Exception:
             page.evaluate("""() => {
                 const b = document.querySelector('button.t-chearts-button');
@@ -1990,7 +2246,7 @@ def _zefoy_click_page(page, n: int) -> bool:
         if btn.count() == 0:
             return False
         btn.first.scroll_into_view_if_needed()
-        btn.first.click()
+        zefoy_click(page, btn.first)
         page_wait(1.5, 2.5)
         return True
     except Exception:
@@ -2102,6 +2358,7 @@ def zefoy_process_url(page, video_url: str, video_like_count: int, keywords: lis
         # which named the symptom and nothing else, and the run went on failing
         # one video at a time with nothing wrong that opening the panel would
         # not fix.
+        zefoy_clear_ad(page)
         url_input = page.locator(url_input_sel).first
         try:
             url_input.wait_for(state="visible", timeout=10000)
@@ -2120,7 +2377,7 @@ def zefoy_process_url(page, video_url: str, video_like_count: int, keywords: lis
         page_wait(0.5, 1.0)
 
         search_btn = page.locator(search_btn_sel).first
-        search_btn.click()
+        zefoy_click(page, search_btn)
         page_wait(2, 3)
 
         # ── 2. Handle cooldown (loop – Zefoy can issue a second timer) ──────
@@ -2132,7 +2389,7 @@ def zefoy_process_url(page, video_url: str, video_like_count: int, keywords: lis
             time.sleep(cooldown)
             if zefoy_session_expired(page):
                 return fail("Session expired during cooldown – will recover on retry")
-            search_btn.click()
+            zefoy_click(page, search_btn)
             page_wait(2, 3)
 
         # Quick session-expiry check before the 15s count-button wait
@@ -2149,7 +2406,7 @@ def zefoy_process_url(page, video_url: str, video_like_count: int, keywords: lis
             # NOT no_comment: Zefoy did not answer, so nothing is known about
             # this video's comments. It stays pending for the next pass.
             return fail("Count button did not appear after Search")
-        count_btn.click()
+        zefoy_click(page, count_btn)
         page_wait(2, 3)
 
         # ── 4. Find target comment row ────────────────────────────────────────────
@@ -2259,7 +2516,7 @@ def zefoy_process_url(page, video_url: str, video_like_count: int, keywords: lis
                     break
                 try:
                     next_btn.first.scroll_into_view_if_needed()
-                    next_btn.first.click()
+                    zefoy_click(page, next_btn.first)
                 except Exception:
                     break
                 scan_page += 1
@@ -2619,7 +2876,7 @@ def zefoy_process_url(page, video_url: str, video_like_count: int, keywords: lis
             print(f"  [!] Could not set quantity dropdown: {e} – using default")
 
         try:
-            target_row.locator("button[type='submit']").first.click()
+            zefoy_click(page, target_row.locator("button[type='submit']").first)
         except Exception as e:
             return fail(f"Could not click heart button: {e}",
                         comment_text, comment_hearts, hearts_sent)
