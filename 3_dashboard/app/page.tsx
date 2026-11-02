@@ -48,6 +48,7 @@ import {
   getReferralOf,
   getGenreMix,
   ourRatioRetiredSet,
+  getRecentClickGenres,
   getUserPausedGenres,
 } from '@/lib/db'
 import { retiredUrlSet } from '@/lib/videos'
@@ -293,11 +294,17 @@ export default async function Home() {
     genreWeights(await getGenreMix().catch(() => null)),
     await getUserPausedGenres(session.user.id).catch(() => [])
   )
+  // Where this worker is in the genre blocks, so a reload continues the block
+  // they are in instead of starting a fresh humanizer one.
+  const recentGenres = await getRecentClickGenres(session.user.id).catch(
+    () => ({}) as Record<string, string[]>
+  )
   const { served, remaining } = buildUserFeed(
     videos,
     new Set([...alreadyOpened, ...retiredUrls]),
     FEED_PER_PLATFORM,
-    genreMix
+    genreMix,
+    recentGenres
   )
 
   // The audience each served link was sorted into, so the page copies a comment
@@ -339,6 +346,8 @@ export default async function Home() {
       profile={profile}
       product={null}
       limits={platformLimits}
+      genreMix={genreMix}
+      recentGenres={recentGenres}
     />
   )
 }

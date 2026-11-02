@@ -56,6 +56,7 @@ import {
   isCommentVoice,
   DEFAULT_COMMENT_STYLE,
   OUR_RATIO_RETIRE_DEFAULT,
+  genreOfProduct,
   clampOurRatioPct,
 } from './config'
 import { isGenericTitle } from './titleFilter'
@@ -3296,6 +3297,31 @@ export async function setServeOnlyClean(on: boolean): Promise<boolean> {
  * Just the URLs — the serving paths only need to know WHETHER, and the full
  * per-product counts are a much larger read for a set membership test.
  */
+/**
+ * The genre of each of this worker's recent clicks, per platform, newest first:
+ * where they are in the genre blocks (see interleaveByWeight). A click with no
+ * product has no genre and reads as '' — it ends a run rather than extending
+ * one.
+ */
+export async function getRecentClickGenres(
+  userId: string,
+  limit = 100
+): Promise<Record<string, string[]>> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ platform: string | null; product: string | null }>(
+    `SELECT platform, product FROM clicked_link
+      WHERE user_id = $1 AND clicked_at > now() - interval '2 days'
+      ORDER BY clicked_at DESC LIMIT $2`,
+    [userId, Math.max(1, Math.min(500, limit))]
+  )
+  const out: Record<string, string[]> = {}
+  for (const r of rows) {
+    const p = r.platform ?? ''
+    ;(out[p] ??= []).push(r.product ? genreOfProduct(r.product) : '')
+  }
+  return out
+}
+
 /** The ratio retirement setting (see OUR_RATIO_RETIRE_DEFAULT); 0 = off. */
 export async function getOurRatioRetirePct(): Promise<number> {
   const raw = await getAppState('our_ratio_retire_pct').catch(() => null)

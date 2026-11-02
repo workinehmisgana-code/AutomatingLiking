@@ -15,6 +15,7 @@ import {
 
   getGenreMix,
   ourRatioRetiredSet,
+  getRecentClickGenres,
   getUserPausedGenres,
   getUserProfile,
   needsTiktokProfileFix,
@@ -214,6 +215,10 @@ export async function GET(req: NextRequest) {
     await getUserPausedGenres(userId).catch(() => [])
   )
   const seed = seedFrom(userId)
+  // Where this worker is in the genre blocks (see interleaveByWeight).
+  const recentGenres = await getRecentClickGenres(userId).catch(
+    () => ({}) as Record<string, string[]>
+  )
 
   const available = videos.filter(
     (v) =>
@@ -258,7 +263,7 @@ export async function GET(req: NextRequest) {
     for (const [g, rows] of Array.from(byGenre.entries())) {
       if (rows.length > 0) ordered.set(g, mixed(rows))
     }
-    return interleaveByWeight(ordered, genreMix, APP_LINK_BATCH)
+    return interleaveByWeight(ordered, genreMix, APP_LINK_BATCH, recentGenres[p] ?? [])
   }
 
   // The feed is CAPPED (APP_LINK_BATCH). The app holds the batch on the device

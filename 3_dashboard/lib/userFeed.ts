@@ -148,55 +148,96 @@ function forPlatform<T extends FeedVideo>(
  * pool. `skipUrls` are the links this user has opened plus the retired ones.
  */
 /**
- * Draw from several ordered lists in a target ratio.
+ * The largest block: the genre with the biggest share serves this many links
+ * in a row before the list moves to another genre.
+ */
+export const GENRE_BLOCK = 10
+/** No block is shorter than this, however small its genre's share. */
+export const GENRE_BLOCK_MIN = 3
+
+/**
+ * How many links in a row each genre serves: GENRE_BLOCK for the biggest
+ * share, the rest IN PROPORTION — at 60/20/20 that is 10, 3, 3 — never under
+ * GENRE_BLOCK_MIN. A small share gets a short block that comes round less
+ * often, rather than a long one that comes round rarely.
+ */
+export function genreBlockSizes(weights: Record<string, number>): Record<string, number> {
+  const max = Math.max(0, ...Object.values(weights).filter((w) => w > 0))
+  const out: Record<string, number> = {}
+  for (const [g, w] of Object.entries(weights)) {
+    out[g] = w > 0 && max > 0
+      ? Math.max(GENRE_BLOCK_MIN, Math.min(GENRE_BLOCK, Math.round((GENRE_BLOCK * w) / max)))
+      : 0
+  }
+  return out
+}
+
+/**
+ * Draw from several ordered lists in a target ratio, ONE GENRE AT A TIME.
  *
- * At each step the genre furthest BEHIND its share gets the next slot, which
- * produces the pattern the ratio describes — at 60/20/20, six humanizer links,
- * then two cocodly, then two pptera, repeating — without any arithmetic about
- * run lengths.
+ * IN BLOCKS, NOT SHUFFLED. A worker given humanizer, slides, study, humanizer…
+ * link after link has a different product and a different comment every time,
+ * and the comment for one video ends up pasted under the next. So a genre
+ * serves a block of links in a row (genreBlockSizes) before the list moves on.
  *
- * A GENRE THAT RUNS DRY YIELDS ITS SLOTS. It simply stops being eligible, so the
- * others fill the list instead of it being short. A worker must never be shown
- * forty links because cocodly has nine left.
+ * WHICH GENRE NEXT: the one furthest behind its share — fewest links taken for
+ * its weight — so over any long stretch the shares come out as the mix says.
+ * Ties go to the first in insertion order (GENRES order: humanizer first).
  *
- * Deterministic: no randomness, so the same pool and the same ratio give the
- * same list, which is what makes the feed stable across a page reload.
+ * IT REMEMBERS WHERE THE WORKER IS. `history` is the genres of their recent
+ * clicks on this platform, newest first. Without it every reload would start a
+ * fresh humanizer block and the other genres would never come round: the run
+ * in progress is finished first, and the shares are counted from what they
+ * have already opened.
+ *
+ * A GENRE THAT RUNS DRY YIELDS ITS SLOTS: it stops being eligible and the
+ * others fill the list. Deterministic, so a reload gives the same list.
  */
 export function interleaveByWeight<T>(
   lists: Map<string, T[]>,
   weights: Record<string, number>,
-  limit: number
+  limit: number,
+  history: string[] = []
 ): T[] {
+  const sizes = genreBlockSizes(weights)
   const at = new Map<string, number>()
-  for (const k of Array.from(lists.keys())) at.set(k, 0)
+  const taken = new Map<string, number>()
+  for (const k of Array.from(lists.keys())) {
+    at.set(k, 0)
+    taken.set(k, 0)
+  }
+  for (const g of history) if (taken.has(g)) taken.set(g, (taken.get(g) ?? 0) + 1)
+  const eligible = (k: string) =>
+    (weights[k] ?? 0) > 0 && (at.get(k) ?? 0) < (lists.get(k)?.length ?? 0)
   const out: T[] = []
+  const take = (k: string, n: number) => {
+    const list = lists.get(k) as T[]
+    while (n-- > 0 && out.length < limit && (at.get(k) ?? 0) < list.length) {
+      out.push(list[at.get(k) ?? 0])
+      at.set(k, (at.get(k) ?? 0) + 1)
+      taken.set(k, (taken.get(k) ?? 0) + 1)
+    }
+  }
+  // Finish the block the worker is in the middle of.
+  if (history.length > 0) {
+    const g = history[0]
+    let run = 0
+    while (run < history.length && history[run] === g) run++
+    if (lists.has(g) && eligible(g) && run < (sizes[g] ?? 0)) take(g, (sizes[g] ?? 0) - run)
+  }
   while (out.length < limit) {
     let best: string | null = null
     let bestCost = Infinity
-    for (const [k, list] of Array.from(lists.entries())) {
-      const i = at.get(k) ?? 0
-      if (i >= list.length) continue
-      const w = weights[k] ?? 0
-      if (w <= 0) continue
-      // WEIGHTED ROUND ROBIN. The next slot goes to whichever genre would reach
-      // it soonest if it were running at its own share: taking item i+1 out of a
-      // share w "costs" (i + 1) / w, and the cheapest wins.
-      //
-      // That is exactly proportional over any length — at 60/20/20 a hundred
-      // slots come out 60/20/20, and interleaved rather than in three blocks —
-      // and it needs no arithmetic about run lengths. Ties go to the first key in
-      // insertion order, which is GENRES order, so it is deterministic: the same
-      // pool and ratio give the same list across a reload.
-      const cost = (i + 1) / w
+    for (const k of Array.from(lists.keys())) {
+      if (!eligible(k)) continue
+      const cost = (taken.get(k) ?? 0) / (weights[k] as number)
       if (cost < bestCost) {
         bestCost = cost
         best = k
       }
     }
     if (best === null) break
-    const i = at.get(best) ?? 0
-    out.push((lists.get(best) as T[])[i])
-    at.set(best, i + 1)
+    take(best, sizes[best] || 1)
   }
   return out
 }
@@ -210,7 +251,9 @@ export function buildUserFeed<T extends FeedVideo>(
    * drawn from the default genre — which is what every link was before genres
    * existed, so an older caller behaves exactly as it did.
    */
-  weights: Record<string, number> = genreWeights(null)
+  weights: Record<string, number> = genreWeights(null),
+  /** Genres of this worker's recent clicks per platform, newest first. */
+  history: Record<string, string[]> = {}
 ): { served: (T & FeedPlacement)[]; remaining: Record<string, number> } {
   const byPlatform = new Map<string, T[]>()
   for (const v of videos) {
@@ -257,7 +300,7 @@ export function buildUserFeed<T extends FeedVideo>(
       // enough ordered to fill the list on its own if it must.
       ordered.set(g, forPlatform(rows, skip, perPlatform))
     }
-    served.push(...interleaveByWeight(ordered, weights, perPlatform))
+    served.push(...interleaveByWeight(ordered, weights, perPlatform, history[key] ?? []))
     remaining[key] = list.reduce((n, v) => (skip(v) ? n : n + 1), 0)
   }
   return { served, remaining }

@@ -15,7 +15,7 @@
  *
  * (scripts/run-genre-feed-check.mjs does both and cleans up after itself.)
  */
-import { buildUserFeed, interleaveByWeight } from '../lib/userFeed'
+import { buildUserFeed, interleaveByWeight, genreBlockSizes } from '../lib/userFeed'
 import { DEFAULT_GENRE, GENRES, genreWeights, clampGenreShare } from '../lib/config'
 
 let fails = 0
@@ -64,13 +64,29 @@ const tally = (xs: string[]) => ({
   w: xs.filter((x) => x[0] === 'w').length,
   s: xs.filter((x) => x[0] === 's').length,
 })
-check('  100 links at 60/20/20', tally(mixed), { h: 60, w: 20, s: 20 })
+// In share to within one short block: the list is served in blocks, so a cut
+// at 100 can fall part-way through one.
+const near = (t: { h: number; w: number; s: number }, want: { h: number; w: number; s: number }) =>
+  Math.abs(t.h - want.h) <= 3 && Math.abs(t.w - want.w) <= 3 && Math.abs(t.s - want.s) <= 3
+check('  100 links at 60/20/20, to within a block', near(tally(mixed), { h: 60, w: 20, s: 20 }), true)
 check('  and the length is the limit', mixed.length, 100)
-// Interleaved, not three blocks: a worker scrolling must not meet sixty
-// humanizer links before the first cocodly one.
+// IN BLOCKS: ten humanizer links in a row, then a short block of another
+// genre — sized 10/3/3 by the mix — never alternating link by link, and never
+// sixty humanizer links before the first of another genre.
+check('  block sizes follow the mix', genreBlockSizes(w), { humanizer: 10, website: 3, slides: 3 })
+check('  the first ten are one genre', new Set(mixed.slice(0, 10).map((x) => x[0])).size, 1)
+check('  then the next genre takes over', mixed[10][0] !== mixed[9][0], true)
 const firstTwenty = tally(mixed.slice(0, 20))
 check('  every genre appears in the first twenty', firstTwenty.w > 0 && firstTwenty.s > 0, true)
-check('  and roughly in share there too', firstTwenty.h >= 10 && firstTwenty.h <= 14, true)
+
+console.log('\nit carries on from where the worker is:')
+// Seven humanizer links opened: three more finish the block, then it moves on.
+const cont = interleaveByWeight(lists, w, 10, Array(7).fill('humanizer'))
+check('  the block in progress is finished', cont.slice(0, 3).every((x) => x[0] === 'h'), true)
+check('  and then another genre', cont[3][0] !== 'h', true)
+// A full block just done: straight to a genre that is behind.
+const after = interleaveByWeight(lists, w, 5, Array(10).fill('humanizer'))
+check('  a finished block is not repeated', after[0][0] !== 'h', true)
 
 console.log('\na genre that runs dry yields its slots:')
 const thin = new Map<string, string[]>([
@@ -101,7 +117,7 @@ const kinds = {
   w: served.filter((v) => v.genre === 'website').length,
   s: served.filter((v) => v.genre === 'slides').length,
 }
-check('  100 served at 60/20/20', kinds, { h: 60, w: 20, s: 20 })
+check('  100 served at 60/20/20, to within a block', near(kinds, { h: 60, w: 20, s: 20 }), true)
 
 // EACH GENRE IS CLUSTERED WITHIN ITSELF. A cluster is relative to the pool it
 // was computed over, so mixing first and clustering after would spread the 300

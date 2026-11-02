@@ -1695,29 +1695,43 @@ _AD_DETECT_JS = """() => {
     }
     return false;
   };
+  // ONLY A FIXED, SCREEN-COVERING AD IS IN THE WAY. Zefoy also has ordinary
+  // banners in the page — one under the form, and Google's auto-placed ones —
+  // and a hit-test that lands on one of those is not an overlay: reading it as
+  // one stalled a run on an ad that was never covering anything. An overlay is
+  // pinned to the screen (position: fixed) and covers most of it.
+  const covering = (el) => {
+    for (let e = el; e && e !== document.documentElement; e = e.parentElement) {
+      const cs = getComputedStyle(e);
+      if (cs.position !== 'fixed') continue;
+      if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+      const r = e.getBoundingClientRect();
+      const w = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+      const h = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+      return w * h >= 0.5 * vw * vh;
+    }
+    return false;
+  };
   // WHAT A CLICK WOULD LAND ON. The vignette outlives its #google_vignette
   // hash, and fades through opacity 0 while still catching every click — so
   // the honest test is the one Playwright's click fails on: hit-test the page
-  // and see whether an ad is on top. Five points, most of the viewport.
+  // and see whether a covering ad is on top. Five points, most of the viewport.
   for (const [fx, fy] of [[0.5, 0.5], [0.25, 0.3], [0.75, 0.3], [0.25, 0.7], [0.75, 0.7]]) {
     const el = document.elementFromPoint(vw * fx, vh * fy);
-    if (el && isAd(el)) {
+    if (el && isAd(el) && covering(el)) {
       const vg = el.closest && el.closest('[data-vignette-loaded]');
       return vg ? 'vignette' : 'overlay';
     }
   }
-  // A full-screen ad iframe: most of the VISIBLE viewport, not just a big
-  // banner further down the page (Zefoy has a 1200x280 one under the form).
+  // A full-screen ad iframe the hit-test missed (it can sit under a
+  // transparent layer). Pinned and covering, as above — never a page banner.
   // Opacity is NOT a sign of absence: a transparent iframe still takes clicks.
   for (const f of document.querySelectorAll('iframe')) {
     const tag = (f.src || '') + ' ' + (f.id || '') + ' ' + (f.name || '');
-    if (!/google|doubleclick|aswift|syndication|ad/i.test(tag)) continue;
-    const r = f.getBoundingClientRect();
-    const w = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
-    const h = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+    if (!/google|doubleclick|aswift|syndication/i.test(tag)) continue;
     const cs = getComputedStyle(f);
-    if (w * h >= 0.5 * vw * vh && cs.display !== 'none' && cs.visibility !== 'hidden'
-        && cs.pointerEvents !== 'none') return 'overlay';
+    if (cs.display === 'none' || cs.visibility === 'hidden' || cs.pointerEvents === 'none') continue;
+    if (covering(f)) return 'overlay';
   }
   return '';
 }"""

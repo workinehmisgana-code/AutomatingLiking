@@ -22,6 +22,7 @@ import {
 const REFERRAL_PCT = Math.round(REFERRAL_SHARE * 100)
 const REFERRAL_RATE = REFERRAL_PAY_RATE
 import { pickDimension, seedFrom } from '@/lib/clusterMix'
+import { interleaveByWeight } from '@/lib/userFeed'
 import FinishButton from '@/components/FinishButton'
 import EditAccountLinks from '@/components/EditAccountLinks'
 import type {
@@ -499,7 +500,13 @@ export default function Dashboard({
   profile,
   product,
   limits,
+  genreMix = {},
+  recentGenres = {},
 }: {
+  /** The genre shares, normalised: how big each genre's block is. */
+  genreMix?: Record<string, number>
+  /** Genres of this worker's recent clicks per platform, newest first. */
+  recentGenres?: Record<string, string[]>
   videos: Video[]
   clickedUrls: string[]
   retiredUrls: string[]
@@ -572,6 +579,9 @@ export default function Dashboard({
 
   // URLs this user has opened — hidden from them from now on.
   const [clicked, setClicked] = useState<Set<string>>(() => new Set(clickedUrls))
+  // Where the worker is in the genre blocks, kept current as they click: the
+  // list drops each opened link, and without this it would restart the block.
+  const [genreHist, setGenreHist] = useState<Record<string, string[]>>(() => recentGenres)
   // What was already clicked when the page loaded. The server's remaining
   // counts have these subtracted already, so only clicks made SINCE then may
   // come off the number again.
@@ -966,12 +976,31 @@ export default function Dashboard({
     // links to the top — which counted who had OPENED a link rather than what
     // was on it. A link's place is now decided by the one number that put it in
     // its cluster, so every user sees the same queue.
-    const orderCluster = (items: Video[]): Video[] =>
-      [...items].sort(
+    //
+    // THEN IN GENRE BLOCKS: ten humanizer links in a row, then the next genre,
+    // sized by the mix (interleaveByWeight). A list that alternated genres
+    // link by link had workers pasting one video's comment under the next.
+    const orderCluster = (items: Video[]): Video[] => {
+      const byScore = [...items].sort(
         (a, b) =>
           (clusterAssignment.pos.get(a.url) ?? Number.MAX_SAFE_INTEGER) -
           (clusterAssignment.pos.get(b.url) ?? Number.MAX_SAFE_INTEGER)
       )
+      const lists = new Map<string, Video[]>()
+      for (const v of byScore) {
+        const g = v.genre || DEFAULT_GENRE
+        const l = lists.get(g)
+        if (l) l.push(v)
+        else lists.set(g, [v])
+      }
+      if (lists.size < 2) return byScore
+      // A genre with no share set still has to appear: the server already
+      // chose to serve it, so it is given the smallest weight there is.
+      const w: Record<string, number> = {}
+      for (const g of Array.from(lists.keys())) w[g] = genreMix[g] > 0 ? genreMix[g] : 1e-6
+      const blocked = interleaveByWeight(lists, w, byScore.length, genreHist[platform] ?? [])
+      return blocked.length === byScore.length ? blocked : byScore
+    }
 
     const out: Cluster[] = buckets
       .map((items, i) => ({
@@ -989,7 +1018,7 @@ export default function Dashboard({
       })
     }
     return out
-  }, [filtered, effGroupBy, clusterAssignment])
+  }, [filtered, effGroupBy, clusterAssignment, genreMix, genreHist, platform])
 
   function proceed(v: Video) {
     // Pick and copy a comment BEFORE anything else, so the click can be recorded
@@ -1005,6 +1034,10 @@ export default function Dashboard({
       }
     }
     window.open(v.url, '_blank', 'noopener,noreferrer')
+    setGenreHist((prev) => ({
+      ...prev,
+      [v.platform]: [v.genre || DEFAULT_GENRE, ...(prev[v.platform] ?? [])].slice(0, 100),
+    }))
     setClicked((prev) => {
       const next = new Set(prev)
       next.add(v.url)
