@@ -15,6 +15,7 @@
 import { llmChat } from './llm'
 import { DEFAULT_GENRE, isGenre, type Genre } from './config'
 import { GENRE_COPY } from './prompts'
+import { ensureGenreRegistry } from './genreStore'
 
 export type Item = { url: string; title: string }
 
@@ -97,6 +98,12 @@ export async function classifyRelated(
 export async function classifyRelatedByGenre(
   items: (Item & { genre?: string })[]
 ): Promise<string[]> {
+  // THE ADDED GENRES FIRST. Study helper is not built in: it exists in this
+  // process only once the registry has been read. Without it isGenre said no,
+  // every study link was asked "is this about AI humanizers?", and the button
+  // marked nearly all of them unrelated — on a fresh server, which is most of
+  // the time, and not on a warm one, which is why it looked random.
+  await ensureGenreRegistry().catch(() => {})
   const groups = new Map<Genre, Item[]>()
   for (const it of items) {
     const g = isGenre(it.genre) ? it.genre : DEFAULT_GENRE

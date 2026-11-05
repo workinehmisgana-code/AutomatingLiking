@@ -149,7 +149,13 @@ export default function VerifyLinks({
   const [channelMenuOpen, setChannelMenuOpen] = useState(false)
   // Same per-channel active/blocked ratio the main Links page calculates — the
   // verify list is exactly where a bad channel is worth spotting before merging.
+  // Keyed "platform:handle", so a TikTok and an Instagram channel that share a
+  // name do not share a ratio.
   const [channelStats, setChannelStats] = useState<Record<string, { active: number; blocked: number }> | null>(null)
+  // Blocked Instagram links of this genre whose owner is still unknown. Non-zero
+  // until scripts/backfill-blocked-instagram-owners.mjs has run, and then only
+  // for deleted posts — so Instagram ratios may read higher than they are.
+  const [igUnattributed, setIgUnattributed] = useState(0)
   // Why the Active % column is empty, when it is: still loading, or the request
   // failed. It used to fail silently, which read as "no data" on every row.
   const [statsState, setStatsState] = useState<'loading' | 'ok' | 'failed'>('loading')
@@ -243,7 +249,11 @@ export default function VerifyLinks({
     fetch('/api/admin/links/channel-stats')
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
-        if (d?.stats) { setChannelStats(d.stats); setStatsState('ok') }
+        if (d?.stats) {
+          setChannelStats(d.stats)
+          setIgUnattributed(Number(d.instagramUnattributedBlocked) || 0)
+          setStatsState('ok')
+        }
         else setStatsState('failed')
       })
       .catch(() => setStatsState('failed'))
@@ -2140,8 +2150,8 @@ export default function VerifyLinks({
             <p className="mt-1 text-[11px] text-zinc-600 leading-relaxed">
               On, every staged link of a channel that meets the spec is merged into the main links on each
               hourly harvest pass — whether the harvest or Extract staged it — <b className="text-zinc-500">without
-              the related check</b>, so off-topic videos from those channels go in too. Instagram has no
-              Active %, so an Active % bound leaves Instagram channels out.
+              the related check</b>, so off-topic videos from those channels go in too. Instagram channels
+              are judged on Active % like the rest, counted by the owner recorded on each blocked link.
             </p>
           </div>
         </div>
@@ -2163,7 +2173,13 @@ export default function VerifyLinks({
           <span className="w-24 shrink-0 text-right">Posted</span>
           <span
             className="w-28 shrink-0 text-right"
-            title="Share of this channel's links that are still active (not blocked), with the active/blocked counts behind it. Instagram has none: its post links do not name the channel, so its blocked links cannot be counted."
+            title={
+              "Share of this channel's links that are still active (not blocked), with the active/blocked counts behind it. " +
+              "Instagram post links do not name the channel, so its blocked links are counted by the owner recorded when they were blocked." +
+              (igUnattributed > 0
+                ? ` ${igUnattributed.toLocaleString()} blocked Instagram link(s) still have no known owner.`
+                : '')
+            }
           >
             {statsState === 'loading' ? (
               'Active % …'
@@ -2314,7 +2330,15 @@ export default function VerifyLinks({
               <span className="w-40 shrink-0 text-right text-xs text-zinc-400 tabular-nums">{fmt(r.view_count)} · {fmt(r.heart_count)}</span>
               <span className="w-24 shrink-0 text-right text-xs text-zinc-500">{r.posted_date || '—'}</span>
               {(() => {
-                const st = r.account ? channelStats?.[r.account.toLowerCase()] : null
+                const st = r.account
+                  ? channelStats?.[`${r.platform || 'tiktok'}:${r.account.toLowerCase().replace(/^@/, '')}`]
+                  : null
+                const igNote =
+                  r.platform === 'instagram' && igUnattributed > 0
+                    ? `\n\n${igUnattributed.toLocaleString()} blocked Instagram link(s) in this genre have no ` +
+                      'known owner yet, so Instagram ratios may read higher than they are. ' +
+                      'Run scripts/backfill-blocked-instagram-owners.mjs to fill them in.'
+                    : ''
                 const tot = st ? st.active + st.blocked : 0
                 const pct = tot > 0 ? Math.round((st!.active / tot) * 100) : null
                 return (
@@ -2329,14 +2353,12 @@ export default function VerifyLinks({
                       st
                         ? `@${r.account}: ${st.active.toLocaleString()} active, ` +
                           `${st.blocked.toLocaleString()} blocked (including links no longer ` +
-                          `in the pool) = ${pct}% active`
-                        : r.platform === 'instagram'
-                          ? 'Not available for Instagram: its post links do not name the channel, so blocked ones cannot be traced back to it'
-                          : statsState === 'failed'
+                          `in the pool) = ${pct}% active` + igNote
+                        : statsState === 'failed'
                             ? 'The Active % numbers could not be loaded — press retry in the column header'
                             : statsState === 'loading'
                               ? 'Loading…'
-                              : 'This channel has no links in the main list yet'
+                              : 'This channel has no links in the main list yet' + igNote
                     }
                   >
                     {pct === null || !st ? (

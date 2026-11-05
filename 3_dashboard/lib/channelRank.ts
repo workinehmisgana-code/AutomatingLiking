@@ -18,7 +18,7 @@
 
 import { loadVideosJson } from './videos'
 import { DEFAULT_GENRE, genreOfRow, isGenre } from './config'
-import { getBlockedUrls, getLinkStats, getExtraChannels, type LinkStat } from './db'
+import { getBlockedUrls, getBlockedInstagramOwners, getLinkStats, getExtraChannels, type LinkStat } from './db'
 import { overlayStats } from './linkStats'
 import { parsePostedDate } from './cluster'
 
@@ -195,9 +195,12 @@ export interface UnattributedCount {
 }
 
 export async function rankChannels(): Promise<ChannelRow[]> {
-  const [videos, blockedUrls, stats, extras] = await Promise.all([
+  const [videos, blockedUrls, igOwners, stats, extras] = await Promise.all([
     loadVideosJson().catch(() => []),
     getBlockedUrls().catch(() => [] as string[]),
+    // Who posted each blocked Instagram link (blocked_link.account): the URL
+    // cannot say, so without this its channel's blocks are uncountable.
+    getBlockedInstagramOwners().catch(() => new Map<string, string>()),
     getLinkStats().catch(() => ({}) as Record<string, LinkStat>),
     // Channels somebody asked for that no link names. Without these the list is
     // a closed loop: only channels we already have links from can ever be
@@ -271,7 +274,7 @@ export async function rankChannels(): Promise<ChannelRow[]> {
   // charged against a same-named Instagram one.
   const blockedByChannel = new Map<string, number>()
   for (const url of blockedUrls) {
-    const handle = handleOf(url)
+    const handle = handleOf(url) ?? igOwners.get(url) ?? null
     if (!handle) continue
     const key = channelKey(siteOf(url), handle)
     blockedByChannel.set(key, (blockedByChannel.get(key) ?? 0) + 1)
@@ -301,11 +304,11 @@ export async function rankChannels(): Promise<ChannelRow[]> {
     } else if (a.times.length === 1) {
       lastPostDays = Math.floor((now - a.times[0]) / 86_400_000)
     }
-    // An Instagram post URL carries no handle, so a blocked Instagram link
-    // cannot be attributed to anyone — its channel would always read 100%
-    // active, which is worse than reading unknown.
-    const canAttributeBlocks = a.site !== 'instagram'
-    const blockedTotal = canAttributeBlocks ? (blockedByChannel.get(key) ?? 0) : 0
+    // An Instagram post URL carries no handle, so its blocks are charged to the
+    // owner stored in blocked_link.account (filled at block time, and for
+    // older blocks by scripts/backfill-blocked-instagram-owners.mjs).
+    const canAttributeBlocks = true
+    const blockedTotal = blockedByChannel.get(key) ?? 0
     const judged = a.active + blockedTotal
     // Explicit first, then the genre most of its links carry, then the
     // default. Ties go to whichever the pool returned first, which is stable

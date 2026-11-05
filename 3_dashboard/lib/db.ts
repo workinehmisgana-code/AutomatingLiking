@@ -62,7 +62,8 @@ import {
 import { isGenericTitle } from './titleFilter'
 import { normalizeReferralCode, referralCodeFrom, candidateCode } from './referrals'
 import { clampShare } from './clusterMix'
-import { getPoolGenreIndex } from './videos'
+import { getPoolGenreIndex, loadVideosJson } from './videos'
+import { instagramHandleFromUrl, isInstagramUrl, lookupInstagramOwners, normHandle } from './igOwner'
 
 const rawUrl = process.env.DATABASE_URL || ''
 // Neon / most hosted Postgres require SSL; local dev usually doesn't.
@@ -179,6 +180,14 @@ export function ensureClickedTable(): Promise<void> {
           END IF;
         END $$;
         CREATE INDEX IF NOT EXISTS blocked_link_genre_idx ON blocked_link (genre);
+        -- WHO POSTED IT, for links whose URL does not say. An Instagram post is
+        -- /p/<code>/ and names nobody, and blocking removes it from the pool, so
+        -- without this a blocked Instagram link can never be charged to its
+        -- channel and every Instagram Active % is unknowable. Filled at block
+        -- time; older rows by scripts/backfill-blocked-instagram-owners.mjs.
+        -- NULL for TikTok and YouTube, whose URL already carries the handle.
+        ALTER TABLE blocked_link ADD COLUMN IF NOT EXISTS account TEXT;
+        CREATE INDEX IF NOT EXISTS blocked_link_account_idx ON blocked_link (account) WHERE account IS NOT NULL;
 
         -- Links the platform no longer serves: deleted, made private, or taken
         -- down. Held apart from blocked_link because they are a different fact
@@ -1753,17 +1762,91 @@ export async function blockLinks(urls: string[], genre?: GenreFor): Promise<numb
   // The table behind these cached reads is about to change; the next
   // reader rebuilds rather than being served last minute's answer.
   invalidate('blockedUrls')
-  const clean = urls.map((u) => String(u).trim()).filter(Boolean)
+  // De-duplicated: DO UPDATE (below) refuses to touch one row twice in a
+  // single statement, which DO NOTHING used to tolerate.
+  const clean = Array.from(new Set(urls.map((u) => String(u).trim()).filter(Boolean)))
   if (clean.length === 0) return 0
   await ensureClickedTable()
-  const genres = await resolveGenres(clean, genre)
-  const { rowCount } = await pool.query(
-    `INSERT INTO blocked_link (url, genre) SELECT * FROM unnest($1::text[], $2::text[])
-     ON CONFLICT (url, genre) DO NOTHING`,
-    [clean, genres]
+  const [genres, owners] = await Promise.all([
+    resolveGenres(clean, genre),
+    instagramOwnersFor(clean).catch(() => new Map<string, string>()),
+  ])
+  const accounts = clean.map((u) => owners.get(u) ?? null)
+  // A repeat block of an already-blocked link still fills a missing owner, but
+  // only a genuinely new row counts as "added" (xmax = 0 on an insert).
+  const { rows } = await pool.query<{ inserted: boolean }>(
+    `INSERT INTO blocked_link (url, genre, account)
+       SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
+     ON CONFLICT (url, genre) DO UPDATE SET account = EXCLUDED.account
+       WHERE blocked_link.account IS NULL AND EXCLUDED.account IS NOT NULL
+     RETURNING (xmax = 0) AS inserted`,
+    [clean, genres, accounts]
   )
   await pool.query('DELETE FROM unrelated_link WHERE url = ANY($1::text[])', [clean]).catch(() => {})
-  return rowCount ?? 0
+  return rows.filter((r) => r.inserted).length
+}
+
+/**
+ * The owner of each Instagram URL in `urls`, as far as it can be found.
+ *
+ * Cheapest first: the URL itself, the staged row's account (the verify page
+ * blocks before it deletes, so the row is still there), the pool row's author,
+ * and only then the post's embed page — bounded, so a bulk block cannot hang.
+ * Anything still unknown stays NULL for the backfill script.
+ */
+async function instagramOwnersFor(urls: string[]): Promise<Map<string, string>> {
+  const ig = urls.filter(isInstagramUrl)
+  const out = new Map<string, string>()
+  if (ig.length === 0) return out
+  for (const u of ig) {
+    const h = instagramHandleFromUrl(u)
+    if (h) out.set(u, h)
+  }
+  let missing = ig.filter((u) => !out.has(u))
+  if (missing.length) {
+    await ensureVerifyLinkTable()
+    const { rows } = await pool.query<{ url: string; account: string | null }>(
+      'SELECT url, account FROM verify_link WHERE url = ANY($1::text[])',
+      [missing]
+    )
+    for (const r of rows) {
+      const h = normHandle(r.account)
+      if (h) out.set(r.url, h)
+    }
+    missing = missing.filter((u) => !out.has(u))
+  }
+  if (missing.length) {
+    const want = new Set(missing)
+    for (const v of await loadVideosJson().catch(() => [])) {
+      const u = String(v?.url ?? '')
+      if (!want.has(u)) continue
+      const h = normHandle((v as { author?: unknown }).author)
+      if (h) out.set(u, h)
+    }
+    missing = missing.filter((u) => !out.has(u))
+  }
+  if (missing.length) {
+    const found = await lookupInstagramOwners(missing)
+    found.forEach((h, u) => out.set(u, h))
+  }
+  return out
+}
+
+/**
+ * Every blocked Instagram link whose owner is known: url → handle.
+ * Feeds the per-channel blocked counts in lib/channelRank.ts.
+ */
+export async function getBlockedInstagramOwners(): Promise<Map<string, string>> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ url: string; account: string }>(
+    'SELECT DISTINCT url, account FROM blocked_link WHERE account IS NOT NULL'
+  )
+  const m = new Map<string, string>()
+  for (const r of rows) {
+    const h = normHandle(r.account)
+    if (h) m.set(r.url, h)
+  }
+  return m
 }
 
 // Admin: lift a permanent block (the link may appear again if it's in the pool).
