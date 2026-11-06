@@ -67,7 +67,10 @@ async function main(): Promise<void> {
 
   console.log('\nnothing judges a link against another genre’s definition:')
   const classify = readFileSync(join(ROOT, 'lib', 'titleClassify.ts'), 'utf8')
-  check('  the system prompt is built per genre', /function systemFor\(genre: Genre\)/.test(classify), true)
+  const promptsSrc = readFileSync(join(ROOT, 'lib', 'prompts.ts'), 'utf8')
+  check('  the system prompt is built per genre',
+        /export function classifySystem\(genre: Genre\)/.test(promptsSrc) &&
+          /classifySystem\(genre\)/.test(classify), true)
   check('  the keyword net is too', /keywordRelated\(title: string, genre: Genre\)/.test(classify), true)
   check('  and a mixed list is split by genre',
         /classifyRelatedByGenre/.test(classify), true)

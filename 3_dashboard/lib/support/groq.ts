@@ -1,5 +1,5 @@
 import { llmChat } from "@/lib/llm";
-import { SUPPORT_REPLY_SYSTEM } from "@/lib/prompts";
+import { SUPPORT_REPLY_SYSTEM, supportReplyUser } from "@/lib/prompts";
 
 export type DraftContext = {
   /** Short note from you: "approved refund, 3 days processing" */
@@ -18,27 +18,12 @@ export type DraftContext = {
 };
 
 export async function draftReply(context: DraftContext): Promise<string> {
-  const parts = [
-    `CUSTOMER: ${context.customerName || "unknown name"} <${context.customerEmail}>`,
-    `THEIR SUBJECT: ${context.originalSubject}`,
-    `THEIR MESSAGE:\n"""\n${context.originalBody.slice(0, 6000)}\n"""`,
-  ];
-
-  if (context.accountFacts?.length) {
-    parts.push(`VERIFIED ACCOUNT FACTS (safe to reference):\n- ${context.accountFacts.join("\n- ")}`);
-  }
-  if (context.actionsTaken?.length) {
-    parts.push(`ACTIONS ALREADY COMPLETED:\n- ${context.actionsTaken.join("\n- ")}`);
-  }
-  parts.push(`WHAT I WANT TO SAY (turn this into the reply): ${context.instruction}`);
-  if (context.tone) parts.push(`TONE: ${context.tone}`);
-
   // The admin's chosen model (lib/llm.ts), with the usual fallbacks, rather
   // than a Groq key of its own.
   const { content: raw } = await llmChat({
     messages: [
       { role: "system", content: SUPPORT_REPLY_SYSTEM(context.brand) },
-      { role: "user", content: parts.join("\n\n") },
+      { role: "user", content: supportReplyUser(context) },
     ],
     temperature: 0.4,
     maxTokens: 900,

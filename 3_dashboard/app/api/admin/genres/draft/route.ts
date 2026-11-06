@@ -3,7 +3,7 @@ import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { isAdminEmail } from '@/lib/config'
 import { llmChat } from '@/lib/llm'
-import { GENRE_DRAFT_SYSTEM } from '@/lib/prompts'
+import { GENRE_DRAFT_SYSTEM, genreDraftUser } from '@/lib/prompts'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
@@ -27,10 +27,7 @@ export async function POST(req: NextRequest) {
       { status: 400 }
     )
   }
-  const user =
-    `CATEGORY: ${label}\n` +
-    `PRODUCT(S): ${products.map((p) => `${p.id}${p.site ? ` (${p.site})` : ''}`).join(', ')}\n` +
-    `WHAT THE PRODUCT DOES: ${description}`
+  const user = genreDraftUser(label, products, description)
   try {
     const { content, model } = await llmChat({
       messages: [

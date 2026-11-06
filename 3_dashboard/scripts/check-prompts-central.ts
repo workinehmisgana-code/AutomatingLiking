@@ -49,6 +49,42 @@ async function main(): Promise<void> {
   }
   check('  every system message is a reference, not a literal', offenders, [])
 
+  // STRICTER, AND FOR THE USER TURN TOO. A reference is not enough on its own:
+  // titleClassify.ts once passed the check above with `content: systemFor(genre)`
+  // — a reference, to a prompt it wrote itself. So every message sent through
+  // llmChat must be built by a name IMPORTED FROM lib/prompts (directly, or via
+  // one local `const x = …` holding such a call), and carry no text of its own:
+  // a string with a space in it is instruction text, however short.
+  const leaks: string[] = []
+  for (const f of files) {
+    if (f === PROMPTS) continue
+    const t = readFileSync(f, 'utf8')
+    if (!/llmChat\(\{/.test(t)) continue
+    const rel = f.slice(ROOT.length + 1).replace(/\\/g, '/')
+    const imported = new Set<string>()
+    for (const m of Array.from(t.matchAll(/import\s*\{([^}]*)\}\s*from\s*['"](?:@\/lib\/|\.\/|\.\.\/)prompts['"]/g))) {
+      for (const part of m[1].split(',')) {
+        const name = part.trim().split(/\s+as\s+/).pop()
+        if (name) imported.add(name.replace(/^type\s+/, ''))
+      }
+    }
+    const usesPrompts = (expr: string) =>
+      Array.from(expr.matchAll(/\b([A-Za-z_]\w*)\b/g)).some((m) => imported.has(m[1]))
+    const hasText = (expr: string) => /(['"`])(?:(?!\1)[^\\]|\\.)*\s(?:(?!\1)[^\\]|\\.)*\1/.test(expr)
+    for (const m of Array.from(
+      t.matchAll(/role:\s*['"](system|user|assistant)['"],?\s*content:\s*([^}]*?)\s*,?\s*\}/g)
+    )) {
+      let expr = m[2].trim()
+      // One hop through a local: `const user = rewriteUser(items)`.
+      const local = /^[A-Za-z_]\w*$/.test(expr) && !imported.has(expr)
+        ? new RegExp(`(?:const|let)\\s+${expr}\\s*=\\s*([^\\n]+)`).exec(t)
+        : null
+      if (local) expr = local[1].trim()
+      if (!usesPrompts(expr) || hasText(expr)) leaks.push(`${rel} [${m[1]}] ${expr.slice(0, 60)}`)
+    }
+  }
+  check('  every message, system and user, is built in lib/prompts.ts', leaks, [])
+
   // The counterpart: prompts.ts must not pull in anything a browser cannot
   // load, or the admin prompt editor - which renders the real prompt in the
   // page - stops working.

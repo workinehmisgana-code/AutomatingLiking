@@ -18,7 +18,7 @@
 import { flatFold } from './lookalike'
 import { llmChat } from './llm'
 import { PRODUCTS, DEACTIVATED_PRODUCTS, genreOfProduct, type Product } from './config'
-import { REPLY_AFFIRM as AFFIRM, REPLY_RECOMMEND as RECOMMEND } from './prompts'
+import { REPLY_AFFIRM as AFFIRM, REPLY_RECOMMEND as RECOMMEND, replyUser } from './prompts'
 import type { WordBand } from './db'
 
 export interface ReplyTarget {
@@ -121,12 +121,6 @@ async function runMode(
   // Every item here is one genre, so any of their products answers for it.
   const genreProduct = items[0].product
 
-  const list = items
-    .map(
-      (t, i) =>
-        `${i + 1}. product: ${t.product} | comment: ${t.topText.slice(0, 220).replace(/\s+/g, ' ')}`
-    )
-    .join('\n')
   try {
     const { content } = await llmChat({
       temperature: mode === 'affirm' ? 0.7 : 0.85,
@@ -141,7 +135,7 @@ async function runMode(
           role: 'system',
           content: mode === 'affirm' ? AFFIRM(band) : RECOMMEND(band, genreProduct),
         },
-        { role: 'user', content: `Write one reply for each:\n${list}` },
+        { role: 'user', content: replyUser(items) },
       ],
     })
     const parsed = JSON.parse(content) as { replies?: unknown }

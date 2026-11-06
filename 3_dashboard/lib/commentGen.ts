@@ -20,7 +20,7 @@ import { llmChat } from './llm'
 import { buildAudiencePrompt } from './prompts'
 import { COMMENTS } from './comments'
 import { audiencesForProduct } from './config'
-import { copyForProduct, SHARED_JARGON } from './prompts'
+import { copyForProduct, SHARED_JARGON, rewriteUser } from './prompts'
 import {
   getProductCommentSettings,
   addCategoryVoice,
@@ -545,9 +545,7 @@ async function callGroqForAudience(
   const system = buildAudiencePrompt(product, category, band, style)
 
   const items = base.map((text, i) => ({ text, words: targets[i] }))
-  const user =
-    `Rewrite these ${base.length} comments. Each item gives the original text and ` +
-    `the exact number of words its rewrite must have:\n${JSON.stringify(items, null, 0)}`
+  const user = rewriteUser(items)
 
   // llmChat tries each model in LLM_MODELS, falling back on a quota/429 error.
   // Free tier counts (input + output) tokens/minute, so keep the cap modest.

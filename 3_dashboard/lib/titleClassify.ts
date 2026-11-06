@@ -10,26 +10,14 @@
 // catastrophic afterwards: pressing the button on a website channel's staging
 // marked every link unrelated, because a video about building a website is
 // genuinely not about humanizers. What counts as related per genre lives in
-// lib/genreCopy.ts beside the rest of the domain copy.
+// lib/prompts.ts (classifySystem) beside the rest of the domain copy.
 
 import { llmChat } from './llm'
 import { DEFAULT_GENRE, isGenre, type Genre } from './config'
-import { GENRE_COPY } from './prompts'
+import { GENRE_COPY, classifySystem, classifyUser } from './prompts'
 import { ensureGenreRegistry } from './genreStore'
 
 export type Item = { url: string; title: string }
-
-export function systemFor(genre: Genre): string {
-  const { subject } = GENRE_COPY[genre].related
-  return (
-    'You classify short social-media video titles/captions. A title is RELATED when it is ' +
-    `${subject}. ` +
-    'Anything else is NOT related. ' +
-    'Return STRICT JSON {"flags":[...]} where flags is a JSON array of booleans, ONE PER TITLE ' +
-    'IN THE SAME ORDER \u2014 true if related, else false \u2014 with exactly as many booleans as titles. ' +
-    'Example for 3 titles: {"flags":[true,false,true]}.'
-  )
-}
 
 // Deterministic safety net: a title literally containing one of its genre's
 // terms is ALWAYS related, no matter what the LLM says. This stops obviously-
@@ -45,14 +33,13 @@ function keywordRelated(title: string, genre: Genre): boolean {
 // Ask the model which of these titles are related to this genre. Falls back to
 // the next model on a quota/rate-limit error (see lib/llm.ts).
 export async function classifyChunk(items: Item[], genre: Genre = DEFAULT_GENRE): Promise<string[]> {
-  const list = items.map((it, i) => `${i + 1}. ${it.title.slice(0, 200)}`).join('\n')
   const { content } = await llmChat({
     temperature: 0,
     jsonObject: true,
     maxTokens: 1200,
     messages: [
-      { role: 'system', content: systemFor(genre) },
-      { role: 'user', content: `Titles:\n${list}` },
+      { role: 'system', content: classifySystem(genre) },
+      { role: 'user', content: classifyUser(items.map((it) => it.title)) },
     ],
   })
   let flags: boolean[] = []

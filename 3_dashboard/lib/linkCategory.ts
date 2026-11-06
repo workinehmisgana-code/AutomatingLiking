@@ -13,7 +13,7 @@
 // ("Cek Plagiasi Turnitin & Parafrase") places the whole account.
 
 import { llmChat } from './llm'
-import { CATEGORISE_SYSTEM as SYSTEM } from './prompts'
+import { CATEGORISE_SYSTEM as SYSTEM, categoriseUser } from './prompts'
 import { type LinkCategory, DEFAULT_LINK_CATEGORY, isLinkCategory } from './config'
 
 export interface Categorizable {
@@ -96,20 +96,13 @@ export async function categorizeChunk(items: Categorizable[]): Promise<LinkCateg
   const fallback = items.map((it) => keywordCategory(it.title, it.bio) ?? DEFAULT_LINK_CATEGORY)
   if (items.length === 0) return []
 
-  const list = items
-    .map((it, i) => {
-      const bio = it.bio ? ` | channel bio: ${it.bio.slice(0, 160)}` : ''
-      return `${i + 1}. caption: ${(it.title || '(no caption)').slice(0, 200)}${bio}`
-    })
-    .join('\n')
-
   try {
     const { content } = await llmChat({
       temperature: 0,
       jsonObject: true,
       messages: [
         { role: 'system', content: SYSTEM },
-        { role: 'user', content: list },
+        { role: 'user', content: categoriseUser(items) },
       ],
     })
     const parsed = JSON.parse(content) as { categories?: unknown }

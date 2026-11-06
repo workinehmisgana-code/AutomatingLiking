@@ -11,7 +11,7 @@ import {
 } from '@/lib/db'
 import { handleFromProfile } from '@/lib/commentPresence'
 import { llmChat } from '@/lib/llm'
-import { PRESENCE_SYSTEM } from '@/lib/prompts'
+import { PRESENCE_SYSTEM, presenceUser } from '@/lib/prompts'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
@@ -225,15 +225,7 @@ export async function POST(req: NextRequest) {
 
     const system = PRESENCE_SYSTEM
 
-    const user =
-      `context = ${JSON.stringify(context)}\n\n` +
-      (withAssigned === 0
-        ? 'NOTE: the assigned comment text was not recorded for any of these clicks ' +
-          '(the system only began storing it recently), so comment WORDING cannot ' +
-          'be compared yet. The product each click drew from IS recorded, in ' +
-          'byProduct.\n\n'
-        : '') +
-      `samples = ${JSON.stringify(samples)}`
+    const user = presenceUser(context, samples, withAssigned === 0)
 
     const { content, model } = await llmChat({
       temperature: 0.2,

@@ -737,6 +737,19 @@ const PRODUCT_WORDS: Record<string, string> = {
   cohumanly: 'co humanly',
 }
 
+const BUILTIN_PRODUCT_WORDS: Record<string, string> = { ...PRODUCT_WORDS }
+
+/**
+ * How an ADDED product's name is written in a comment ("co humanly" for
+ * cohumanly). Set by the genre registry (Admin → Genres); empty puts back the
+ * built-in spelling, or the bare name when there is none.
+ */
+export function setProductWords(product: string, words?: string | null): void {
+  if (words) PRODUCT_WORDS[product] = words
+  else if (BUILTIN_PRODUCT_WORDS[product]) PRODUCT_WORDS[product] = BUILTIN_PRODUCT_WORDS[product]
+  else delete PRODUCT_WORDS[product]
+}
+
 // The forms a comment may use, first one canonical.
 //
 // Only where the inflection is real English. "purify texted my essay" is a

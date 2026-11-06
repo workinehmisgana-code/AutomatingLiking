@@ -24,7 +24,7 @@
 // PURE: no database, no network. The browser imports this. lib/genreStore.ts is
 // the server half that reads and writes the stored list.
 
-import { BUILTIN_GENRES, GENRES, GENRE_LABELS, PRODUCTS, PRODUCT_GENRE } from './config'
+import { BUILTIN_GENRES, GENRES, GENRE_LABELS, PRODUCTS, PRODUCT_GENRE, setProductWords } from './config'
 import { GENRE_COPY, type GenreCopy } from './prompts'
 import { COMMENTS } from './comments'
 
@@ -46,6 +46,87 @@ export interface CustomGenre {
   seeds: Record<string, string[]>
   /** One search phrase per line, for the control center. */
   searchPhrases: string
+  /**
+   * Set on the entries that ADD PRODUCTS TO A BUILT-IN GENRE (a new humanizer,
+   * say) rather than define a genre: `id` is then the built-in genre's id, and
+   * only `products`, `seeds` and `words` are used — the genre itself, its copy
+   * and its label stay as the code defines them. Built by lib/genreStore from
+   * its own stored list; never saved as a genre.
+   */
+  addsToBuiltin?: boolean
+  /** How each product's name is written in a comment, e.g. "co humanly". */
+  words?: Record<string, string>
+}
+
+/** A product added to a BUILT-IN genre from the admin (Admin → Genres). */
+export interface ExtraProduct {
+  /** Lowercase letters and digits, e.g. "cohumanly" — the name comments say. */
+  id: string
+  /** The built-in genre it joins, e.g. "humanizer". */
+  genre: string
+  /** The site, e.g. "cohumanly.com". */
+  site: string
+  /** The name split into words for comments, e.g. "co humanly". Optional. */
+  words: string
+  /** Base comments; every generated comment is a rewrite of one. */
+  seeds: string[]
+}
+
+const isBuiltinGenre = (id: string) => (BUILTIN_GENRES as readonly string[]).includes(id)
+
+/** Extra products as registry entries, one per built-in genre they join. */
+export function extraProductsAsGenres(extras: ExtraProduct[]): CustomGenre[] {
+  const by = new Map<string, CustomGenre>()
+  for (const x of extras) {
+    if (!x?.id || !isBuiltinGenre(x.genre)) continue
+    let g = by.get(x.genre)
+    if (!g) {
+      g = {
+        id: x.genre,
+        label: '',
+        products: [],
+        copy: {} as GenreCopy,
+        seeds: {},
+        searchPhrases: '',
+        addsToBuiltin: true,
+        words: {},
+      }
+      by.set(x.genre, g)
+    }
+    g.products.push({ id: x.id, site: x.site })
+    g.seeds[x.id] = x.seeds
+    if (x.words) (g.words as Record<string, string>)[x.id] = x.words
+  }
+  return Array.from(by.values())
+}
+
+/**
+ * Check a product being added to a built-in genre. Empty when it is fine.
+ * `taken` is every product id already in use, in any genre.
+ */
+export function validateExtraProduct(x: ExtraProduct, taken: Set<string>): string[] {
+  const out: string[] = []
+  if (!isBuiltinGenre(x.genre)) out.push(`"${x.genre}" is not a built-in genre.`)
+  if (!/^[a-z][a-z0-9]{1,30}$/.test(x.id || '')) {
+    out.push('The name must be 2–31 lowercase letters and digits, starting with a letter — the name comments say.')
+  }
+  if (taken.has(x.id)) out.push(`There is already a product called "${x.id}".`)
+  // Every product matcher flattens a comment and looks for the bare name in
+  // it, so the split spelling must flatten back to exactly that name or the
+  // product's own comments would never be recognised as its own.
+  if (x.words && x.words.toLowerCase().replace(/[^a-z0-9]/g, '') !== x.id) {
+    out.push(`"${x.words}" must spell "${x.id}" once the spaces are taken out.`)
+  }
+  if (x.seeds.filter((s) => s.trim()).length < 5) {
+    out.push('Give at least 5 base comments — every generated comment is a rewrite of one.')
+  }
+  const missing = x.seeds.filter(
+    (s) => s.trim() && !s.toLowerCase().replace(/[^a-z0-9]/g, '').includes(x.id)
+  )
+  if (x.id && missing.length) {
+    out.push(`${missing.length} base comment(s) do not mention ${x.id}: "${missing[0].slice(0, 60)}"`)
+  }
+  return out
 }
 
 /** Genre ids that may not be reused: the built-in three. */
@@ -92,31 +173,39 @@ export function applyGenreRegistry(list: CustomGenre[]): void {
 /** applyGenreRegistry for THIS copy of the tables only. */
 function applyHere(list: CustomGenre[]): void {
   for (const g of applied) {
-    const gi = GENRES.indexOf(g.id)
-    if (gi >= 0 && !(BUILTIN_GENRES as readonly string[]).includes(g.id)) GENRES.splice(gi, 1)
-    delete GENRE_LABELS[g.id]
-    delete (GENRE_COPY as Record<string, GenreCopy>)[g.id]
+    // An entry that only adds products to a built-in genre leaves the genre
+    // itself — its place, label and copy — alone, on the way out as on the way in.
+    if (!isBuiltinGenre(g.id)) {
+      const gi = GENRES.indexOf(g.id)
+      if (gi >= 0) GENRES.splice(gi, 1)
+      delete GENRE_LABELS[g.id]
+      delete (GENRE_COPY as Record<string, GenreCopy>)[g.id]
+    }
     for (const p of g.products) {
       if (BUILTIN_PRODUCTS.includes(p.id)) continue
       const pi = PRODUCTS.indexOf(p.id)
       if (pi >= 0) PRODUCTS.splice(pi, 1)
       delete PRODUCT_GENRE[p.id]
       delete (COMMENTS as Record<string, string[]>)[p.id]
+      setProductWords(p.id, null)
     }
   }
   const clean = list.filter(
-    (g) => g && g.id && !(BUILTIN_GENRES as readonly string[]).includes(g.id)
+    (g) => g && g.id && (!isBuiltinGenre(g.id) || g.addsToBuiltin === true)
   )
   for (const g of clean) {
-    if (!GENRES.includes(g.id)) GENRES.push(g.id)
-    GENRE_LABELS[g.id] = g.label || g.id
-    ;(GENRE_COPY as Record<string, GenreCopy>)[g.id] = g.copy
+    if (!isBuiltinGenre(g.id)) {
+      if (!GENRES.includes(g.id)) GENRES.push(g.id)
+      GENRE_LABELS[g.id] = g.label || g.id
+      ;(GENRE_COPY as Record<string, GenreCopy>)[g.id] = g.copy
+    }
     for (const p of g.products) {
       // A built-in product cannot be moved into another genre from here.
       if (!p.id || BUILTIN_PRODUCTS.includes(p.id)) continue
       if (!PRODUCTS.includes(p.id)) PRODUCTS.push(p.id)
       PRODUCT_GENRE[p.id] = g.id
       ;(COMMENTS as Record<string, string[]>)[p.id] = g.seeds?.[p.id] ?? []
+      setProductWords(p.id, g.words?.[p.id])
     }
   }
   applied = clean

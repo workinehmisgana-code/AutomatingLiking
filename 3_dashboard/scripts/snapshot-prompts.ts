@@ -3,7 +3,7 @@
 //   node scripts/run-ts-check.mjs scripts/snapshot-prompts.ts > before.json
 //   ...refactor...
 //   node scripts/run-ts-check.mjs scripts/snapshot-prompts.ts > after.json
-//   node scripts/diff-prompts.mjs before.json after.json
+//   git diff --no-index before.json after.json     (no output = identical)
 //
 // Moving prompt text between files is the kind of change that looks safe and
 // is not: a lost space, a reordered clause or a dropped sentence changes what
@@ -18,7 +18,6 @@
 async function main(): Promise<void> {
   const cfg = await import('../lib/config')
   const prompt = await import('../lib/prompts')
-  const classify = await import('../lib/titleClassify')
 
   const out: Record<string, string> = {}
 
@@ -37,7 +36,7 @@ async function main(): Promise<void> {
 
   // The "Mark unrelated" question, per genre.
   for (const g of cfg.GENRES) {
-    out[`classify/${g}`] = classify.systemFor(g)
+    out[`classify/${g}`] = prompt.classifySystem(g)
   }
 
   // Everything the genre table holds, flattened - this is the text the builders

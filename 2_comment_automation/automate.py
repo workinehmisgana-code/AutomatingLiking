@@ -94,6 +94,12 @@ STATE_TAG           = os.getenv("STATE_TAG", "").strip()
 PARALLEL_WINDOWS    = int(_DOTENV.get("PARALLEL_WINDOWS", os.getenv("PARALLEL_WINDOWS", "1")))
 GEMINI_API_KEY      = _DOTENV.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
 GEMINI_MODEL        = _DOTENV.get("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.0-flash"))
+# ZEFOY_AD_MODE: manual = when a full-screen ad covers Zefoy, notify you, bring
+# the window to the front and wait for YOU to watch it and close it; auto = the
+# script watches it to the end and closes it itself.
+ZEFOY_AD_MODE       = _DOTENV.get("ZEFOY_AD_MODE", os.getenv("ZEFOY_AD_MODE", "manual")).strip().lower()
+# How long to wait for you before the script deals with the ad itself (seconds).
+ZEFOY_AD_WAIT_S     = int(_DOTENV.get("ZEFOY_AD_WAIT_S", os.getenv("ZEFOY_AD_WAIT_S", "1800")) or 1800)
 # CAPTCHA_MODE: auto = Gemini solves it; manual = you type the word in the terminal
 CAPTCHA_MODE        = _DOTENV.get("CAPTCHA_MODE", os.getenv("CAPTCHA_MODE", "auto")).strip().lower()
 # STAGGER_WINDOWS: open the parallel windows one at a time (so you solve each
@@ -1815,15 +1821,243 @@ def _ad_video_playing(page) -> bool:
     return False
 
 
-def zefoy_clear_ad(page, timeout_s: float = 180) -> bool:
-    """Watch a full-screen ad to its end and close it. True if none is left.
+_notify_mod = None
+
+
+def _notify():
+    """6_comment_liker/notify.py (toast, sound, window focus), or None.
+
+    Borrowed rather than copied: it already knows how to get a Chrome window in
+    front of everything on Windows, which is the hard part.
+    """
+    global _notify_mod
+    if _notify_mod is None:
+        try:
+            d = str(Path(__file__).resolve().parent.parent / "6_comment_liker")
+            if d not in sys.path:
+                sys.path.append(d)  # appended: never shadows anything of ours
+            import notify as _m  # type: ignore
+            _notify_mod = _m
+        except Exception:  # noqa: BLE001
+            _notify_mod = False
+    return _notify_mod or None
+
+
+def zefoy_page_ready(page) -> bool:
+    """No ad in the way, and Zefoy's own page is showing again.
+
+    "Its own page" is any of the things the run goes on to use: the captcha,
+    the Comments Hearts button, the URL box, or the session-expired notice
+    (which the run knows how to handle).
+    """
+    if zefoy_ad_showing(page):
+        return False
+    for css in (_CAPTCHA_SEL,
+                sel("comments_hearts_btn", _CH_BTN_SEL),
+                sel("url_input", _URL_INPUT_SEL)):
+        try:
+            if page.locator(css).first.is_visible(timeout=300):
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    try:
+        body = page.inner_text("body", timeout=1000).lower()
+        if any(w in body for w in SESSION_GONE):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+# Seconds the page must stay clear of any ad before the run carries on: a
+# plain full-screen ad, and anything involving a video (the reward offer).
+AD_QUIET_S = 4
+AD_QUIET_OFFER_S = 10
+
+# Is an ad video still going in this frame? READ-ONLY — unlike _AD_VIDEO_JS it
+# never starts or mutes anything: while you watch, the script keeps its hands
+# off. A video still loading counts as going (it has not started yet).
+_AD_VIDEO_STATE_JS = """() => {
+  for (const v of document.querySelectorAll('video')) {
+    if (v.ended) continue;
+    const r = v.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) continue;
+    if (!v.paused) return true;
+    if ((v.currentSrc || v.src) && (v.readyState < 2 || !(v.duration > 0))) return true;
+    if (v.duration > 0 && v.currentTime > 0 && v.currentTime < v.duration - 0.3) return true;
+  }
+  return false;
+}"""
+
+
+def _frame_covers_screen(page, frame) -> bool:
+    """Is this frame inside an iframe that covers most of the screen?
+
+    Zefoy's in-page banners play videos too, and one of those is not an ad
+    in the way: only a frame filling at least half the viewport counts.
+    """
+    top = frame
+    while top.parent_frame is not None and top.parent_frame is not page.main_frame:
+        top = top.parent_frame
+    try:
+        box = top.frame_element().bounding_box()
+        vp = page.viewport_size or page.evaluate("() => ({width: innerWidth, height: innerHeight})")
+    except Exception:  # noqa: BLE001
+        return False
+    if not box or not vp:
+        return False
+    w = max(0, min(box["x"] + box["width"], vp["width"]) - max(box["x"], 0))
+    h = max(0, min(box["y"] + box["height"], vp["height"]) - max(box["y"], 0))
+    return w * h >= 0.5 * vp["width"] * vp["height"]
+
+
+def _ad_video_running(page) -> bool:
+    """A visible ad video, in a screen-covering frame, not finished yet."""
+    for frame in page.frames:
+        if frame is page.main_frame or frame.is_detached():
+            continue
+        try:
+            if not _frame_covers_screen(page, frame):
+                continue
+            if frame.evaluate(_AD_VIDEO_STATE_JS):
+                return True
+        except Exception:  # noqa: BLE001 - a frame that went away mid-ask
+            continue
+    return False
+
+
+def _clickable(locator) -> bool:
+    """Would a click land on this element (nothing covering it)? Clicks nothing."""
+    try:
+        locator.click(trial=True, timeout=1200)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def zefoy_wait_ad_manual(page, kind: str, timeout_s: float, target=None) -> bool:
+    """Hand the ad to the person: notify, bring the window forward, and wait
+    until they have watched it and closed it and Zefoy's page is back.
+
+    Never touches the ad. "Finished" means: no full-screen ad, no ad video
+    still playing in any frame, and — when `target` (the button the run was
+    about to press) is given — nothing in front of that button, all holding
+    for a few seconds so the gap between an offer and its video is not taken
+    for the end.
+
+    True when Zefoy is usable again. False after `timeout_s` with nobody there,
+    and the caller then deals with the ad the automatic way.
+    """
+    tag = _pfx()
+    who = tag.strip("[] ") or "Zefoy"
+    print(f"{tag} [AD] Zefoy is showing an ad ({kind}) — watch it and close it "
+          f"yourself; the run carries on once Zefoy's page is back.")
+    n = _notify()
+    # A unique title so the RIGHT window comes forward when several are open.
+    marker = f"ZEFOY AD {who} {int(time.time()) % 100000}"
+    old_title = ""
+    try:
+        old_title = page.title()
+        page.evaluate("(t) => { document.title = t }", marker)
+        page.bring_to_front()
+    except Exception:  # noqa: BLE001
+        pass
+    if n:
+        try:
+            n.focus_window(marker)
+        except Exception:  # noqa: BLE001
+            pass
+
+    class _Quiet:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    nag = (n.nagging("Zefoy ad — your turn",
+                     f"{who}: watch the ad to the end and close it")
+           if n else _Quiet())
+    deadline = time.time() + timeout_s
+    # HOW LONG THE PAGE MUST STAY CLEAR before the run takes it back. The
+    # reward offer ("View a short ad") is the trap: pressing it closes the
+    # offer box, and for a second or two — before the video arrives — nothing
+    # covers Zefoy at all. Taking that gap as "done" had the run typing and
+    # clicking underneath a video that was only just starting. So the page has
+    # to stay clear for a while, longer once a video is involved.
+    quiet_needed = AD_QUIET_OFFER_S if kind == "offer" else AD_QUIET_S
+    clear_since = None
+    last_log = time.time()
+    try:
+        with nag:
+            while time.time() < deadline:
+                video = _ad_video_running(page)
+                if video:
+                    quiet_needed = max(quiet_needed, AD_QUIET_OFFER_S)
+                busy = bool(video or zefoy_ad_showing(page))
+                if not busy and target is not None:
+                    # Something still in front of the very button the run is
+                    # about to press is an ad too, detected or not.
+                    busy = not _clickable(target)
+                if busy:
+                    clear_since = None
+                else:
+                    clear_since = clear_since or time.time()
+                    clear_for = time.time() - clear_since
+                    if clear_for >= quiet_needed:
+                        if zefoy_page_ready(page) or target is not None:
+                            print(f"{tag} [AD] Ad finished and Zefoy is back — carrying on.")
+                            page_wait(1, 2)
+                            return True
+                        # No ad, but none of Zefoy's usual parts are up either
+                        # — a cooldown screen, or a page still loading. After a
+                        # while that is Zefoy's page too: the normal flow knows
+                        # how to wait out a cooldown.
+                        try:
+                            on_zefoy = "zefoy" in (page.url or "")
+                        except Exception:  # noqa: BLE001
+                            on_zefoy = False
+                        if on_zefoy and clear_for >= quiet_needed + 15:
+                            print(f"{tag} [AD] Ad gone — carrying on.")
+                            return True
+                if time.time() - last_log > 60:
+                    left = int(deadline - time.time())
+                    print(f"{tag} [AD] Still waiting for you to finish the ad "
+                          f"({left // 60} min left before the script steps in).")
+                    last_log = time.time()
+                page.wait_for_timeout(1000)
+    finally:
+        # Put Zefoy's own title back (the marker only had to last for the focus).
+        try:
+            if old_title and page.title() == marker:
+                page.evaluate("(t) => { document.title = t }", old_title)
+        except Exception:  # noqa: BLE001
+            pass
+    print(f"{tag} [AD] Nobody closed the ad in {int(timeout_s // 60)} min — "
+          f"the script will deal with it.")
+    return False
+
+
+def zefoy_clear_ad(page, timeout_s: float = 180, manual: bool = True) -> bool:
+    """Get a full-screen ad out of the way. True if none is left.
+
+    ZEFOY_AD_MODE=manual (the default): you watch it and close it, and the run
+    waits for Zefoy's page to come back. auto: the script watches it to the end
+    and closes it itself — also what happens if nobody comes in time.
 
     Cheap when there is no ad (one evaluate), so it is called at every
     checkpoint where an ad would otherwise make the next click fail.
     """
     kind = zefoy_ad_showing(page)
+    manual = manual and ZEFOY_AD_MODE != "auto"
+    if not kind and manual and _ad_video_running(page):
+        # A reward video playing in a frame the overlay test did not catch.
+        kind = "video"
     if not kind:
         return True
+    if manual:
+        if zefoy_wait_ad_manual(page, kind, ZEFOY_AD_WAIT_S):
+            return True
+        kind = zefoy_ad_showing(page)
+        if not kind:
+            return True
     tag = _pfx()
     print(f"{tag} [AD] Zefoy is showing an ad ({kind}) — watching it to the end...")
     if kind == "offer":
@@ -1882,14 +2116,32 @@ def zefoy_click(page, locator, timeout_ms: int = 30000) -> None:
     whole video: Playwright retried for thirty seconds against an iframe that
     "intercepts pointer events", and the link was failed for it.
     """
+    # An ad already up (or a reward video playing) is yours to finish first —
+    # cheap when there is none.
+    zefoy_clear_ad(page)
     try:
         locator.click(timeout=timeout_ms)
         return
     except Exception as e:  # noqa: BLE001
         if "intercepts pointer events" not in str(e) and not zefoy_ad_showing(page):
             raise
+    if ZEFOY_AD_MODE != "auto":
+        # YOUR AD, NOT OURS. The old path here hid whatever covered the button
+        # — which, with you halfway through a reward video, threw the video
+        # away. Now: wait for you, with the button itself as the test of when
+        # the ad is really gone (some ads cover it without being recognised).
+        for _ in range(3):
+            kind = zefoy_ad_showing(page) or ("video" if _ad_video_running(page) else "covering")
+            if not zefoy_wait_ad_manual(page, kind, ZEFOY_AD_WAIT_S, target=locator):
+                break  # nobody came: fall through to the automatic way
+            try:
+                locator.click(timeout=timeout_ms)
+                return
+            except Exception as e:  # noqa: BLE001
+                if "intercepts pointer events" not in str(e):
+                    raise
     print(f"{_pfx()} [AD] An ad is covering the button — clearing it.")
-    if not zefoy_clear_ad(page):
+    if not zefoy_clear_ad(page, manual=False):
         zefoy_hide_ad(page)
     try:
         locator.click(timeout=timeout_ms)

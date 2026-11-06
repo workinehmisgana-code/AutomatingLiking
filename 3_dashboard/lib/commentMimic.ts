@@ -20,7 +20,7 @@
 // thrown away and the caller falls back to the bank.
 import { llmChat } from './llm'
 import { sanitize, settingsFor } from './commentGen'
-import { buildMimicPrompt } from './prompts'
+import { buildMimicPrompt, mimicUser } from './prompts'
 import { COMPETITOR_BRANDS } from './linkCategory'
 import type { Product } from './config'
 
@@ -66,16 +66,7 @@ export async function mimicComment(
       timeoutMs: opts.timeoutMs ?? 30_000,
       messages: [
         { role: 'system', content: system },
-        {
-          role: 'user',
-          content:
-            `Here is a comment from under the video:\n${JSON.stringify(text)}\n\n` +
-            `Write 5 comments of your own in that same vein.` +
-            (strict
-              ? ` IMPORTANT: your last attempt named another tool. Name NO tool except ` +
-                `the one you were told to write about — not even to say it was worse.`
-              : ''),
-        },
+        { role: 'user', content: mimicUser(text, strict) },
       ],
     })
     try {

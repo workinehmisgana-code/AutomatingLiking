@@ -7,7 +7,7 @@ import {
   PROMO_EXTRA_TAG_MAX,
 } from './config'
 import { llmChat } from './llm'
-import { promoSystem } from './prompts'
+import { promoSystem, promoUser } from './prompts'
 import { copyForProduct, withProduct } from './prompts'
 import {
   getGeneratedPromo,
@@ -55,7 +55,7 @@ async function callModel(product: Product): Promise<{ titles: string[]; tags: st
   const { content, model } = await llmChat({
     messages: [
       { role: 'system', content: system },
-      { role: 'user', content: `Generate captions and tags for "${product}".` },
+      { role: 'user', content: promoUser(product) },
     ],
     temperature: 0.9,
     jsonObject: true,

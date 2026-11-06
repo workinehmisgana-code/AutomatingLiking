@@ -4,6 +4,8 @@
 // commentPrompt.ts, the "mark unrelated" question in titleClassify.ts, the
 // audience categoriser in linkCategory.ts, the reply prompts in replyGen.ts,
 // the promo brief in promoGen.ts and the presence analysis inside an API route.
+// The user turns followed later: the wording each call puts in front of its
+// data ("Rewrite these 12 comments…") is read by the model too.
 // Every one of them was findable and none of them was findable TOGETHER, which
 // is what you need when the question is "what are we actually telling the
 // model" or "why does this product sound like that one".
@@ -19,13 +21,17 @@
 //                       count, shape, emoji, the JSON contract
 //   classifying         sorting a link into one audience
 //   replies             what to say under somebody else's comment
-//   everything else     promo captions, the presence analysis, the test probe
+//   everything else     promo captions, the presence analysis, the test
+//                       probe, the support desk, drafting a new genre
+//   mark unrelated      is a title about what this genre sells
+//   user turns          the labelled data each call sends with its prompt
 //
 // TWO RULES THAT KEEP IT ONE FILE:
 //
 //   1. A generator may not write its own instruction text. scripts/
-//      check-prompts-central.ts fails the build of anybody who does — a
-//      system message has to name something defined here.
+//      check-prompts-central.ts fails the build of anybody who does — every
+//      message sent to the model, system AND user, has to be built by
+//      something defined here.
 //   2. This file stays PURE: config and types only, nothing that reaches a
 //      database or the network. The admin comments page renders the real
 //      prompt in the browser, and a browser cannot load either.
@@ -1086,3 +1092,130 @@ export const GENRE_DRAFT_SYSTEM = [
   'Write in English. Be concrete to this category. Never mention AI humanizers or AI detectors',
   'unless the category is about them.',
 ].join('\n')
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// "MARK UNRELATED": is a video title about what this genre sells?
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * The question behind the "Mark unrelated" button and the hourly channel
+ * harvest (lib/titleClassify.ts). What counts as related is the genre's own
+ * `related.subject` in GENRE_COPY above, so a website title is judged against
+ * websites, never against humanizers.
+ */
+export function classifySystem(genre: Genre): string {
+  const { subject } = GENRE_COPY[genre].related
+  return (
+    'You classify short social-media video titles/captions. A title is RELATED when it is ' +
+    `${subject}. ` +
+    'Anything else is NOT related. ' +
+    'Return STRICT JSON {"flags":[...]} where flags is a JSON array of booleans, ONE PER TITLE ' +
+    'IN THE SAME ORDER \u2014 true if related, else false \u2014 with exactly as many booleans as titles. ' +
+    'Example for 3 titles: {"flags":[true,false,true]}.'
+  )
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// THE USER TURNS: what each call sends beside its system prompt
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Mostly data, but data with labels and an instruction on the front ("Rewrite
+// these 12 comments…", "Write one reply for each:"), and the model reads those
+// words as closely as the system prompt. So they live here too: a generator
+// hands over its data and sends whatever comes back.
+
+/** "Mark unrelated": the numbered titles. */
+export const classifyUser = (titles: string[]): string =>
+  `Titles:\n${titles.map((t, i) => `${i + 1}. ${t.slice(0, 200)}`).join('\n')}`
+
+/** The audience categoriser: each link's caption, and its channel bio if known. */
+export const categoriseUser = (items: { title: string; bio: string }[]): string =>
+  items
+    .map((it, i) => {
+      const bio = it.bio ? ` | channel bio: ${it.bio.slice(0, 160)}` : ''
+      return `${i + 1}. caption: ${(it.title || '(no caption)').slice(0, 200)}${bio}`
+    })
+    .join('\n')
+
+/** A comment set: the seed comments to rewrite, each with its word target. */
+export const rewriteUser = (items: { text: string; words: number }[]): string =>
+  `Rewrite these ${items.length} comments. Each item gives the original text and ` +
+  `the exact number of words its rewrite must have:\n${JSON.stringify(items, null, 0)}`
+
+/**
+ * Mimic: one real comment from under the video. `strict` is the second try,
+ * after the first named a rival tool.
+ */
+export const mimicUser = (text: string, strict: boolean): string =>
+  `Here is a comment from under the video:\n${JSON.stringify(text)}\n\n` +
+  `Write 5 comments of your own in that same vein.` +
+  (strict
+    ? ` IMPORTANT: your last attempt named another tool. Name NO tool except ` +
+      `the one you were told to write about — not even to say it was worse.`
+    : '')
+
+/** Replies: the comments to answer, each with the product it should name. */
+export const replyUser = (items: { product: string; topText: string }[]): string =>
+  `Write one reply for each:\n` +
+  items
+    .map(
+      (t, i) =>
+        `${i + 1}. product: ${t.product} | comment: ${t.topText.slice(0, 220).replace(/\s+/g, ' ')}`
+    )
+    .join('\n')
+
+/** Promo captions for one product. */
+export const promoUser = (product: string): string =>
+  `Generate captions and tags for "${product}".`
+
+/**
+ * The presence analysis: the aggregates and the sample links. `noAssigned` is
+ * true while no click in the window has its assigned comment text recorded.
+ */
+export const presenceUser = (context: unknown, samples: unknown, noAssigned: boolean): string =>
+  `context = ${JSON.stringify(context)}\n\n` +
+  (noAssigned
+    ? 'NOTE: the assigned comment text was not recorded for any of these clicks ' +
+      '(the system only began storing it recently), so comment WORDING cannot ' +
+      'be compared yet. The product each click drew from IS recorded, in ' +
+      'byProduct.\n\n'
+    : '') +
+  `samples = ${JSON.stringify(samples)}`
+
+/** Adding a genre: the three facts the admin typed. */
+export const genreDraftUser = (
+  label: string,
+  products: { id?: string; site?: string }[],
+  description: string
+): string =>
+  `CATEGORY: ${label}\n` +
+  `PRODUCT(S): ${products.map((p) => `${p.id}${p.site ? ` (${p.site})` : ''}`).join(', ')}\n` +
+  `WHAT THE PRODUCT DOES: ${description}`
+
+/** The support desk: the customer's email, what was done, and what to say. */
+export function supportReplyUser(context: {
+  instruction: string
+  customerName?: string | null
+  customerEmail: string
+  originalSubject: string
+  originalBody: string
+  actionsTaken?: string[]
+  accountFacts?: string[]
+  tone?: string
+}): string {
+  const parts = [
+    `CUSTOMER: ${context.customerName || "unknown name"} <${context.customerEmail}>`,
+    `THEIR SUBJECT: ${context.originalSubject}`,
+    `THEIR MESSAGE:\n"""\n${context.originalBody.slice(0, 6000)}\n"""`,
+  ]
+  if (context.accountFacts?.length) {
+    parts.push(`VERIFIED ACCOUNT FACTS (safe to reference):\n- ${context.accountFacts.join("\n- ")}`)
+  }
+  if (context.actionsTaken?.length) {
+    parts.push(`ACTIONS ALREADY COMPLETED:\n- ${context.actionsTaken.join("\n- ")}`)
+  }
+  parts.push(`WHAT I WANT TO SAY (turn this into the reply): ${context.instruction}`)
+  if (context.tone) parts.push(`TONE: ${context.tone}`)
+  return parts.join("\n\n")
+}

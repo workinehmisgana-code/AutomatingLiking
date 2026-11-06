@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import ScrollX from '@/components/ScrollX'
+import RelatedRuleEditor from '@/components/RelatedRuleEditor'
 import {
   CLASSIFY_BATCH,
   CLICK_PLATFORMS,
@@ -1389,6 +1390,8 @@ export default function VerifyLinks({
               ? `🤖 Mark ${GENRE_LABELS[pageGenres[0]] ?? pageGenres[0]} unrelated`
               : '🤖 Mark unrelated'}
         </button>
+        {/* What the button above counts as related — editable for an added genre. */}
+        <RelatedRuleEditor genres={pageGenres.length ? pageGenres : GENRES} />
         <button
           type="button" onClick={blockSelected} disabled={deleting || selected.size === 0}
           title="Permanently block these links and drop them from the verify list — they stay hidden even if a future upload re-adds them"

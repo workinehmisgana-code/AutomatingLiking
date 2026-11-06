@@ -3,7 +3,8 @@
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { useState } from 'react'
-import type { CustomGenre } from '@/lib/genreRegistry'
+import type { CustomGenre, ExtraProduct } from '@/lib/genreRegistry'
+import BuiltinProductAdder from '@/components/BuiltinProductAdder'
 
 type Builtin = { id: string; label: string; products: string[] }
 
@@ -134,10 +135,14 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 export default function GenreAdmin({
   builtin,
   custom: initial,
+  extras: initialExtras = [],
 }: {
   builtin: Builtin[]
   custom: CustomGenre[]
+  /** Products added to the built-in genres (a new humanizer, say). */
+  extras?: ExtraProduct[]
 }) {
+  const [extras, setExtras] = useState(initialExtras)
   const router = useRouter()
   const [custom, setCustom] = useState(initial)
   const [form, setForm] = useState<Form | null>(null)
@@ -260,10 +265,19 @@ export default function GenreAdmin({
         <div className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Genres</div>
         <ul className="space-y-1.5 text-sm">
           {builtin.map((g) => (
-            <li key={g.id} className="flex items-center gap-2">
-              <span className="text-white">{g.label}</span>
-              <span className="text-zinc-500 text-xs">{g.products.join(', ')}</span>
-              <span className="ml-auto text-[11px] text-zinc-600">built in</span>
+            <li key={g.id}>
+              <div className="flex items-center gap-2">
+                <span className="text-white">{g.label}</span>
+                <span className="text-zinc-500 text-xs">{g.products.join(', ')}</span>
+                <span className="ml-auto text-[11px] text-zinc-600">built in</span>
+              </div>
+              <BuiltinProductAdder
+                genre={g.id}
+                label={g.label}
+                builtinProducts={[...g.products, ...extras.filter((x) => x.genre === g.id).map((x) => x.id)]}
+                extras={extras.filter((x) => x.genre === g.id)}
+                onChange={setExtras}
+              />
             </li>
           ))}
           {custom.map((g) => (

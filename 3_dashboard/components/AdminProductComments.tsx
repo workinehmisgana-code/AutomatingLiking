@@ -745,6 +745,13 @@ export default function AdminProductComments({
               </option>
             ))}
           </select>
+          <Link
+            href="/admin/genres"
+            title="Add another product to this genre (Admin → Genres)"
+            className="text-xs font-normal text-zinc-400 hover:text-white border border-zinc-700 rounded-lg px-2 py-1 hover:bg-zinc-800"
+          >
+            + product
+          </Link>
         </h1>
         <Link
           href="/admin"
