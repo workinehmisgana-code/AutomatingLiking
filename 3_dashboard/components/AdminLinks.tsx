@@ -15,6 +15,7 @@ import {
   CLASSIFY_BATCH,
   type SearchField,
   GENRE_LABELS,
+  DEFAULT_GENRE,
   audiencesForGenre,
 } from '@/lib/config'
 
@@ -58,6 +59,8 @@ const tagFor = (p: string) => PRODUCT_TAG[p] ?? p.slice(0, 2).toUpperCase()
 
 export interface LinkRow {
   url: string
+  /** The pool it is served in (AdminLinkRow.genre); several in the switch's All. */
+  genre?: string
   platform: string
   search_query: string
   search_rank: number
@@ -268,7 +271,8 @@ export default function AdminLinks({
   clusterCount,
   genre,
 }: {
-  /** The admin's master genre switch. Every query on this page is cut to it. */
+  /** The admin's master genre switch. Every query on this page is cut to it;
+   *  '' is the switch's All (every genre's links, each clustered in its own). */
   genre: string
   retireCap: number
   instagramRetire: number
@@ -417,6 +421,8 @@ export default function AdminLinks({
       cluster: number
       keyword: string
       blocked: boolean
+      /** Its genre (the related question is asked per genre). */
+      genre?: string
     }[]
   }
   const [rankOnlyOpen, setRankOnlyOpen] = useState(false)
@@ -481,6 +487,7 @@ export default function AdminLinks({
       platform: string
       handle: string
       profileUrl: string
+      genre?: string
     }[] = []
     for (const c of rankOnlyShown) {
       for (const v of c.videos ?? []) {
@@ -496,6 +503,7 @@ export default function AdminLinks({
           platform: c.platform,
           handle: c.handle,
           profileUrl: c.profileUrl,
+          genre: v.genre,
         })
       }
     }
@@ -533,7 +541,9 @@ export default function AdminLinks({
    * rather than leaving a half-classified selection that looks complete.
    */
   async function classifyRankOnly() {
-    const items = rankOnlyOpenRows.filter((r) => r.title).map((r) => ({ url: r.url, title: r.title }))
+    // Each with its own genre: the related question differs per genre, and in
+    // the switch's All the list holds several.
+    const items = rankOnlyOpenRows.filter((r) => r.title).map((r) => ({ url: r.url, title: r.title, genre: r.genre }))
     if (items.length === 0) {
       setRankOnlyNote(
         rankOnlyBlockedCount > 0 && rankOnlyOpenRows.length === 0
@@ -2395,7 +2405,9 @@ export default function AdminLinks({
    * leaving a partial one that looks finished.
    */
   async function markByTitle(mode: 'related' | 'unrelated') {
-    const items = shown.filter((l) => titles[l.url]).map((l) => ({ url: l.url, title: titles[l.url] }))
+    // Each with its own genre (see classifyRelatedByGenre): in the switch's All
+    // the page holds several, and one question for all would misjudge the rest.
+    const items = shown.filter((l) => titles[l.url]).map((l) => ({ url: l.url, title: titles[l.url], genre: l.genre }))
     if (items.length === 0) { alert('Fetch titles first (Process).'); return }
     setClassifying(`0/${items.length}`)
     try {
@@ -2985,8 +2997,9 @@ export default function AdminLinks({
         </button>
         {/* HUMANIZER ONLY. The audiences (competitors / ai detector) are
             humanizer audiences; every other genre's links are 'generic' by
-            definition, so the button has nothing to do under another genre. */}
-        {audiencesForGenre(genre).length > 1 && (
+            definition, so the button has nothing to do under another genre.
+            Shown in All too ('' → the default's audiences), which includes it. */}
+        {audiencesForGenre(genre || DEFAULT_GENRE).length > 1 && (
         <button
           type="button"
           onClick={() => categorize(false)}
@@ -3532,8 +3545,8 @@ export default function AdminLinks({
                 className="w-full bg-zinc-900 border border-zinc-700 rounded px-1 py-0.5 text-[10px] normal-case tracking-normal text-zinc-300 focus:outline-none focus:border-emerald-500"
               >
                 <option value="">All categories</option>
-                {/* Only the audiences this genre has. */}
-                {audiencesForGenre(genre).map((c) => (
+                {/* Only the audiences this genre has (every audience in All). */}
+                {audiencesForGenre(genre || DEFAULT_GENRE).map((c) => (
                   <option key={c} value={c}>
                     {c === 'competitors' ? 'Competitors' : c === 'ai_detector' ? 'AI detector' : 'Generic'}
                   </option>

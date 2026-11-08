@@ -22,7 +22,7 @@ for (const p of [
   'app/admin/comments/[product]/page.tsx',
   'app/admin/promo/page.tsx',
 ]) {
-  ok(read(p).includes('getAdminGenre()'), `${p} reads the switch`)
+  ok(/getAdminGenre(Scope)?\(\)/.test(read(p)), `${p} reads the switch`)
 }
 for (const c of ['components/AdminLinks.tsx', 'components/VerifyLinks.tsx', 'components/AdminDashboard.tsx']) {
   ok(!/<option value="">All genres<\/option>/.test(read(c)), `${c} has no page-level genre dropdown`)
@@ -57,6 +57,19 @@ for (const p of [
 ok(read('lib/adminLinks.ts').includes('`${r.platform}|${r.genre}`'), 'Links-page clusters are per genre, like the feeds')
 ok(read('lib/replyGen.ts').includes('genreOfProduct(p) === genre'), 'replies only recommend the genre’s products')
 ok(!/<option value="">All genres<\/option>/.test(read('components/LikerSettings.tsx')), 'liker genre comes from the switch')
+
+// The switch's All position: a button for it, a scope reader that turns it
+// into '' (every genre), and the one-genre screens asking for a genre instead
+// of silently using the default.
+ok(read('components/GenreSwitch.tsx').includes('[ALL_GENRES, ...GENRES]'), 'the switch offers All')
+ok(read('lib/adminGenre.ts').includes("if (v === ALL_GENRES) return ''"), 'All reads as the every-genre scope')
+ok(read('lib/config.ts').includes("export const ALL_GENRES = 'all'"), 'All is a cookie value, not a genre')
+for (const p of ['app/admin/liker/page.tsx', 'app/admin/promo/page.tsx']) {
+  ok(read(p).includes('<PickGenreNote'), `${p} asks for a genre in All`)
+}
+ok(read('app/api/admin/verify-links/auto-merge/route.ts').includes('Auto-merge specs are saved per genre'), 'an auto-merge spec is never saved for All')
+ok(read('app/api/admin/verify-links/channels/route.ts').includes('body.genre === ALL_GENRES'), 'a channel is never added to All')
+ok(read('app/api/admin/links/blocked/route.ts').includes('blockLinks(urls, allGenres ? undefined : genre)'), 'a block made in All keeps each link’s own genre')
 
 console.log(bad ? `\n${bad} failed` : '\nall good')
 process.exit(bad ? 1 : 0)

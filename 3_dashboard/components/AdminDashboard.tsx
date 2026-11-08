@@ -18,6 +18,8 @@ import {
   DEFAULT_GENRE,
   genreOfProduct,
   productsInGenre,
+  productsInScope,
+  genreLabel,
 } from '@/lib/config'
 import type {
   AdminData,
@@ -522,7 +524,8 @@ export default function AdminDashboard({
    * The admin's master genre. The server has already cut every click in
    * `data` to this genre's products, so most of this page is about it with no
    * further work; this prop is for the parts that have to NAME it, and for the
-   * product lists that must not offer another genre's products.
+   * product lists that must not offer another genre's products. '' is the
+   * switch's All: every genre at once (shares of 1, every product listed).
    */
   genre: string
   data: AdminData
@@ -777,7 +780,7 @@ export default function AdminDashboard({
   // them back, because "where did that person go" must have an answer on screen.
   const [showIdle, setShowIdle] = useState(false)
   /** Which question the list is ordered to answer — see sortedUsers. */
-  const [userSort, setUserSort] = useState<'clicks' | 'pending' | 'comments' | 'name' | 'referrals'>('clicks')
+  const [userSort, setUserSort] = useState<'clicks' | 'pending' | 'comments' | 'gap' | 'name' | 'referrals'>('clicks')
   const [deductingUser, setDeductingUser] = useState<string | null>(null)
   const [blockingUser, setBlockingUser] = useState<string | null>(null)
 
@@ -1419,6 +1422,13 @@ export default function AdminDashboard({
     }
     if (userSort === 'comments')
       return genreComments(b, genre) - genreComments(a, genre) || b.totalClicks - a.totalClicks
+    if (userSort === 'gap')
+      // Comments minus clicks, biggest first: the most over-reported on top.
+      // Ties go to whoever clicked more.
+      return (
+        clickCommentGap(b) - clickCommentGap(a) ||
+        b.totalClicks - a.totalClicks
+      )
     if (userSort === 'name') {
       return (a.profile?.name || a.name || a.email).localeCompare(
         b.profile?.name || b.name || b.email
@@ -1528,7 +1538,8 @@ export default function AdminDashboard({
   // clicks yet, so it reads 0 rather than disappearing; another genre's
   // products are not offered at all, because the clicks behind them have
   // already been cut away on the server and they would read a misleading 0.
-  const genreProductList = productsInGenre(genre)
+  // Every product in the switch's All ('').
+  const genreProductList = productsInScope(genre)
   const clickProducts = genreProductList.slice().sort()
   // The other direction. referralByUser is keyed by REFERRER; an admin looking
   // at a worker wants to know who is being paid a commission on that worker's
@@ -1699,13 +1710,23 @@ export default function AdminDashboard({
    * every link they were given, so the other genres have to be in the sum for
    * this genre's share to come out right. Only this genre's row is shown.
    */
-  const thisGenre = genreSplit.list.find((r) => r.genre === genre) ?? {
-    genre,
-    clicks: 0,
-    comments: 0,
-    referrals: 0,
-    pay: 0,
-  }
+  // In the switch's All ('') it is every genre's row summed, and the table
+  // below lists each genre's row rather than one.
+  const thisGenre = !genre
+    ? {
+        genre: '',
+        clicks: genreSplit.clicks,
+        comments: genreSplit.list.reduce((n, r) => n + r.comments, 0),
+        referrals: genreSplit.list.reduce((n, r) => n + r.referrals, 0),
+        pay: genreSplit.pay,
+      }
+    : genreSplit.list.find((r) => r.genre === genre) ?? {
+        genre,
+        clicks: 0,
+        comments: 0,
+        referrals: 0,
+        pay: 0,
+      }
 
   // Addresses nobody has checked yet. Shown on the Email task button, because
   // that number is the only thing standing between a worker and their pay.
@@ -1784,7 +1805,9 @@ export default function AdminDashboard({
               {/* Grouped by genre: the comments for a slides product have
                   nothing in common with a humanizer's, so picking one from a
                   flat list of eight invites opening the wrong page. */}
-              {[genre].map((g) => (
+              {/* Every genre's group in the switch's All: each product's page
+                  is about its own genre whatever the switch says. */}
+              {(genre ? [genre] : GENRES).map((g) => (
                 <optgroup key={g} label={GENRE_LABELS[g] ?? g}>
                   {productsInGenre(g).map((p) => {
                     // productsInGenre returns strings, so the widened list is
@@ -1914,7 +1937,7 @@ export default function AdminDashboard({
         <Stat
           label="Links clicked"
           value={totalClicks.toLocaleString()}
-          hint={clickProduct ? `${clickProduct} only` : `all ${GENRE_LABELS[genre] ?? genre}`}
+          hint={clickProduct ? `${clickProduct} only` : `all ${genreLabel(genre)}`}
           control={
             <select
               value={clickProduct}
@@ -1948,7 +1971,7 @@ export default function AdminDashboard({
           label="Pending pay"
           value={`${fmtBirr(thisGenre.pay)} birr`}
           accent="amber"
-          hint={`${GENRE_LABELS[genre] ?? genre} share ~ · ${fmtBirr(pendingSum.total)} owed in all genres`}
+          hint={`${genreLabel(genre)} share ~ · ${fmtBirr(pendingSum.total)} owed in all genres`}
         />
         <Stat
           label="Of which video"
@@ -1972,7 +1995,7 @@ export default function AdminDashboard({
         <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3 mb-4">
           <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2">
             <div className="text-sm font-semibold text-white">
-              🎭 {GENRE_LABELS[genre] ?? genre}: clicks and pay
+              🎭 {genreLabel(genre)}: clicks and pay
             </div>
             <div className="text-[11px] text-zinc-500">
               {thisGenre.clicks.toLocaleString()} clicks · {fmtBirr(thisGenre.pay)} birr
@@ -2012,7 +2035,7 @@ export default function AdminDashboard({
                 {/* One row: the switch has chosen the genre. The other genres
                     are still in genreSplit because this one's pay is
                     apportioned against them. */}
-                {[thisGenre].map((r) => (
+                {(genre ? [thisGenre] : genreSplit.list).map((r) => (
                   <tr key={r.genre} className="border-t border-zinc-800/70">
                     <td className="pr-3 py-1 text-zinc-200 whitespace-nowrap">
                       {GENRE_LABELS[r.genre] ?? (r.genre === '(none)' ? 'no product stamped' : r.genre)}
@@ -2104,7 +2127,7 @@ export default function AdminDashboard({
               products are served, and where. First, under its own heading, so
               it is not read as one of the all-genre settings below. */}
           <div className="text-[10px] uppercase tracking-wide text-emerald-500/80">
-            {GENRE_LABELS[genre] ?? genre} only
+            {genreLabel(genre)} only
           </div>
           <ActiveProducts genre={genre} />
           {/* ── THESE APPLY TO EVERY GENRE ── Said once, above them, so nobody
@@ -2158,12 +2181,13 @@ export default function AdminDashboard({
           <select
             value={userSort}
             onChange={(e) => setUserSort(e.target.value as typeof userSort)}
-            title="Clicks: who is working. Pending pay: who you are about to pay, biggest first. Comments: what actually landed. Name: to find somebody."
+            title="Clicks: who is working. Pending pay: who you are about to pay, biggest first. Comments: what actually landed. Comments − clicks: most comments reported over links clicked first. Name: to find somebody."
             className="bg-zinc-900 border border-zinc-700 rounded px-1.5 py-0.5 text-xs text-zinc-200 font-normal focus:outline-none focus:border-emerald-500"
           >
             <option value="clicks">clicks</option>
             <option value="pending">pending pay</option>
             <option value="comments">comments</option>
+            <option value="gap">comments − clicks</option>
             <option value="name">name</option>
             <option value="referrals">referral tree</option>
           </select>
@@ -2212,6 +2236,7 @@ export default function AdminDashboard({
               minAgeDays={minAgeDays}
               payHistory={payAdjustments[u.id] ?? []}
               autoBlocks={autoBlockCounts[u.id] ?? 0}
+              showGap={userSort === 'gap'}
               u={u}
               pending={pendingByUser[u.id] ?? null}
               referral={referralByUser[u.id] ?? null}
@@ -3316,6 +3341,8 @@ export default function AdminDashboard({
  * Website builder. Rounded, because a third of a comment is not a comment.
  */
 function genreCommentShare(u: AdminUserRow, genre: string): number {
+  // The switch's All: every genre, so the whole of their comments.
+  if (!genre) return 1
   const w = u.payClicksByGenre ?? {}
   const total = Object.values(w).reduce((a, b) => a + b, 0)
   if (total <= 0) return genre === DEFAULT_GENRE ? 1 : 0
@@ -3323,6 +3350,20 @@ function genreCommentShare(u: AdminUserRow, genre: string): number {
 }
 function genreComments(u: AdminUserRow, genre: string, n: number = u.totalCommented): number {
   return Math.round(n * genreCommentShare(u, genre))
+}
+/**
+ * Reported comments MINUS clicked links. Positive: more comments reported than
+ * links opened — over-reporting, the thing the gap sort is for. The sort puts
+ * the biggest positive first and the most negative last.
+ *
+ * BOTH IN ALL GENRES. The card's "clicked" chip is every genre's clicks, while
+ * its "comments" chip is only this genre's apportioned share — subtracting one
+ * from the other would show a gap for anyone who also works another genre.
+ * The reported comment count itself is never split by genre, so the whole
+ * totals are the only exact pair.
+ */
+function clickCommentGap(u: AdminUserRow): number {
+  return u.totalCommented - u.totalClicks
 }
 
 function UserCard({
@@ -3363,7 +3404,10 @@ function UserCard({
   minAgeDays,
   payHistory,
   autoBlocks,
+  showGap,
 }: {
+  /** Show the clicks-vs-comments gap chip (the list is sorted by it). */
+  showGap?: boolean
   /** How many times the check has blocked them automatically. */
   autoBlocks: number
   minAgeDays: number
@@ -3684,8 +3728,22 @@ function UserCard({
           <Chip
             label="comments"
             value={genreComments(u, genre)}
-            title={`≈ ${GENRE_LABELS[genre] ?? genre} share of ${u.totalCommented.toLocaleString()} comment(s) in all genres, apportioned by their clicks`}
+            title={`≈ ${genreLabel(genre)} share of ${u.totalCommented.toLocaleString()} comment(s) in all genres, apportioned by their clicks`}
           />
+          {showGap && (() => {
+            const gap = clickCommentGap(u)
+            return (
+              <Chip
+                label="comments − clicks"
+                value={gap > 0 ? `+${gap.toLocaleString()}` : gap.toLocaleString()}
+                accent={gap > 0 ? 'amber' : undefined}
+                title={
+                  `${u.totalCommented.toLocaleString()} comment(s) reported − ${u.totalClicks.toLocaleString()} ` +
+                  'link(s) clicked, all genres. The list is sorted by this number, biggest first.'
+                }
+              />
+            )
+          })()}
           {/* WHEN THEIR TIKTOK ACCOUNT WAS MADE, read from its id — in place of
               the per-day rates and the repost count (reposts are still listed in
               the expanded details). Amber when it is under the minimum account

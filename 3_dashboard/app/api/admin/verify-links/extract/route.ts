@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { getAdminGenre } from '@/lib/adminGenre'
+import { getAdminGenreScope } from '@/lib/adminGenre'
 import { isAdminEmail } from '@/lib/config'
 import { isAdminRequest } from '@/lib/machineAuth'
 import { loadVideosJson } from '@/lib/videos'
@@ -49,7 +49,8 @@ export async function GET(req: NextRequest) {
     // harvester reads this with a token and no session; it asks for every
     // genre and filters by its own --genre, so it gets the whole ranking.
     const session = await auth.api.getSession({ headers: await headers() }).catch(() => null)
-    const genre = session ? await getAdminGenre() : null
+    // '' (the switch's All) is the whole ranking, like the harvester's read.
+    const genre = session ? await getAdminGenreScope() : null
     const ranked = await rankChannels()
     const channels = genre ? ranked.filter((c) => c.genre === genre) : ranked
     // Links whose channel cannot be read at all. Sent so the table can say so:
@@ -128,9 +129,11 @@ export async function POST(req: NextRequest) {
       )
       channels = only.map((h) => known.get(h)).filter((c): c is (typeof ranked)[number] => !!c)
     } else {
-      // "Extract everything" means every channel OF THE SWITCH'S GENRE.
-      const genre = await getAdminGenre()
-      channels = ranked.filter((c) => c.genre === genre)
+      // "Extract everything" means every channel OF THE SWITCH'S GENRE — every
+      // channel in All. Each staged row still inherits its channel's genre
+      // (genreOfChannel below), never the switch's.
+      const genre = await getAdminGenreScope()
+      channels = genre ? ranked.filter((c) => c.genre === genre) : ranked
     }
     // TikTok only: everything below reads a TikTok snowflake id out of the URL
     // to decide what is new, and fetches listings from tiktok.com/embed/@handle.

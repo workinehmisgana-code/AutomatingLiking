@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { getAdminGenre, adminGenreUrlTest } from '@/lib/adminGenre'
+import { getAdminGenreScope } from '@/lib/adminGenre'
 import { isAdminEmail } from '@/lib/config'
 import { buildAdminLinks, filterAdminLinks, parseLinkQuery } from '@/lib/adminLinks'
 import {
@@ -42,9 +42,10 @@ const CONCURRENCY = 4
  * bar that never reaches the end.
  */
 async function scopeUrls(sp: URLSearchParams): Promise<string[] | undefined> {
-  // ALWAYS ONE GENRE. "Everywhere" means every link of the genre the switch
-  // is on, so a website session never fills dates on humanizer links.
-  const genre = await getAdminGenre()
+  // THE SWITCH'S SCOPE. "Everywhere" means every link of the genre the switch
+  // is on, so a website session never fills dates on humanizer links; in All
+  // ('') it is every genre's links.
+  const genre = await getAdminGenreScope()
   if (sp.get('scope') === 'all') {
     const { rows, retirePlatforms } = await buildAdminLinks('')
     return filterAdminLinks(rows, { ...parseLinkQuery(new URLSearchParams()), genre }, retirePlatforms).map((l) => l.url)

@@ -1,8 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { getAdminGenre, adminGenreUrlTest } from '@/lib/adminGenre'
-import { isAdminEmail, genreOfRow } from '@/lib/config'
+import { getAdminGenreScope, adminGenreUrlTest } from '@/lib/adminGenre'
+import { isAdminEmail, genreOfRow, genreInScope } from '@/lib/config'
 import { loadVideosJson } from '@/lib/videos'
 import {
   getBrokenLinks,
@@ -128,10 +128,10 @@ export async function POST(req: NextRequest) {
   const limit = Math.min(MAX_BATCH, Math.max(1, Number(body.limit) || MAX_BATCH))
   try {
     const videos = (await loadVideosJson()) as { url?: unknown; genre?: unknown }[]
-    // The sweep covers the switch's genre only.
-    const genre = await getAdminGenre()
+    // The sweep covers the switch's genre only (every genre in All).
+    const genre = await getAdminGenreScope()
     const urls = videos
-      .filter((v) => genreOfRow(v) === genre)
+      .filter((v) => genreInScope(genre, genreOfRow(v)))
       .map((v) => String(v.url ?? ''))
       .filter((u) => u.startsWith('http'))
     const total = urls.length

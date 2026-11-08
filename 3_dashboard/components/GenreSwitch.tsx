@@ -2,15 +2,18 @@
 
 import { useRouter } from 'next/navigation'
 import { useState, type ReactNode } from 'react'
-import { ADMIN_GENRE_COOKIE, GENRES, GENRE_LABELS, productsInGenre } from '@/lib/config'
+import { ADMIN_GENRE_COOKIE, ALL_GENRES, GENRES, genreLabel, productsInGenre } from '@/lib/config'
 
 /**
  * The master genre switch, at the top of every admin page.
  *
- * Every number on the admin is about ONE genre at a time: the links, the
+ * Every number on the admin is about ONE genre at a time — or, in the "All"
+ * position (cookie value ALL_GENRES), every genre together: the links, the
  * clicks, the comments, the products, and each worker's share of the pay. This
  * is the one place that choice is made, so no screen can be on a different
- * genre from the one beside it.
+ * genre from the one beside it. The few screens that only make sense for one
+ * genre (a product's comments, liker settings, promo, adding a channel) say
+ * "pick a genre" in All rather than quietly using one.
  *
  * It writes a cookie and re-renders, rather than holding the choice in this
  * component's state: the pages that need it are server-rendered, and a choice
@@ -20,6 +23,7 @@ export default function GenreSwitch({
   current,
   children,
 }: {
+  /** A genre, or ALL_GENRES ('all') for the All position. */
   current: string
   /** Shown in the same bar, after the genres (the users' messages). */
   children?: ReactNode
@@ -46,8 +50,9 @@ export default function GenreSwitch({
       <div className="max-w-6xl mx-auto px-4 py-2 flex flex-wrap items-center gap-x-3 gap-y-2">
         <span className="text-[11px] uppercase tracking-wide text-zinc-500">Genre</span>
         <div className="flex flex-wrap gap-1" role="radiogroup" aria-label="Admin genre">
-          {GENRES.map((g) => {
+          {[ALL_GENRES, ...GENRES].map((g) => {
             const on = (pending ?? current) === g
+            const all = g === ALL_GENRES
             return (
               <button
                 key={g}
@@ -60,9 +65,13 @@ export default function GenreSwitch({
                     ? 'border-emerald-500 bg-emerald-600/20 text-emerald-200'
                     : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-200 hover:border-zinc-700')
                 }
-                title={`Products: ${productsInGenre(g).join(', ') || 'none'}`}
+                title={
+                  all
+                    ? 'Every genre together (pages that need one genre will ask you to pick one)'
+                    : `Products: ${productsInGenre(g).join(', ') || 'none'}`
+                }
               >
-                {GENRE_LABELS[g] ?? g}
+                {all ? 'All' : genreLabel(g)}
               </button>
             )
           })}
@@ -87,7 +96,7 @@ export default function GenreSwitch({
         {/* Says what is being looked at, in words, so a screenshot of any admin
             page carries its own genre. */}
         <span className="text-[11px] text-zinc-600 ml-auto">
-          {pending ? 'switching…' : `everything below is ${GENRE_LABELS[current] ?? current}`}
+          {pending ? 'switching…' : `everything below is ${genreLabel(current)}`}
         </span>
       </div>
     </div>

@@ -13,12 +13,17 @@ export function RefundModal({
   customerEmail,
   onClose,
   onDone,
+  yearlySubscription,
+  onDowngradeToMonthly,
 }: {
   order: BillingOrder;
   project: Project;
   customerEmail: string;
   onClose: () => void;
   onDone: (summary: string) => void;
+  /** This payment's subscription, when it is yearly and can be made monthly. */
+  yearlySubscription?: BillingSubscription | null;
+  onDowngradeToMonthly?: (subscription: BillingSubscription) => void;
 }) {
   const maxRefundable = order.totalAmount - order.refundedAmount;
   const reasons = project.capabilities?.refundReasons ?? [];
@@ -187,6 +192,27 @@ export function RefundModal({
           />
         )}
       </div>
+
+      {yearlySubscription && onDowngradeToMonthly && (
+        <div className="rounded-lg border border-sky-900/60 bg-sky-950/30 px-3 py-2.5 text-xs leading-relaxed">
+          <div className="text-sky-200">
+            This is a <span className="font-medium">yearly</span> subscription payment.
+          </div>
+          <div className="mt-0.5 text-slate-400">
+            Instead of refunding it, switch them to monthly: every month used is kept at the
+            monthly price, the rest is refunded, and monthly billing starts when those months run
+            out.
+          </div>
+          <button
+            type="button"
+            onClick={() => onDowngradeToMonthly(yearlySubscription)}
+            disabled={busy}
+            className="btn btn-ghost mt-2"
+          >
+            Downgrade to monthly &amp; refund the difference…
+          </button>
+        </div>
+      )}
 
       <div>
         <label className="label">Refund amount ({order.currency.toUpperCase()})</label>

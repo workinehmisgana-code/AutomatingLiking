@@ -4,6 +4,7 @@ import {
   getGenreMix,
   ourRatioRetiredSet,
   getUserPausedGenres,
+  getServingGenreWeights,
   getHourlyClickTimes,
   getTodayClickCountsByPlatform,
   getUserNameEmail,
@@ -85,12 +86,17 @@ export async function GET(req: NextRequest) {
   // MINUS THIS WORKER'S PAUSED GENRES: the comment check found too few of their
   // comments on those links while another genre's were fine (noCommentVerdict),
   // so the other genres fill their list instead.
-  const genreMix = withoutGenres(
+  // Same weights as the links route (getServingGenreWeights), so the counts
+  // match what the app is handed.
+  const genreMix =
     onlyGenre && isGenre(onlyGenre)
-      ? { [onlyGenre]: 1 }
-      : genreWeights(await getGenreMix().catch(() => null)),
-    await getUserPausedGenres(userId).catch(() => [])
-  )
+      ? withoutGenres({ [onlyGenre]: 1 }, await getUserPausedGenres(userId).catch(() => []))
+      : await getServingGenreWeights(userId).catch(async () =>
+          withoutGenres(
+            genreWeights(await getGenreMix().catch(() => null)),
+            await getUserPausedGenres(userId).catch(() => [])
+          )
+        )
   const avail: Record<string, number> = {}
   for (const v of videos) {
     if (!v.url || !v.url.startsWith('http') || hidden.has(v.url)) continue

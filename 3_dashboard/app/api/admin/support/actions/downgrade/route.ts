@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { findUserByEmail, q, withDbRetry } from "@/lib/support/db";
 import { getProject } from "@/lib/support/projects";
 import { BillingError, formatMoney, providerFor } from "@/lib/support/providers";
+import { isMonthly, isYearly, quoteYearlyToMonthly } from "@/lib/support/intervalDowngrade";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -23,6 +24,13 @@ type Body = {
   newPlanName?: string;
   /** Lift a pending cancellation as part of the downgrade. */
   resume?: boolean;
+  /**
+   * YEARLY → MONTHLY. The refund is then worked out here, not taken from the
+   * page: every started month kept at the monthly price, the rest back to the
+   * card, and the year cut short so monthly billing starts when those months
+   * run out. refundAmount is ignored.
+   */
+  toMonthly?: boolean;
   confirm?: string;
 };
 
@@ -75,6 +83,18 @@ export async function POST(request: Request) {
   const steps: { step: string; ok: boolean; detail: string }[] = [];
   const record = (step: string, ok: boolean, detail: string) => steps.push({ step, ok, detail });
 
+  if (body.toMonthly) {
+    try {
+      const failed = await yearlyToMonthly(provider, body, record);
+      if (failed) return failed;
+    } catch (error) {
+      const message = error instanceof BillingError ? error.message : String(error);
+      return NextResponse.json({ error: message, steps }, { status: 502 });
+    }
+    await capCredits(project, body, record);
+    return NextResponse.json({ ok: true, steps });
+  }
+
   // ── 1. Move the subscription onto the cheaper plan ──────────────────────
   try {
     await provider.changePlan(body.subscriptionId, body.newProductId, { resume: body.resume });
@@ -125,7 +145,146 @@ export async function POST(request: Request) {
     record("refund", false, "No refund requested.");
   }
 
-  // ── 3. Cap their credits at what the new plan grants ────────────────────
+  await capCredits(project, body, record);
+
+  return NextResponse.json({ ok: true, steps });
+}
+
+type RecordStep = (step: string, ok: boolean, detail: string) => void;
+
+/**
+ * Yearly → monthly, in the order that never leaves money moved for a change
+ * that did not take:
+ *
+ *   1. Cut the current (yearly) period short to the months they keep. Moves
+ *      no money; put back below if the next step fails.
+ *   2. Schedule the monthly plan for the next period — which now starts when
+ *      those months run out. next_period, so the provider issues no proration
+ *      credit of its own (the refund below is the whole compensation).
+ *   3. Refund the rest of the yearly payment to the card. The irreversible one.
+ *
+ * Returns an error response to send, or null when the caller should go on.
+ */
+async function yearlyToMonthly(
+  provider: NonNullable<ReturnType<typeof providerFor>>,
+  body: Body,
+  record: RecordStep,
+): Promise<NextResponse | null> {
+  const fail = (error: string, status = 400) => NextResponse.json({ error }, { status });
+  const setEnd = provider.setBillingPeriodEnd?.bind(provider);
+  if (!provider.capabilities.billingPeriodChanges || !setEnd) {
+    return fail(
+      `${provider.label} cannot shorten a billing period through its API, so a yearly plan cannot be turned into a monthly one from here. Do it in the ${provider.label} dashboard.`,
+      501,
+    );
+  }
+  if (!body.email) return fail("The customer email is required.");
+  if (!body.refundOrderId) return fail("The yearly payment to refund from is required.");
+
+  // Everything from the provider, nothing from the page.
+  const customer = await provider.findCustomer({ email: body.email });
+  const subs = customer ? await provider.listSubscriptions(customer) : [];
+  const sub = subs.find((s) => s.id === body.subscriptionId);
+  if (!sub) return fail("That subscription was not found for this customer.");
+  if (!isYearly(sub.interval)) return fail("That subscription is not billed yearly.");
+
+  const target = (await provider.listProducts()).find((p) => p.id === body.newProductId);
+  if (!target || !isMonthly(target.interval) || target.amount == null) {
+    return fail("The plan to move onto must be a monthly plan with a price.");
+  }
+
+  const order = await provider.getOrder(body.refundOrderId);
+  if (order.subscriptionId !== sub.id) return fail("That payment is not for this subscription.");
+  if (!order.isPaid) return fail("That payment has not been paid.");
+  const refundable = order.totalAmount - order.refundedAmount;
+
+  const quote = quoteYearlyToMonthly({
+    paidAt: order.createdAt,
+    paid: order.totalAmount,
+    monthly: target.amount,
+  });
+  const refund = Math.min(quote.difference, refundable);
+  if (refund <= 0) {
+    return fail(
+      `Nothing to refund: ${quote.monthsUsed} month(s) at ${formatMoney(target.amount, target.currency)} come to ${formatMoney(quote.kept, order.currency)}, which is not less than what is left on the payment (${formatMoney(refundable, order.currency)}).`,
+    );
+  }
+  if (sub.currentPeriodEnd && new Date(quote.paidThrough) >= new Date(sub.currentPeriodEnd)) {
+    return fail("The months kept already reach the end of the yearly period — nothing to shorten.");
+  }
+
+  // ── 1. Cut the year short ───────────────────────────────────────────────
+  try {
+    await setEnd(sub.id, quote.paidThrough);
+    record(
+      "period",
+      true,
+      `Yearly period now ends ${quote.paidThrough.slice(0, 10)} (${quote.monthsUsed} month(s) kept).`,
+    );
+  } catch (error) {
+    const message = error instanceof BillingError ? error.message : String(error);
+    record("period", false, message);
+    return fail(`Could not shorten the yearly period: ${message}. Nothing was changed.`, 502);
+  }
+
+  // ── 2. Monthly from then on ─────────────────────────────────────────────
+  try {
+    await provider.changePlan(sub.id, target.id, { resume: sub.cancelAtPeriodEnd });
+    record(
+      "plan",
+      true,
+      `Moves to ${target.name} on ${quote.paidThrough.slice(0, 10)}, billed ${formatMoney(target.amount, target.currency)} a month${
+        sub.cancelAtPeriodEnd ? "; the pending cancellation was lifted" : ""
+      }.`,
+    );
+  } catch (error) {
+    const message = error instanceof BillingError ? error.message : String(error);
+    record("plan", false, message);
+    // Put the year back, or it would renew early on the YEARLY price.
+    const oldEnd = sub.currentPeriodEnd;
+    const restored = oldEnd ? await setEnd(sub.id, oldEnd).then(() => true, () => false) : false;
+    return fail(
+      `Plan change failed: ${message}. Nothing was refunded. ${
+        restored
+          ? "The yearly period end was put back."
+          : `PUT THE PERIOD END BACK BY HAND in ${provider.label}: it was ${oldEnd ?? "unknown"}, it is now ${quote.paidThrough}.`
+      }`,
+      502,
+    );
+  }
+
+  // ── 3. The rest of the year back on the card ────────────────────────────
+  try {
+    await provider.createRefund({
+      orderId: order.id,
+      amount: refund,
+      reason: provider.capabilities.refundReasons[0]?.value ?? "customer_request",
+      comment: `Yearly to monthly: ${quote.monthsUsed} month(s) kept at ${formatMoney(target.amount, target.currency)}`,
+      revokeBenefits: false,
+    });
+    record(
+      "refund",
+      true,
+      `${formatMoney(refund, order.currency)} refunded (paid ${formatMoney(order.totalAmount, order.currency)}, kept ${formatMoney(quote.kept, order.currency)}${
+        refund < quote.difference ? ", capped at what was left refundable" : ""
+      }).`,
+    );
+  } catch (error) {
+    record(
+      "refund",
+      false,
+      `${error instanceof BillingError ? error.message : String(error)} — the plan change WAS made, so refund ${formatMoney(refund, order.currency)} by hand.`,
+    );
+  }
+  return null;
+}
+
+/** Cap their credits at what the new plan grants. */
+async function capCredits(
+  project: NonNullable<ReturnType<typeof getProject>>,
+  body: Body,
+  record: RecordStep,
+): Promise<void> {
   if (project.databaseUrl && body.email && typeof body.newPlanCredits === "number") {
     try {
       const url = project.databaseUrl;
@@ -167,6 +326,4 @@ export async function POST(request: Request) {
       record("database", false, error instanceof Error ? error.message : String(error));
     }
   }
-
-  return NextResponse.json({ ok: true, steps });
 }

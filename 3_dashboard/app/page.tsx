@@ -50,6 +50,7 @@ import {
   ourRatioRetiredSet,
   getRecentClickGenres,
   getUserPausedGenres,
+  getServingGenreWeights,
 } from '@/lib/db'
 import { retiredUrlSet } from '@/lib/videos'
 import { buildUserFeed, FEED_PER_PLATFORM } from '@/lib/userFeed'
@@ -290,9 +291,12 @@ export default async function Home() {
   // MINUS THIS WORKER'S PAUSED GENRES: the comment check found too few of their
   // comments on those links while another genre's were fine (noCommentVerdict),
   // so the other genres fill their list instead.
-  const genreMix = withoutGenres(
-    genreWeights(await getGenreMix().catch(() => null)),
-    await getUserPausedGenres(session.user.id).catch(() => [])
+  // Tilted so the team lands on the mix (getServingGenreWeights).
+  const genreMix = await getServingGenreWeights(session.user.id).catch(async () =>
+    withoutGenres(
+      genreWeights(await getGenreMix().catch(() => null)),
+      await getUserPausedGenres(session.user.id).catch(() => [])
+    )
   )
   // Where this worker is in the genre blocks, so a reload continues the block
   // they are in instead of starting a fresh humanizer one.

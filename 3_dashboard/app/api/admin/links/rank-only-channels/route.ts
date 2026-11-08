@@ -3,7 +3,7 @@ import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { isAdminEmail } from '@/lib/config'
 import { buildAdminLinks, type AdminLinkRow } from '@/lib/adminLinks'
-import { getAdminGenre } from '@/lib/adminGenre'
+import { getAdminGenreScope } from '@/lib/adminGenre'
 import { channelOf } from '@/lib/dateScore'
 
 export const dynamic = 'force-dynamic'
@@ -109,10 +109,12 @@ export async function GET(req: NextRequest) {
 
   try {
     const { rows } = await buildAdminLinks(String(sp.get('product') ?? ''))
-    const genre = await getAdminGenre()
+    // '' (the switch's All) is every genre. Each row's clusters are already its
+    // own genre's (buildAdminLinks clusters per platform|genre).
+    const genre = await getAdminGenreScope()
     const pool = rows.filter(
       (l) =>
-        l.genre === genre &&
+        (!genre || l.genre === genre) &&
         (!platform || l.platform === platform) &&
         (includeBlocked || !l.blocked)
     )
@@ -162,6 +164,7 @@ export async function GET(req: NextRequest) {
         cluster: l.rankCluster,
         keyword: kw,
         blocked: l.blocked,
+        genre: l.genre,
       }
       const cur = found.get(c)
       if (!cur) {

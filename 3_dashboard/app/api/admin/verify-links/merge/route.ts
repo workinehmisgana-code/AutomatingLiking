@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { getAdminGenre } from '@/lib/adminGenre'
+import { getAdminGenreScope } from '@/lib/adminGenre'
 import { isAdminEmail } from '@/lib/config'
 import { mergeVerifyLinks } from '@/lib/verifyMerge'
 
@@ -60,7 +60,9 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    return NextResponse.json(await mergeVerifyLinks({ urls, accounts, genre: await getAdminGenre() }))
+    // The switch's genre's staged links; in All ('' → undefined) every genre's.
+    // Either way each merged row keeps the genre it was staged with.
+    return NextResponse.json(await mergeVerifyLinks({ urls, accounts, genre: (await getAdminGenreScope()) || undefined }))
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 })
   }

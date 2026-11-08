@@ -1,7 +1,7 @@
 import { headers } from 'next/headers'
 import { redirect, notFound } from 'next/navigation'
 import { auth } from '@/lib/auth'
-import { getAdminGenre } from '@/lib/adminGenre'
+import { getAdminGenreScope } from '@/lib/adminGenre'
 import {
   getProductCommentSettings,
   getCategoryComments,
@@ -13,7 +13,7 @@ import {
   isAdminEmail,
   isProduct,
   genreOfProduct,
-  productsInGenre,
+  productsInScope,
   COMMENT_WORD_MIN,
   COMMENT_WORD_MAX,
   DEFAULT_COMMENT_STYLE,
@@ -46,9 +46,13 @@ export default async function AdminProductCommentsPage({
   // business while the switch says otherwise, so flipping the switch while
   // looking at purifytext lands on the selected genre's first product rather
   // than leaving a humanizer page under a "Website builder" switch.
-  const genre = await getAdminGenre()
-  const genreProducts = productsInGenre(genre)
-  if (genreOfProduct(product) !== genre && genreProducts.length > 0) {
+  //
+  // IN THE SWITCH'S ALL ('') there is no other genre to land on: the page is
+  // about this product, and so about its own genre (its audiences, its voice).
+  // The switcher then offers every product.
+  const genre = await getAdminGenreScope()
+  const genreProducts = productsInScope(genre)
+  if (genre && genreOfProduct(product) !== genre && genreProducts.length > 0) {
     redirect(`/admin/comments/${genreProducts[0]}`)
   }
 

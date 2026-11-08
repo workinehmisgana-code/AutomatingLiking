@@ -3,7 +3,7 @@ import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { isAdminEmail } from '@/lib/config'
 import { buildAdminLinks, filterAdminLinks, parseLinkQuery, type LinkQuery } from '@/lib/adminLinks'
-import { getAdminGenre, adminGenreUrlTest } from '@/lib/adminGenre'
+import { getAdminGenreScope } from '@/lib/adminGenre'
 import { saveLinkScan, startScanRun, getScanRunUrls, recordScanRunBatch } from '@/lib/db'
 import { scanLink } from '@/lib/commentScan'
 
@@ -45,8 +45,9 @@ function scopeFor(qy: LinkQuery): { key: string; label: string } {
   const clusters = [...(qy.clusters ?? [])].sort((a, b) => a - b)
   const parts: string[] = [
     // The genre first: two runs on "TikTok, all clusters" in different genres
-    // scanned different links and must not share a line on the graph.
-    `genre=${qy.genre || 'humanizer'}`,
+    // scanned different links and must not share a line on the graph. '' is
+    // the switch's All (every genre's links), a set of its own.
+    `genre=${qy.genre || 'all'}`,
     `by=${qy.clusterBy ?? 'rank'}`,
     `clusters=${clusters.join('.') || 'all'}`,
     `platform=${qy.platform || 'all'}`,
@@ -60,7 +61,7 @@ function scopeFor(qy: LinkQuery): { key: string; label: string } {
     `q=${qy.q || ''}`,
   ]
   const bits: string[] = []
-  bits.push(qy.genre || 'humanizer')
+  bits.push(qy.genre || 'all genres')
   bits.push(clusters.length ? `${qy.clusterBy ?? 'rank'} cluster ${clusters.join(', ')}` : 'all clusters')
   if (qy.platform) bits.push(qy.platform)
   if (qy.keyword) bits.push(`"${qy.keyword}"`)
@@ -73,7 +74,7 @@ function scopeFor(qy: LinkQuery): { key: string; label: string } {
 
 /** The filtered URLs this endpoint may scan, in a stable order. */
 async function targetUrls(sp: URLSearchParams): Promise<{ urls: string[]; error?: string }> {
-  const qy = { ...parseLinkQuery(sp), genre: await getAdminGenre() }
+  const qy = { ...parseLinkQuery(sp), genre: await getAdminGenreScope() }
   const { rows, retirePlatforms } = await buildAdminLinks(qy.product ?? '')
   const filtered = filterAdminLinks(rows, qy, retirePlatforms)
   // TikTok only: the comment endpoint has no equivalent elsewhere. Blocked links
@@ -141,7 +142,7 @@ export async function POST(req: NextRequest) {
 
     // The first request of a press opens the run; the client echoes its id on
     // every request after, so one press is one row in the history.
-    const scope = scopeFor({ ...parseLinkQuery(sp), genre: await getAdminGenre() })
+    const scope = scopeFor({ ...parseLinkQuery(sp), genre: await getAdminGenreScope() })
     const run = runId ?? (await startScanRun(scope.key, scope.label))
 
     // Only what THIS run has read. Links read by an earlier press are read

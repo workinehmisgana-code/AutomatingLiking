@@ -3,7 +3,7 @@ import { put } from '@vercel/blob'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { isAdminEmail } from '@/lib/config'
-import { DEFAULT_GENRE, isGenre } from '@/lib/config'
+import { ALL_GENRES, DEFAULT_GENRE, isGenre } from '@/lib/config'
 import { loadVideosJson } from '@/lib/videos'
 import {
   getBlockedLinksPage,
@@ -13,6 +13,7 @@ import {
   unblockLinks,
   blockLinks,
   getLinkStats,
+  getBlockedPairs,
   type LinkStat,
   type BlockedSort,
 } from '@/lib/db'
@@ -56,7 +57,11 @@ function videoId(url: string): string | null {
  * Returns how many were added. Writes videos.json only when there is something
  * to add: it is a 24 MB blob.
  */
-async function restoreToPool(urls: string[], genre: string = DEFAULT_GENRE): Promise<number> {
+async function restoreToPool(
+  urls: string[],
+  /** One genre for all, or each URL's own (the switch's All lifts several genres' blocks). */
+  genre: string | ((url: string) => string) = DEFAULT_GENRE
+): Promise<number> {
   const tiktok = urls.filter((u) => videoId(u))
   if (tiktok.length === 0) return 0
   if (!process.env.BLOB_READ_WRITE_TOKEN) return 0
@@ -90,7 +95,7 @@ async function restoreToPool(urls: string[], genre: string = DEFAULT_GENRE): Pro
       // far predates genres — and the admin can re-file it from the Links page.
       // Now the genre the lifted block was for: that is the pool it is
       // being let back into.
-      genre,
+      genre: typeof genre === 'function' ? genre(url) : genre,
     })
   }
   await put('videos.json', JSON.stringify(videos), {
@@ -185,12 +190,18 @@ export async function POST(req: NextRequest) {
   const action = String(body.action ?? '')
   // WHICH GENRE'S BLOCK. Blocks are per genre: unblocking under Website lifts
   // the website block and leaves a humanizer block on the same link alone.
+  //
+  // THE SWITCH'S ALL ('' or 'all' sent explicitly): no one genre. A block is
+  // then made under each link's own pool genre (blockLinks with no genre), and
+  // an unblock lifts every genre's block on those links, each restored into
+  // the genre its block was for. Never stamped as the default by accident.
+  const allGenres = body.genre === '' || body.genre === ALL_GENRES
   const genre = isGenre(body.genre) ? body.genre : DEFAULT_GENRE
   // `handles` unblocks whole channels — a block is usually a judgement about a
   // channel, so undoing one link at a time would be the wrong unit of work.
   const handles = Array.isArray(body.handles) ? body.handles.map((h) => String(h)) : []
   const urls = handles.length > 0
-    ? await getBlockedUrlsForChannels(handles, genre).catch(() => [] as string[])
+    ? await getBlockedUrlsForChannels(handles, allGenres ? undefined : genre).catch(() => [] as string[])
     : Array.isArray(body.urls) ? body.urls.map((u) => String(u)) : []
   if (urls.length === 0) {
     return NextResponse.json({ error: 'No links given.' }, { status: 400 })
@@ -202,8 +213,22 @@ export async function POST(req: NextRequest) {
     // block is here so an accidental unblock can be undone in one click, from
     // the same screen, without hunting the links down again.
     if (action === 'block') {
-      const n = await blockLinks(urls, genre)
+      const n = await blockLinks(urls, allGenres ? undefined : genre)
       return NextResponse.json({ ok: true, action, changed: n })
+    }
+    if (allGenres) {
+      // Which genre each lifted block was for, read BEFORE it is deleted.
+      const wanted = new Set(urls)
+      const liftedGenre = new Map<string, string>()
+      for (const p of await getBlockedPairs().catch(() => [] as { url: string; genre: string }[])) {
+        if (wanted.has(p.url) && !liftedGenre.has(p.url)) liftedGenre.set(p.url, p.genre)
+      }
+      const n = await unblockLinks(urls)
+      const restored = await restoreToPool(urls, (u) => {
+        const g = liftedGenre.get(u)
+        return isGenre(g) ? g : DEFAULT_GENRE
+      }).catch(() => 0)
+      return NextResponse.json({ ok: true, action, changed: n, restored })
     }
     const n = await unblockLinks(urls, genre)
     // Restore AFTER the block is lifted, so a link can never be back in the pool

@@ -67,6 +67,7 @@ type RawRefund = {
 const CAPABILITIES: ProviderCapabilities = {
   refundsViaApi: true,
   planChanges: true,
+  billingPeriodChanges: true,
   immediateCancellation: true,
   partialRefunds: true,
   refundReasons: [
@@ -301,6 +302,17 @@ export function createPolarProvider(project: Project): BillingProvider {
         createdAt: raw.created_at,
         orderId: raw.order_id,
       };
+    },
+
+    async setBillingPeriodEnd(subscriptionId, endIso) {
+      // SubscriptionUpdateBillingPeriod: "Set a new date for the end of the
+      // current billing period. The subscription will renew on this date."
+      // Earlier or later, must be in the future; moves no money by itself.
+      const raw = await call<RawSubscription>(`/subscriptions/${subscriptionId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ current_billing_period_end: endIso }),
+      });
+      return toSubscription(raw);
     },
 
     async cancelSubscription(subscriptionId, atPeriodEnd) {

@@ -4,6 +4,7 @@ import { AlertTriangle, ArrowDown } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { DowngradeTarget } from "@/app/api/admin/support/products/route";
 import type { BillingOrder, BillingSubscription, CustomerProfile } from "@/lib/support/types";
+import { isMonthly, isYearly, quoteYearlyToMonthly } from "@/lib/support/intervalDowngrade";
 import { ErrorNote, formatDate, Modal, money, ProjectBadge, Spinner } from "./ui";
 
 type Project = CustomerProfile["project"];
@@ -17,11 +18,15 @@ type Project = CustomerProfile["project"];
 export function DowngradeModal({
   profile,
   subscription,
+  preferMonthly,
   onClose,
   onDone,
 }: {
   profile: CustomerProfile;
   subscription: BillingSubscription;
+  /** Opened from the refund dialog's "downgrade to monthly": preselect the
+   *  monthly version of their plan. */
+  preferMonthly?: boolean;
   onClose: () => void;
   onDone: (summary: string) => void;
 }) {
@@ -82,10 +87,53 @@ export function DowngradeModal({
     [targets, currentAmount, subscription.interval],
   );
 
-  const target = options.find((o) => o.id === choice) ?? null;
-  const difference = target?.amount != null ? Math.max(0, currentAmount - target.amount) : 0;
-  const refundable = lastPaid ? lastPaid.totalAmount - lastPaid.refundedAmount : 0;
+  // YEARLY → MONTHLY: any monthly plan, where the provider can cut the year
+  // short (otherwise the monthly plan would only start a year from now). The
+  // refund comes out of the yearly payment for THIS subscription.
+  const yearly = isYearly(subscription.interval);
+  const canGoMonthly = yearly && (project.capabilities?.billingPeriodChanges ?? false);
+  const yearlyOrder: BillingOrder | undefined = useMemo(
+    () => profile.billing?.orders.find((o) => o.isPaid && o.subscriptionId === subscription.id),
+    [profile.billing, subscription.id],
+  );
+  const monthlyOptions = useMemo(
+    () =>
+      canGoMonthly
+        ? (targets ?? []).filter((t) => t.amount !== null && isMonthly(t.interval))
+        : [],
+    [targets, canGoMonthly],
+  );
+
+  // From the refund dialog: start on the monthly plan of the same tier
+  // ("Pro Yearly" → "Pro Monthly"), when there is exactly one.
+  useEffect(() => {
+    if (!preferMonthly || choice || monthlyOptions.length === 0) return;
+    const tier = (subscription.productName ?? "").split(/\s+/)[0]?.toLowerCase();
+    const same = monthlyOptions.filter((o) => o.name.split(/\s+/)[0]?.toLowerCase() === tier);
+    const pick = same.length === 1 ? same[0] : monthlyOptions.length === 1 ? monthlyOptions[0] : null;
+    if (pick) setChoice(pick.id);
+  }, [preferMonthly, choice, monthlyOptions, subscription.productName]);
+
+  const monthlyTarget = monthlyOptions.find((o) => o.id === choice) ?? null;
+  const target = options.find((o) => o.id === choice) ?? monthlyTarget;
+  const toMonthly = !!monthlyTarget;
+  const quote =
+    monthlyTarget && yearlyOrder
+      ? quoteYearlyToMonthly({
+          paidAt: yearlyOrder.createdAt,
+          paid: yearlyOrder.totalAmount,
+          monthly: monthlyTarget.amount ?? 0,
+        })
+      : null;
+  const refundFrom = toMonthly ? yearlyOrder : lastPaid;
+  const difference = toMonthly
+    ? (quote?.difference ?? 0)
+    : target?.amount != null
+      ? Math.max(0, currentAmount - target.amount)
+      : 0;
+  const refundable = refundFrom ? refundFrom.totalAmount - refundFrom.refundedAmount : 0;
   const refundAmount = Math.min(difference, refundable);
+  const monthlyBlocked = toMonthly && (!yearlyOrder || refundAmount <= 0);
 
   async function submit() {
     if (!target) return;
@@ -104,8 +152,10 @@ export function DowngradeModal({
           newPlanName: target.name.split(/\s+/)[0],
           resume: subscription.cancelAtPeriodEnd,
           newPlanCredits: target.credits ?? undefined,
-          refundOrderId: lastPaid?.id,
+          refundOrderId: refundFrom?.id,
           refundAmount,
+          // The server works the refund out itself in this mode.
+          toMonthly,
         }),
       });
       const d = (await r.json()) as {
@@ -174,12 +224,18 @@ export function DowngradeModal({
           <button onClick={onClose} className="btn btn-ghost" disabled={busy}>
             Cancel
           </button>
-          <button onClick={submit} disabled={!target || busy} className="btn btn-warn">
+          <button
+            onClick={submit}
+            disabled={!target || busy || monthlyBlocked}
+            className="btn btn-warn"
+          >
             {busy && <Spinner />}
             {busy
               ? "Working…"
               : target
-                ? `Downgrade & refund ${money(refundAmount, currency)}`
+                ? toMonthly
+                  ? `Switch to monthly & refund ${money(refundAmount, currency)}`
+                  : `Downgrade & refund ${money(refundAmount, currency)}`
                 : "Pick a plan"}
           </button>
         </>
@@ -208,7 +264,7 @@ export function DowngradeModal({
           </p>
         ) : loadError ? (
           <ErrorNote>{loadError}</ErrorNote>
-        ) : options.length === 0 ? (
+        ) : options.length === 0 && monthlyOptions.length === 0 ? (
           <p className="rounded-lg border border-ink-700 bg-ink-850 px-3 py-2 text-[11px] leading-relaxed text-slate-500">
             No cheaper recurring plan billed {subscription.interval ?? "the same way"}. One-time
             top-ups are excluded — a subscription cannot be moved onto one. There is nothing to
@@ -217,18 +273,109 @@ export function DowngradeModal({
         ) : (
           <select value={choice} onChange={(e) => setChoice(e.target.value)} className="field">
             <option value="">Select a plan…</option>
-            {options.map((o) => (
-              <option key={o.id} value={o.id}>
-                {o.name} — {money(o.amount, o.currency)}
-                {o.interval ? `/${o.interval}` : ""}
-                {o.credits ? ` · ${o.credits.toLocaleString()} credits` : ""}
-              </option>
-            ))}
+            {options.length > 0 && (
+              <optgroup label={`Cheaper, billed ${subscription.interval ?? "the same way"}`}>
+                {options.map((o) => (
+                  <option key={o.id} value={o.id}>
+                    {o.name} — {money(o.amount, o.currency)}
+                    {o.interval ? `/${o.interval}` : ""}
+                    {o.credits ? ` · ${o.credits.toLocaleString()} credits` : ""}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+            {monthlyOptions.length > 0 && (
+              <optgroup label="Yearly → monthly">
+                {monthlyOptions.map((o) => (
+                  <option key={o.id} value={o.id}>
+                    {o.name} — {money(o.amount, o.currency)}/month
+                    {o.credits ? ` · ${o.credits.toLocaleString()} credits` : ""}
+                  </option>
+                ))}
+              </optgroup>
+            )}
           </select>
+        )}
+        {yearly && !canGoMonthly && (
+          <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
+            Switching yearly to monthly needs {project.providerLabel} to shorten the billing period,
+            which it cannot do through its API — do that one in the {project.providerLabel} dashboard.
+          </p>
         )}
       </div>
 
-      {target && (
+      {monthlyTarget && (
+        <>
+          <div className="rounded-lg border border-ink-700 bg-ink-850 px-3 py-2.5 text-xs">
+            <div className="mb-1.5 flex items-center gap-2 text-slate-300">
+              <span>{subscription.productName ?? "Current"} (yearly)</span>
+              <ArrowDown size={12} className="text-slate-600" />
+              <span className="font-medium text-slate-100">{monthlyTarget.name} (monthly)</span>
+            </div>
+            {!yearlyOrder || !quote ? (
+              <p className="text-amber-300">
+                No paid yearly payment for this subscription was found, so there is nothing to refund
+                the difference from.
+              </p>
+            ) : (
+              <>
+                <Row label="Paid for the year" value={money(yearlyOrder.totalAmount, yearlyOrder.currency)} />
+                <Row label="Paid on" value={formatDate(yearlyOrder.createdAt)} />
+                <Row
+                  label={`Months used (incl. this one)`}
+                  value={`${quote.monthsUsed} × ${money(monthlyTarget.amount, monthlyTarget.currency)} = ${money(quote.kept, yearlyOrder.currency)}`}
+                />
+                <div className="my-1 border-t border-ink-700" />
+                <Row label="Refund to card" value={money(refundAmount, yearlyOrder.currency)} strong />
+                <Row label="First monthly charge" value={formatDate(quote.paidThrough)} />
+                {refundAmount < quote.difference && refundAmount > 0 && (
+                  <p className="mt-1 text-[10px] text-amber-300">
+                    Capped at what is left refundable on that payment.
+                  </p>
+                )}
+                {refundAmount <= 0 && (
+                  <p className="mt-1 text-[10px] text-amber-300">
+                    The months used already cost as much as what is left on the payment — nothing to
+                    refund, so there is no point switching this way.
+                  </p>
+                )}
+              </>
+            )}
+          </div>
+
+          {quote && refundAmount > 0 && (
+            <ul className="space-y-1 text-[11px] leading-relaxed text-slate-400">
+              <li>
+                • Every month started since they paid is charged at the monthly price; the rest,{" "}
+                {money(refundAmount, currency)}, goes back on their card now as a real refund.
+              </li>
+              <li>
+                • Their yearly period is cut short to {formatDate(quote.paidThrough)}. They keep full
+                access until then, and from then on {project.providerLabel} bills{" "}
+                {money(monthlyTarget.amount, monthlyTarget.currency)} a month for{" "}
+                {monthlyTarget.name}.
+              </li>
+              <li>
+                • The plan change is scheduled with no proration, so {project.providerLabel} issues
+                no credit of its own — they are not compensated twice.
+              </li>
+              {subscription.cancelAtPeriodEnd && (
+                <li className="text-amber-300">
+                  • Their scheduled cancellation is lifted, so they stay a paying monthly customer.
+                </li>
+              )}
+              {monthlyTarget.credits !== null && (
+                <li>
+                  • Credits are capped at {monthlyTarget.credits.toLocaleString()} in the{" "}
+                  {project.label} database.
+                </li>
+              )}
+            </ul>
+          )}
+        </>
+      )}
+
+      {target && !toMonthly && (
         <>
           <div className="rounded-lg border border-ink-700 bg-ink-850 px-3 py-2.5 text-xs">
             <div className="mb-1.5 flex items-center gap-2 text-slate-300">

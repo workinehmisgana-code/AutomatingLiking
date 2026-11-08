@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { getAdminGenre } from '@/lib/adminGenre'
+import { getAdminGenreScope } from '@/lib/adminGenre'
 import { isAdminEmail } from '@/lib/config'
 import {
   buildAdminLinks,
@@ -25,8 +25,9 @@ async function parseQuery(sp: URLSearchParams): Promise<LinkQuery> {
   return {
     ...parseLinkQuery(sp),
     // THE MASTER SWITCH, not the query string: every admin list is one
-    // genre's, and a stale tab sending another genre must not mix them.
-    genre: await getAdminGenre(),
+    // genre's, and a stale tab sending another genre must not mix them. ''
+    // (the switch's All) is every genre, which filterAdminLinks already reads.
+    genre: await getAdminGenreScope(),
     offset: Math.max(0, Number(sp.get('offset')) || 0),
     limit: Math.min(MAX_ROWS, Math.max(1, Number(sp.get('limit')) || MAX_ROWS)),
   }

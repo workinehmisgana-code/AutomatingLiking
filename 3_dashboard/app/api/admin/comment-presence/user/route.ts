@@ -1,8 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { getAdminGenre } from '@/lib/adminGenre'
-import { isAdminEmail, productsInGenre } from '@/lib/config'
+import { getAdminGenreScope } from '@/lib/adminGenre'
+import { isAdminEmail, productsFilterFor } from '@/lib/config'
 import {
   getPresenceLinks,
   getPresenceHistoryForUser,
@@ -57,7 +57,8 @@ export async function GET(req: NextRequest) {
   const days = Math.max(1, Math.min(60, Number(req.nextUrl.searchParams.get('days')) || 7))
 
   try {
-    const products = productsInGenre(await getAdminGenre())
+    // The switch's genre's products (every product in All).
+    const products = productsFilterFor(await getAdminGenreScope())
     const [profile, info, rows, history] = await Promise.all([
       getUserProfile(userId).catch(() => null),
       getUserNameEmail(userId).catch(() => null),

@@ -1,7 +1,7 @@
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { isAdminEmail } from '@/lib/config'
-import { getAdminGenre } from '@/lib/adminGenre'
+import { getAdminGenreScope, ALL_GENRES } from '@/lib/adminGenre'
 import GenreSwitch from '@/components/GenreSwitch'
 import UserMessagesPopup from '@/components/UserMessagesPopup'
 import SupportInboxButton from '@/components/SupportInboxButton'
@@ -23,7 +23,8 @@ export const dynamic = 'force-dynamic'
 export default async function AdminLayout({ children }: { children: React.ReactNode }) {
   const session = await auth.api.getSession({ headers: await headers() }).catch(() => null)
   const admin = isAdminEmail(session?.user?.email)
-  const genre = await getAdminGenre()
+  // '' is the All position; the switch names it by its cookie value.
+  const genre = (await getAdminGenreScope()) || ALL_GENRES
   // Users' messages sit in the genre bar, on every admin page, rather than in a
   // full-width row of their own on the home page.
   const unread = admin ? await getUnreadReplies().catch(() => []) : []

@@ -4,6 +4,7 @@ import { useState } from 'react'
 import Link from 'next/link'
 import { upload } from '@vercel/blob/client'
 import { compressImage } from '@/lib/imageCompress'
+import ReportFineWarning from '@/components/ReportFineWarning'
 
 const PLATFORMS: { key: string; label: string; dot: string }[] = [
   { key: 'tiktok', label: 'TikTok', dot: 'bg-pink-500' },
@@ -163,6 +164,7 @@ export default function FinishForm() {
         For each platform, enter how many videos you commented on and attach your comment-history
         screenshots (you can select multiple).
       </p>
+      <ReportFineWarning className="mb-4" />
 
       <div className="space-y-4">
         {PLATFORMS.map((p) => (

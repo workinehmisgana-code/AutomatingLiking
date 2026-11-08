@@ -1,8 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { getAdminGenre, adminGenreUrlTest } from '@/lib/adminGenre'
-import { isAdminEmail, productsInGenre } from '@/lib/config'
+import { getAdminGenreScope } from '@/lib/adminGenre'
+import { isAdminEmail, productsFilterFor } from '@/lib/config'
 import { buildAdminLinks, filterAdminLinks, parseLinkQuery } from '@/lib/adminLinks'
 import { getProductCommentTally, getLinksForComment } from '@/lib/db'
 
@@ -32,9 +32,10 @@ export async function GET(req: NextRequest) {
   }
   const sp = req.nextUrl.searchParams
   // The master switch: only this genre's products are tallied, served or
-  // listed, so a website session never reads humanizer comments.
-  const genre = await getAdminGenre()
-  const products = productsInGenre(genre)
+  // listed, so a website session never reads humanizer comments. All ('')
+  // tallies every product.
+  const genre = await getAdminGenreScope()
+  const products = productsFilterFor(genre)
 
   // ── one comment's links, for the row that was expanded ──────────────────
   const one = (sp.get('text') ?? '').trim()

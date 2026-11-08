@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { getAdminGenre } from '@/lib/adminGenre'
-import { isAdminEmail, genreOfRow, RANK_CLUSTER_COUNT, DATE_CLUSTER_COUNT, retireThreshold } from '@/lib/config'
+import { getAdminGenreScope } from '@/lib/adminGenre'
+import { isAdminEmail, genreOfRow, genreInScope, RANK_CLUSTER_COUNT, DATE_CLUSTER_COUNT, retireThreshold } from '@/lib/config'
 import { loadVideosJson } from '@/lib/videos'
 import { getClickCountsByProductAndUrl, getBlockedPoolUrls, getEffectivePlatformLimits } from '@/lib/db'
 import { parsePostedDate } from '@/lib/cluster'
@@ -193,9 +193,11 @@ export async function GET(req: NextRequest) {
   // filters (so cluster numbers stay correct regardless of the platform filter).
   // ONE GENRE: the switch's. Each genre's pool is clustered on its own (the
   // feeds do the same), so the genre is cut BEFORE the clusters are assigned.
-  const genre = await getAdminGenre()
+  // In the switch's All ('') every genre is exported, still clustered genre by
+  // genre, so a link's cluster is the one it has on its own genre's page.
+  const genre = await getAdminGenreScope()
   const httpAll: Row[] = all
-    .filter((v) => genreOfRow(v as { genre?: unknown }) === genre)
+    .filter((v) => genreInScope(genre, genreOfRow(v as { genre?: unknown })))
     // Blocked links are never exported (mirrors the admin list, which hides them).
     .filter((v) => String(v.url ?? '').startsWith('http') && !blockedSet.has(String(v.url)))
     .map((v) => {
@@ -203,7 +205,18 @@ export async function GET(req: NextRequest) {
       const retire_at = retireThreshold(String(v.platform ?? ''), Number(v.like_count ?? 0))
       return { ...v, clicked_by, retire_at }
     })
-  assignClusters(httpAll)
+  if (genre) {
+    assignClusters(httpAll)
+  } else {
+    const byGenre = new Map<string, Row[]>()
+    for (const r of httpAll) {
+      const g = genreOfRow(r as { genre?: unknown })
+      const bucket = byGenre.get(g) ?? []
+      if (!byGenre.has(g)) byGenre.set(g, bucket)
+      bucket.push(r)
+    }
+    Array.from(byGenre.values()).forEach((rows) => assignClusters(rows))
+  }
   // Retirement applies only on platforms where it is switched on; a row on any
   // other platform never counts as retired → a "retired only" export is empty
   // when retirement is off everywhere.

@@ -1,8 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { getAdminGenre } from '@/lib/adminGenre'
-import { DEFAULT_GENRE, isAdminEmail, isGenre } from '@/lib/config'
+import { getAdminGenreScope } from '@/lib/adminGenre'
+import { ALL_GENRES, DEFAULT_GENRE, isAdminEmail, isGenre } from '@/lib/config'
 import { addExtraChannel, removeExtraChannel, getExtraChannels } from '@/lib/db'
 import { fetchChannelVideos } from '@/lib/linkStats'
 import {
@@ -39,10 +39,10 @@ export async function GET() {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   try {
-    // The switch's genre's hand-added channels only.
-    const genre = await getAdminGenre()
+    // The switch's genre's hand-added channels only (every genre's in All).
+    const genre = await getAdminGenreScope()
     const all = await getExtraChannels()
-    return NextResponse.json({ channels: all.filter((c) => (c.genre || DEFAULT_GENRE) === genre) })
+    return NextResponse.json({ channels: all.filter((c) => !genre || (c.genre || DEFAULT_GENRE) === genre) })
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 })
   }
@@ -107,6 +107,14 @@ export async function POST(req: NextRequest) {
     // Everything extracted from it inherits this, and the merge files those
     // links in that genre's pool — so adding a cocodly channel is the whole of
     // telling the system that its videos are cocodly videos.
+    // The switch's All is not a genre to file a channel under: refused rather
+    // than quietly filed as the default.
+    if (body.genre === '' || body.genre === ALL_GENRES) {
+      return NextResponse.json(
+        { error: 'A channel is added to one genre. Pick a genre in the switch at the top, then add it.' },
+        { status: 400 }
+      )
+    }
     const genre = isGenre(body.genre) ? body.genre : DEFAULT_GENRE
     const added = await addExtraChannel(site, parsed.handle, String(body.note ?? ''), genre)
     return NextResponse.json({

@@ -1,10 +1,11 @@
 import { headers } from 'next/headers'
 import { redirect } from 'next/navigation'
 import { auth } from '@/lib/auth'
-import { getAdminGenre } from '@/lib/adminGenre'
+import { getAdminGenreScope } from '@/lib/adminGenre'
 import { isAdminEmail } from '@/lib/config'
 import Login from '@/components/Login'
 import LikerSettings from '@/components/LikerSettings'
+import PickGenreNote from '@/components/PickGenreNote'
 
 export const dynamic = 'force-dynamic'
 
@@ -29,5 +30,9 @@ export default async function AdminLikerPage() {
   }
   if (!session) return <Login />
   if (!isAdminEmail(session.user.email)) redirect('/')
-  return <LikerSettings genre={await getAdminGenre()} />
+  // ONE GENRE: the phone works one genre's links, and saving here switches it.
+  // In the switch's All there is no genre to save, so it asks for one.
+  const genre = await getAdminGenreScope()
+  if (!genre) return <PickGenreNote what="The phone liker's settings" />
+  return <LikerSettings genre={genre} />
 }

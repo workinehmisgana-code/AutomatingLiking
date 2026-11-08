@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { getAdminGenre } from '@/lib/adminGenre'
+import { getAdminGenreScope } from '@/lib/adminGenre'
 import { isAdminEmail } from '@/lib/config'
 import { getVerifyAccounts } from '@/lib/db'
 
@@ -16,7 +16,7 @@ export async function GET() {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   try {
-    return NextResponse.json({ accounts: await getVerifyAccounts(await getAdminGenre()) })
+    return NextResponse.json({ accounts: await getVerifyAccounts((await getAdminGenreScope()) || undefined) })
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 })
   }

@@ -105,6 +105,13 @@ export type ProviderCapabilities = {
    * Freemius cannot, so its downgrade dialog only guides.
    */
   planChanges: boolean;
+  /**
+   * The current billing period's end can be moved through the API. Needed to
+   * turn a yearly subscription into a monthly one now rather than at the end
+   * of the year: the year is cut short to the months the customer keeps, and
+   * the monthly plan starts when they run out.
+   */
+  billingPeriodChanges?: boolean;
   /** Cancel can revoke access immediately, not just at period end. */
   immediateCancellation: boolean;
   /** Cancelling is ALWAYS immediate — there is no period-end option. */
@@ -140,5 +147,11 @@ export interface BillingProvider {
     opts?: { resume?: boolean },
   ): Promise<BillingSubscription>;
   createRefund(input: RefundInput): Promise<BillingRefund>;
+  /**
+   * Move the end of the current billing period (where billingPeriodChanges).
+   * The subscription renews on that date, applying any scheduled plan change.
+   * No money moves.
+   */
+  setBillingPeriodEnd?(subscriptionId: string, endIso: string): Promise<BillingSubscription>;
   cancelSubscription(subscriptionId: string, atPeriodEnd: boolean): Promise<BillingSubscription>;
 }

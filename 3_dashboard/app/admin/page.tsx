@@ -20,7 +20,7 @@ import {
   getAllGenrePauses,
 } from '@/lib/db'
 import { isAdminEmail } from '@/lib/config'
-import { getAdminGenre } from '@/lib/adminGenre'
+import { getAdminGenreScope } from '@/lib/adminGenre'
 import Login from '@/components/Login'
 import AdminDashboard from '@/components/AdminDashboard'
 
@@ -38,8 +38,9 @@ export default async function AdminPage() {
 
   // The master genre switch. Read once, here, and handed to every query and
   // to the page, so nothing on the screen can be about a different genre from
-  // the number beside it.
-  const genre = await getAdminGenre()
+  // the number beside it. '' is the switch's All: getAdminData reads it as
+  // every product, and the page shows every genre's rows.
+  const genre = await getAdminGenreScope()
 
   const [
     data, pendingByUser, apk, appVersions, videoTaskEnabled, promoTaskEnabled,

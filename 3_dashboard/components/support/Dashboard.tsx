@@ -22,7 +22,7 @@ import { cx } from "./ui";
 type ModalState =
   | { type: "refund"; order: BillingOrder }
   | { type: "cancel"; subscription: BillingSubscription }
-  | { type: "downgrade"; subscription: BillingSubscription }
+  | { type: "downgrade"; subscription: BillingSubscription; preferMonthly?: boolean }
   | { type: "delete" }
   | null;
 
@@ -424,6 +424,18 @@ export default function Dashboard({
           customerEmail={lookupEmail ?? ""}
           onClose={() => setModal(null)}
           onDone={completeAction}
+          // A yearly subscription's payment can instead be turned into monthly
+          // billing, refunding only the difference.
+          yearlySubscription={(() => {
+            const order = modal.order;
+            const sub = profile.billing?.subscriptions.find((s) => s.id === order.subscriptionId);
+            return sub && sub.interval === "year" && profile.project.capabilities?.billingPeriodChanges
+              ? sub
+              : null;
+          })()}
+          onDowngradeToMonthly={(subscription) =>
+            setModal({ type: "downgrade", subscription, preferMonthly: true })
+          }
         />
       )}
       {modal?.type === "cancel" && profile && (
@@ -439,6 +451,7 @@ export default function Dashboard({
         <DowngradeModal
           profile={profile}
           subscription={modal.subscription}
+          preferMonthly={modal.preferMonthly}
           onClose={() => setModal(null)}
           onDone={completeAction}
         />

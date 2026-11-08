@@ -11,6 +11,7 @@ import {
   DEFAULT_GENRE,
   GENRES,
   GENRE_LABELS,
+  genreLabel,
   isGenre,
 } from '@/lib/config'
 
@@ -91,7 +92,8 @@ interface ChannelRank {
 export default function VerifyLinks({
   genre,
 }: {
-  /** The admin's master genre switch. The staged list is cut to it. */
+  /** The admin's master genre switch. The staged list is cut to it; '' is the
+   *  switch's All (every genre's staging, each row keeping its own genre). */
   genre: string
 }) {
   const [rows, setRows] = useState<VRow[]>([])
@@ -561,6 +563,12 @@ export default function VerifyLinks({
   async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (!file) return
+    // Uploaded rows are staged INTO the switch's genre, and All is not one.
+    if (!genre) {
+      alert('Uploaded links are staged into one genre. Pick a genre in the switch at the top, then upload.')
+      if (fileRef.current) fileRef.current.value = ''
+      return
+    }
     setUploading('reading file…')
     try {
       const text = await file.text()
@@ -776,8 +784,9 @@ export default function VerifyLinks({
   // per video: every link extracted from it inherits this, and the merge files
   // them in that genre's pool. Adding a cocodly channel is the whole of telling
   // the system that its videos are cocodly videos.
-  const [addGenre, setAddGenre] = useState<string>(genre || DEFAULT_GENRE)
-  useEffect(() => { setAddGenre(genre || DEFAULT_GENRE) }, [genre])
+  // '' in the switch's All: no genre to add to, so the Add button is off.
+  const [addGenre, setAddGenre] = useState<string>(genre)
+  useEffect(() => { setAddGenre(genre) }, [genre])
   const [addNote, setAddNote] = useState('')
   const [addBusy, setAddBusy] = useState(false)
   const [addMsg, setAddMsg] = useState('')
@@ -816,6 +825,10 @@ export default function VerifyLinks({
 
   async function addChannel() {
     if (!addInput.trim()) return
+    if (!addGenre) {
+      setAddErr('A channel is added to one genre. Pick a genre in the switch at the top first.')
+      return
+    }
     setAddBusy(true)
     setAddMsg('')
     setAddErr('')
@@ -995,24 +1008,33 @@ export default function VerifyLinks({
   const [amSpec, setAmSpec] = useState<AmSpec | null>(null)
   const [amCover, setAmCover] = useState<{ links: number; channels: number } | null>(null)
   const [amBusy, setAmBusy] = useState('')
+  // In the switch's All there is no one spec: the genres whose spec is on,
+  // which is what Run now merges there.
+  const [amEnabledGenres, setAmEnabledGenres] = useState<string[]>([])
+  const amAll = !genre
   const loadAutoMerge = useCallback(() => {
+    // A count from another genre (or from before a merge) is not this one's.
+    setAmCover(null)
     fetch('/api/admin/verify-links/auto-merge', { cache: 'no-store' })
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
-        if (!d?.spec) return
+        if (!d) return
+        setAmEnabledGenres(Array.isArray(d.enabledGenres) ? d.enabledGenres.map(String) : [])
+        if (!d.spec) { setAmSpec(null); return }
         setAmSpec(d.spec)
         // Only a preview carries the count; a plain read leaves the last one.
         if (d.links !== undefined) setAmCover({ links: Number(d.links) || 0, channels: Number(d.channels) || 0 })
       })
       .catch(() => {})
-  }, [])
+    // Re-read when the switch moves: each genre has its own spec.
+  }, [genre])
   const [amCounting, setAmCounting] = useState(false)
   async function countAutoMerge() {
     setAmCounting(true)
     try {
       const res = await fetch('/api/admin/verify-links/auto-merge?preview=1', { cache: 'no-store' })
       const d = await res.json().catch(() => ({}))
-      if (res.ok && d?.spec) setAmCover({ links: Number(d.links) || 0, channels: Number(d.channels) || 0 })
+      if (res.ok && (d?.spec || amAll)) setAmCover({ links: Number(d.links) || 0, channels: Number(d.channels) || 0 })
       else alert(d?.error || 'Could not count what the spec covers.')
     } finally {
       setAmCounting(false)
@@ -1057,7 +1079,10 @@ export default function VerifyLinks({
   }
   async function runAutoMerge() {
     if (!confirm(
-      'Merge every staged link of the channels meeting the auto-merge spec now' +
+      (amAll
+        ? `Merge every staged link of the channels meeting each genre's switched-on auto-merge spec ` +
+          `(${amEnabledGenres.map((g) => genreLabel(g)).join(', ') || 'none'}) now, each into its own genre`
+        : 'Merge every staged link of the channels meeting the auto-merge spec now') +
       (amCover ? ` (${amCover.links} link(s) from ${amCover.channels} channel(s))` : '') +
       '? No related check.'
     )) return
@@ -1371,9 +1396,15 @@ export default function VerifyLinks({
 
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2 my-4">
-        <label className="text-sm text-white bg-zinc-800 hover:bg-zinc-700 rounded-lg px-3 py-1.5 cursor-pointer transition-colors">
-          {uploading || '⬆ Upload channel CSV'}
-          <input ref={fileRef} type="file" accept=".csv,text/csv" onChange={onFile} disabled={!!uploading} className="hidden" />
+        <label
+          title={genre ? undefined : 'Pick a genre in the switch at the top: uploaded links are staged into one genre.'}
+          className={
+            'text-sm rounded-lg px-3 py-1.5 transition-colors ' +
+            (genre ? 'text-white bg-zinc-800 hover:bg-zinc-700 cursor-pointer' : 'text-zinc-500 bg-zinc-900 cursor-not-allowed')
+          }
+        >
+          {uploading || (genre ? '⬆ Upload channel CSV' : '⬆ Upload channel CSV (pick a genre)')}
+          <input ref={fileRef} type="file" accept=".csv,text/csv" onChange={onFile} disabled={!!uploading || !genre} className="hidden" />
         </label>
         <button
           type="button" onClick={markUnrelated} disabled={classifying || rows.length === 0}
@@ -1680,9 +1711,12 @@ export default function VerifyLinks({
                 "genre's comments are ever served on them. Move the switch to add " +
                 'a channel to another genre.'
               }
-              className="bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-sm text-zinc-400"
+              className={
+                'bg-zinc-900 border rounded-lg px-2 py-1.5 text-sm ' +
+                (addGenre ? 'border-zinc-700 text-zinc-400' : 'border-amber-700 text-amber-300')
+              }
             >
-              {GENRE_LABELS[addGenre] ?? addGenre}
+              {addGenre ? (GENRE_LABELS[addGenre] ?? addGenre) : 'Pick a genre in the switch'}
             </span>
             <select
               value={detectedSite || addSite}
@@ -1705,7 +1739,8 @@ export default function VerifyLinks({
             <button
               type="button"
               onClick={() => void addChannel()}
-              disabled={addBusy || !addInput.trim()}
+              disabled={addBusy || !addInput.trim() || !addGenre}
+              title={addGenre ? undefined : 'A channel is added to one genre: pick one in the switch at the top'}
               className="text-sm text-white bg-teal-700 hover:bg-teal-600 border border-teal-600 disabled:opacity-40 rounded-lg px-3 py-1.5 transition-colors"
             >
               {addBusy ? 'Checking…' : 'Add'}
@@ -2098,14 +2133,21 @@ export default function VerifyLinks({
                 Auto-merge channels meeting the spec
               </label>
               <span className="text-zinc-500">
-                ({GENRE_LABELS[genre] ?? genre}) spec: <span className="text-zinc-300">{amSpec ? specText(amSpec) : '…'}</span>
+                {amAll ? (
+                  <>
+                    (All genres) specs are saved per genre — pick a genre in the switch to see or edit one.
+                    Switched on: <span className="text-zinc-300">{amEnabledGenres.map((g) => genreLabel(g)).join(', ') || 'none'}</span>
+                  </>
+                ) : (
+                  <>({genreLabel(genre)}) spec: <span className="text-zinc-300">{amSpec ? specText(amSpec) : '…'}</span></>
+                )}
               </span>
-              {amCover && amSpec ? (
+              {amCover && (amSpec || amAll) ? (
                 <span className="text-zinc-500">
                   · covers <span className="text-zinc-300 tabular-nums">{amCover.links.toLocaleString()}</span> staged
                   link(s) from <span className="text-zinc-300 tabular-nums">{amCover.channels.toLocaleString()}</span> channel(s) now
                 </span>
-              ) : amSpec ? (
+              ) : amSpec || (amAll && amEnabledGenres.length > 0) ? (
                 <button
                   type="button"
                   onClick={countAutoMerge}
@@ -2118,9 +2160,9 @@ export default function VerifyLinks({
               <span className="ml-auto flex flex-wrap gap-1.5">
                 <button
                   type="button"
-                  disabled={amBusy !== ''}
+                  disabled={amBusy !== '' || amAll}
                   onClick={() => saveAutoMerge(specFromFilters(!!amSpec?.enabled), 'save')}
-                  title="Save the site chip and the min/max filters above as this genre's auto-merge spec"
+                  title={amAll ? 'A spec is saved for one genre: pick one in the switch at the top' : "Save the site chip and the min/max filters above as this genre's auto-merge spec"}
                   className="text-zinc-200 border border-zinc-700 hover:bg-zinc-800 rounded px-2 py-0.5 disabled:opacity-40"
                 >
                   {amBusy === 'save' ? 'Saving…' : 'Save filters as spec'}
@@ -2141,9 +2183,9 @@ export default function VerifyLinks({
                 </button>
                 <button
                   type="button"
-                  disabled={!amSpec?.enabled || amBusy !== '' || (amCover !== null && !amCover.links)}
+                  disabled={(amAll ? amEnabledGenres.length === 0 : !amSpec?.enabled) || amBusy !== '' || (amCover !== null && !amCover.links)}
                   onClick={runAutoMerge}
-                  title="Merge what the spec covers now instead of waiting for the next hourly harvest"
+                  title={amAll ? "Merge what every genre's switched-on spec covers now, each link into its own genre" : 'Merge what the spec covers now instead of waiting for the next hourly harvest'}
                   className="text-white bg-emerald-600 hover:bg-emerald-500 rounded px-2 py-0.5 disabled:opacity-40"
                 >
                   {amBusy === 'run' ? 'Merging…' : 'Run now'}

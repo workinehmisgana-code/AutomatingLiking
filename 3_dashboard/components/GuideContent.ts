@@ -59,6 +59,8 @@ export interface Section {
   steps?: string[]
   rows?: { k: string; v: string }[]
   note?: string
+  /** A hard warning, shown boxed in red above the steps. */
+  danger?: 'reportFine'
 }
 
 export interface GuideCopy {
@@ -180,6 +182,7 @@ export function en(p: GuideProps): GuideCopy {
       },
       {
         heading: '7. Report your work and get paid',
+        danger: 'reportFine',
         intro: 'Your commenting is only counted once you report it. Do this at the end of every session.',
         steps: [
           'Tap Finish in the app, or open the Finish page on the website.',
@@ -386,6 +389,7 @@ export function am(p: GuideProps): GuideCopy {
       },
       {
         heading: '7. ሥራዎን ሪፖርት አድርገው ክፍያ ያግኙ',
+        danger: 'reportFine',
         intro: 'የሰጡት አስተያየት የሚቆጠረው ሪፖርት ካደረጉ በኋላ ብቻ ነው። ይህን በእያንዳንዱ የሥራ ጊዜ መጨረሻ ላይ ያድርጉ።',
         steps: [
           'በአፑ ላይ Finish ን ይንኩ፣ ወይም በድረ-ገጹ ላይ የFinish ገጹን ይክፈቱ።',

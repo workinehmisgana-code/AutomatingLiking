@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { adminGenreUrlTest } from '@/lib/adminGenre'
-import { isAdminEmail, productsInGenre } from '@/lib/config'
+import { isAdminEmail, productsFilterFor } from '@/lib/config'
 import {
   getLinksNeedingReplies,
   saveReplyDrafts,
@@ -35,7 +35,8 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   const sp = req.nextUrl.searchParams
-  // The master switch: this genre's links and this genre's drafts only.
+  // The master switch: this genre's links and this genre's drafts only (every
+  // genre's in All).
   const inGenre = await adminGenreUrlTest()
   if (sp.get('pending') === '1') {
     const [all, band, unrelated] = await Promise.all([
@@ -53,7 +54,7 @@ export async function GET(req: NextRequest) {
   const limit = Math.min(200, Math.max(1, Number(sp.get('limit')) || 50))
   const q = sp.get('q') ?? ''
   try {
-    const page = await getReplyDrafts({ offset, limit, q, products: productsInGenre(inGenre.genre) })
+    const page = await getReplyDrafts({ offset, limit, q, products: productsFilterFor(inGenre.genre) })
     return NextResponse.json({ ...page, offset, limit })
   } catch (e) {
     return NextResponse.json({ error: `Could not load: ${String(e)}` }, { status: 500 })
@@ -106,8 +107,21 @@ export async function POST(req: NextRequest) {
     if (targets.length === 0) {
       return NextResponse.json({ ok: true, generated: 0, remaining: 0, done: true })
     }
-    const chunks: typeof targets[] = []
-    for (let i = 0; i < targets.length; i += CHUNK) chunks.push(targets.slice(i, i + CHUNK))
+    // Chunked WITHIN a genre: each link is drafted against its own genre's
+    // products. In the switch's All the targets span genres, and one chunk
+    // drafted with no genre would recommend a website builder under a
+    // humanizer video.
+    const byGenre = new Map<string, typeof targets>()
+    for (const t of targets) {
+      const g = inGenre.genre || inGenre.genreOf(t.url)
+      const bucket = byGenre.get(g) ?? []
+      if (!byGenre.has(g)) byGenre.set(g, bucket)
+      bucket.push(t)
+    }
+    const chunks: { genre: string; items: typeof targets }[] = []
+    Array.from(byGenre.entries()).forEach(([genre, list]) => {
+      for (let i = 0; i < list.length; i += CHUNK) chunks.push({ genre, items: list.slice(i, i + CHUNK) })
+    })
 
     const band = await getReplyWordBand({ min: REPLY_WORD_MIN, max: REPLY_WORD_MAX }).catch(() => ({
       min: REPLY_WORD_MIN,
@@ -123,8 +137,8 @@ export async function POST(req: NextRequest) {
         if (attempted > 0 && Date.now() >= deadline) return
         const i = next++
         if (i >= chunks.length) return
-        attempted += chunks[i].length
-        const { drafts, skips } = await draftReplies(chunks[i], band, inGenre.genre)
+        attempted += chunks[i].items.length
+        const { drafts, skips } = await draftReplies(chunks[i].items, band, chunks[i].genre)
         if (drafts.length > 0) generated += await saveReplyDrafts(drafts).catch(() => 0)
         // Recorded so an unrelated comment is judged once, not on every run.
         if (skips.length > 0) skipped += await saveReplySkips(skips).catch(() => 0)

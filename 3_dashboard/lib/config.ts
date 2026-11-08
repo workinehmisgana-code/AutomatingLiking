@@ -590,6 +590,42 @@ export const PRODUCT_GENRE: Record<string, Genre> = {
  */
 export const ADMIN_GENRE_COOKIE = 'admin_genre'
 
+/**
+ * The switch's "All" position: the cookie value that means every genre at once.
+ *
+ * Never a genre (isGenre rejects it), so no code that STAMPS a genre onto a row
+ * can be handed it by mistake. Server code reads it through getAdminGenreScope
+ * (lib/adminGenre), which turns it into '' — the "every genre" value LinkQuery,
+ * the staging list and the extract route already use.
+ */
+export const ALL_GENRES = 'all'
+export const ALL_GENRES_LABEL = 'All genres'
+
+/** A genre's label, or "All genres" for the switch's All position ('' / 'all'). */
+export function genreLabel(g: string | null | undefined): string {
+  if (!g || g === ALL_GENRES) return ALL_GENRES_LABEL
+  return GENRE_LABELS[g] ?? g
+}
+
+/** Is a row of genre `g` inside the scope ('' = every genre)? */
+export function genreInScope(scope: string | null | undefined, g: string): boolean {
+  return !scope || scope === ALL_GENRES || g === scope
+}
+
+/** The products of a scope: one genre's, or every product for '' (All). */
+export function productsInScope(scope: string | null | undefined): string[] {
+  return !scope || scope === ALL_GENRES ? [...PRODUCTS] : productsInGenre(scope)
+}
+
+/**
+ * The `products` filter for a db read that takes "these products, or every row
+ * when omitted": one genre's products, or undefined in All — so a row stamped
+ * with no product, or a product since removed, is not dropped by an All view.
+ */
+export function productsFilterFor(scope: string | null | undefined): string[] | undefined {
+  return !scope || scope === ALL_GENRES ? undefined : productsInGenre(scope)
+}
+
 /** Human-readable label for the admin tables. */
 export const GENRE_LABELS: Record<string, string> = {
   humanizer: 'Humanizer',
@@ -670,6 +706,62 @@ export function genreWeights(mix: Partial<GenreMix> | null | undefined): GenreMi
   GENRES.forEach((g, i) => {
     out[g] = use[i] / sum
   })
+  return out
+}
+
+/** How far the balancing below may tilt one genre against another. */
+export const GENRE_BALANCE_MAX_BOOST = 20
+
+/**
+ * THE MIX, TILTED SO THE WHOLE TEAM'S CLICKS COME OUT AT THE SHARES SET.
+ *
+ * A worker paused from a genre gets none of it (withoutGenres), and their whole
+ * list goes to the other genres. When the paused workers are the busiest ones,
+ * the team's clicks drift far from the mix: humanizer set to 50% came out at
+ * ~25% because the heaviest clickers were all paused from it. So the workers
+ * who CAN take a genre are given proportionally more of it.
+ *
+ * `groups` is recent click volume by paused-set ("these workers, paused from
+ * these genres, clicked this much"). A multiplier per genre is found by fixed-
+ * point iteration so that, if each group keeps clicking at the same volume
+ * with its own paused genres taken out, the predicted team share of each genre
+ * matches the target. Stable: it depends on who is paused and how much they
+ * click, not on the outcome it is trying to steer.
+ *
+ * Bounded: no genre is weighted more than GENRE_BALANCE_MAX_BOOST times
+ * another's set ratio, so an unpaused worker still meets every genre. When the
+ * target cannot be reached (the unpaused workers are too few), it gets as
+ * close as that bound allows. Pure.
+ */
+export function balanceGenreWeights(
+  target: Record<string, number>,
+  groups: { paused: string[]; clicks: number }[],
+  maxBoost = GENRE_BALANCE_MAX_BOOST
+): Record<string, number> {
+  const gs = Object.keys(target).filter((g) => (target[g] ?? 0) > 0)
+  const live = groups.filter((x) => x.clicks > 0 && gs.some((g) => !x.paused.includes(g)))
+  // Nobody paused from anything that matters: the mix already is the answer.
+  if (gs.length < 2 || !live.some((x) => gs.some((g) => x.paused.includes(g)))) return target
+  const total = live.reduce((a, x) => a + x.clicks, 0)
+  const m: Record<string, number> = {}
+  for (const g of gs) m[g] = 1
+  for (let it = 0; it < 200; it++) {
+    const pred: Record<string, number> = {}
+    for (const x of live) {
+      const w = gs.map((g) => (x.paused.includes(g) ? 0 : target[g] * m[g]))
+      const s = w.reduce((a, b) => a + b, 0)
+      if (s <= 0) continue
+      gs.forEach((g, i) => (pred[g] = (pred[g] ?? 0) + (x.clicks * w[i]) / s / total))
+    }
+    for (const g of gs) if ((pred[g] ?? 0) > 0) m[g] *= target[g] / pred[g]
+    // Keep the ratio between multipliers within the bound.
+    const lo = Math.min(...gs.map((g) => m[g]))
+    for (const g of gs) m[g] = Math.min(m[g] / lo, maxBoost)
+  }
+  const out: Record<string, number> = {}
+  let sum = 0
+  for (const g of Object.keys(target)) sum += (target[g] ?? 0) * (m[g] ?? 1)
+  for (const g of Object.keys(target)) out[g] = sum > 0 ? ((target[g] ?? 0) * (m[g] ?? 1)) / sum : 0
   return out
 }
 

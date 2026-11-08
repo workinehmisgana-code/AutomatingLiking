@@ -58,6 +58,9 @@ import {
   OUR_RATIO_RETIRE_DEFAULT,
   genreOfProduct,
   clampOurRatioPct,
+  genreWeights,
+  withoutGenres,
+  balanceGenreWeights,
 } from './config'
 import { isGenericTitle } from './titleFilter'
 import { normalizeReferralCode, referralCodeFrom, candidateCode } from './referrals'
@@ -4037,6 +4040,45 @@ export async function getUserPausedGenres(userId: string): Promise<string[]> {
     [userId]
   )
   return rows.map((r) => r.genre)
+}
+
+/**
+ * Last week's clicks grouped by the workers' CURRENT paused genres — the input
+ * to balanceGenreWeights. Cached for ten minutes: it is read on every feed
+ * request and changes only as pauses come and go.
+ */
+let balanceCache: { at: number; groups: { paused: string[]; clicks: number }[] } | null = null
+export async function getGenreBalanceGroups(): Promise<{ paused: string[]; clicks: number }[]> {
+  if (balanceCache && Date.now() - balanceCache.at < 10 * 60 * 1000) return balanceCache.groups
+  await ensureGenrePauseTable()
+  const { rows } = await pool.query<{ paused: string; clicks: string }>(
+    `SELECT COALESCE(p.paused, '') AS paused, sum(c.n)::text AS clicks
+       FROM (SELECT user_id, count(*) AS n FROM clicked_link
+              WHERE clicked_at > now() - interval '7 days' GROUP BY user_id) c
+       LEFT JOIN (SELECT user_id, string_agg(genre, ',' ORDER BY genre) AS paused
+                    FROM user_genre_pause GROUP BY user_id) p ON p.user_id = c.user_id
+      GROUP BY 1`
+  )
+  const groups = rows.map((r) => ({
+    paused: r.paused ? r.paused.split(',') : [],
+    clicks: Number(r.clicks) || 0,
+  }))
+  balanceCache = { at: Date.now(), groups }
+  return groups
+}
+
+/**
+ * The genre weights ONE WORKER's list is built with: the admin's mix, tilted
+ * so the team as a whole lands on it (balanceGenreWeights), minus this
+ * worker's paused genres. Every feed — app, web, status counts — reads this.
+ */
+export async function getServingGenreWeights(userId: string): Promise<Record<string, number>> {
+  const [mix, groups, paused] = await Promise.all([
+    getGenreMix().catch(() => null),
+    getGenreBalanceGroups().catch(() => [] as { paused: string[]; clicks: number }[]),
+    getUserPausedGenres(userId).catch(() => [] as string[]),
+  ])
+  return withoutGenres(balanceGenreWeights(genreWeights(mix), groups), paused)
 }
 
 /** Every worker's paused genres, for the admin list. */

@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import { en, am, type GuideProps } from '@/components/GuideContent'
+import ReportFineWarning from '@/components/ReportFineWarning'
 
 type Props = GuideProps
 
@@ -85,12 +86,15 @@ export default function Guide(props: Props & { signedIn?: boolean }) {
         </div>
       </a>
 
+      <ReportFineWarning lang={lang} className="mb-6" />
+
       {t.sections.map((sec) => (
         <section key={sec.heading} className="mb-7">
           <h2 className="text-base font-semibold text-white border-b border-zinc-800 pb-1.5 mb-3">
             {sec.heading}
           </h2>
           {sec.intro && <p className="text-sm text-zinc-400 mb-3 leading-relaxed">{sec.intro}</p>}
+          {sec.danger === 'reportFine' && <ReportFineWarning lang={lang} className="mb-3" />}
           {sec.steps && (
             <ol className="space-y-2.5">
               {sec.steps.map((s, i) => (

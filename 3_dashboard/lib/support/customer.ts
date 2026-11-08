@@ -25,6 +25,7 @@ export type CustomerProfile = {
       refundsViaApi: boolean;
       refundConsoleUrl?: string;
       planChanges: boolean;
+      billingPeriodChanges?: boolean;
       immediateCancellation: boolean;
       cancellationAlwaysImmediate?: boolean;
       partialRefunds: boolean;

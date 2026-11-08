@@ -17,6 +17,7 @@ import {
   ourRatioRetiredSet,
   getRecentClickGenres,
   getUserPausedGenres,
+  getServingGenreWeights,
   getUserProfile,
   needsTiktokProfileFix,
   getLinkCategories,
@@ -208,12 +209,17 @@ export async function GET(req: NextRequest) {
   // MINUS THIS WORKER'S PAUSED GENRES: the comment check found too few of their
   // comments on those links while another genre's were fine (noCommentVerdict),
   // so the other genres fill their list instead.
-  const genreMix = withoutGenres(
+  // The mix itself is TILTED toward genres many busy workers are paused from,
+  // so the team's clicks still land on the shares set (getServingGenreWeights).
+  const genreMix =
     onlyGenre && isGenre(onlyGenre)
-      ? { [onlyGenre]: 1 }
-      : genreWeights(await getGenreMix().catch(() => null)),
-    await getUserPausedGenres(userId).catch(() => [])
-  )
+      ? withoutGenres({ [onlyGenre]: 1 }, await getUserPausedGenres(userId).catch(() => []))
+      : await getServingGenreWeights(userId).catch(async () =>
+          withoutGenres(
+            genreWeights(await getGenreMix().catch(() => null)),
+            await getUserPausedGenres(userId).catch(() => [])
+          )
+        )
   const seed = seedFrom(userId)
   // Where this worker is in the genre blocks (see interleaveByWeight).
   const recentGenres = await getRecentClickGenres(userId).catch(
