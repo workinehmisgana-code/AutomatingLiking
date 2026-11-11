@@ -633,6 +633,15 @@
           <label class="f"><span>Accounts at once (0 = all)</span>
             <input type="number" id="k_at_once" min="0" step="1"
               title="How many of the ticked accounts run at the same time.&#10;&#10;0 starts every ticked account together. With more ticked than this, the first ones start and the rest wait as QUEUED in the job list; each takes the place of an account that finishes its links (or is stopped). Stop on a queued one cancels it before it starts."></label>
+          <label class="f"><span>Links per account turn (0 = every account does every link)</span>
+            <input type="number" id="k_links_per_account" min="0" step="1"
+              title="RELAY MODE when above 0. The link list is fetched once and worked through in turns of this many links. Each turn goes to an account picked AT RANDOM from the ticked ones (every ticked account gets a turn before any gets a second). When an account finishes its turn it stops, and another random account carries on from the next link — so each link is worked by ONE account.&#10;&#10;'Accounts at once' still says how many turns run side by side.&#10;&#10;0 is the old behaviour: every ticked account works the whole list."></label>
+          <label class="f"><span>Close an account after this many dropped likes in a row (0 = never)</span>
+            <input type="number" id="k_drop_limit" min="0" step="1"
+              title="A DROPPED like: the heart was pressed and TikTok did not keep it (checked by reading it back). This many in a row and the account's browser is closed.&#10;&#10;In relay mode (links per account turn above 0) its unfinished links go straight to the ticked account that has not worked for the longest, and the closed account rests for the minutes below before it can be picked again."></label>
+          <label class="f"><span>Rest a closed account for (minutes)</span>
+            <input type="number" id="k_rest_minutes" min="0" step="5"
+              title="How long an account closed for dropped likes is left alone before the relay may pick it again. Remembered across runs."></label>
           <label class="f"><span>How it reads the comments</span>
             <select id="k_mode"
               title="Clicking the heart is the only route that actually applies a like — the request route is accepted and then silently not applied. Keep this on the page unless you are re-testing that.">
@@ -724,6 +733,8 @@ const FIELDS = {
             clusters:'k_clusters', platform:'k_platform', genre:'k_genre',
             category:'k_category', max_links:'k_max_links',
             target:'k_target', users:'k_users', profiles:'k_profiles', at_once:'k_at_once',
+            links_per_account:'k_links_per_account',
+            drop_limit:'k_drop_limit', rest_minutes:'k_rest_minutes',
             keywords:'k_keywords',
             mode:'k_mode', pages:'k_pages', scrolls:'k_scrolls',
             delay:'k_delay', limit:'k_limit',

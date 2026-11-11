@@ -14,12 +14,34 @@ object LinkStore {
     private const val PREFS = "bubble_links"
     private const val KEY_LINKS = "links_json"
     private const val KEY_INDEX = "index"
+    private const val KEY_FETCHED_AT = "fetched_at"
+
+    /**
+     * A saved list older than this is thrown away and fetched again before the
+     * next link is opened. The list is the server's answer AT THAT MOMENT — the
+     * genre mix, paused genres, blocked links — and a worker who comes back after
+     * days would otherwise work through links the server stopped serving long
+     * ago (how cocodly links were still clicked on Nov 8 after its share went to
+     * 0 on Oct 26).
+     */
+    const val MAX_AGE_MS = 2L * 60 * 60 * 1000
 
     private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     /** Replace the list from the API's `links` array (JSON string) and reset. */
     fun setFromJson(ctx: Context, linksJson: String) {
-        prefs(ctx).edit().putString(KEY_LINKS, linksJson).putInt(KEY_INDEX, 0).apply()
+        prefs(ctx).edit()
+            .putString(KEY_LINKS, linksJson)
+            .putInt(KEY_INDEX, 0)
+            .putLong(KEY_FETCHED_AT, System.currentTimeMillis())
+            .apply()
+    }
+
+    /** True when the saved list is too old to trust. A list saved by an older
+     *  build has no time on it, and counts as old. */
+    fun isStale(ctx: Context, now: Long = System.currentTimeMillis()): Boolean {
+        val at = prefs(ctx).getLong(KEY_FETCHED_AT, 0L)
+        return at <= 0L || now - at > MAX_AGE_MS || now < at
     }
 
     fun items(ctx: Context): List<Item> {

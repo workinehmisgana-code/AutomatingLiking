@@ -382,6 +382,15 @@ _clicked_nothing = 0
 _ever_landed = False
 _discard_said = False
 
+# --drop-limit: this many likes IN A ROW pressed and not kept, and the account
+# is closed so it can rest — TikTok has started throwing its likes away. 0 = off.
+# The run then ends with DROPPED_EXIT, so the control center can put an account
+# that has been resting in its place.
+DROP_LIMIT = 0
+DROPPED_EXIT = 4
+_drop_streak = 0
+DROPPED_OUT = False
+
 
 def clicked_but_not_kept(profile: str, account: str) -> bool:
     """Report a like that was pressed and not kept, and say what it means.
@@ -417,8 +426,20 @@ def clicked_but_not_kept(profile: str, account: str) -> bool:
     working accounts were starving on — their render failures are partly the
     price of these three.
     """
-    global _clicked_nothing, _discard_said
+    global _clicked_nothing, _discard_said, _drop_streak, DROPPED_OUT
     _clicked_nothing += 1
+    _drop_streak += 1
+    if DROP_LIMIT > 0 and _drop_streak >= DROP_LIMIT:
+        if not DROPPED_OUT:
+            DROPPED_OUT = True
+            print(
+                f"\n  {_drop_streak} likes in a row pressed on profile '{profile}'"
+                f"{f' (@{account})' if account else ''} and dropped by TikTok.\n"
+                "  Closing this account so it can rest; a rested one takes over.\n"
+                "[relay-dropped]",
+                flush=True,
+            )
+        return True
     if _ever_landed or _clicked_nothing < 8:
         return False
     if _discard_said:
@@ -440,8 +461,9 @@ def clicked_but_not_kept(profile: str, account: str) -> bool:
 
 def like_landed() -> None:
     """A like TikTok kept. Whatever the last few did, the account works."""
-    global _clicked_nothing, _ever_landed
+    global _clicked_nothing, _ever_landed, _drop_streak
     _clicked_nothing = 0
+    _drop_streak = 0
     _ever_landed = True
 
 
@@ -3007,6 +3029,18 @@ def main() -> int:
     ap.add_argument("--keep-failures", action="store_true",
                     help="leave failed rows in done.csv, so failed comments are "
                          "never retried (by default they are dropped and tried again)")
+    ap.add_argument("--drop-limit", type=int, default=0,
+                    help="close this account after this many likes IN A ROW that "
+                         "TikTok drops (pressed, not kept) and exit with code 4, so "
+                         "the control center can swap in a rested account. 0 = off")
+    ap.add_argument("--progress-marks", action="store_true",
+                    help="print '[relay-video] N url' as each video starts, so the "
+                         "control center's relay knows where a stopped account got to")
+    ap.add_argument("--list-only", type=Path, default=None,
+                    help="work out the link list and the product words exactly as a "
+                         "run would, write them to this JSON file and exit — no "
+                         "browser. The control center's account relay uses it to "
+                         "share one list between accounts")
     args = ap.parse_args()
     # A SECOND BROWSER ON A HELD PROFILE IS NOT A SECOND BROWSER.
     #
@@ -3015,9 +3049,13 @@ def main() -> int:
     # nothing. Then the run stops with "Not signed in on profile 'a'" about a
     # profile that is signed in and working in the window next to it.
     pdir = profile_dir(args.profile, "tiktok")
-    if busy.is_busy(pdir):
+    # --list-only opens no browser, so a profile in use elsewhere is no obstacle.
+    if not args.list_only and busy.is_busy(pdir):
         print(busy.note(pdir))
         return 1
+    if args.drop_limit > 0:
+        global DROP_LIMIT
+        DROP_LIMIT = args.drop_limit
     if args.debug:
         # Both of them: dbg() lines are worthless without knowing when.
         global DEBUG
@@ -3155,6 +3193,18 @@ def main() -> int:
     if not links:
         print("No links. Pass --from-dashboard, --links, or URLs directly.")
         return 2
+    if args.list_only:
+        # Deduped in order: the relay hands each link to exactly one account.
+        seen: set[str] = set()
+        ordered = [u for u in links if not (u in seen or seen.add(u))]
+        args.list_only.parent.mkdir(parents=True, exist_ok=True)
+        args.list_only.write_text(
+            json.dumps({"links": ordered, "products": list(products)}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"listed {len(ordered)} link(s) and {len(products)} product word(s) "
+              f"to {args.list_only}")
+        return 0
     if want_products:
         # Say what will actually be matched. "active products" above is what the
         # dashboard reports, which is not the same list once --all-products is
@@ -3531,6 +3581,8 @@ def main() -> int:
                 page.wait_for_timeout(1500)
 
                 for vn, (url, aweme) in enumerate(targets_videos, 1):
+                    if args.progress_marks:
+                        print(f"[relay-video] {vn} {url}", flush=True)
                     # One authenticated read serves as discovery AND as the
                     # already-liked check, because user_digged comes with it.
                     comments = safe_eval(page, READ_ALL_JS, [aweme, args.pages]) or []
@@ -3575,15 +3627,20 @@ def main() -> int:
                             record(url, aweme, c, "ok", f"digg_count={state.get('digg')}")
                             ok += 1
                             landed += 1
+                            like_landed()
                         else:
                             record(url, aweme, c, "fail:silent", "accepted but not applied")
                             failed += 1
+                            if clicked_but_not_kept(args.profile, "") and DROPPED_OUT:
+                                dead_account = True
                     rate = vn / max(0.001, time.time() - started)
                     print(
                         f"  [{vn}/{total_videos}] {url}: {landed}/{len(todo)} liked"
                         f"   {rate:.2f} video/s",
                         flush=True,
                     )
+                    if dead_account:
+                        break
                     if args.limit and ok >= args.limit:
                         print(f"\n  reached --limit {args.limit}")
                         break
@@ -3601,6 +3658,8 @@ def main() -> int:
                 # click reports nothing useful, and the endpoint lies.
                 total_videos = len(targets_videos)
                 for vn, (url, aweme) in enumerate(targets_videos, 1):
+                    if args.progress_marks:
+                        print(f"[relay-video] {vn} {url}", flush=True)
                     # Everything a video needs is inside this try.
                     #
                     # TikTok re-routes on its own, and with nine browsers on one
@@ -4147,4 +4206,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _rc = main()
+    # Closed because TikTok was dropping this account's likes: a code of its
+    # own, so the control center rests it and swaps in another.
+    sys.exit(DROPPED_EXIT if DROPPED_OUT else _rc)

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import os
 import platform
 import queue
@@ -189,6 +190,18 @@ DEFAULTS = {
         # takes the place of one that finishes — so a laptop that can hold
         # three browsers can still work ten accounts through in one press.
         "at_once": 0,
+        # RELAY: links per account turn. 0 = every account works the whole list
+        # (the old way). Above 0, the list is fetched once and handed out in
+        # turns of this many links, each to an account picked at random from
+        # the ticked ones; when an account's turn ends it stops and another
+        # carries on from the next link. See LikerRelay.
+        "links_per_account": 0,
+        # DROPPED LIKES: an account whose likes TikTok drops this many times IN
+        # A ROW (pressed, not kept) is closed. 0 = never. In a relay its
+        # unfinished links go to the account that has been resting longest,
+        # and it rests `rest_minutes` before it can be picked again.
+        "drop_limit": 5,
+        "rest_minutes": 60,
         # The words that make a comment ours. Blank uses the dashboard's active
         # products, which is the normal run.
         "keywords": "",
@@ -467,6 +480,237 @@ class Job:
         return True
 
 
+# WHEN EACH ACCOUNT LAST WORKED, and until when it is resting — kept across
+# runs, so "an account that has not been working for a while" means a while,
+# not just "not in this press".
+RELAY_LEDGER = LIKER_DIR / "relay" / "accounts.json"
+_ledger_lock = threading.Lock()
+
+
+def relay_ledger() -> dict:
+    try:
+        return json.loads(RELAY_LEDGER.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - missing or corrupt: nobody has worked
+        return {}
+
+
+def relay_ledger_set(name: str, **vals: float) -> None:
+    with _ledger_lock:
+        d = relay_ledger()
+        d.setdefault(name, {}).update(vals)
+        try:
+            RELAY_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+            RELAY_LEDGER.write_text(json.dumps(d, indent=1), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class RelayTurn(Job):
+    """One relay turn: an ordinary liker run that also remembers every video it
+    started ([relay-video] lines), however long its log grows."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.reached: list[str] = []
+
+    def write(self, text: str) -> None:
+        if text.startswith("[relay-video] "):
+            parts = text.split(" ", 2)
+            if len(parts) == 3:
+                self.reached.append(parts[2].strip())
+        super().write(text)
+
+
+class LikerRelay(Job):
+    """THE ACCOUNT RELAY: one list, worked through in turns by random accounts.
+
+    The link list is fetched ONCE (like.py --list-only), so every turn works
+    the same list and none of it is fetched twice or shifts between turns. It
+    is cut into turns of `per` links. Each turn goes to an account picked at
+    random from the ticked ones — from those that have not had a turn this
+    round, so every account gets one before any gets a second. A turn is an
+    ordinary account-liker job (it shows in the list and can be stopped);
+    when it ends, the next turn starts on another account from the next link.
+
+    A turn that FAILS or is STOPPED by hand does not lose its links: each
+    video a turn starts is marked in its log ([relay-video]), so the links it
+    never reached — and the one it was on — go back to the front of the queue
+    for the next account. That account is then left out for the rest of the
+    run (a failure is usually a signed-out or blocked account; a stop is you
+    saying so). Stopping THIS job stops the whole relay.
+    """
+
+    # like.py's exit code for "closed: TikTok was dropping this account's likes".
+    DROPPED_EXIT = 4
+
+    def __init__(self, s: dict, names: list[str], per: int, at_once: int):
+        super().__init__("liker", f"Account liker · relay · {per} links a turn "
+                         f"· {len(names)} account(s)", [], LIKER_DIR)
+        self.s = s
+        self.names = names
+        self.per = per
+        self.slots = min(len(names), at_once if at_once > 0 else len(names))
+        self._stop = False
+        self.children: list[Job] = []
+
+    def stop(self) -> bool:
+        if self.finished():
+            return False
+        self._stop = True
+        self.status = "stopping"
+        for c in list(self.children):
+            if not c.finished():
+                c.stop()
+        return True
+
+    def run(self) -> None:
+        try:
+            self._relay()
+        except Exception as e:  # noqa: BLE001
+            self.write(f"[!] relay failed: {e}")
+            self.status = "failed"
+        self.ended = time.time()
+        if self.status == "stopping":
+            self.status = "stopped"
+        elif self.status not in OVER:
+            self.status = "done"
+        self.write(f"[relay {self.status}]")
+
+    def _relay(self) -> None:
+        self.status = "running"
+        # ── 1. the list, once ────────────────────────────────────────────
+        tmp = LIKER_DIR / "relay"
+        tmp.mkdir(exist_ok=True)
+        list_file = tmp / f"{self.id}-list.json"
+        _, cmd, cwd = build_liker_for(self.s, self.names[0], self.names)
+        cmd = cmd + ["--list-only", str(list_file)]
+        self.write("[*] fetching the link list once for every account")
+        lister = RUNNER.start("liker", "Account liker · relay · fetching the list",
+                              cmd, cwd)
+        self.children.append(lister)
+        while not lister.finished():
+            time.sleep(1)
+        if self._stop:
+            return
+        if lister.status != "done" or not list_file.exists():
+            raise RuntimeError("could not fetch the link list — see the list job's log")
+        data = json.loads(list_file.read_text(encoding="utf-8"))
+        links: list[str] = list(data.get("links") or [])
+        products: list[str] = list(data.get("products") or [])
+        if not links:
+            self.write("[*] the selection has no links")
+            return
+        queue_: deque[str] = deque(links)
+        self.write(f"[*] {len(links)} link(s), {self.per} a turn, "
+                   f"{self.slots} account(s) at once, accounts picked at random")
+
+        # ── 2. turns ─────────────────────────────────────────────────────
+        unused: list[str] = []          # accounts without a turn this round
+        dropped: set[str] = set()       # failed or stopped by hand
+        running: dict[str, tuple[RelayTurn, list[str]]] = {}   # account -> (job, its links)
+        turn = 0
+
+        rest_s = max(0, int(self.s.get("rest_minutes", 60) or 0)) * 60
+        replace_pending = 0             # dropped accounts still to be replaced
+        waiting_said = False
+
+        def resting(n: str) -> bool:
+            return float(relay_ledger().get(n, {}).get("rest_until", 0)) > time.time()
+
+        def pick(replacement: bool = False) -> str | None:
+            nonlocal unused
+            idle = [n for n in self.names
+                    if n not in running and n not in dropped and not resting(n)]
+            if not idle:
+                return None
+            if replacement:
+                # THE ONE THAT HAS NOT WORKED FOR LONGEST (never = longest).
+                led = relay_ledger()
+                name = min(idle, key=lambda n: float(led.get(n, {}).get("last", 0)))
+                if name in unused:
+                    unused.remove(name)
+                return name
+            fresh = [n for n in unused if n in idle]
+            if not fresh:
+                # New round: everyone idle is eligible again.
+                unused = [n for n in self.names if n not in dropped and not resting(n)]
+                fresh = [n for n in unused if n in idle] or idle
+            name = random.choice(fresh)
+            if name in unused:
+                unused.remove(name)
+            return name
+
+
+        while (queue_ or running) and not self._stop:
+            # Collect finished turns.
+            for name, (job, mine) in list(running.items()):
+                if not job.finished():
+                    continue
+                del running[name]
+                relay_ledger_set(name, last=time.time())
+                if job.status == "done":
+                    continue
+                # Failed, stopped or closed for drops: give back what it never finished.
+                seen = set(job.reached)
+                on = job.reached[-1] if job.reached else None
+                back = [u for u in mine if u not in seen or u == on]
+                for u in reversed(back):
+                    queue_.appendleft(u)
+                if job.exit_code == self.DROPPED_EXIT and job.status != "stopped":
+                    # TikTok is dropping its likes: rest it, and put the account
+                    # that has been resting longest in its place.
+                    relay_ledger_set(name, rest_until=time.time() + rest_s)
+                    replace_pending += 1
+                    self.write(f"[!] {name}: TikTok kept dropping its likes — closed, "
+                               f"resting {rest_s // 60} min; {len(back)} of its {len(mine)} "
+                               "link(s) go to the account that has rested longest")
+                    continue
+                dropped.add(name)
+                why = "was stopped" if job.status == "stopped" else f"failed (exit {job.exit_code})"
+                self.write(f"[!] {name} {why}; {len(back)} of its {len(mine)} link(s) go to "
+                           f"the next account, and {name} sits out the rest of this run")
+            if self._stop:
+                break
+            # Start turns while there are links, free slots and idle accounts.
+            while queue_ and len(running) < self.slots:
+                name = pick(replacement=replace_pending > 0)
+                if name is None:
+                    break
+                if replace_pending > 0:
+                    replace_pending -= 1
+                    self.write(f"[*] {name} replaces the closed account "
+                               "(it has not worked for the longest)")
+                mine = [queue_.popleft() for _ in range(min(self.per, len(queue_)))]
+                turn += 1
+                f = tmp / f"{self.id}-turn{turn}-{name}.txt"
+                f.write_text("\n".join(mine) + "\n", encoding="utf-8")
+                title, tcmd, tcwd = build_liker_for(self.s, name, self.names,
+                                                    relay_links=f, relay_products=products)
+                job = RUNNER.launch(RelayTurn("liker", f"{title} · turn {turn}", tcmd, tcwd))
+                self.children.append(job)
+                running[name] = (job, mine)
+                self.write(f"[*] turn {turn}: {name} takes {len(mine)} link(s); "
+                           f"{len(queue_)} left after it")
+            if queue_ and not running and len(dropped) >= len(self.names):
+                self.write(f"[!] every account dropped out; {len(queue_)} link(s) not worked")
+                self.status = "failed"
+                return
+            if queue_ and not running and pick() is None:
+                # Everyone left is resting: wait for the first to be rested.
+                if not waiting_said:
+                    led = relay_ledger()
+                    soon = min((float(led.get(n, {}).get("rest_until", 0))
+                                for n in self.names if n not in dropped), default=0)
+                    self.write(f"[*] every account is resting; carrying on at "
+                               f"{time.strftime('%H:%M', time.localtime(soon))}")
+                    waiting_said = True
+            else:
+                waiting_said = False
+            time.sleep(1)
+        if not self._stop:
+            self.write(f"[*] all {len(links)} link(s) handed out and worked")
+
+
 class Runner:
     """Every job this window has started, running or finished."""
 
@@ -476,7 +720,10 @@ class Runner:
         self.lock = threading.Lock()
 
     def start(self, tool: str, title: str, cmd: list[str], cwd: Path) -> Job:
-        job = Job(tool, title, cmd, cwd)
+        return self.launch(Job(tool, title, cmd, cwd))
+
+    def launch(self, job: Job) -> Job:
+        """List an already-built job and start it (the relay's own kinds)."""
         with self.lock:
             self.jobs[job.id] = job
             self.order.append(job.id)
@@ -855,8 +1102,14 @@ def liker_profiles(s: dict) -> list[str]:
     return seen or ["default"]
 
 
-def build_liker_for(s: dict, profile: str, all_profiles: list[str]) -> tuple[str, list[str], Path]:
+def build_liker_for(s: dict, profile: str, all_profiles: list[str],
+                    relay_links: Path | None = None,
+                    relay_products: list[str] | None = None) -> tuple[str, list[str], Path]:
     """One run of 6_comment_liker/like.py.
+
+    relay_links / relay_products: one RELAY TURN (see LikerRelay) — the links
+    come from that file instead of the selection, and the product words the
+    list was fetched with are passed on, so every turn matches the same words.
 
     It signs in as one of our own accounts and clicks the heart on our comments,
     so the settings that matter are WHICH LINKS, WHAT TO LIKE and AS WHOM. The
@@ -867,7 +1120,10 @@ def build_liker_for(s: dict, profile: str, all_profiles: list[str]) -> tuple[str
     cmd = _py(SCRIPTS["liker"])
 
     # ── which links ───────────────────────────────────────────────────────
-    if str(s.get("source", "dashboard")) == "file":
+    genre = str(s.get("genre", "")).strip().lower()
+    if relay_links is not None:
+        cmd += ["--links", str(relay_links), "--progress-marks"]
+    elif str(s.get("source", "dashboard")) == "file":
         path = str(s.get("links", "")).strip()
         if not path:
             raise ValueError("Give a links file, or switch the source back to the dashboard.")
@@ -907,7 +1163,13 @@ def build_liker_for(s: dict, profile: str, all_profiles: list[str]) -> tuple[str
     # one tied on likes with another of ours (the tie rule, like_ties).
     if str(s.get("keywords", "")).strip():
         cmd += ["--keywords", str(s["keywords"]).strip()]
+    elif relay_products and target != "users":
+        # A turn reads a file, so it would fall back to like.py's compiled
+        # product list; the words the shared list was fetched with go instead.
+        cmd += ["--keywords", ",".join(relay_products)]
     cmd += ["--mode", str(s.get("mode", "dom"))]
+    if int(s.get("drop_limit", 0) or 0) > 0:
+        cmd += ["--drop-limit", str(int(s["drop_limit"]))]
     cmd += ["--pages", str(int(s.get("pages", 3)))]
     if str(s.get("mode", "dom")) == "dom":
         cmd += ["--scrolls", str(int(s.get("scrolls", 6)))]
@@ -980,6 +1242,13 @@ def preview(tool: str, s: dict) -> str:
             )
         if tool == "liker":
             names = liker_profiles(s)
+            per = int(s.get("links_per_account", 0) or 0)
+            if per > 0:
+                one = " ".join(build_liker_for(s, "<account>", names,
+                                               relay_links=Path("<turn links>"))[1][1:])
+                return (f"# relay: fetch the list once ({' '.join(build_liker_for(s, names[0], names)[1][1:])} "
+                        f"--list-only ...), then turns of {per} links, each on a random one of: "
+                        f"{', '.join(names)}\n{one}")
             return "\n".join(
                 " ".join(build_liker_for(s, n, names)[1][1:]) for n in names
             )
@@ -1493,6 +1762,15 @@ class Handler(BaseHTTPRequestHandler):
                     at_once = max(0, int(s["liker"].get("at_once", 0) or 0))
                 except (TypeError, ValueError):
                     at_once = 0
+                try:
+                    per = max(0, int(s["liker"].get("links_per_account", 0) or 0))
+                except (TypeError, ValueError):
+                    per = 0
+                if per > 0:
+                    # THE RELAY: one list, random accounts, `per` links a turn.
+                    relay = RUNNER.launch(LikerRelay(dict(s["liker"]), names, per, at_once))
+                    self._json({"ok": True, "job": relay.id, "jobs": [relay.id]})
+                    return
                 started = [j.id for j in RUNNER.start_limited(tool, built, at_once)]
                 self._json({"ok": True, "job": started[0], "jobs": started})
                 return

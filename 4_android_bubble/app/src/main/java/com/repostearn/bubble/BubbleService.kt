@@ -60,6 +60,8 @@ class BubbleService : Service() {
     // tap would record a second click and skip a link the user never saw. It
     // lasts one request, not one pause — there is no cooldown any more.
     private var busy = false
+    // A fetch of the link list is in flight: a second Next tap waits for it.
+    @Volatile private var refreshing = false
     // Set when the server refuses links because this app build is out of date. While
     // true the bubble tells the user to update instead of opening links.
     private var needsUpdate = false
@@ -137,7 +139,9 @@ class BubbleService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent != null) refreshData()
+        // Also when Android restarts the bubble on its own (intent == null after
+        // START_STICKY): that used to keep the list saved days earlier.
+        refreshData()
         return START_STICKY
     }
 
@@ -321,6 +325,18 @@ class BubbleService : Service() {
      * see onMarkUnrelated(). Callers are responsible for the guard.
      */
     private fun openNextLink() {
+        // AN OLD LIST IS FETCHED AGAIN FIRST, then the first fresh link opens. A
+        // bubble left running (or restored) for days still holds what the server
+        // served back then — genres since set to 0, links since blocked.
+        if (refreshing) {
+            Toast.makeText(this, "Loading fresh links…", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!needsUpdate && LinkStore.isStale(this)) {
+            urlView?.text = "loading fresh links…"
+            refreshData { if (!needsUpdate && LinkStore.size(this) > 0) openNextLink() }
+            return
+        }
         // THE TESTER SKIPS EVERY LINK THAT ALREADY HAS ONE OF OURS, checked on the
         // video itself just before opening (or by the background look-ahead), and
         // only then opens the first one that is clean.
@@ -1027,12 +1043,18 @@ class BubbleService : Service() {
     }
 
     // ── Networking ───────────────────────────────────────────────────────────
-    private fun refreshData() {
+    /** Fetch links, comments, status and messages. [after] runs on the UI thread
+     *  once the new list is saved (not when signed out). */
+    private fun refreshData(after: (() -> Unit)? = null) {
         val token = AuthStore.token(this) ?: run { ui.post { promptSignIn() }; return }
+        refreshing = true
         thread {
             // Links (for the currently selected platform)
             val (lc, lb) = httpGet(Config.linksUrl(SettingsStore.platform(this)), token)
-            if (lc == 401) { ui.post { promptSignIn() }; return@thread }
+            if (lc == 401) { refreshing = false; ui.post { promptSignIn() }; return@thread }
+            // Offline or a server error: the saved list stays, but the clock is
+            // not reset, so the next tap tries again instead of opening it.
+            val fetched = lc == 200
             // Version gate: the server sends updateRequired=true (and no links) when
             // this build is older than the published APK. Force an update first.
             needsUpdate = false
@@ -1088,10 +1110,18 @@ class BubbleService : Service() {
                     }
                 } catch (_: Exception) {}
             }
+            refreshing = false
             ui.post {
                 unlock()
                 refreshCounter()
                 showMessages(msgs)
+                if (!fetched) {
+                    Toast.makeText(this, "Couldn't load links — check the connection and tap again", Toast.LENGTH_LONG).show()
+                } else if (!LinkStore.isStale(this)) {
+                    // Only once the list really was replaced, or a reply that
+                    // could not be read would send Next round in a loop.
+                    after?.invoke()
+                }
                 if (needsUpdate) {
                     updateInfo?.let { (vn, url) -> showUpdateBanner(vn, url) }
                     urlView?.text = "Update required — tap Download to update"

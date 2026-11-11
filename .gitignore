@@ -96,3 +96,6 @@ desktop.ini
 .idea/
 .vscode/
 *.swp
+
+# Account-liker relay: the shared link list and each turn's links (7_control_center)
+6_comment_liker/relay/

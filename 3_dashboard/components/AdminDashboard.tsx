@@ -3564,23 +3564,28 @@ function UserCard({
    */
   async function editPendingPay() {
     if (!pending) return
-    const floor = pending.total - pending.comments.birr
+    // THE COMMENT PAY is what is edited. Videos, reposts and the referral
+    // commission THEY earn on others stay exactly as they are.
+    const others = pending.total - pending.comments.birr
     const raw = window.prompt(
-      `New pending pay for ${u.profile?.name || u.name || u.email}, in birr.\n\n` +
-        `Now: ${fmtBirr(pending.total)} birr. The change is made to their comment pay ` +
-        `(${COMMENT_PAY_RATE} birr a comment), so it cannot go below ${fmtBirr(floor)} birr ` +
-        '(videos, reposts and referral commission stay as they are).',
-      String(pending.total)
+      `New COMMENT pay for ${u.profile?.name || u.name || u.email}, in birr.\n\n` +
+        `Comment pay now: ${fmtBirr(pending.comments.birr)} birr ` +
+        `(${COMMENT_PAY_RATE} birr a comment).\n` +
+        `Their referral pay and other pay (${fmtBirr(others)} birr) stay the same.`,
+      String(pending.comments.birr)
     )
     if (raw === null) return
-    const total = Number(raw.replace(/[^\d.]/g, ''))
-    if (!Number.isFinite(total) || raw.trim() === '') { alert('Type an amount in birr.'); return }
-    const deltaComments = Math.round((total - pending.total) / COMMENT_PAY_RATE)
+    const commentBirr = Number(raw.replace(/[^\d.]/g, ''))
+    if (!Number.isFinite(commentBirr) || raw.trim() === '') { alert('Type an amount in birr.'); return }
+    const deltaComments = Math.round((commentBirr - pending.comments.birr) / COMMENT_PAY_RATE)
     if (deltaComments === 0) return
     const refDelta = deltaComments * REFERRAL_PAY_RATE
+    const newComment = pending.comments.birr + deltaComments * COMMENT_PAY_RATE
     if (!confirm(
-      `Change ${fmtBirr(pending.total)} → ${fmtBirr(pending.total + deltaComments * COMMENT_PAY_RATE)} birr ` +
-        `(${deltaComments > 0 ? '+' : ''}${deltaComments} comments)?` +
+      `Comment pay ${fmtBirr(pending.comments.birr)} → ${fmtBirr(newComment)} birr ` +
+        `(${deltaComments > 0 ? '+' : ''}${deltaComments} comments).\n` +
+        `Pending pay ${fmtBirr(pending.total)} → ${fmtBirr(others + newComment)} birr; ` +
+        `their referral and other pay stay at ${fmtBirr(others)} birr.` +
         (referredBy
           ? `\n\nTheir referrer ${referredBy.name ?? ''} earns ${Math.round(REFERRAL_SHARE * 100)}% of this, ` +
             `so their commission changes by ${refDelta > 0 ? '+' : ''}${fmtBirr(refDelta)} birr too.`
@@ -3591,7 +3596,7 @@ function UserCard({
       const res = await fetch('/api/admin/pay-adjust', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: u.id, total }),
+        body: JSON.stringify({ userId: u.id, commentBirr }),
       })
       const d = await res.json().catch(() => ({}))
       if (!res.ok) { alert(d?.error || 'Could not change the pending pay.'); return }
@@ -4488,10 +4493,10 @@ function UserCard({
                   type="button"
                   onClick={() => void editPendingPay()}
                   disabled={editingPay || !pending}
-                  title="Change this pending pay. Their referrer's commission on them changes with it."
+                  title="Change their COMMENT pay. Their own referral pay, videos and reposts stay the same; their referrer's commission on them changes with it."
                   className="text-[11px] text-zinc-400 hover:text-white border border-zinc-700 hover:border-zinc-500 rounded px-1.5 py-0.5 disabled:opacity-40"
                 >
-                  {editingPay ? '…' : '✎ Edit'}
+                  {editingPay ? '…' : '✎ Edit comment pay'}
                 </button>
               </span>
             </div>
