@@ -522,6 +522,11 @@ _csv = _csv / "__check_app__.csv"
 _csv.write_text("url\nhttps://example.com/1\n", encoding="utf-8")
 _prog = "print(%r)" % (f"[+] Done! Saved 1 unique URLs to '{_csv}'")
 
+# ONE PROFILE IN THE POOL for this check, so the second search has to wait —
+# with several, it would simply get a profile of its own and run.
+_real_candidates = a.profile_candidates
+a.profile_candidates = lambda plat: [a.Slot("browser_profile", a.SCRAPER_DIR / "browser_profile", False)]
+
 _holder = _real_start("search", "holder",
                       [sys.executable, "-c", "import time; time.sleep(3)"], HERE)
 time.sleep(0.5)
@@ -553,6 +558,7 @@ try:
               _cmd[-2] if _cmd[-1] == "--append" else _cmd[-1], str(_csv))
 finally:
     a.RUNNER.start = _real_start
+    a.profile_candidates = _real_candidates
     try:
         _csv.unlink()
     except OSError:

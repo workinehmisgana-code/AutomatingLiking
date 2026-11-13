@@ -34,6 +34,7 @@ import platform
 import queue
 import socket
 import subprocess
+from typing import NamedTuple
 import sys
 import threading
 import time
@@ -65,22 +66,276 @@ SCRIPTS = {
     "liker": LIKER_DIR / "like.py",
 }
 
-# WHICH TOOLS DRIVE THE SHARED CHROME PROFILE.
+# WHICH TOOLS DRIVE A CHROME PROFILE, AND WHICH PROFILE EACH GETS.
 #
-# scraper.py and scrape_channels.py both open BROWSER_PROFILE_DIR as a persistent
+# scraper.py and scrape_channels.py open BROWSER_PROFILE_DIR as a persistent
 # context, and Chromium allows exactly one instance per profile directory. Start
-# two and the second dies on the spot:
+# two on one directory and the second dies on the spot:
 #
 #   BrowserType.launch_persistent_context: Opening in existing browser session.
 #   This usually means that the profile is already in use by another instance.
 #
-# So these queue behind one another. Everything else still runs alongside them —
-# the heart runner launches its own throwaway browser, or attaches to the phone,
-# the account liker opens a profile of its own under 6_comment_liker (one
-# directory per signed-in account, none of them this one), and an upload opens
-# nothing at all.
-BROWSER_TOOLS = ("search", "harvest")
-BROWSER_LOCK = threading.Lock()
+# So there is a POOL, and each search or harvest takes a free profile from it,
+# handed to the child as BROWSER_PROFILE_DIR. A job waits only when every
+# profile that suits it is busy. The pool is:
+#
+#   1. the scraper's own profiles (Search -> Chrome profiles), first;
+#   2. the account liker's saved logins in 6_comment_liker (login.py makes one
+#      per account) — a TikTok search can use any TikTok account's profile, an
+#      Instagram one any profile-ig-*, and YouTube and Reddit, which need no
+#      login to search, any of them.
+#
+# The liker profiles are SHARED with the account liker, so liker jobs take
+# their profile from the same pool: a search never opens an account the liker
+# is using and the liker waits for a search to finish rather than failing. A
+# browser this window did not start (a run in another terminal) is seen too:
+# the running Chrome processes are asked which directories they hold.
+#
+# The heart runner launches its own throwaway browser or attaches to the phone,
+# and an upload opens nothing at all, so those are not in the pool.
+# "signin" is the window that opens one profile so its accounts can be logged in.
+BROWSER_TOOLS = ("search", "harvest", "signin")
+PROFILE_PREFIX = "browser_profile"
+PROFILE_NAME_RE = __import__("re").compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
+def profile_names(raw: object) -> list[str]:
+    """The scraper's own profiles, from the setting: comma- or line-separated
+    directory names inside 1_tiktok_search_scraper. Anything that is not a plain
+    name is dropped rather than turned into a path somewhere else."""
+    out: list[str] = []
+    for part in str(raw or "").replace("\n", ",").split(","):
+        n = part.strip()
+        if n and PROFILE_NAME_RE.match(n) and n not in out:
+            out.append(n)
+    return out or [PROFILE_PREFIX]
+
+
+def scraper_profiles() -> list[str]:
+    return profile_names(load_settings()["search"].get("browser_profiles"))
+
+
+def profile_signed_in(name: str) -> bool:
+    """Whether a scraper profile has ever been opened (a fresh one has no Default/)."""
+    return (SCRAPER_DIR / name / "Default").is_dir()
+
+
+# login.py's directory names: profile[-name] is TikTok, profile-ig[-name]
+# Instagram, profile-yt[-name] YouTube.
+LIKER_SITE_PREFIX = (("profile-ig", "instagram"), ("profile-yt", "youtube"))
+
+
+def liker_profile_dirs() -> list[Path]:
+    """The account liker's saved logins that have been opened at least once."""
+    out: list[Path] = []
+    try:
+        for p in sorted(LIKER_DIR.iterdir()):
+            rest = p.name[len("profile"):]
+            if (p.is_dir() and p.name.startswith("profile")
+                    and (not rest or rest.startswith("-"))
+                    and (p / "Default").is_dir()):
+                out.append(p)
+    except OSError:
+        pass
+    return out
+
+
+def liker_site(d: Path) -> str:
+    for pre, site in LIKER_SITE_PREFIX:
+        if d.name == pre or d.name.startswith(pre + "-"):
+            return site
+    return "tiktok"
+
+
+def liker_profile_path(name: str) -> Path:
+    """like.py --profile <name> -> its TikTok directory (login.profile_dir)."""
+    return LIKER_DIR / ("profile" if name in ("", "default") else f"profile-{name}")
+
+
+class Slot(NamedTuple):
+    label: str      # shown in the log: "browser_profile" or "liker:profile-a"
+    path: Path
+    liker: bool     # one of 6_comment_liker's — opened with bundled Chromium
+
+
+def profile_candidates(platform: str) -> list[Slot]:
+    """Every profile a browser job for `platform` may use, in order of preference."""
+    own = [Slot(n, SCRAPER_DIR / n, False) for n in scraper_profiles()]
+    if not load_settings()["search"].get("use_liker_profiles", True):
+        return own
+    lk = liker_profile_dirs()
+    if platform in ("tiktok", "instagram"):
+        extra = [d for d in lk if liker_site(d) == platform]
+    else:
+        # YouTube and Reddit search signed out just as well.
+        extra = lk
+    return own + [Slot(f"liker:{d.name}", d, True) for d in extra]
+
+
+def _dkey(p: object) -> str:
+    """One spelling of a directory, so two spellings compare equal."""
+    try:
+        return os.path.normcase(os.path.normpath(os.path.abspath(str(p))))
+    except Exception:  # noqa: BLE001
+        return str(p).strip().lower()
+
+
+_HELD: list = [0.0, set()]
+_HELD_PS = (
+    "Get-CimInstance Win32_Process -Filter \"Name like '%chrome%'\" | "
+    "Select-Object -ExpandProperty CommandLine | "
+    "Select-String -Pattern 'user-data-dir=(\"\"[^\"\"]+\"\"|[^ ]+)' -AllMatches | "
+    "ForEach-Object { $_.Matches.Groups[1].Value } | Sort-Object -Unique"
+)
+
+
+def dirs_held_now() -> set[str]:
+    """Profile directories some running Chrome holds — including ones this
+    window did not start. The same question 6_comment_liker/busy.py asks.
+    Empty on failure: not being able to ask must not stop a run."""
+    now = time.time()
+    if now - _HELD[0] < 3:
+        return _HELD[1]
+    found: set[str] = set()
+    if platform.system() == "Windows":
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", _HELD_PS],
+                capture_output=True, text=True, timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            ).stdout
+            for line in out.splitlines():
+                line = line.strip().strip('"')
+                if line:
+                    found.add(_dkey(line))
+        except Exception:  # noqa: BLE001
+            pass
+    _HELD[0], _HELD[1] = now, found
+    return found
+
+
+# SIGNED IN OR NOT. TikTok and Instagram search need a logged-in account;
+# YouTube and Reddit search signed out just as well, so they are not checked.
+LOGIN_SITES = {"tiktok": "tiktok.com", "instagram": "instagram.com"}
+# scraper.py's exit code for "this profile is not logged in to the site"
+# (SIGNIN_MODE=exit) — the cue to hand the search to the next profile.
+SIGNED_OUT_EXIT = 5
+# Profiles a run found signed out, per site, and when. Forgotten after an hour,
+# so a profile logged in by hand meanwhile is tried again.
+_SIGNED_OUT: dict[tuple[str, str], float] = {}
+SIGNED_OUT_TTL = 3600
+
+
+def cookie_session(path: Path, site: str) -> bool | None:
+    """Does the profile's cookie file hold an unexpired session for `site`?
+
+    Read from disk without opening a browser: cookie NAMES and domains are
+    stored in plain text (only the values are encrypted), so "is there a
+    sessionid for tiktok.com" is a plain query. None = could not tell (no
+    file yet, or it could not be read) — the run itself then decides.
+    """
+    domain = LOGIN_SITES.get(site)
+    if not domain:
+        return True
+    import shutil
+    import sqlite3
+    import tempfile
+    for rel in ("Default/Network/Cookies", "Default/Cookies"):
+        f = path / rel
+        if not f.exists():
+            continue
+        tmp = Path(tempfile.gettempdir()) / f"cc-cookies-{os.getpid()}-{threading.get_ident()}.db"
+        try:
+            shutil.copyfile(f, tmp)
+            con = sqlite3.connect(str(tmp))
+            try:
+                # Chrome time: microseconds since 1601-01-01. 0 = session cookie.
+                now = int((time.time() + 11644473600) * 1_000_000)
+                row = con.execute(
+                    "SELECT 1 FROM cookies WHERE name = 'sessionid' AND host_key LIKE ? "
+                    "AND (expires_utc = 0 OR expires_utc > ?) LIMIT 1",
+                    (f"%{domain}", now),
+                ).fetchone()
+                return row is not None
+            finally:
+                con.close()
+        except Exception:  # noqa: BLE001
+            return None
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    return None
+
+
+def known_signed_out(sl: "Slot", site: str) -> bool:
+    at = _SIGNED_OUT.get((_dkey(sl.path), site))
+    return at is not None and time.time() - at < SIGNED_OUT_TTL
+
+
+def mark_signed_out(sl: "Slot", site: str) -> None:
+    _SIGNED_OUT[(_dkey(sl.path), site)] = time.time()
+
+
+def logged_in_candidates(site: str) -> list["Slot"]:
+    """The profiles for `site` that look logged in: not found signed out by a
+    recent run, and with a session cookie on disk (or a file that could not be
+    read — then the run checks for itself)."""
+    return [sl for sl in profile_candidates(site)
+            if not known_signed_out(sl, site) and cookie_session(sl.path, site) is not False]
+
+
+class ProfilePool:
+    """Which profile directories this window's jobs hold, and which job holds each."""
+
+    def __init__(self) -> None:
+        self.cond = threading.Condition()
+        self.busy: dict[str, str] = {}
+
+    def take(self, job: "Job", slots: list[Slot], outside: bool = True) -> Slot | None:
+        """The first free slot, waiting until one is. None = stopped meanwhile.
+
+        `outside` also skips a directory a browser this window did not start
+        has open (checked outside the lock: it is a PowerShell call)."""
+        said = False
+        while True:
+            held = dirs_held_now() if outside else set()
+            with self.cond:
+                if job.status == "stopped":
+                    return None
+                for sl in slots:
+                    k = _dkey(sl.path)
+                    if k not in self.busy and k not in held:
+                        self.busy[k] = job.id
+                        return sl
+                if not said:
+                    job.status = "queued"
+                    names = ", ".join(sl.label for sl in slots[:8]) + (
+                        f" and {len(slots) - 8} more" if len(slots) > 8 else "")
+                    job.write(
+                        f"[*] waiting for a free browser profile — all {len(slots)} that "
+                        f"suit this job are in use ({names})." + (
+                            "" if len(slots) > 1 else
+                            " Add profiles under Search -> Chrome profiles, or let it "
+                            "use the account liker's.")
+                    )
+                    said = True
+                # A timeout as well as the notify: a job stopped while it waits,
+                # or a browser outside this window closing, is noticed too.
+                self.cond.wait(timeout=3)
+
+    def give(self, sl: Slot) -> None:
+        with self.cond:
+            self.busy.pop(_dkey(sl.path), None)
+            self.cond.notify_all()
+
+    def snapshot(self) -> dict[str, str]:
+        with self.cond:
+            return dict(self.busy)
+
+
+PROFILES = ProfilePool()
 
 # How many log lines each job keeps. Enough to scroll back through a long run
 # without letting a week-long one eat the machine.
@@ -132,6 +387,13 @@ DEFAULTS = {
         "output": "",
         "upload_after": True,
         "upload_mode": "replace",
+        # THE SCRAPER'S CHROME PROFILES, comma-separated directory names inside
+        # 1_tiktok_search_scraper. Each search or harvest job takes a free one,
+        # so N profiles run N at once; with one, they queue as before.
+        "browser_profiles": PROFILE_PREFIX,
+        # And the account liker's saved logins too (6_comment_liker), when this
+        # window's own are busy — shared safely with the liker, see the pool.
+        "use_liker_profiles": True,
     },
     "harvest": {
         "limit": 50,
@@ -353,7 +615,11 @@ class Job:
         self.ended: float | None = None
         self.proc: subprocess.Popen | None = None
         self._lines_lock = threading.Lock()
-        self._holds_lock = False
+        # The browser profile this job holds, and the one it must have when it
+        # is pinned to one (the sign-in window).
+        self.profile: Slot | None = None
+        self.pin_profile = ""
+        self.env_extra: dict[str, str] = {}
 
     def finished(self) -> bool:
         return self.status in OVER
@@ -373,36 +639,128 @@ class Job:
                 start = 0
             return list(self.lines)[start:], self.seq
 
-    def run(self) -> None:
-        if self.tool in BROWSER_TOOLS:
-            # Not blocking straight away keeps the common case silent: the lock
-            # is free, nothing is said, and the job starts.
-            if not BROWSER_LOCK.acquire(blocking=False):
-                self.status = "queued"
-                self.write("[*] waiting for the Chrome profile — the scraper and "
-                           "the harvester share one, and Chromium allows a single "
-                           "window per profile")
-                BROWSER_LOCK.acquire()
-            self._holds_lock = True
-            if self.status == "stopped":
-                # Cancelled while it sat in the queue.
-                BROWSER_LOCK.release()
-                self._holds_lock = False
-                return
+    def _cmd_arg(self, flag: str) -> str:
+        try:
+            return str(self.cmd[self.cmd.index(flag) + 1])
+        except (ValueError, IndexError):
+            return ""
+
+    def _use_slot(self, got: "Slot") -> None:
+        self.profile = got
+        self.env_extra["BROWSER_PROFILE_DIR"] = str(got.path.resolve())
+        if got.liker:
+            # Bundled Chromium, as the liker opens it: Google Chrome would
+            # re-encrypt its cookies and sign the liker out of the account.
+            self.env_extra["BROWSER_CHANNEL"] = ""
+        else:
+            self.env_extra.pop("BROWSER_CHANNEL", None)
+        if self.status == "queued":
+            self.status = "starting"
+            self.started = time.time()
+
+    def _run_logged_in(self, site: str) -> None:
+        """A TikTok or Instagram search: run it on a profile that is LOGGED IN.
+
+        Profiles with no session cookie on disk are skipped without opening
+        them. One that has a cookie but turns out signed out when the run looks
+        (an expired session) exits with SIGNED_OUT_EXIT, and the search moves
+        on to the next profile — the same job, the same log. When no profile is
+        logged in to the site, the search opens one and WAITS for a manual login
+        in its window, then carries on by itself.
+        """
+        tried: set[str] = set()
+        while True:
+            slots = [sl for sl in logged_in_candidates(site) if _dkey(sl.path) not in tried]
+            if not slots:
+                break
+            got = PROFILES.take(self, slots)
+            if got is None:
+                return  # stopped while it waited
+            self._use_slot(got)
+            self.env_extra["SIGNIN_MODE"] = "exit"
+            self.write(f"[*] browser profile: {got.label}")
+            try:
+                self._run_process(retry_signed_out=True)
+            finally:
+                PROFILES.give(got)
+            if self.status != "signed-out":
+                return  # finished, failed or stopped: the run's own ending
+            mark_signed_out(got, site)
+            tried.add(_dkey(got.path))
+            self.write(f"[*] {got.label} is not logged in to {site} — trying another profile")
+            self.status = "starting"
+        # NOBODY IS LOGGED IN. Open the first free profile and wait for a login.
+        self.write(f"[!] no profile is logged in to {site}. Opening one — log in in the "
+                   "browser window that opens; the search starts by itself once you are in.")
+        got = PROFILES.take(self, profile_candidates(site))
+        if got is None:
+            return
+        self._use_slot(got)
+        self.env_extra["SIGNIN_MODE"] = "wait"
+        self.write(f"[*] browser profile: {got.label} (waiting for your login)")
         try:
             self._run_process()
         finally:
-            if self._holds_lock:
-                BROWSER_LOCK.release()
-                self._holds_lock = False
+            PROFILES.give(got)
+        _SIGNED_OUT.pop((_dkey(got.path), site), None)
 
-    def _run_process(self) -> None:
+    def run(self) -> None:
+        if self.tool == "search" and not self.pin_profile:
+            site = self._cmd_arg("--platform")
+            if site in LOGIN_SITES:
+                self._run_logged_in(site)
+                return
+        got: Slot | None = None
+        if self.tool in BROWSER_TOOLS:
+            if self.pin_profile:
+                slots = [Slot(self.pin_profile, SCRAPER_DIR / self.pin_profile, False)]
+            else:
+                plat = "instagram" if self.tool == "harvest" else self._cmd_arg("--platform")
+                slots = profile_candidates(plat)
+                if plat in LOGIN_SITES:
+                    # Logged-in profiles first (by their cookie file); the rest
+                    # only if none is, where the run asks for a login itself.
+                    slots = logged_in_candidates(plat) or slots
+            got = PROFILES.take(self, slots)
+            if got is None:
+                return  # cancelled while it waited
+            self.env_extra["BROWSER_PROFILE_DIR"] = str(got.path.resolve())
+            if got.liker:
+                # Bundled Chromium, as the liker opens it: Google Chrome would
+                # re-encrypt its cookies and sign the liker out of the account.
+                self.env_extra["BROWSER_CHANNEL"] = ""
+            fresh = not got.liker and not profile_signed_in(got.label) and self.tool != "signin"
+            self.write(f"[*] browser profile: {got.label}" + (
+                " — never opened before, so it is signed out of everything. "
+                "Use Search -> Sign in to a profile to log its accounts in." if fresh else ""))
+        elif self.tool == "liker" and self.cmd and "--list-only" not in self.cmd:
+            # THE ACCOUNT LIKER TAKES ITS PROFILE FROM THE SAME POOL, so a search
+            # never opens an account it is liking with, and it waits for a
+            # search to finish rather than failing. like.py checks for browsers
+            # outside this window itself, so only this window's jobs count here.
+            path = liker_profile_path(self._cmd_arg("--profile"))
+            got = PROFILES.take(self, [Slot(f"liker:{path.name}", path, True)], outside=False)
+            if got is None:
+                return
+        if got is not None:
+            self.profile = got
+            if self.status == "queued":
+                self.status = "starting"
+                self.started = time.time()
+        try:
+            self._run_process()
+        finally:
+            if got is not None:
+                PROFILES.give(got)
+
+    def _run_process(self, retry_signed_out: bool = False) -> None:
         env = dict(os.environ)
         # LEARNED THE HARD WAY. A TikTok comment is full of emoji and a Windows
         # console is cp1252; a child that prints one dies with UnicodeEncodeError
         # halfway through its work. Telling it to speak UTF-8 costs nothing.
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
+        env.update(self.env_extra)
         creation = 0
         if platform.system() == "Windows":
             # Its own process group, so stopping this job cannot take the window
@@ -439,6 +797,13 @@ class Job:
             self.write(line.rstrip("\n"))
         self.proc.wait()
         self.exit_code = self.proc.returncode
+        if (retry_signed_out and self.exit_code == SIGNED_OUT_EXIT
+                and self.status != "stopping"):
+            # NOT FINISHED: the profile was signed out and the job tries the
+            # next one. Never a finished state in between, or the chained
+            # upload watching this job would give up on it.
+            self.status = "signed-out"
+            return
         self.ended = time.time()
         if self.status == "stopping":
             self.status = "stopped"
@@ -461,8 +826,10 @@ class Job:
         return True
 
     def stop(self) -> bool:
-        if self.status == "queued" and not self.proc:
-            # Never started; the thread waiting on the lock checks this.
+        if self.status in ("queued", "starting", "signed-out") and (
+                not self.proc or self.proc.poll() is not None):
+            # Not running a program right now — never started, or between two
+            # profiles. The thread waiting for a profile checks this.
             self.status = "stopped"
             self.ended = time.time()
             self.write("[*] cancelled before it started")
@@ -1622,6 +1989,26 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             self._json(phone_state((q.get("cdp") or [""])[0]))
             return
+        if u.path == "/api/profiles":
+            # The scraper profile pool: which are in use, and which have never
+            # been opened (so are signed out of everything).
+            busy = PROFILES.snapshot()
+            held = dirs_held_now()
+            own = [Slot(n, SCRAPER_DIR / n, False) for n in scraper_profiles()]
+            lk = ([Slot(f"liker:{d.name}", d, True) for d in liker_profile_dirs()]
+                  if load_settings()["search"].get("use_liker_profiles", True) else [])
+            out = []
+            for sl in own + lk:
+                k = _dkey(sl.path)
+                out.append({
+                    "name": sl.label,
+                    "site": liker_site(sl.path) if sl.liker else "all",
+                    "busy": k in busy or k in held,
+                    "job": busy.get(k, ""),
+                    "opened": sl.liker or profile_signed_in(sl.label),
+                })
+            self._json({"profiles": out})
+            return
         if u.path == "/api/log":
             q = parse_qs(u.query)
             job = RUNNER.get((q.get("id") or [""])[0])
@@ -1642,6 +2029,20 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length) or b"{}")
         except Exception:  # noqa: BLE001
             self._json({"error": "bad json"}, 400)
+            return
+
+        if u.path == "/api/profile-signin":
+            # Open ONE scraper profile in a window to log its accounts in. Pinned
+            # to that profile, so it waits if a search is using it right now.
+            name = str(body.get("name") or "").strip()
+            if not PROFILE_NAME_RE.match(name):
+                self._json({"error": "Give a profile name: letters, digits, - or _."}, 400)
+                return
+            script = SCRAPER_DIR / "open_profile.py"
+            job = Job("signin", f"Sign in · Chrome profile {name}", _py(script), SCRAPER_DIR)
+            job.pin_profile = name
+            RUNNER.launch(job)
+            self._json({"ok": True, "job": job.id})
             return
 
         if u.path == "/api/settings":

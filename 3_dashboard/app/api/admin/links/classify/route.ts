@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { CLASSIFY_MAX_ITEMS, isAdminEmail } from '@/lib/config'
-import { classifyRelatedByGenre, type Item } from '@/lib/titleClassify'
+import { classifyRelatedByGenre, classifyWithReasonsByGenre, type Item } from '@/lib/titleClassify'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
@@ -22,8 +22,11 @@ export async function POST(req: NextRequest) {
   // of them about all the links marks the other genres' links unrelated, which
   // is exactly what happened when the question was humanizer-only.
   let items: (Item & { genre?: string })[] = []
+  // { reasons: true } — also say WHY, one line per title (the review page).
+  let withReasons = false
   try {
     const b = await req.json()
+    withReasons = b?.reasons === true
     if (Array.isArray(b?.items)) {
       items = b.items
         .map((it: unknown) => {
@@ -56,6 +59,10 @@ export async function POST(req: NextRequest) {
   }
 
   try {
+    if (withReasons) {
+      const verdicts = await classifyWithReasonsByGenre(items)
+      return NextResponse.json({ related: verdicts.filter((v) => v.related).map((v) => v.url), verdicts })
+    }
     return NextResponse.json({ related: await classifyRelatedByGenre(items) })
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 })

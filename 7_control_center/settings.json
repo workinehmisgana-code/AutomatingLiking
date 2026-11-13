@@ -1,7 +1,10 @@
 {
   "search": {
     "platforms": [
-      "tiktok"
+      "tiktok",
+      "youtube",
+      "instagram",
+      "reddit"
     ],
     "genre": "slides",
     "queries_by_genre": {
@@ -16,7 +19,9 @@
     "content": "all",
     "output": "",
     "upload_after": true,
-    "upload_mode": "replace"
+    "upload_mode": "replace",
+    "browser_profiles": "browser_profile",
+    "use_liker_profiles": true
   },
   "harvest": {
     "limit": 2500,

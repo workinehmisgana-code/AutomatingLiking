@@ -283,6 +283,27 @@
       </div>
 
       <div class="card">
+        <h3>Chrome profiles</h3>
+        <p class="sub">Each search or harvest takes a free profile, so with three profiles three run at once
+          instead of waiting for each other. Each profile is its own Chrome with its own signed-in
+          accounts. List them comma-separated; a new name is created on first use, signed out — sign it in first.</p>
+        <label class="f"><span>Profiles to use</span>
+          <input type="text" id="s_browser_profiles" placeholder="browser_profile, browser_profile-2, browser_profile-3"></label>
+        <div class="checks" style="margin-top:10px">
+          <label class="c" title="The account liker's saved logins (6_comment_liker): TikTok searches use its TikTok accounts, Instagram searches its profile-ig ones, YouTube and Reddit any. Shared safely: a search never opens an account the liker is using, and the liker waits for a search to finish.">
+            <input type="checkbox" id="s_use_liker_profiles">
+            Also use the account liker's signed-in profiles</label>
+        </div>
+        <div id="profileList" class="sub" style="margin-top:10px"></div>
+        <div style="margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+          <input type="text" id="signinName" placeholder="browser_profile-2" style="max-width:220px">
+          <button type="button" class="btn" onclick="signInProfile()"
+            title="Opens that profile on TikTok, Instagram and YouTube. Log in, then press Enter in the job log (or close the window).">
+            🔑 Sign in to a profile</button>
+        </div>
+      </div>
+
+      <div class="card">
         <h3>When it finishes</h3>
         <p class="sub">The upload runs as its own job, so you can watch it, stop it, or re-run it alone.</p>
         <div class="checks">
@@ -691,9 +712,10 @@
         <div>
           <h2>Jobs</h2>
           <p>Everything this window has started. They run independently — stopping one leaves
-             the others alone. The <b>scraper and the harvester share one Chrome profile</b>,
-             so those queue: Chromium allows a single window per profile, and a second one
-             would be refused on the spot.</p>
+             the others alone. Each <b>search or harvest needs a Chrome profile of its own</b>
+             (Chromium allows a single window per profile), so as many run at once as there are
+             profiles free under <b>Search extraction → Chrome profiles</b> (yours, plus the account
+             liker's signed-in ones); the rest queue for the next free one.</p>
         </div>
         <div class="spacer"></div>
         <button class="btn danger" onclick="stopAll()">Stop everything</button>
@@ -726,7 +748,8 @@ const FIELDS = {
   // input, so it does not fit the read/fill-by-id table.
   search: { content:'s_content', min:'s_min', max:'s_max',
             queries:'s_queries', output:'s_output',
-            upload_after:'s_upload_after', upload_mode:'s_upload_mode' },
+            upload_after:'s_upload_after', upload_mode:'s_upload_mode',
+            browser_profiles:'s_browser_profiles', use_liker_profiles:'s_use_liker_profiles' },
   harvest:{ limit:'h_limit', accounts:'h_accounts', genre:'h_genre',
             dry_run:'h_dry_run', upload:'h_upload' },
   liker:  { source:'k_source', links:'k_links', cluster_by:'k_cluster_by',
@@ -1149,6 +1172,54 @@ async function start(tool) {
   refresh();
 }
 
+// The scraper profile pool: which are free, busy, or never opened (signed out).
+let PROFILES_AT = 0;
+async function loadProfiles() {
+  const box = document.getElementById('profileList');
+  if (!box) return;
+  // Every 5 s, not every refresh: the server asks the running Chrome processes
+  // which profiles they hold, and that is a PowerShell call.
+  if (Date.now() - PROFILES_AT < 5000) return;
+  PROFILES_AT = Date.now();
+  const r = await api('/api/profiles');
+  const list = (r && r.profiles) || [];
+  const state = (p) => p.busy ? '<span style="color:#fbbf24">in use</span>'
+    : p.opened ? '<span style="color:#34d399">free</span>'
+    : '<span style="color:#f87171">never opened — sign in first</span>';
+  const own = list.filter((p) => !p.name.startsWith('liker:'));
+  const lk = list.filter((p) => p.name.startsWith('liker:'));
+  const sites = { tiktok: 'TikTok', instagram: 'Instagram', youtube: 'YouTube' };
+  let html = own.map((p) => `<div>• <b>${p.name}</b> — ${state(p)}</div>`).join('');
+  if (lk.length) {
+    const freeN = lk.filter((p) => !p.busy).length;
+    html += `<div style="margin-top:6px">Account liker profiles: ${freeN} of ${lk.length} free — ` +
+      Object.entries(sites).map(([k, label]) => {
+        const s = lk.filter((p) => p.site === k);
+        return s.length ? `${label} ${s.filter((p) => !p.busy).length}/${s.length}` : '';
+      }).filter(Boolean).join(' · ') + '</div>';
+  }
+  box.innerHTML = html;
+}
+
+async function signInProfile() {
+  const inp = document.getElementById('signinName');
+  const name = (inp.value || '').trim();
+  if (!name) { alert('Type the profile name to sign in, e.g. browser_profile-2'); return; }
+  // Save the form first, so the profile is in the pool once it is signed in.
+  const cur = document.getElementById('s_browser_profiles');
+  const names = cur.value.split(',').map((x) => x.trim()).filter(Boolean);
+  if (!names.includes(name)) {
+    names.push(name);
+    cur.value = names.join(', ');
+    await api('/api/settings', { tool: 'search', values: readForm('search') });
+  }
+  const r = await api('/api/profile-signin', { name });
+  if (r.error) { alert(r.error); return; }
+  OPEN = r.job; SEEN = 0;
+  document.querySelector('nav button[data-page="jobs"]').click();
+  refresh();
+}
+
 async function stopJob(id, ev) {
   ev.stopPropagation();
   await api('/api/stop', { id });
@@ -1427,6 +1498,7 @@ async function refresh() {
   const s = await api('/api/state');
   if (!s || !s.jobs) return;
   STATE = s;
+  loadProfiles();
   if (first) {
     first = false;
     // Genres added in the dashboard: every genre dropdown is rebuilt from the

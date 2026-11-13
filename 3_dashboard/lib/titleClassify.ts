@@ -14,7 +14,7 @@
 
 import { llmChat } from './llm'
 import { DEFAULT_GENRE, isGenre, type Genre } from './config'
-import { GENRE_COPY, classifySystem, classifyUser } from './prompts'
+import { GENRE_COPY, classifyReasonSystem, classifySystem, classifyUser } from './prompts'
 import { ensureGenreRegistry } from './genreStore'
 
 export type Item = { url: string; title: string }
@@ -26,8 +26,79 @@ export type Item = { url: string; title: string }
 // normalized form (lowercased, all non-alphanumerics stripped) so "AI detector",
 // "ai-detector" and "aidetector" all match the same key.
 function keywordRelated(title: string, genre: Genre): boolean {
+  return keywordHit(title, genre) !== null
+}
+
+/** The genre keyword the title contains, or null. */
+function keywordHit(title: string, genre: Genre): string | null {
   const norm = title.toLowerCase().replace(/[^a-z0-9]/g, '')
-  return GENRE_COPY[genre].related.keywords.some((k) => norm.includes(k))
+  return GENRE_COPY[genre].related.keywords.find((k) => norm.includes(k)) ?? null
+}
+
+/** One title's verdict, with why — for the admin's review. */
+export type Verdict = { url: string; related: boolean; reason: string }
+
+/**
+ * Judge these titles against the genre AND say why, one short sentence each.
+ *
+ * The keyword safety net still wins: a title containing a genre keyword is
+ * related whatever the model says, and its reason then names the keyword.
+ */
+export async function classifyChunkWithReasons(items: Item[], genre: Genre = DEFAULT_GENRE): Promise<Verdict[]> {
+  const { content } = await llmChat({
+    temperature: 0,
+    jsonObject: true,
+    // A sentence per title, plus room for a reasoning model's thinking.
+    maxTokens: Math.min(8000, 2500 + items.length * 60),
+    messages: [
+      { role: 'system', content: classifyReasonSystem(genre) },
+      { role: 'user', content: classifyUser(items.map((it) => it.title)) },
+    ],
+  })
+  let out: { related: boolean; reason: string }[] = []
+  try {
+    const parsed = JSON.parse(content) as { items?: unknown }
+    if (Array.isArray(parsed?.items)) {
+      out = parsed.items.map((x) => {
+        const o = (x ?? {}) as { related?: unknown; reason?: unknown }
+        return {
+          related: o.related === true || o.related === 'true' || o.related === 1,
+          reason: String(o.reason ?? '').trim().slice(0, 240),
+        }
+      })
+    }
+  } catch {
+    /* no verdicts on a parse failure: every title falls back below */
+  }
+  return items.map((it, i) => {
+    const v = out[i]
+    const kw = keywordHit(it.title, genre)
+    if (kw && !v?.related) {
+      return { url: it.url, related: true, reason: `Mentions "${kw}", one of this genre's keywords` }
+    }
+    if (!v) return { url: it.url, related: false, reason: 'The model gave no answer for this title' }
+    return { url: it.url, related: v.related, reason: v.reason || (v.related ? 'Related' : 'Not related') }
+  })
+}
+
+/** classifyRelatedByGenre with a reason for every title. */
+export async function classifyWithReasonsByGenre(items: (Item & { genre?: string })[]): Promise<Verdict[]> {
+  await ensureGenreRegistry().catch(() => {})
+  const groups = new Map<Genre, Item[]>()
+  for (const it of items) {
+    const g = isGenre(it.genre) ? it.genre : DEFAULT_GENRE
+    const list = groups.get(g) ?? []
+    list.push({ url: it.url, title: it.title })
+    groups.set(g, list)
+  }
+  const CHUNK = 25
+  const out: Verdict[] = []
+  for (const [g, list] of Array.from(groups.entries())) {
+    for (let i = 0; i < list.length; i += CHUNK) {
+      out.push(...(await classifyChunkWithReasons(list.slice(i, i + CHUNK), g)))
+    }
+  }
+  return out
 }
 
 // Ask the model which of these titles are related to this genre. Falls back to

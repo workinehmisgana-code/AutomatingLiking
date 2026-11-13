@@ -13,6 +13,7 @@ Usage:
 import argparse
 import csv
 import os
+import sys
 import time
 import random
 import re
@@ -46,6 +47,68 @@ REQUIRE_LOGIN        = os.getenv("REQUIRE_LOGIN", "false").lower() in ("true", "
 # and only waits when it is actually signed out.
 NO_LOGIN_WAIT        = False
 BROWSER_PROFILE_DIR  = os.getenv("BROWSER_PROFILE_DIR", "./browser_profile")
+
+# WHICH BROWSER OPENS THE PROFILE. Google Chrome by default ("chrome"). The
+# Control Center sets BROWSER_CHANNEL to empty when it lends this run one of
+# 6_comment_liker's account profiles: those were made by Playwright's bundled
+# Chromium, and Google Chrome re-encrypts cookies in a way that Chromium cannot
+# read back - one Chrome run would sign the account liker out of that account.
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome") or None
+
+# WHAT TO DO WHEN THE PROFILE IS NOT LOGGED IN to the site being searched (set
+# by the Control Center, which lends each run a profile):
+#   "exit" - say so ([signed-out]) and exit with SIGNED_OUT_EXIT, so the Control
+#            Center can hand the search another profile;
+#   "wait" - no profile was logged in: wait, with no time limit, for a manual
+#            login in this window, then search;
+#   ""     - the old behaviour (run from a terminal).
+# Only TikTok and Instagram are checked: YouTube and Reddit search signed out.
+SIGNIN_MODE = os.getenv("SIGNIN_MODE", "").strip().lower()
+SIGNED_OUT_EXIT = 5
+SESSION_COOKIE = {
+    "tiktok": ("tiktok.com", "sessionid", "https://www.tiktok.com/login"),
+    "instagram": ("instagram.com", "sessionid", "https://www.instagram.com/accounts/login/"),
+}
+
+
+def _has_session(context, site: str) -> bool:
+    domain, name, _ = SESSION_COOKIE[site]
+    try:
+        return any(
+            c.get("name") == name and c.get("value") and domain in c.get("domain", "")
+            for c in context.cookies()
+        )
+    except Exception:
+        return False
+
+
+def require_session(context, page, site: str) -> None:
+    """Make sure this profile is logged in to `site`, the SIGNIN_MODE way."""
+    if not SIGNIN_MODE or site not in SESSION_COOKIE:
+        return
+    if _has_session(context, site):
+        print(f"[+] This profile is logged in to {site}.")
+        return
+    if SIGNIN_MODE == "exit":
+        print(f"[signed-out] This profile is not logged in to {site} — handing the search to another profile.")
+        try:
+            context.close()
+        except Exception:
+            pass
+        sys.exit(SIGNED_OUT_EXIT)
+    try:
+        page.bring_to_front()
+        page.goto(SESSION_COOKIE[site][2], wait_until="commit", timeout=60000)
+    except Exception:
+        pass
+    print("\n" + "=" * 60)
+    print(f"  No profile is logged in to {site}.")
+    print("  Log in in this browser window — the search starts by itself")
+    print("  as soon as you are in (and the login is kept for next time).")
+    print("=" * 60)
+    while not _has_session(context, site):
+        time.sleep(3)
+    print(f"[+] Login detected – starting the {site} search...")
 # Platform: "tiktok" (default) or "youtube"
 DEFAULT_PLATFORM     = os.getenv("PLATFORM", "tiktok").lower()
 # YouTube content filter: "all" (default), "videos", or "shorts"
@@ -415,7 +478,7 @@ def scrape_youtube_search(queries: list[str], min_videos: int, max_videos: int,
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(Path(BROWSER_PROFILE_DIR).resolve()),
             headless=False,
-            channel="chrome",
+            channel=BROWSER_CHANNEL,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
@@ -660,7 +723,7 @@ def scrape_tiktok_search(queries: list[str], min_videos: int, max_videos: int, o
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(Path(BROWSER_PROFILE_DIR).resolve()),
             headless=False,
-            channel="chrome",
+            channel=BROWSER_CHANNEL,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
@@ -687,7 +750,9 @@ def scrape_tiktok_search(queries: list[str], min_videos: int, max_videos: int, o
                 except Exception:
                     pass
 
-        if REQUIRE_LOGIN and not NO_LOGIN_WAIT:
+        require_session(context, page, "tiktok")
+
+        if REQUIRE_LOGIN and not NO_LOGIN_WAIT and not SIGNIN_MODE:
             print("[*] Opening TikTok for manual login...")
             print(f"[*] Navigating to https://www.tiktok.com ...")
             page.bring_to_front()
@@ -1117,7 +1182,7 @@ def scrape_instagram_search(queries: list[str], min_videos: int, max_videos: int
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(Path(BROWSER_PROFILE_DIR).resolve()),
             headless=False,
-            channel="chrome",
+            channel=BROWSER_CHANNEL,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
@@ -1154,7 +1219,9 @@ def scrape_instagram_search(queries: list[str], min_videos: int, max_videos: int
         except Exception as e:
             print(f"[!] Navigation error: {e}")
             raise
-        if NO_LOGIN_WAIT:
+        if SIGNIN_MODE:
+            require_session(context, page, "instagram")
+        elif NO_LOGIN_WAIT:
             _await_instagram_session(context)
         else:
             print("\n" + "=" * 60)
@@ -1469,7 +1536,7 @@ def scrape_reddit_search(queries: list[str], min_videos: int, max_videos: int, o
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(Path(BROWSER_PROFILE_DIR).resolve()),
             headless=False,
-            channel="chrome",
+            channel=BROWSER_CHANNEL,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",

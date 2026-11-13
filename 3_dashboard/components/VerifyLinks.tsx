@@ -117,6 +117,10 @@ export default function VerifyLinks({
    */
   const [pinnedUrls, setPinnedUrls] = useState<Set<string>>(new Set())
   const [classifying, setClassifying] = useState(false)
+  // "Mark unrelated"'s verdict per link, with the model's one-line reason.
+  // Kept per URL, so it survives reloading the page the link is on.
+  const [reasons, setReasons] = useState<Record<string, { related: boolean; reason: string }>>({})
+  const hasReasons = Object.keys(reasons).length > 0
   // Merge is gated on this: the current page must be run through "Mark humanizer
   // unrelated" before it can be merged. Resets whenever a new page/batch loads.
   const [classifiedThisPage, setClassifiedThisPage] = useState(false)
@@ -234,6 +238,23 @@ export default function VerifyLinks({
   }, [titleFilter, platform, genre, mergeAccounts])
 
   useEffect(() => { fetchPage(page) }, [page, fetchPage])
+
+  /**
+   * The empty list, explained. The page shows ONE genre (the master switch), so
+   * "nothing staged" usually means nothing staged IN THIS GENRE while thousands
+   * wait in the others — say which, rather than suggesting the list is empty.
+   */
+  const emptyGenreText = (what: 'links' | 'channels'): string => {
+    if (!genre) return `No ${what} staged. Upload a channel CSV to begin.`
+    const others = Object.entries(genreCounts)
+      .filter(([g, n]) => g !== genre && n > 0)
+      .sort((a, b) => b[1] - a[1])
+      .map(([g, n]) => `${GENRE_LABELS[g] ?? g} ${n.toLocaleString()}`)
+    const here = `No ${GENRE_LABELS[genre] ?? genre} ${what} staged — the switch at the top shows one genre at a time.`
+    return others.length
+      ? `${here} Links waiting in other genres: ${others.join(' · ')}. Switch genre to review them, or upload a ${GENRE_LABELS[genre] ?? genre} channel CSV.`
+      : `${here} Upload a channel CSV to begin.`
+  }
 
   // Channel list for the whole-channel merge. Refreshed whenever the list size
   // changes, so counts stay right after an upload, a merge or a block.
@@ -667,14 +688,23 @@ export default function VerifyLinks({
         Math.max(1, Math.ceil(items.length / CLASSIFY_BATCHES))
       )
       const related = new Set<string>()
+      const why: Record<string, { related: boolean; reason: string }> = {}
       for (let i = 0; i < items.length; i += batchSize) {
         const res = await fetch('/api/admin/links/classify', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items: items.slice(i, i + batchSize) }),
+          // reasons: one line per title saying why it is (or is not) related.
+          body: JSON.stringify({ items: items.slice(i, i + batchSize), reasons: true }),
         })
         const d = await res.json().catch(() => ({}))
         if (res.ok && Array.isArray(d.related)) d.related.forEach((u: string) => related.add(u))
         else if (!res.ok) { alert(d?.error || 'Classification failed.'); return }
+        if (Array.isArray(d.verdicts)) {
+          for (const v of d.verdicts as { url: string; related: boolean; reason: string }[]) {
+            why[v.url] = { related: !!v.related, reason: String(v.reason || '') }
+          }
+        }
+        // Shown as each batch lands, not only at the end.
+        setReasons((prev) => ({ ...prev, ...why }))
       }
       const unrelated = items.filter((it) => !related.has(it.url)).map((it) => it.url)
       setSelected(new Set(unrelated))
@@ -1535,6 +1565,19 @@ export default function VerifyLinks({
         >
           📄 Export handles{ranked && visibleChannels.length ? ` (${visibleChannels.length})` : ''}
         </button>
+        {/* Extraction progress: its own full-width line in the toolbar, shown
+            while a run is going and kept afterwards with the run's summary. */}
+        {(extracting || exNote) && (
+          <ExtractProgress
+            running={extracting}
+            done={exDone}
+            total={exTotal}
+            found={exNew}
+            failed={exFailed}
+            note={exNote}
+            onDismiss={() => setExNote('')}
+          />
+        )}
         <label
           className="flex items-center gap-1.5 text-sm text-zinc-400"
           title={
@@ -1769,6 +1812,21 @@ export default function VerifyLinks({
           </div>
           {addErr && <p className="text-xs text-rose-400 mt-2">{addErr}</p>}
           {addMsg && <p className="text-xs text-emerald-300 mt-2">{addMsg}</p>}
+          {/* The same progress as the toolbar's, here too: this button sits far
+              below it, and a run started from here should be watchable here. */}
+          {(extracting || exNote) && (
+            <div className="mt-2">
+              <ExtractProgress
+                running={extracting}
+                done={exDone}
+                total={exTotal}
+                found={exNew}
+                failed={exFailed}
+                note={exNote}
+                onDismiss={() => setExNote('')}
+              />
+            </div>
+          )}
           {/* The add worked, the channel is ranked, and the filters on the table
               are hiding it — so ⬇ Extract would walk straight past it. Said
               here, next to the message that promised extraction, rather than
@@ -2207,13 +2265,18 @@ export default function VerifyLinks({
       <div className="rounded-xl border border-zinc-800 overflow-hidden" style={{ overflowAnchor: 'none' }}>
       {/* Header and rows in ONE scroller, at a fixed minimum width, so a
           search that narrows the rows cannot take the scroll away. */}
-      <ScrollX min={860}>
+      <ScrollX min={hasReasons ? 1120 : 860}>
         <div className="flex items-center gap-2 px-3 py-2 bg-zinc-900 border-b border-zinc-800 text-xs text-zinc-400 font-medium">
           <span className="w-6 flex justify-center">
             <input type="checkbox" checked={allSelected} onChange={toggleAll} className="accent-teal-500 cursor-pointer" />
           </span>
           <span className="w-28 shrink-0">Account / Bio</span>
           <span className="flex-1 min-w-0">Title / URL</span>
+          {hasReasons && (
+            <span className="w-64 shrink-0" title="Why 🤖 Mark unrelated judged each link related to its genre, or not">
+              Why (related?)
+            </span>
+          )}
           <span className="w-40 shrink-0 text-right">Views · Hearts</span>
           <span className="w-24 shrink-0 text-right">Posted</span>
           <span
@@ -2245,7 +2308,7 @@ export default function VerifyLinks({
         {loading ? (
           <p className="text-sm text-zinc-500 text-center py-12">Loading…</p>
         ) : displayRows.length === 0 ? (
-          <p className="text-sm text-zinc-500 text-center py-12">No links. Upload a channel CSV to begin.</p>
+          <p className="text-sm text-zinc-500 text-center py-12">{emptyGenreText('links')}</p>
         ) : (
           rowGroups.map((g) => {
             const staged = stagedFor(g.account)
@@ -2372,6 +2435,23 @@ export default function VerifyLinks({
                 <span className="block text-zinc-200 text-xs leading-tight line-clamp-2" title={r.title || ''}>{r.title || '—'}</span>
                 <a href={r.url} target="_blank" rel="noopener noreferrer" className="block text-[11px] text-zinc-500 hover:text-emerald-400 truncate">{r.url}</a>
               </span>
+              {hasReasons && (() => {
+                const v = reasons[r.url]
+                return (
+                  <span className="w-64 shrink-0 text-[11px] leading-tight" title={v?.reason || ''}>
+                    {v ? (
+                      <>
+                        <span className={v.related ? 'text-emerald-400 font-medium' : 'text-rose-400 font-medium'}>
+                          {v.related ? '✓ related' : '✗ unrelated'}
+                        </span>
+                        <span className="block text-zinc-400 line-clamp-2">{v.reason}</span>
+                      </>
+                    ) : (
+                      <span className="text-zinc-600">{r.title ? 'not checked yet' : 'no title to check'}</span>
+                    )}
+                  </span>
+                )
+              })()}
               <span className="w-40 shrink-0 text-right text-xs text-zinc-400 tabular-nums">{fmt(r.view_count)} · {fmt(r.heart_count)}</span>
               <span className="w-24 shrink-0 text-right text-xs text-zinc-500">{r.posted_date || '—'}</span>
               {(() => {
@@ -2488,7 +2568,7 @@ export default function VerifyLinks({
               {chanShown.length === 0 ? (
                 <p className="text-sm text-zinc-500 py-10 text-center">
                   {accounts.length === 0
-                    ? 'No channels staged. Upload a channel CSV first.'
+                    ? emptyGenreText('channels')
                     : 'Nothing matches — clear the search, or bring back the ones you set aside.'}
                 </p>
               ) : (
@@ -2555,6 +2635,79 @@ export default function VerifyLinks({
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * How far ⬇ Extract has got: channels checked out of the run, a bar, the new
+ * links staged so far, and the run's own message (which becomes the summary
+ * when it finishes). Stays after the run until dismissed.
+ */
+function ExtractProgress({
+  running,
+  done,
+  total,
+  found,
+  failed,
+  note,
+  onDismiss,
+}: {
+  running: boolean
+  done: number
+  total: number
+  found: number
+  failed: number
+  note: string
+  onDismiss: () => void
+}) {
+  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0
+  // A run that never started (nothing to check) has only its message to show.
+  if (!running && total === 0) {
+    return (
+      <div className="basis-full w-full flex items-start justify-between gap-3 rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-[11px] text-zinc-400">
+        <span>{note}</span>
+        <button type="button" onClick={onDismiss} className="text-zinc-500 hover:text-white" aria-label="Dismiss">
+          ✕
+        </button>
+      </div>
+    )
+  }
+  return (
+    <div className="basis-full w-full rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 text-xs">
+        <span className="text-zinc-300">
+          {running ? 'Extracting new videos…' : 'Extraction finished'}
+          <span className="text-zinc-500 tabular-nums">
+            {' '}· {done.toLocaleString()} of {total.toLocaleString()} channel(s) checked
+          </span>
+        </span>
+        <span className="flex items-center gap-3 tabular-nums">
+          <span className="text-emerald-300">{found.toLocaleString()} new link(s)</span>
+          {failed > 0 && <span className="text-amber-300">{failed.toLocaleString()} empty</span>}
+          <span className="text-zinc-400">{pct}%</span>
+          {!running && (
+            <button type="button" onClick={onDismiss} className="text-zinc-500 hover:text-white" aria-label="Dismiss">
+              ✕
+            </button>
+          )}
+        </span>
+      </div>
+      <div
+        className="mt-1.5 h-2 w-full overflow-hidden rounded-full bg-zinc-800"
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={total}
+        aria-valuenow={done}
+      >
+        <div
+          className={`h-full rounded-full transition-[width] duration-500 ${
+            running ? 'bg-emerald-500' : 'bg-emerald-600/70'
+          }`}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      {note && <p className="mt-1.5 text-[11px] text-zinc-400">{note}</p>}
     </div>
   )
 }

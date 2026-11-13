@@ -42,6 +42,7 @@
 
 import {
   genreOfProduct,
+  GENRE_LABELS,
   PROMO_EXTRA_TAG_MAX,
   PROMO_TITLE_COUNT,
   productForms,
@@ -1132,6 +1133,28 @@ export function classifySystem(genre: Genre): string {
     'Return STRICT JSON {"flags":[...]} where flags is a JSON array of booleans, ONE PER TITLE ' +
     'IN THE SAME ORDER \u2014 true if related, else false \u2014 with exactly as many booleans as titles. ' +
     'Example for 3 titles: {"flags":[true,false,true]}.'
+  )
+}
+
+/**
+ * The same question as classifySystem, with a one-line REASON per title — for
+ * the "Mark unrelated" button, where an admin reviews each verdict and wants to
+ * see why. The hourly harvest keeps the flags-only form: nobody reads its
+ * reasons, and they would only cost tokens.
+ */
+export function classifyReasonSystem(genre: Genre): string {
+  const { subject } = GENRE_COPY[genre].related
+  const label = GENRE_LABELS[genre] ?? genre
+  return (
+    'You classify short social-media video titles/captions for the "' + label + '" genre. ' +
+    `A title is RELATED when it is ${subject}. Anything else is NOT related. ` +
+    'Return STRICT JSON {"items":[{"related":true,"reason":"..."}, ...]} with ONE item PER TITLE ' +
+    'IN THE SAME ORDER and exactly as many items as titles. "reason" is ONE short plain sentence ' +
+    '(at most 15 words) saying what in the title makes it related to the genre, or why it is not ' +
+    '— name the actual topic, e.g. "Shows how to pass Turnitin with AI text" or "A cooking video, ' +
+    'nothing about studying". ' +
+    'Example for 2 titles: {"items":[{"related":true,"reason":"Tips for revising before exams"},' +
+    '{"related":false,"reason":"A dance trend, no study or school content"}]}.'
   )
 }
 

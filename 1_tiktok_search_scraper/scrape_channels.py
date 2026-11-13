@@ -78,6 +78,13 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 load_dotenv()
 
 BROWSER_PROFILE_DIR = os.getenv("BROWSER_PROFILE_DIR", "./browser_profile")
+
+# WHICH BROWSER OPENS THE PROFILE. Google Chrome by default ("chrome"). The
+# Control Center sets BROWSER_CHANNEL to empty when it lends this run one of
+# 6_comment_liker's account profiles: those were made by Playwright's bundled
+# Chromium, and Google Chrome re-encrypts cookies in a way that Chromium cannot
+# read back - one Chrome run would sign the account liker out of that account.
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome") or None
 VIEWPORT_WIDTH      = int(os.getenv("VIEWPORT_WIDTH", "1280"))
 VIEWPORT_HEIGHT     = int(os.getenv("VIEWPORT_HEIGHT", "800"))
 SCROLL_DELAY_MIN    = float(os.getenv("SCROLL_DELAY_MIN", "4.5"))
@@ -850,7 +857,7 @@ def main():
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(Path(BROWSER_PROFILE_DIR).resolve()),
             headless=False,
-            channel="chrome",
+            channel=BROWSER_CHANNEL,
             args=["--disable-blink-features=AutomationControlled", "--no-first-run", "--no-default-browser-check"],
             viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
