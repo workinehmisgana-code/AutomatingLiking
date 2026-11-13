@@ -1,6 +1,7 @@
 import { applyProductAlias } from './lookalike'
 import {
   activeProductsForPlatform,
+  applyReviveRule,
   getLinkCategory,
   pickFairProductForUrl,
   getProductCommentSettings,
@@ -97,7 +98,13 @@ export async function serveCommentForUrl(
   // So a genre with nothing written returns no comment, and the click is
   // recorded with no product. An empty clipboard is the right answer here.
   const inGenre = new Set(productsInGenre(genre))
-  const products = allowed.filter((p) => inGenre.has(p))
+  // And the revive rule (lib/db ReviveRule) — here as well as in the fair pick,
+  // so the fallback loop below cannot hand a covered link to another product,
+  // or a reserved product to a link it does not cover.
+  const products = await applyReviveRule(
+    url,
+    allowed.filter((p) => inGenre.has(p))
+  ).catch(() => allowed.filter((p) => inGenre.has(p)))
   if (products.length === 0) return { product: null, comment: null, category }
 
   const first = await pickFairProductForUrl(url, products).catch(() => null)

@@ -3,6 +3,7 @@ import { userIdFromApp } from '@/lib/appAuth'
 import {
   getGenreMix,
   ourRatioRetiredSet,
+  reviveSet,
   getUserPausedGenres,
   getServingGenreWeights,
   getHourlyClickTimes,
@@ -72,6 +73,9 @@ export async function GET(req: NextRequest) {
   // AND THE TIKTOK LINKS OUR COMMENTS ALREADY CROWD: retired by the ratio
   // setting (getOurRatioRetirePct), whatever their click count.
   ;(await ourRatioRetiredSet(videos).catch(() => new Set<string>())).forEach((u) => retired.add(u))
+  // EXCEPT the links the revive rule brings back for its product (lib/db
+  // ReviveRule): opened by many, none of our comments stuck.
+  ;(await reviveSet(videos).catch(() => new Set<string>())).forEach((u) => retired.delete(u))
   const hidden = new Set<string>(clicked)
   retired.forEach((u) => hidden.add(u))
   blocked.forEach((u) => hidden.add(u))

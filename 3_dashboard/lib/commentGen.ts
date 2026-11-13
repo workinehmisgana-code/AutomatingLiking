@@ -294,6 +294,11 @@ export function sanitize(
   const used = new Map<string, number>()
   const lineCount = Array.isArray(lines) ? lines.length : 0
   const needle = product.toLowerCase()
+  // The name however it is spelled ("co humanizer", "cohumanizer", inflected).
+  const nameRe = new RegExp(
+    productMatchWords(product).split(' ').map(escapeRe).join('[\\s._-]*') + '\\w*',
+    'gi'
+  )
   for (const raw of lines) {
     if (typeof raw !== 'string') continue
     let s = raw.trim().replace(/^["'\s]+|["'\s]+$/g, '')
@@ -342,7 +347,10 @@ export function sanitize(
     // every voice: the informational one is the plainest, not the most
     // technical, and it drifts hardest because "state what it is" reads to the
     // model as an invitation to describe the product.
-    if (jargonFor(product).test(s)) continue
+    // Tested with the product's OWN NAME taken out: "co humanizer" contains
+    // "humanizer", which the humanizer genre bans as advert-speak — and every
+    // one of its comments would be rejected for naming it.
+    if (jargonFor(product).test(s.replace(nameRe, ' '))) continue
     if (DANGLING.test(stripEmoji(s))) continue
     // One or two upbeat emoji, appended when the model forgot and trimmed when
     // it got carried away. Doing it here rather than rejecting keeps a good

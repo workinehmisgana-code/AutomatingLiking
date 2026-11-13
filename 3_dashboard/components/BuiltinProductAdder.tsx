@@ -6,9 +6,9 @@ import { COMMENTS } from '@/lib/comments'
 import { productWords } from '@/lib/config'
 import type { ExtraProduct } from '@/lib/genreRegistry'
 
-type Form = { id: string; site: string; words: string; seeds: string; isNew: boolean }
+type Form = { id: string; site: string; words: string; note: string; seeds: string; isNew: boolean }
 
-const BLANK: Form = { id: '', site: '', words: '', seeds: '', isNew: true }
+const BLANK: Form = { id: '', site: '', words: '', note: '', seeds: '', isNew: true }
 
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
@@ -74,6 +74,7 @@ export default function BuiltinProductAdder({
           genre,
           site: form.site,
           words: form.words,
+          note: form.note,
           seeds: form.seeds.split(/\r?\n/),
         }),
       })
@@ -138,7 +139,7 @@ export default function BuiltinProductAdder({
           <span className="ml-auto flex gap-2">
             <button
               onClick={() => {
-                setForm({ id: x.id, site: x.site, words: x.words, seeds: x.seeds.join('\n'), isNew: false })
+                setForm({ id: x.id, site: x.site, words: x.words, note: x.note ?? '', seeds: x.seeds.join('\n'), isNew: false })
                 setProblems([])
                 setNote('')
               }}
@@ -209,6 +210,21 @@ export default function BuiltinProductAdder({
               />
             </label>
           </div>
+
+          <label className="block">
+            <span className="block text-xs text-zinc-300 mb-1">How comments talk about it</span>
+            <span className="block text-[11px] text-zinc-500 mb-1">
+              Optional: an instruction to the comment writer that overrides the genre&apos;s usual
+              message. {'{PRODUCT}'} is the name as comments write it.
+            </span>
+            <textarea
+              rows={3}
+              className={input + ' text-xs'}
+              placeholder='e.g. Talk about {PRODUCT} as an idea — the step you run AI text through — not as a brand you recommend.'
+              value={form.note}
+              onChange={(e) => setForm({ ...form, note: e.target.value })}
+            />
+          </label>
 
           <div>
             <div className="flex flex-wrap items-center gap-2 mb-1">

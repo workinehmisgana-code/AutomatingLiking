@@ -23,6 +23,8 @@ export interface GuideProps {
    *  normal state — the guide reads perfectly well without them. */
   videos?: GuideVideoItem[]
   commentRate: number
+  /** Birr per Reddit comment (Reddit pays more than the other platforms). */
+  redditRate: number
   videoBirr: number
   promoBirr: number
   promoPerPlatform: number
@@ -89,7 +91,8 @@ export function en(p: GuideProps): GuideCopy {
     startCta: 'Start working →',
     startHint: 'Sign in with Google, finish the short setup, and your first links are there.',
     rates: [
-      { label: 'Per comment', value: `${p.commentRate} birr`, hint: 'on your reported count' },
+      { label: 'Per comment', value: `${p.commentRate} birr`, hint: 'TikTok, YouTube, Instagram — on your reported count' },
+      { label: 'Per Reddit comment', value: `${p.redditRate} birr`, hint: 'on your reported Reddit count' },
       ...(p.otherTasks
         ? [
             { label: 'Per video you make', value: `${p.videoBirr} birr`, hint: '30s–1min, once approved' },
@@ -296,7 +299,8 @@ export function am(p: GuideProps): GuideCopy {
     startCta: 'ሥራ ይጀምሩ →',
     startHint: 'በGoogle ይግቡ፣ አጭሩን ዝግጅት ይጨርሱ፤ የመጀመሪያዎቹ ሊንኮችዎ እዚያው ይጠብቁዎታል።',
     rates: [
-      { label: 'ለአንድ አስተያየት', value: `${p.commentRate} ብር`, hint: 'ሪፖርት ባደረጉት ብዛት መሠረት' },
+      { label: 'ለአንድ አስተያየት', value: `${p.commentRate} ብር`, hint: 'TikTok፣ YouTube፣ Instagram — ሪፖርት ባደረጉት ብዛት መሠረት' },
+      { label: 'ለአንድ የReddit አስተያየት', value: `${p.redditRate} ብር`, hint: 'ሪፖርት ባደረጉት የReddit ብዛት መሠረት' },
       ...(p.otherTasks
         ? [
             { label: 'ለሠሩት አንድ ቪዲዮ', value: `${p.videoBirr} ብር`, hint: '30 ሰከንድ–1 ደቂቃ፣ ከጸደቀ በኋላ' },

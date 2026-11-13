@@ -48,6 +48,7 @@ import {
   getReferralOf,
   getGenreMix,
   ourRatioRetiredSet,
+  reviveSet,
   getRecentClickGenres,
   getUserPausedGenres,
   getServingGenreWeights,
@@ -263,10 +264,13 @@ export default async function Home() {
   // retirement switch) — independent of the hourly quotas.
   // AND THE TIKTOK LINKS OUR COMMENTS ALREADY CROWD: retired by the ratio
   // setting (getOurRatioRetirePct), whatever their click count.
+  // EXCEPT the links the revive rule brings back for its product (lib/db
+  // ReviveRule): opened by many, none of our comments stuck.
+  const revived = await reviveSet(videos).catch(() => new Set<string>())
   const retiredUrls = Array.from(new Set([
     ...Array.from(retiredUrlSet(videos, clickCounts, retirePlatforms)),
     ...Array.from(await ourRatioRetiredSet(videos).catch(() => new Set<string>())),
-  ]))
+  ])).filter((u) => !revived.has(u))
 
   // Only this user's slice crosses the wire. The whole pool used to: 129k links,
   // tens of megabytes, re-sent on every load so a phone could render the first

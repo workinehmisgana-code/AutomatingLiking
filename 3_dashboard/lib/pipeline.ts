@@ -38,6 +38,7 @@ import {
   startPipelineCycle,
   recordPipelineStage,
   finishPipelineCycle,
+  getServedTiktokUrls,
   savePipelineScans,
   prunePipelineScans,
 } from './db'
@@ -61,6 +62,26 @@ const CYCLE_STARTED_KEY = 'pipeline_cycle_started'
 const CYCLE_ID_KEY = 'pipeline_cycle_id'
 /** Held while a tick is running, so two never work the same cursor at once. */
 const EXTRACT_CURSOR_KEY = 'pipeline_extract_cursor'
+// ── THE SERVED-LINK CHECK, every SERVED_CHECK_MINUTES ───────────────────────
+//
+// Reading comments is no longer part of the six-hour cycle. Our comments only
+// arrive on links workers are sent to, so a check reads exactly the TikTok
+// links clicked since the last check, and runs on its own, much shorter clock.
+//
+// THE WINDOW is fixed when a check starts — [end of the last window, now −
+// SERVED_LAG_MINUTES) — so the list does not grow under the cursor while workers
+// keep clicking, and the windows join end to end: every served link is read by
+// exactly one check. The lag leaves a worker time to post: a link opened a
+// minute before the check would otherwise be read before its comment is up,
+// and stored as carrying none of ours.
+export const SERVED_CHECK_MINUTES = 30
+export const SERVED_LAG_MINUTES = 10
+const SERVED_FROM_KEY = 'pipeline_served_from'
+const SERVED_TO_KEY = 'pipeline_served_to'
+/** '1' while a check is part-way through its window. */
+const SERVED_RUNNING_KEY = 'pipeline_served_running'
+/** When the last check finished (ms). Read by the admin's daily-clicks table. */
+export const SERVED_DONE_AT_KEY = 'pipeline_served_done_at'
 const LAST_KEY = 'pipeline_last'
 
 /**
@@ -116,12 +137,16 @@ export async function getLastTick(): Promise<TickResult | null> {
 }
 
 /**
- * The links the extract stage covers: EVERY search-rank cluster, plus the top
- * `DATE_CLUSTERS` posted-date clusters.
+ * The links a served-link check covers: EVERY TikTok link served (opened by a
+ * worker) in the check's window — and nothing else.
  *
- * Cluster membership is assigned by buildAdminLinks, so this asks the same code
- * the Links page does rather than re-deriving it — clusters are relative, and a
- * second derivation would drift from what is on screen.
+ * It used to read every search-rank cluster plus the top posted-date clusters,
+ * ~7,400 links a cycle, most of which nobody had been sent to since the last
+ * read, so nothing on them could have changed because of us. Our comments only
+ * arrive on links that are served, and every served link is read by the cycle
+ * after it, so over time every link that can carry ours is read.
+ *
+ * The clusters are still looked up, only to label each link in the cycle report.
  */
 interface Target {
   url: string
@@ -129,23 +154,32 @@ interface Target {
    *  with the pool, so the report stores them rather than reading them back. */
   rankCluster: number | null
   dateCluster: number | null
+  /** Served to a worker since the last automatic check. */
+  served?: boolean
 }
 
 async function extractTargets(): Promise<Target[]> {
-  const { rows } = await buildAdminLinks('')
-  const out = rows
-    .filter((l) => !l.blocked)
-    .filter((l) => /tiktok\.com\/@[^/]+\/(?:video|photo)\/\d+/i.test(l.url))
-    .filter((l) => l.rankCluster > 0 || (l.dateCluster > 0 && l.dateCluster <= DATE_CLUSTERS))
-    .map((l) => ({
-      url: l.url,
-      rankCluster: l.rankCluster > 0 ? l.rankCluster : null,
-      // Only the clusters this stage actually covers, so the report never shows
-      // a date cluster it was never asked to read.
-      dateCluster: l.dateCluster > 0 && l.dateCluster <= DATE_CLUSTERS ? l.dateCluster : null,
-    }))
-  out.sort((a, b) => a.url.localeCompare(b.url))
-  return out
+  const from = Number(await getAppState(SERVED_FROM_KEY).catch(() => null))
+  const to = Number(await getAppState(SERVED_TO_KEY).catch(() => null))
+  const served =
+    Number.isFinite(from) && Number.isFinite(to) && to > from
+      ? (await getServedTiktokUrls(new Date(from), new Date(to)).catch(() => [] as string[])).filter((u) =>
+          /tiktok\.com\/@[^/]+\/(?:video|photo)\/\d+/i.test(u)
+        )
+      : []
+  if (served.length === 0) return []
+  // Labels for the report: the cluster each link sits in right now, if any.
+  const { rows } = await buildAdminLinks('').catch(() => ({ rows: [] as Awaited<ReturnType<typeof buildAdminLinks>>['rows'] }))
+  const byUrl = new Map(rows.map((l) => [l.url, l]))
+  return served.map((url) => {
+    const l = byUrl.get(url)
+    return {
+      url,
+      rankCluster: l && l.rankCluster > 0 ? l.rankCluster : null,
+      dateCluster: l && l.dateCluster > 0 && l.dateCluster <= DATE_CLUSTERS ? l.dateCluster : null,
+      served: true,
+    }
+  })
 }
 
 /** Read comments for the next slice of the target set. */
@@ -160,9 +194,7 @@ async function extractTick(
   let cursor = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0
   if (cursor >= urls.length) cursor = 0
 
-  // A pass ends when the cursor reaches the end, and the next one starts over
-  // and re-reads everything. That is deliberate — the whole point is to notice
-  // comments appearing over time.
+  // A check ends when the cursor reaches the end of its window's links.
   const slice = urls.slice(cursor, cursor + 60)
   const alreadyDone = await getScannedUrls(slice.map((t) => t.url)).catch(() => new Set<string>())
 
@@ -217,6 +249,7 @@ async function extractTick(
     done: finished,
     detail: {
       targets: urls.length,
+      served: urls.filter((t) => t.served).length,
       from: cursor,
       read,
       withOurs,
@@ -242,10 +275,56 @@ export async function tick(deadline: number): Promise<TickResult> {
     }
   }
   try {
+    const check = await servedCheckTick(deadline, t0)
+    if (check) return check
     return await runStage(stage, deadline, t0)
   } finally {
     await releaseLock()
   }
+}
+
+/**
+ * The served-link check, if one is due or part-way through; null otherwise, and
+ * the tick goes on to the cycle. A check is ~125 links, two or three minutes of
+ * ticks, so the cycle loses little time to it.
+ *
+ * Its numbers fold into whichever cycle row is current, as the extract stage's
+ * did, so the cycle report still shows what was read and found.
+ */
+async function servedCheckTick(deadline: number, t0: number): Promise<TickResult | null> {
+  const now = Date.now()
+  let running = (await getAppState(SERVED_RUNNING_KEY).catch(() => null)) === '1'
+  if (!running) {
+    const prevTo = Number(await getAppState(SERVED_TO_KEY).catch(() => null))
+    const to = now - SERVED_LAG_MINUTES * 60_000
+    // First check ever: start one window back.
+    const from = Number.isFinite(prevTo) && prevTo > 0 ? prevTo : to - SERVED_CHECK_MINUTES * 60_000
+    if (to - from < SERVED_CHECK_MINUTES * 60_000) return null
+    await setAppState(SERVED_FROM_KEY, String(from)).catch(() => {})
+    await setAppState(SERVED_TO_KEY, String(to)).catch(() => {})
+    await setAppState(EXTRACT_CURSOR_KEY, '0').catch(() => {})
+    await setAppState(SERVED_RUNNING_KEY, '1').catch(() => {})
+    running = true
+  }
+  const cycleId = Number(await getAppState(CYCLE_ID_KEY).catch(() => null))
+  const id = Number.isFinite(cycleId) ? cycleId : 0
+  const r = await extractTick(deadline, id)
+  if (r.done) {
+    await setAppState(SERVED_RUNNING_KEY, '0').catch(() => {})
+    await setAppState(SERVED_DONE_AT_KEY, String(Date.now())).catch(() => {})
+  }
+  if (id > 0) await recordPipelineStage(id, 'extract', r.detail, ['read', 'withOurs']).catch(() => {})
+  const stage = await getStage()
+  const out: TickResult = {
+    stage: 'extract',
+    nextStage: stage,
+    done: r.done,
+    detail: { check: `served links, every ${SERVED_CHECK_MINUTES} min`, ...r.detail },
+    ms: Date.now() - t0,
+    at: new Date().toISOString(),
+  }
+  await setAppState(LAST_KEY, JSON.stringify(out)).catch(() => {})
+  return out
 }
 
 async function runStage(stage: Stage, deadline: number, t0: number): Promise<TickResult> {
@@ -283,10 +362,11 @@ async function runStage(stage: Stage, deadline: number, t0: number): Promise<Tic
     // A harvest lap ends when its channel cursor wraps back to the top.
     done = r.wrapped || r.eligible === 0
   } else if (stage === 'extract') {
-    const cycleId = Number(await getAppState(CYCLE_ID_KEY).catch(() => null))
-    const r = await extractTick(deadline, Number.isFinite(cycleId) ? cycleId : 0)
-    done = r.done
-    detail = r.detail
+    // Moved out of the cycle: served links are read every SERVED_CHECK_MINUTES
+    // by servedCheckTick. The stage stays so the cycle's shape (and its report)
+    // does not change; it passes straight through.
+    done = true
+    detail = { movedTo: `served-link check every ${SERVED_CHECK_MINUTES} min` }
   } else if (stage === 'categorise') {
     const r = await categorizeSome(deadline)
     done = r.done
@@ -304,7 +384,7 @@ async function runStage(stage: Stage, deadline: number, t0: number): Promise<Tic
     if (Number.isFinite(id) && id > 0) {
       const ADD: Record<string, string[]> = {
         harvest: ['checked', 'found', 'merged', 'staged', 'untitled', 'failed', 'specMerged'],
-        extract: ['read', 'withOurs'],
+        extract: [],
         categorise: ['processed', 'saved'],
         recluster: [],
       }

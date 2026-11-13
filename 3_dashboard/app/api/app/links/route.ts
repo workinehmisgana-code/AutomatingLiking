@@ -15,6 +15,7 @@ import {
 
   getGenreMix,
   ourRatioRetiredSet,
+  reviveSet,
   getRecentClickGenres,
   getUserPausedGenres,
   getServingGenreWeights,
@@ -180,6 +181,9 @@ export async function GET(req: NextRequest) {
   // AND THE TIKTOK LINKS OUR COMMENTS ALREADY CROWD: retired by the ratio
   // setting (getOurRatioRetirePct), whatever their click count.
   ;(await ourRatioRetiredSet(videos).catch(() => new Set<string>())).forEach((u) => retired.add(u))
+  // EXCEPT the links the revive rule brings back for its product (lib/db
+  // ReviveRule): opened by many, none of our comments stuck.
+  ;(await reviveSet(videos).catch(() => new Set<string>())).forEach((u) => retired.delete(u))
   // ALREADY-OPENED LINKS COME BACK when "only links with none of ours" is on.
   //
   // That setting only ever serves a link the extraction has NOT found one of

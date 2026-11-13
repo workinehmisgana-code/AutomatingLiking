@@ -45,6 +45,7 @@ import {
   PROMO_EXTRA_TAG_MAX,
   PROMO_TITLE_COUNT,
   productForms,
+  productNote,
   productWords,
   type CommentStyle,
   type Genre,
@@ -512,6 +513,22 @@ export interface PromptBand {
  * treats it as the register to write in, and every comment comes back sounding
  * like the product's own about page.
  */
+/**
+ * The admin's own instruction for how this product is talked about (Admin →
+ * Genres, an added product's "How comments talk about it"). Empty for most.
+ * It comes AFTER the audience angle and says it wins, because it exists to
+ * change the message the angle would otherwise give.
+ */
+function noteFor(product: Product, mention: string): string {
+  const note = productNote(product)
+  if (!note) return ''
+  return (
+    `HOW TO TALK ABOUT "${mention}" — THIS OVERRIDES THE MESSAGE ABOVE WHERE THEY DIFFER: ` +
+    note.split('{PRODUCT}').join(mention) +
+    SEP
+  )
+}
+
 export function productBackground(product: Product): string {
   // WHAT THE PRODUCT IS comes from the genre table, not from here. This used to
   // state the humanizer definition inline, which was invisible while every
@@ -810,6 +827,7 @@ export function buildAudiencePrompt(
     SEP +
     angleFor(product, category) +
     SEP +
+    noteFor(product, mention) +
     naiveVoice(product) +
     SEP +
     voiceShapeRule(style, mention, product) +
@@ -842,6 +860,7 @@ export function buildSystemPrompt(
   return (
     productBackground(product) +
     SEP +
+    noteFor(product, mention) +
     naiveVoice(product) +
     SEP +
     voiceShapeRule(style, mention, product) +

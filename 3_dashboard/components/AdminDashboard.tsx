@@ -8,6 +8,8 @@ import {
   DEACTIVATED_PRODUCTS,
   VIDEO_PAYMENT_BIRR,
   COMMENT_PAY_RATE,
+  COMMENT_PAY_RATE_BY_PLATFORM,
+  commentPayRate,
   PROMO_PAY_BIRR,
   ACCOUNT_PAY_BIRR,
   REFERRAL_PAY_RATE,
@@ -2093,6 +2095,9 @@ export default function AdminDashboard({
         days={data.dailyClicks}
         byProduct={data.dailyClicksByProduct}
         byPlatform={data.dailyClicksByPlatform}
+        tiktokLinks={data.dailyTiktokLinks ?? []}
+        tiktokLinksByProduct={data.dailyTiktokLinksByProduct ?? {}}
+        autoUpdates={data.autoUpdates ?? null}
         products={clickProducts}
       />
 
@@ -3512,6 +3517,8 @@ function UserCard({
       : null
 
   const [editLinks, setEditLinks] = useState(false)
+  // The platform whose clicked links are open in a modal (the Reddit count).
+  const [platLinks, setPlatLinks] = useState<string | null>(null)
   const [savingLinks, setSavingLinks] = useState(false)
   const [linkErr, setLinkErr] = useState('')
   const [linkDraft, setLinkDraft] = useState({
@@ -3570,7 +3577,8 @@ function UserCard({
     const raw = window.prompt(
       `New COMMENT pay for ${u.profile?.name || u.name || u.email}, in birr.\n\n` +
         `Comment pay now: ${fmtBirr(pending.comments.birr)} birr ` +
-        `(${COMMENT_PAY_RATE} birr a comment).\n` +
+        `(${COMMENT_PAY_RATE} birr a comment, ${COMMENT_PAY_RATE_BY_PLATFORM.reddit} on Reddit; ` +
+        `the change is written in ${COMMENT_PAY_RATE}-birr units).\n` +
         `Their referral pay and other pay (${fmtBirr(others)} birr) stay the same.`,
       String(pending.comments.birr)
     )
@@ -4181,7 +4189,18 @@ function UserCard({
                   <span className="text-zinc-600"> clicked</span>
                 </div>
                 <div className="text-sm text-zinc-200 tabular-nums">
-                  {genreComments(u, genre, u.commentedByPlatform[p.key] ?? 0)}
+                  {p.key === 'reddit' && (u.commentedByPlatform[p.key] ?? 0) > 0 ? (
+                    <button
+                      type="button"
+                      onClick={() => setPlatLinks(p.key)}
+                      className="underline decoration-dotted decoration-zinc-600 underline-offset-2 hover:text-white"
+                      title="See the Reddit links they clicked since their reset"
+                    >
+                      {genreComments(u, genre, u.commentedByPlatform[p.key] ?? 0)}
+                    </button>
+                  ) : (
+                    genreComments(u, genre, u.commentedByPlatform[p.key] ?? 0)
+                  )}
                   <span className="text-zinc-600"> commented ≈</span>
                 </div>
                 {u.sampleUrls[p.key]?.length ? (
@@ -4198,6 +4217,17 @@ function UserCard({
               </div>
             ))}
           </div>
+          {platLinks && (
+            <UserPlatformLinksModal
+              userId={u.id}
+              name={u.profile?.name || u.name || u.email}
+              platform={platLinks}
+              label={PLATFORMS.find((x) => x.key === platLinks)?.label ?? platLinks}
+              commented={u.commentedByPlatform[platLinks] ?? 0}
+              samples={u.sampleUrls[platLinks] ?? []}
+              onClose={() => setPlatLinks(null)}
+            />
+          )}
 
           {/* Daily clicks & comments — Comments table carries the pay column */}
           <div className="grid lg:grid-cols-2 gap-4">
@@ -4207,7 +4237,15 @@ function UserCard({
             </div>
             <div>
               <div className="text-xs text-zinc-500 mb-1">Comments per day (since reset)</div>
-              <DayTable title="Comments" rows={u.dailyComments} payRate={COMMENT_PAY_RATE} />
+              <DayTable
+                title="Comments"
+                rows={u.dailyComments}
+                pay={Object.entries(u.commentedByPlatform).reduce((s, [k, n]) => s + n * commentPayRate(k), 0)}
+                payTitle={Object.entries(u.commentedByPlatform)
+                  .filter(([, n]) => n)
+                  .map(([k, n]) => `${k} ${n} × ${commentPayRate(k)}`)
+                  .join(' + ')}
+              />
             </div>
           </div>
 
@@ -4541,7 +4579,10 @@ function UserCard({
                   key: 'comments',
                   label: 'Comments',
                   count: pending.comments.count,
-                  unit: `${pending.comments.count} × ${COMMENT_PAY_RATE}`,
+                  unit: pending.comments.reddit
+                    ? `${pending.comments.count - pending.comments.reddit} × ${COMMENT_PAY_RATE} + ` +
+                      `${pending.comments.reddit} Reddit × ${COMMENT_PAY_RATE_BY_PLATFORM.reddit}`
+                    : `${pending.comments.count} × ${COMMENT_PAY_RATE}`,
                   birr: pending.comments.birr,
                   note: 'their own approved comments',
                   tone: 'text-zinc-300',
@@ -4727,13 +4768,13 @@ function UserCard({
                           {m.comments} unpaid
                         </span>
                         <span className="w-20 text-right tabular-nums text-sky-300">
-                          {fmtBirr(m.comments * REFERRAL_PAY_RATE)}
+                          {fmtBirr(m.birr)}
                         </span>
                         <span
                           className="w-24 text-right tabular-nums text-zinc-600"
                           title="Everything this person has ever earned the referrer"
                         >
-                          {fmtBirr(m.lifetimeComments * REFERRAL_PAY_RATE)} total
+                          {fmtBirr(m.lifetimeBirr)} total
                         </span>
                       </div>
                     ))}
@@ -4973,15 +5014,49 @@ function DailyClicksTable({
   days,
   byProduct,
   byPlatform,
+  tiktokLinks,
+  tiktokLinksByProduct,
+  autoUpdates,
   products,
 }: {
   days: { day: string; count: number }[]
   byProduct: Record<string, { day: string; count: number }[]>
   /** The same days split by the platform stamped on each click. */
   byPlatform: Record<string, { day: string; count: number }[]>
+  /** TikTok's distinct links per day, and how many carry our comments. */
+  tiktokLinks: { day: string; unique: number; scanned: number; withOurs: number; withOwn: number }[]
+  /** Per product: TikTok links clicked for it, and how many carry ITS comments. */
+  tiktokLinksByProduct: Record<string, { day: string; unique: number; scanned: number; withOurs: number; withOwn: number }[]>
+  /** When the automatic comment reads last ran (the "with ours" freshness). */
+  autoUpdates: {
+    servedCheckAt: string | null
+    servedUpTo: string | null
+    servedRunning: boolean
+    cycleStartedAt: string | null
+    cycleFinishedAt: string | null
+  } | null
   products: string[]
 }) {
+  // The cell clicked in a product row: its links open in a modal.
+  // own: only the links carrying the served worker's own comment; product null
+  // = the TikTok platform row (every product).
+  const [open, setOpen] = useState<{ product: string | null; day: string; own?: boolean } | null>(null)
   if (days.length === 0) return null
+  /** A count that opens its links when clicked (0 stays plain text). */
+  const ownCell = (n: number, product: string | null, day: string) =>
+    n > 0 ? (
+      <button
+        type="button"
+        onClick={() => setOpen({ product, day, own: true })}
+        className="underline decoration-dotted decoration-zinc-600 underline-offset-2 hover:text-white"
+        title={`See the links with the worker's own ${product ?? ''} comment on ${day}`.replace('  ', ' ')}
+      >
+        {n.toLocaleString()}
+      </button>
+    ) : (
+      n.toLocaleString()
+    )
+  const tiktokByDay = new Map(tiktokLinks.map((t) => [t.day, t]))
   const total = days.reduce((s, d) => s + d.count, 0)
   const busiest = days.reduce((m, d) => Math.max(m, d.count), 0)
   // Only products that actually saw a click in the window get a row; '(none)'
@@ -5029,6 +5104,7 @@ function DailyClicksTable({
           last {days.length} days · {total.toLocaleString()} clicks
         </div>
       </div>
+      {autoUpdates && <AutoUpdateLine t={autoUpdates} />}
       <div className="overflow-x-auto">
         <table className="text-xs border-collapse w-full min-w-[420px]">
           <thead>
@@ -5103,19 +5179,94 @@ function DailyClicksTable({
             )}
             {rows.map((p) => {
               const series = byProduct[p] ?? []
-              return (
+              const tk = tiktokLinksByProduct[p]
+              const tkByDay = new Map((tk ?? []).map((t) => [t.day, t]))
+              const subCell = 'text-zinc-500 px-2 py-0.5 border-l border-t border-zinc-800/60 text-center tabular-nums text-[11px]'
+              const subRows = tk?.some((t) => t.unique > 0)
+                ? [
+                    <tr key={`${p}-tk-unique`}>
+                      <td
+                        className="text-zinc-600 pl-4 pr-3 py-0.5 whitespace-nowrap text-[11px]"
+                        title={`Distinct TikTok links clicked for ${p} that day`}
+                      >
+                        ↳ TikTok unique links
+                      </td>
+                      {days.map((d) => (
+                        <td key={d.day} className={subCell}>
+                          {(tkByDay.get(d.day)?.unique ?? 0).toLocaleString()}
+                        </td>
+                      ))}
+                    </tr>,
+                    <tr key={`${p}-tk-ours`}>
+                      <td
+                        className="text-zinc-600 pl-4 pr-3 py-0.5 whitespace-nowrap text-[11px]"
+                        title={`Of those links, how many the comment scan found a ${p} comment on. A link never scanned counts as not having one.`}
+                      >
+                        ↳ with {p} comments
+                      </td>
+                      {days.map((d) => {
+                        const t = tkByDay.get(d.day)
+                        const pct = t && t.unique > 0 ? Math.round((t.withOurs / t.unique) * 100) : null
+                        return (
+                          <td
+                            key={d.day}
+                            className={subCell}
+                            title={t ? `${t.scanned.toLocaleString()} of ${t.unique.toLocaleString()} scanned` : undefined}
+                          >
+                            {(t?.withOurs ?? 0).toLocaleString()}
+                            {pct !== null && <span className="text-[10px] text-zinc-600"> {pct}%</span>}
+                          </td>
+                        )
+                      })}
+                    </tr>,
+                    <tr key={`${p}-tk-own`}>
+                      <td
+                        className="text-zinc-600 pl-4 pr-3 py-0.5 whitespace-nowrap text-[11px]"
+                        title={`Of those links, how many carry a ${p} comment posted by the TikTok account of the worker who was served it.`}
+                      >
+                        ↳ with the worker&apos;s own comment
+                      </td>
+                      {days.map((d) => {
+                        const t = tkByDay.get(d.day)
+                        const pct = t && t.unique > 0 ? Math.round((t.withOwn / t.unique) * 100) : null
+                        return (
+                          <td key={d.day} className={subCell}>
+                            {ownCell(t?.withOwn ?? 0, p, d.day)}
+                            {pct !== null && <span className="text-[10px] text-zinc-600"> {pct}%</span>}
+                          </td>
+                        )
+                      })}
+                    </tr>,
+                  ]
+                : []
+              return [
                 <tr key={p}>
                   <td className="text-zinc-400 pr-3 py-1 whitespace-nowrap capitalize">{p}</td>
-                  {days.map((d, i) => (
-                    <td
-                      key={d.day}
-                      className="text-zinc-400 px-2 py-1 border-l border-t border-zinc-800 text-center tabular-nums"
-                    >
-                      {(series[i]?.count ?? 0).toLocaleString()}
-                    </td>
-                  ))}
-                </tr>
-              )
+                  {days.map((d, i) => {
+                    const n = series[i]?.count ?? 0
+                    return (
+                      <td
+                        key={d.day}
+                        className="text-zinc-400 px-2 py-1 border-l border-t border-zinc-800 text-center tabular-nums"
+                      >
+                        {n > 0 ? (
+                          <button
+                            type="button"
+                            onClick={() => setOpen({ product: p, day: d.day })}
+                            className="underline decoration-dotted decoration-zinc-600 underline-offset-2 hover:text-white"
+                            title={`See the links clicked for ${p} on ${d.day}`}
+                          >
+                            {n.toLocaleString()}
+                          </button>
+                        ) : (
+                          n.toLocaleString()
+                        )}
+                      </td>
+                    )
+                  })}
+                </tr>,
+                ...subRows,
+              ]
             })}
             {platformRows.length > 0 && (
               <tr>
@@ -5147,9 +5298,376 @@ function DailyClicksTable({
                   </td>
                 ))}
               </tr>
-            ))}
+            )).flatMap((row, idx) =>
+              // UNDER TIKTOK: its distinct links, and how many carry ours.
+              platformRows[idx].key !== 'tiktok' || tiktokLinks.length === 0
+                ? [row]
+                : [
+                    row,
+                    <tr key="tiktok-unique">
+                      <td
+                        className="text-zinc-500 pl-4 pr-3 py-1 whitespace-nowrap text-[11px]"
+                        title="Distinct TikTok links clicked that day (a link clicked by five workers counts once)"
+                      >
+                        ↳ unique links
+                      </td>
+                      {days.map((d) => (
+                        <td
+                          key={d.day}
+                          className="text-zinc-400 px-2 py-1 border-l border-t border-zinc-800 text-center tabular-nums"
+                        >
+                          {(tiktokByDay.get(d.day)?.unique ?? 0).toLocaleString()}
+                        </td>
+                      ))}
+                    </tr>,
+                    <tr key="tiktok-ours">
+                      <td
+                        className="text-zinc-500 pl-4 pr-3 py-1 whitespace-nowrap text-[11px]"
+                        title="Of those links, how many the comment scan found one of our products' comments on. A link never scanned counts as not having any."
+                      >
+                        ↳ with our comments
+                      </td>
+                      {days.map((d) => {
+                        const t = tiktokByDay.get(d.day)
+                        const pct = t && t.unique > 0 ? Math.round((t.withOurs / t.unique) * 100) : null
+                        return (
+                          <td
+                            key={d.day}
+                            className="text-zinc-400 px-2 py-1 border-l border-t border-zinc-800 text-center tabular-nums"
+                            title={t ? `${t.scanned.toLocaleString()} of ${t.unique.toLocaleString()} scanned` : undefined}
+                          >
+                            {(t?.withOurs ?? 0).toLocaleString()}
+                            {pct !== null && <span className="text-[10px] text-zinc-600"> {pct}%</span>}
+                          </td>
+                        )
+                      })}
+                    </tr>,
+                    <tr key="tiktok-own">
+                      <td
+                        className="text-zinc-500 pl-4 pr-3 py-1 whitespace-nowrap text-[11px]"
+                        title="Of those links, how many carry a comment of ours posted by the TikTok account of a worker who was served that link (matched by the @handle in their profile)."
+                      >
+                        ↳ with the worker&apos;s own comment
+                      </td>
+                      {days.map((d) => {
+                        const t = tiktokByDay.get(d.day)
+                        const pct = t && t.unique > 0 ? Math.round((t.withOwn / t.unique) * 100) : null
+                        return (
+                          <td
+                            key={d.day}
+                            className="text-zinc-400 px-2 py-1 border-l border-t border-zinc-800 text-center tabular-nums"
+                          >
+                            {ownCell(t?.withOwn ?? 0, null, d.day)}
+                            {pct !== null && <span className="text-[10px] text-zinc-600"> {pct}%</span>}
+                          </td>
+                        )
+                      })}
+                    </tr>,
+                  ]
+            )}
           </tbody>
         </table>
+      </div>
+      {open && (
+        <DayLinksModal product={open.product} day={open.day} own={!!open.own} onClose={() => setOpen(null)} />
+      )}
+    </div>
+  )
+}
+
+/** "3:41 PM (12 min ago)" — a time, and how long ago it was. */
+function whenAgo(iso: string | null): string {
+  if (!iso) return 'never'
+  const d = new Date(iso)
+  const mins = Math.max(0, Math.round((Date.now() - d.getTime()) / 60000))
+  const ago =
+    mins < 1 ? 'just now' : mins < 60 ? `${mins} min ago` : mins < 48 * 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m ago` : `${Math.floor(mins / 1440)} days ago`
+  const sameDay = d.toDateString() === new Date().toDateString()
+  const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+  return `${sameDay ? time : `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${time}`} (${ago})`
+}
+
+/** When the automatic comment reads last ran: the "with ours" rows are only as
+ *  fresh as these. */
+function AutoUpdateLine({
+  t,
+}: {
+  t: {
+    servedCheckAt: string | null
+    servedUpTo: string | null
+    servedRunning: boolean
+    cycleStartedAt: string | null
+    cycleFinishedAt: string | null
+  }
+}) {
+  return (
+    <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-zinc-500 mb-2">
+      <span
+        title={
+          t.servedUpTo
+            ? `Reads the TikTok links served since the previous check. Links clicked up to ${new Date(t.servedUpTo).toLocaleString()} are covered.`
+            : 'Reads the TikTok links served since the previous check.'
+        }
+      >
+        🔄 30-min comment check:{' '}
+        <span className="text-zinc-300">{whenAgo(t.servedCheckAt)}</span>
+        {t.servedRunning && <span className="text-amber-300"> · running now</span>}
+      </span>
+      <span title="Harvest new videos, categorise and recluster the pool.">
+        ⏱ 6-hour cycle:{' '}
+        {t.cycleFinishedAt ? (
+          <span className="text-zinc-300">{whenAgo(t.cycleFinishedAt)}</span>
+        ) : (
+          <>
+            <span className="text-amber-300">running</span>
+            {t.cycleStartedAt && <> · started {whenAgo(t.cycleStartedAt)}</>}
+          </>
+        )}
+      </span>
+    </div>
+  )
+}
+
+/** The links one worker clicked on one platform since their reset, beside the
+ *  comment count they reported for it — a scrollable modal. */
+function UserPlatformLinksModal({
+  userId,
+  name,
+  platform,
+  label,
+  commented,
+  samples,
+  onClose,
+}: {
+  userId: string
+  name: string
+  platform: string
+  label: string
+  commented: number
+  samples: string[]
+  onClose: () => void
+}) {
+  const [rows, setRows] = useState<
+    { url: string; clicks: number; first: string; last: string; product: string | null }[] | null
+  >(null)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    const q = new URLSearchParams({ user: userId, platform })
+    fetch(`/api/admin/user-links?${q}`, { cache: 'no-store' })
+      .then(async (r) => {
+        const d = await r.json().catch(() => ({}))
+        if (!r.ok) throw new Error(d?.error || `HTTP ${r.status}`)
+        setRows(d.links ?? [])
+      })
+      .catch((e) => setError(String(e?.message ?? e)))
+  }, [userId, platform])
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const sampleSet = new Set(samples)
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={onClose}>
+      <div
+        className="w-full max-w-3xl max-h-[85vh] flex flex-col rounded-xl border border-zinc-700 bg-zinc-950"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-baseline justify-between gap-3 border-b border-zinc-800 px-4 py-3">
+          <div>
+            <div className="text-sm font-semibold text-white">
+              {name} · {label} links clicked
+            </div>
+            <div className="text-[11px] text-zinc-500">
+              since their reset · {commented.toLocaleString()} comment(s) reported
+              {rows && <> · {rows.length.toLocaleString()} distinct link(s) clicked</>}
+              {rows && commented > rows.length && (
+                <span className="text-amber-300"> · more comments reported than links clicked</span>
+              )}
+            </div>
+          </div>
+          <button type="button" onClick={onClose} className="text-zinc-400 hover:text-white text-lg leading-none">
+            ×
+          </button>
+        </div>
+        <div className="overflow-y-auto px-4 py-2">
+          {error && <p className="text-xs text-red-300">{error}</p>}
+          {!rows && !error && <p className="text-xs text-zinc-500">Loading…</p>}
+          {rows && rows.length === 0 && <p className="text-xs text-zinc-500">No links clicked.</p>}
+          {rows && rows.length > 0 && (
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 bg-zinc-950">
+                <tr className="text-[11px] text-zinc-500">
+                  <th className="text-left font-medium py-1">Link</th>
+                  <th className="text-left font-medium py-1 px-2">Product</th>
+                  <th className="text-right font-medium py-1 px-2">Clicks</th>
+                  <th className="text-right font-medium py-1">Last clicked</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.url} className="border-t border-zinc-900">
+                    <td className="py-1 pr-2 max-w-0 w-full">
+                      <a
+                        href={r.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="block truncate text-sky-300 hover:underline"
+                        title={r.url}
+                      >
+                        {sampleSet.has(r.url) && <span className="text-emerald-400" title="One of their reported samples">★ </span>}
+                        {r.url.replace(/^https?:\/\/(www\.)?/, '')}
+                      </a>
+                    </td>
+                    <td className="py-1 px-2 whitespace-nowrap text-zinc-400">{r.product ?? '—'}</td>
+                    <td className="py-1 px-2 text-right tabular-nums text-zinc-300">{r.clicks}</td>
+                    <td className="py-1 text-right whitespace-nowrap text-zinc-500">
+                      {new Date(r.last).toLocaleString(undefined, {
+                        month: 'short',
+                        day: 'numeric',
+                        hour: 'numeric',
+                        minute: '2-digit',
+                      })}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {samples.length > 0 && (
+            <div className="mt-3 border-t border-zinc-800 pt-2">
+              <div className="text-[11px] text-zinc-500 mb-1">Sample links they reported</div>
+              {samples.map((s) => (
+                <a key={s} href={s} target="_blank" rel="noreferrer" className="block truncate text-xs text-emerald-300 hover:underline">
+                  {s}
+                </a>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** The links clicked for one product on one day, in a scrollable modal. */
+function DayLinksModal({
+  product,
+  day,
+  own = false,
+  onClose,
+}: {
+  /** null with `own`: the TikTok platform row, every product. */
+  product: string | null
+  day: string
+  /** Only the TikTok links carrying the served worker's own comment. */
+  own?: boolean
+  onClose: () => void
+}) {
+  const [rows, setRows] = useState<
+    { url: string; platform: string | null; clicks: number; last: string; ours: number | null; handles?: string[] }[] | null
+  >(null)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    const q = new URLSearchParams({ day })
+    if (product) q.set('product', product)
+    if (own) q.set('own', '1')
+    fetch(`/api/admin/day-links?${q}`, { cache: 'no-store' })
+      .then(async (r) => {
+        const d = await r.json().catch(() => ({}))
+        if (!r.ok) throw new Error(d?.error || `HTTP ${r.status}`)
+        setRows(d.links ?? [])
+      })
+      .catch((e) => setError(String(e?.message ?? e)))
+  }, [day, product, own])
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const clicks = rows?.reduce((n, r) => n + r.clicks, 0) ?? 0
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={onClose}>
+      <div
+        className="w-full max-w-3xl max-h-[85vh] flex flex-col rounded-xl border border-zinc-700 bg-zinc-950"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-baseline justify-between gap-3 border-b border-zinc-800 px-4 py-3">
+          <div>
+            <div className="text-sm font-semibold text-white">
+              <span className="capitalize">{product ?? 'TikTok'}</span> · {day}
+              {own && <span className="text-zinc-400 font-normal"> · with the worker&apos;s own comment</span>}
+            </div>
+            {rows && (
+              <div className="text-[11px] text-zinc-500">
+                {rows.length.toLocaleString()} link(s) · {clicks.toLocaleString()} click(s)
+              </div>
+            )}
+          </div>
+          <button type="button" onClick={onClose} className="text-zinc-400 hover:text-white text-lg leading-none">
+            ×
+          </button>
+        </div>
+        <div className="overflow-y-auto px-4 py-2">
+          {error && <p className="text-xs text-red-300">{error}</p>}
+          {!rows && !error && <p className="text-xs text-zinc-500">Loading…</p>}
+          {rows && rows.length === 0 && <p className="text-xs text-zinc-500">No links.</p>}
+          {rows && rows.length > 0 && (
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 bg-zinc-950">
+                <tr className="text-[11px] text-zinc-500">
+                  <th className="text-left font-medium py-1">Link</th>
+                  {own && (
+                    <th className="text-left font-medium py-1 px-2" title="The worker account(s) whose comment was found">
+                      Worker
+                    </th>
+                  )}
+                  <th className="text-right font-medium py-1 px-2">Clicks</th>
+                  <th className="text-right font-medium py-1" title="Our comments the scan found on the video">
+                    Ours
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.url} className="border-t border-zinc-900">
+                    <td className="py-1 pr-2 max-w-0 w-full">
+                      <a
+                        href={r.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="block truncate text-sky-300 hover:underline"
+                        title={r.url}
+                      >
+                        {r.url.replace(/^https?:\/\/(www\.)?/, '')}
+                      </a>
+                    </td>
+                    {own && (
+                      <td className="py-1 px-2 whitespace-nowrap text-zinc-300">
+                        {(r.handles ?? []).map((h) => `@${h}`).join(', ')}
+                      </td>
+                    )}
+                    <td className="py-1 px-2 text-right tabular-nums text-zinc-300">{r.clicks}</td>
+                    <td
+                      className={`py-1 text-right tabular-nums ${
+                        r.ours === null ? 'text-zinc-600' : r.ours > 0 ? 'text-emerald-300' : 'text-zinc-400'
+                      }`}
+                      title={r.ours === null ? 'never scanned' : undefined}
+                    >
+                      {r.ours === null ? '—' : r.ours}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
       </div>
     </div>
   )
@@ -5170,14 +5688,19 @@ function DayTable({
   title,
   rows,
   payRate,
+  pay: payGiven,
+  payTitle,
 }: {
   title: string
   rows: { day: string; count: number }[]
   payRate?: number
+  /** The pay itself, when one rate does not cover it (comments: Reddit pays more). */
+  pay?: number
+  payTitle?: string
 }) {
   if (rows.length === 0) return <div className="text-xs text-zinc-600">None</div>
   const total = rows.reduce((s, r) => s + r.count, 0)
-  const pay = payRate != null ? total * payRate : null
+  const pay = payGiven != null ? payGiven : payRate != null ? total * payRate : null
   // Over the days that HAVE a row, which is what the table shows. Days with
   // nothing on them are not in `rows`, so this is the rate on the days they
   // worked — the row chips carry the other rate, over every day since the reset.
@@ -5228,7 +5751,7 @@ function DayTable({
             {pay != null && (
               <td
                 className="text-emerald-300 px-2 py-1 border-l-2 border-t border-zinc-700 text-center tabular-nums font-semibold"
-                title={`${total} comments × ${payRate}`}
+                title={payTitle || `${total} comments × ${payRate}`}
               >
                 {fmtBirr(pay)}
               </td>

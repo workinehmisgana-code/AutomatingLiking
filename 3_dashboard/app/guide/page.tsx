@@ -13,6 +13,7 @@ import {
 } from '@/lib/db'
 import {
   COMMENT_PAY_RATE,
+  commentPayRate,
   VIDEO_PAYMENT_BIRR,
   PROMO_PAY_BIRR,
   PROMO_DAILY_LIMIT_PER_PLATFORM,
@@ -63,6 +64,7 @@ export default async function GuidePage() {
     <Guide
       linksPerPage={HOURLY_LINK_LIMIT}
       commentRate={COMMENT_PAY_RATE}
+      redditRate={commentPayRate('reddit')}
       videoBirr={VIDEO_PAYMENT_BIRR}
       promoBirr={PROMO_PAY_BIRR}
       promoPerPlatform={PROMO_DAILY_LIMIT_PER_PLATFORM}

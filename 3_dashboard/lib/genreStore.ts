@@ -104,6 +104,7 @@ export async function saveExtraProduct(
     genre: String(input.genre ?? '').trim(),
     site: String(input.site ?? '').trim().replace(/^https?:\/\//, '').replace(/\/+$/, ''),
     words: String(input.words ?? '').trim().toLowerCase().replace(/\s+/g, ' '),
+    note: String(input.note ?? '').trim(),
     seeds: (Array.isArray(input.seeds) ? input.seeds : [])
       .map((t) => String(t).trim())
       .filter(Boolean),

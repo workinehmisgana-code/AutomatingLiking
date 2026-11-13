@@ -452,7 +452,7 @@ export function validateAllProfileLinks(links: {
 
 // Platforms users report commented-video counts and screenshots for.
 // Reddit included: workers comment on Reddit posts, report them on the Finish
-// form and are paid the same COMMENT_PAY_RATE as on every other platform.
+// form and are paid COMMENT_PAY_RATE_BY_PLATFORM.reddit (2 birr) a comment.
 export const COMMENT_PLATFORMS = ['tiktok', 'youtube_shorts', 'youtube_videos', 'instagram', 'reddit'] as const
 
 /** The most comments one Finish submission may report, per platform. The
@@ -524,7 +524,8 @@ export const PRODUCTS: string[] = [
   'prohumanly',
   'humlexic',
   'kinprose',
-  'tintfolio',
+  // tintfolio was a humanizer here; it now lives in the Study helper genre,
+  // which is saved from Admin → Genres (scripts/move-tintfolio-to-study.ts).
   // Not humanizers. See GENRES below — these two advertise different things to
   // different people, and almost nothing about a humanizer comment transfers.
   'cocodly',
@@ -576,7 +577,6 @@ export const PRODUCT_GENRE: Record<string, Genre> = {
   prohumanly: 'humanizer',
   humlexic: 'humanizer',
   kinprose: 'humanizer',
-  tintfolio: 'humanizer',
   cocodly: 'website',
   pptera: 'slides',
 }
@@ -836,6 +836,23 @@ const BUILTIN_PRODUCT_WORDS: Record<string, string> = { ...PRODUCT_WORDS }
  * cohumanly). Set by the genre registry (Admin → Genres); empty puts back the
  * built-in spelling, or the bare name when there is none.
  */
+/**
+ * HOW TO TALK ABOUT A PRODUCT, per added product (Admin → Genres): an extra
+ * instruction to the comment writer that overrides the genre's usual message —
+ * e.g. write about "co humanizer" as the idea of a kind of tool rather than as
+ * a brand somebody recommends. Filled from the stored list like PRODUCT_WORDS.
+ */
+const PRODUCT_NOTES: Record<string, string> = {}
+
+export function setProductNote(product: string, note?: string | null): void {
+  if (note && note.trim()) PRODUCT_NOTES[product] = note.trim()
+  else delete PRODUCT_NOTES[product]
+}
+
+export function productNote(product: string): string {
+  return PRODUCT_NOTES[product] ?? ''
+}
+
 export function setProductWords(product: string, words?: string | null): void {
   if (words) PRODUCT_WORDS[product] = words
   else if (BUILTIN_PRODUCT_WORDS[product]) PRODUCT_WORDS[product] = BUILTIN_PRODUCT_WORDS[product]
@@ -1201,8 +1218,29 @@ export const ETHIOPIAN_BANKS: readonly string[] = [
 export const VIDEO_PAYMENT_BIRR = 150
 
 // Birr paid per comment a user makes. Total owed for comments =
-// (total comments since last reset) x COMMENT_PAY_RATE.
+// Σ (comments reported per platform since last reset) x that platform's rate.
+// COMMENT_PAY_RATE is the rate for every platform not listed below — and for
+// 'adjustment' rows, which the admin's pay edit writes in units of this rate.
 export const COMMENT_PAY_RATE = 0.5
+
+/** Platforms whose comments pay differently from COMMENT_PAY_RATE. */
+export const COMMENT_PAY_RATE_BY_PLATFORM: Record<string, number> = {
+  reddit: 2,
+}
+
+/** Birr for one comment reported on `platform`. */
+export function commentPayRate(platform: string | null | undefined): number {
+  return COMMENT_PAY_RATE_BY_PLATFORM[platform ?? ''] ?? COMMENT_PAY_RATE
+}
+
+/** The same rate as a SQL expression over a platform column — so a SUM can
+ *  weigh each commented_submission row by what it pays. */
+export function commentPayRateSql(col: string): string {
+  const whens = Object.entries(COMMENT_PAY_RATE_BY_PLATFORM)
+    .map(([p, r]) => `WHEN '${p.replace(/'/g, "''")}' THEN ${Number(r)}`)
+    .join(' ')
+  return whens ? `(CASE ${col} ${whens} ELSE ${Number(COMMENT_PAY_RATE)} END)` : String(COMMENT_PAY_RATE)
+}
 
 // ── Referrals ────────────────────────────────────────────────────────────────
 // Every user has a referral username. Somebody entering it when they register
@@ -1220,7 +1258,9 @@ export const COMMENT_PAY_RATE = 0.5
 // afterwards.
 export const REFERRAL_SHARE = 0.2
 
-/** Birr a referrer earns per comment made by somebody they referred. */
+/** Birr a referrer earns per comment made by somebody they referred, at the
+ *  base rate. A Reddit comment earns REFERRAL_SHARE of ITS rate; the sums in
+ *  db.ts weigh each row by platform. */
 export const REFERRAL_PAY_RATE = COMMENT_PAY_RATE * REFERRAL_SHARE
 
 // How often the click-to-copy comments are re-shuffled (order only) so users

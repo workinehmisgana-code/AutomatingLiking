@@ -16,11 +16,13 @@ import {
   PRODUCT_GENRE,
   REFERRAL_SHARE,
   REFERRAL_PAY_RATE,
+  commentPayRate,
 } from '@/lib/config'
 
 /** What a referrer gets, as the dashboard says it: a percentage and a rate. */
 const REFERRAL_PCT = Math.round(REFERRAL_SHARE * 100)
 const REFERRAL_RATE = REFERRAL_PAY_RATE
+const REFERRAL_REDDIT_RATE = commentPayRate('reddit') * REFERRAL_SHARE
 import { pickDimension, seedFrom } from '@/lib/clusterMix'
 import { interleaveByWeight } from '@/lib/userFeed'
 import FinishButton from '@/components/FinishButton'
@@ -1191,7 +1193,15 @@ export default function Dashboard({
             </>
           )}
           {([
-            { label: 'Comments', t: pendingPay.comments, note: `${pendingPay.comments.count} unpaid` },
+            {
+              label: 'Comments',
+              t: pendingPay.comments,
+              note:
+                `${pendingPay.comments.count} unpaid` +
+                (pendingPay.comments.reddit
+                  ? ` — ${pendingPay.comments.reddit} of them on Reddit, at ${commentPayRate('reddit')} birr each`
+                  : ''),
+            },
             { label: 'Video', t: pendingPay.video, note: `${pendingPay.video.count} unpaid` },
             { label: 'Repost', t: pendingPay.promo, note: `${pendingPay.promo.count} unpaid` },
             {
@@ -1267,7 +1277,8 @@ export default function Dashboard({
           </div>
           <p className="text-xs text-zinc-500 mt-1 max-w-md">
             Anyone who enters this when they register earns you {REFERRAL_PCT}% of their comment
-            pay — {fmtBirr(REFERRAL_RATE)} birr for every comment they make. We pay it; nothing is
+            pay — {fmtBirr(REFERRAL_RATE)} birr for every comment they make, and{' '}
+            {fmtBirr(REFERRAL_REDDIT_RATE)} for every Reddit comment. We pay it; nothing is
             taken off them. They can only enter it while registering.
           </p>
         </div>
@@ -1309,10 +1320,10 @@ export default function Dashboard({
               </span>
               <span className="w-24 text-right tabular-nums text-zinc-400">{m.comments}</span>
               <span className="w-24 text-right tabular-nums text-emerald-300">
-                {fmtBirr(m.comments * REFERRAL_RATE)}
+                {fmtBirr(m.birr)}
               </span>
               <span className="w-24 text-right tabular-nums text-zinc-400">
-                {fmtBirr(m.lifetimeComments * REFERRAL_RATE)}
+                {fmtBirr(m.lifetimeBirr)}
               </span>
             </div>
           ))}

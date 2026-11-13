@@ -28,6 +28,8 @@ import {
   type TopListSetting,
   COMMENT_PAY_RATE,
   REFERRAL_PAY_RATE,
+  REFERRAL_SHARE,
+  commentPayRateSql,
   VIDEO_PAYMENT_BIRR,
   PROMO_PAY_BIRR,
   ACCOUNT_PAY_BIRR,
@@ -57,6 +59,7 @@ import {
   DEFAULT_COMMENT_STYLE,
   OUR_RATIO_RETIRE_DEFAULT,
   genreOfProduct,
+  genreOfRow,
   clampOurRatioPct,
   genreWeights,
   withoutGenres,
@@ -3456,6 +3459,168 @@ export async function ourRatioRetiredSet(
   return out
 }
 
+// ── A PRODUCT KEPT FOR THE LINKS NOBODY'S COMMENT STUCK ON ──────────────────
+//
+// Plenty of links have been opened by many workers and still carry none of our
+// comments when scanned: whatever was posted there did not stay. Those links
+// are usually RETIRED already (the click quota is 5+ users on TikTok), so they
+// would never be served again.
+//
+// This rule hands them to one product (cohumanizer, as first set up):
+//   • a link opened by MORE THAN `minUsers` workers (not counting this
+//     product's own clicks), with NONE of our other products' comments found on
+//     it — and, with `requireScanned`, only links the comment scan has actually
+//     read, since an unscanned link might carry ten of ours,
+//   • comes BACK into the feeds despite CLICK retirement, and is served this
+//     product only, whatever product leads it,
+//   • until our comments crowd it (the ratio rule, getOurRatioRetirePct) — the
+//     only thing that retires a TikTok link. How often it has been served does
+//     not end it.
+// With `reserved`, the product is served on these links ONLY.
+
+export interface ReviveRule {
+  enabled: boolean
+  product: string
+  /** More than this many workers must have opened the link. */
+  minUsers: number
+  /** Only links the comment scan has read (and found none of ours on). */
+  requireScanned: boolean
+  /** Serve the product on these links only. */
+  reserved: boolean
+}
+
+export const DEFAULT_REVIVE_RULE: ReviveRule = {
+  enabled: false,
+  product: 'cohumanizer',
+  minUsers: 5,
+  requireScanned: true,
+  reserved: true,
+}
+
+const REVIVE_KEY = 'revive_product_rule'
+
+export function clampReviveRule(v: unknown): ReviveRule {
+  const o = (v && typeof v === 'object' ? v : {}) as Partial<Record<keyof ReviveRule, unknown>>
+  const int = (x: unknown, d: number, lo: number, hi: number) => {
+    const n = Math.round(Number(x))
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d
+  }
+  const d = DEFAULT_REVIVE_RULE
+  return {
+    enabled: o.enabled === undefined ? d.enabled : o.enabled === true,
+    product: typeof o.product === 'string' && o.product.trim() ? o.product.trim().toLowerCase() : d.product,
+    minUsers: int(o.minUsers, d.minUsers, 0, 1000),
+    requireScanned: o.requireScanned === undefined ? d.requireScanned : o.requireScanned === true,
+    reserved: o.reserved === undefined ? d.reserved : o.reserved === true,
+  }
+}
+
+export function getReviveRule(): Promise<ReviveRule> {
+  return cached('revive:rule', TTL.blocked, async () => {
+    const raw = await getAppState(REVIVE_KEY).catch(() => null)
+    if (!raw) return { ...DEFAULT_REVIVE_RULE }
+    try {
+      return clampReviveRule(JSON.parse(raw))
+    } catch {
+      return { ...DEFAULT_REVIVE_RULE }
+    }
+  })
+}
+
+export async function setReviveRule(v: unknown): Promise<ReviveRule> {
+  const rule = clampReviveRule(v)
+  if (rule.enabled && !isProduct(rule.product)) throw new Error(`"${rule.product}" is not a product.`)
+  await setAppState(REVIVE_KEY, JSON.stringify(rule))
+  invalidate('revive:')
+  return rule
+}
+
+/**
+ * Every link the rule covers right now, whatever its platform or genre (those
+ * are checked against the pool in reviveSet). About two seconds over the whole
+ * click table, so it is cached for twice the pool's TTL.
+ */
+export function getReviveUrls(rule: ReviveRule): Promise<Set<string>> {
+  const key = `revive:urls:${rule.product}:${rule.minUsers}:${rule.requireScanned}`
+  return cached(key, TTL.pool * 2, async () => {
+    await ensureClickedTable()
+    // UNIQUE (user_id, url) on clicked_link: a row is a distinct worker.
+    const { rows } = await pool.query<{ url: string }>(
+      `SELECT url FROM (
+         SELECT url,
+                count(*) FILTER (WHERE product IS DISTINCT FROM $1) AS others
+           FROM clicked_link GROUP BY url) c
+        WHERE c.others > $2
+          AND NOT EXISTS (SELECT 1 FROM link_product_comment p WHERE p.url = c.url AND p.product <> $1)
+          AND ($3::boolean = false OR EXISTS (SELECT 1 FROM link_comment_scan s WHERE s.url = c.url))`,
+      [rule.product, rule.minUsers, rule.requireScanned]
+    )
+    return new Set(rows.map((r) => r.url))
+  })
+}
+
+/**
+ * The pool's links the rule brings back, for the feeds to take OUT of their
+ * retired set. Only links the product can actually be served on: its genre,
+ * and a platform where it is active — otherwise a worker would be handed a
+ * revived link with no comment for it.
+ */
+export async function reviveSet(
+  videos: { url?: unknown; platform?: unknown; genre?: unknown }[]
+): Promise<Set<string>> {
+  const rule = await getReviveRule()
+  const out = new Set<string>()
+  if (!rule.enabled || !isProduct(rule.product)) return out
+  const hit = await getReviveUrls(rule)
+  if (hit.size === 0) return out
+  const genre = genreOfProduct(rule.product)
+  // OUR COMMENTS STILL RETIRE IT: a revived link that the product's own
+  // comments now crowd stays retired, so this never undoes the ratio rule.
+  const pct = await getOurRatioRetirePct().catch(() => 0)
+  const crowded = new Set(pct > 0 ? await getOurRatioRetiredUrls(pct).catch(() => [] as string[]) : [])
+  const okPlatform = new Map<string, boolean>()
+  for (const v of videos) {
+    const url = String(v.url ?? '')
+    if (!url || !hit.has(url) || crowded.has(url) || genreOfRow(v) !== genre) continue
+    const p = String(v.platform ?? '')
+    if (!okPlatform.has(p)) {
+      okPlatform.set(p, (await activeProductsForPlatform(p).catch(() => [] as string[])).includes(rule.product))
+    }
+    if (okPlatform.get(p)) out.add(url)
+  }
+  return out
+}
+
+/**
+ * Narrow the products that may be served on `url` by the rule: only the rule's
+ * product on a covered link, and (when reserved) everything but it elsewhere.
+ * Idempotent, so it is safe to apply twice on one request.
+ */
+export async function applyReviveRule(url: string, products: readonly string[]): Promise<string[]> {
+  const list = [...products]
+  const rule = await getReviveRule().catch(() => null)
+  if (!rule?.enabled || !list.includes(rule.product)) return list
+  const hit = await getReviveUrls(rule).catch(() => new Set<string>())
+  if (hit.has(url)) return [rule.product]
+  return rule.reserved ? list.filter((p) => p !== rule.product) : list
+}
+
+/**
+ * The distinct TikTok links clicked (served to a worker and opened) in
+ * [from, to), for the automatic cycle's extract stage. Sorted, so the stage's
+ * cursor walks the same list on every tick.
+ */
+export async function getServedTiktokUrls(from: Date, to: Date): Promise<string[]> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ url: string }>(
+    `SELECT DISTINCT url FROM clicked_link
+      WHERE platform = 'tiktok' AND clicked_at >= $1 AND clicked_at < $2
+      ORDER BY url`,
+    [from, to]
+  )
+  return rows.map((r) => r.url)
+}
+
 export function getUrlsWithProductComments(): Promise<string[]> {
   // Cached: see lib/poolCache. This is a whole-table read and it used to
   // run on every request that touched the link pool.
@@ -5438,8 +5603,11 @@ function hashUrl(url: string): number {
  */
 export async function pickFairProductForUrl(
   url: string,
-  products: readonly string[]
+  candidates: readonly string[]
 ): Promise<string | null> {
+  // The revive rule first (see ReviveRule): a covered link goes to its product
+  // whatever leads it, and a reserved product stays off every other link.
+  const products = await applyReviveRule(url, candidates).catch(() => [...candidates])
   if (products.length === 0) return null
 
   // Ordered, so the hash maps a URL to the same product on every call. The
@@ -8016,6 +8184,10 @@ export interface ReferredMember {
   comments: number
   /** Every comment they have ever been credited for. */
   lifetimeComments: number
+  /** Commission on `comments` — REFERRAL_SHARE of what they were paid, so a
+   *  Reddit comment (2 birr) earns more than a TikTok one. */
+  birr: number
+  lifetimeBirr: number
 }
 
 export interface ReferralEarnings {
@@ -8065,6 +8237,8 @@ export async function getReferralEarnings(userId: string): Promise<ReferralEarni
       created_at: Date
       n: string | null
       lifetime: string | null
+      pay: number | null
+      lifetime_pay: number | null
     }>(
       `SELECT r.user_id,
               p.name,
@@ -8091,6 +8265,11 @@ export async function getReferralEarnings(userId: string): Promise<ReferralEarni
                         $2::timestamptz,
                         COALESCE(rpm.paid_at, $2::timestamptz))
               ), 0) AS n,
+              COALESCE(SUM(cs.count * ${commentPayRateSql('cs.platform')}) FILTER (
+                WHERE cs.submitted_at >= GREATEST(
+                        $2::timestamptz,
+                        COALESCE(rpm.paid_at, $2::timestamptz))
+              ), 0)::float8 AS pay,
               -- "in total", which is what the dashboard calls it: everything
               -- since the global reset, paid or not. Floored by the member's
               -- reset it was not a total of anything — a worker watched their
@@ -8098,7 +8277,10 @@ export async function getReferralEarnings(userId: string): Promise<ReferralEarni
               -- reset.
               COALESCE(SUM(cs.count) FILTER (
                 WHERE cs.submitted_at >= $2::timestamptz
-              ), 0) AS lifetime
+              ), 0) AS lifetime,
+              COALESCE(SUM(cs.count * ${commentPayRateSql('cs.platform')}) FILTER (
+                WHERE cs.submitted_at >= $2::timestamptz
+              ), 0)::float8 AS lifetime_pay
          FROM referral r
          LEFT JOIN user_profile p          ON p.user_id  = r.user_id
          LEFT JOIN commented_submission cs ON cs.user_id = r.user_id
@@ -8116,6 +8298,8 @@ export async function getReferralEarnings(userId: string): Promise<ReferralEarni
     joinedAt: new Date(r.created_at).toISOString(),
     comments: Number(r.n ?? 0),
     lifetimeComments: Number(r.lifetime ?? 0),
+    birr: Number(r.pay ?? 0) * REFERRAL_SHARE,
+    lifetimeBirr: Number(r.lifetime_pay ?? 0) * REFERRAL_SHARE,
   }))
   const comments = members.reduce((a, m) => a + m.comments, 0)
   const lifetimeComments = members.reduce((a, m) => a + m.lifetimeComments, 0)
@@ -8123,9 +8307,9 @@ export async function getReferralEarnings(userId: string): Promise<ReferralEarni
     code: codeRes.rows[0]?.referral_code ?? null,
     people: members.length,
     comments,
-    birr: comments * REFERRAL_PAY_RATE,
+    birr: members.reduce((a, m) => a + m.birr, 0),
     lifetimeComments,
-    lifetimeBirr: lifetimeComments * REFERRAL_PAY_RATE,
+    lifetimeBirr: members.reduce((a, m) => a + m.lifetimeBirr, 0),
     members,
   }
 }
@@ -8142,6 +8326,8 @@ export async function getAllReferralEarnings(): Promise<Record<string, ReferralE
     created_at: Date
     n: string | null
     lifetime: string | null
+    pay: number | null
+    lifetime_pay: number | null
   }>(
     `SELECT r.referrer_id,
             rp.referral_code AS referrer_code,
@@ -8158,7 +8344,15 @@ export async function getAllReferralEarnings(): Promise<Record<string, ReferralE
             ), 0) AS n,
             COALESCE(SUM(cs.count) FILTER (
               WHERE cs.submitted_at >= $1::timestamptz
-            ), 0) AS lifetime
+            ), 0) AS lifetime,
+            COALESCE(SUM(cs.count * ${commentPayRateSql('cs.platform')}) FILTER (
+              WHERE cs.submitted_at >= GREATEST(
+                      $1::timestamptz,
+                      COALESCE(rpm.paid_at, $1::timestamptz))
+            ), 0)::float8 AS pay,
+            COALESCE(SUM(cs.count * ${commentPayRateSql('cs.platform')}) FILTER (
+              WHERE cs.submitted_at >= $1::timestamptz
+            ), 0)::float8 AS lifetime_pay
        FROM referral r
        LEFT JOIN user_profile p          ON p.user_id  = r.user_id
        LEFT JOIN user_profile rp         ON rp.user_id = r.referrer_id
@@ -8186,14 +8380,14 @@ export async function getAllReferralEarnings(): Promise<Record<string, ReferralE
       joinedAt: new Date(r.created_at).toISOString(),
       comments: Number(r.n ?? 0),
       lifetimeComments: Number(r.lifetime ?? 0),
+      birr: Number(r.pay ?? 0) * REFERRAL_SHARE,
+      lifetimeBirr: Number(r.lifetime_pay ?? 0) * REFERRAL_SHARE,
     })
     e.people++
     e.comments += Number(r.n ?? 0)
     e.lifetimeComments += Number(r.lifetime ?? 0)
-  }
-  for (const e of Object.values(out)) {
-    e.birr = e.comments * REFERRAL_PAY_RATE
-    e.lifetimeBirr = e.lifetimeComments * REFERRAL_PAY_RATE
+    e.birr += Number(r.pay ?? 0) * REFERRAL_SHARE
+    e.lifetimeBirr += Number(r.lifetime_pay ?? 0) * REFERRAL_SHARE
   }
   return out
 }
@@ -8202,6 +8396,8 @@ export async function getAllReferralEarnings(): Promise<Record<string, ReferralE
 export interface PendingTask {
   count: number
   birr: number
+  /** Comments only: how many of `count` were on Reddit (paid at its own rate). */
+  reddit?: number
 }
 export interface PendingPayments {
   comments: PendingTask
@@ -8244,8 +8440,10 @@ export async function getUserPendingPayments(userId: string): Promise<PendingPay
   const [commentedRes, videoRes, promoRes, accountRes, statusRes, referralRes] = await Promise.all([
     // Comment pay: counts comments after the effective reset AND after the last
     // time the admin marked this user's comment pay as paid.
-    pool.query<{ n: number }>(
-      `SELECT COALESCE(SUM(cs.count), 0)::float8 AS n
+    pool.query<{ n: number; pay: number; reddit: number }>(
+      `SELECT COALESCE(SUM(cs.count), 0)::float8 AS n,
+              COALESCE(SUM(cs.count * ${commentPayRateSql('cs.platform')}), 0)::float8 AS pay,
+              COALESCE(SUM(cs.count) FILTER (WHERE cs.platform = 'reddit'), 0)::float8 AS reddit
          FROM commented_submission cs
          LEFT JOIN user_reset ur ON ur.user_id = cs.user_id
          LEFT JOIN comment_pay_marker cpm ON cpm.user_id = cs.user_id
@@ -8288,7 +8486,11 @@ export async function getUserPendingPayments(userId: string): Promise<PendingPay
   const promoCount = promoRes.rows[0]?.n ?? 0
   const accountCount = accountRes.rows[0]?.ok ?? 0
   const awaitingCount = accountRes.rows[0]?.waiting ?? 0
-  const comments: PendingTask = { count: commentsCount, birr: commentsCount * COMMENT_PAY_RATE }
+  const comments: PendingTask = {
+    count: commentsCount,
+    birr: commentedRes.rows[0]?.pay ?? 0,
+    reddit: commentedRes.rows[0]?.reddit ?? 0,
+  }
   const video: PendingTask = { count: videoCount, birr: videoCount * VIDEO_PAYMENT_BIRR }
   const promo: PendingTask = { count: promoCount, birr: promoCount * PROMO_PAY_BIRR }
   const accounts: PendingTask = { count: accountCount, birr: accountCount * ACCOUNT_PAY_BIRR }
@@ -9078,8 +9280,10 @@ export async function getAllPendingPay(): Promise<Record<string, PendingPayments
   await Promise.all([ensureAdminTables(), ensurePromoTables()])
   const resetAt = await getResetAt()
   const [commented, video, promo, accounts, status, referrals] = await Promise.all([
-    pool.query<{ user_id: string; n: number }>(
-      `SELECT cs.user_id, COALESCE(SUM(cs.count), 0)::float8 AS n
+    pool.query<{ user_id: string; n: number; pay: number; reddit: number }>(
+      `SELECT cs.user_id, COALESCE(SUM(cs.count), 0)::float8 AS n,
+              COALESCE(SUM(cs.count * ${commentPayRateSql('cs.platform')}), 0)::float8 AS pay,
+              COALESCE(SUM(cs.count) FILTER (WHERE cs.platform = 'reddit'), 0)::float8 AS reddit
          FROM commented_submission cs
          LEFT JOIN user_reset ur ON ur.user_id = cs.user_id
          LEFT JOIN comment_pay_marker cpm ON cpm.user_id = cs.user_id
@@ -9126,7 +9330,7 @@ export async function getAllPendingPay(): Promise<Record<string, PendingPayments
       approvedBirr: 0,
       unapprovedBirr: 0,
     })
-  for (const r of commented.rows) ensure(r.user_id).comments = { count: r.n, birr: r.n * COMMENT_PAY_RATE }
+  for (const r of commented.rows) ensure(r.user_id).comments = { count: r.n, birr: r.pay, reddit: r.reddit }
   for (const r of video.rows) ensure(r.user_id).video = { count: r.n, birr: r.n * VIDEO_PAYMENT_BIRR }
   for (const r of promo.rows) ensure(r.user_id).promo = { count: r.n, birr: r.n * PROMO_PAY_BIRR }
   for (const r of accounts.rows) {
@@ -9780,6 +9984,214 @@ export interface AdminData {
    *  from the product split: one says which product is advertised, the
    *  other which site the work happened on. */
   dailyClicksByPlatform: Record<string, { day: string; count: number }[]>
+  /** TikTok, per day of the same window: the DISTINCT links clicked, how many
+   *  of them the comment scan has read, and how many it found one of our
+   *  products' comments on. */
+  dailyTiktokLinks: TiktokDayLinks[]
+  /** The same per PRODUCT: TikTok links clicked for it, and how many carry
+   *  THAT product's comments (not just any of ours). */
+  dailyTiktokLinksByProduct: Record<string, TiktokDayLinks[]>
+  autoUpdates: AutoUpdateTimes | null
+}
+
+/** When the automatic comment reads last ran — shown on the daily-clicks table,
+ *  since its "with our comments" numbers are only as fresh as those reads. */
+export interface AutoUpdateTimes {
+  /** The 30-minute served-link check: when the last one finished, and the end
+   *  of the window it read (links clicked before this are covered). */
+  servedCheckAt: string | null
+  servedUpTo: string | null
+  servedRunning: boolean
+  /** The 6-hour cycle: when the last one started, and when it finished (null
+   *  while it is still running). */
+  cycleStartedAt: string | null
+  cycleFinishedAt: string | null
+}
+
+export async function getAutoUpdateTimes(): Promise<AutoUpdateTimes> {
+  const ms = (v: string | null) => {
+    const n = Number(v)
+    return Number.isFinite(n) && n > 0 ? new Date(n).toISOString() : null
+  }
+  const [doneAt, upTo, running, cycle] = await Promise.all([
+    getAppState('pipeline_served_done_at').catch(() => null),
+    getAppState('pipeline_served_to').catch(() => null),
+    getAppState('pipeline_served_running').catch(() => null),
+    pool
+      .query<{ started_at: Date; finished_at: Date | null }>(
+        'SELECT started_at, finished_at FROM pipeline_cycle ORDER BY started_at DESC LIMIT 1'
+      )
+      .then((r) => r.rows[0] ?? null)
+      .catch(() => null),
+  ])
+  return {
+    servedCheckAt: ms(doneAt),
+    servedUpTo: ms(upTo),
+    servedRunning: running === '1',
+    cycleStartedAt: cycle ? new Date(cycle.started_at).toISOString() : null,
+    cycleFinishedAt: cycle?.finished_at ? new Date(cycle.finished_at).toISOString() : null,
+  }
+}
+
+export interface TiktokDayLinks {
+  day: string
+  unique: number
+  scanned: number
+  withOurs: number
+  /** Links carrying a comment of ours posted by the TikTok account of a
+   *  worker who was served that link (per product: naming that product). */
+  withOwn: number
+}
+
+/**
+ * Each worker's TikTok handle(s), lowercased: the @name in their profile link,
+ * and the handle a presence check learned. A comment the scan found is THEIRS
+ * when its username is one of these.
+ */
+const WORKER_HANDLES_SQL = `
+  SELECT user_id, lower(substring(tiktok_url from '@([^/?#]+)')) AS handle
+    FROM user_profile WHERE tiktok_url ~ '@[^/?#]+'
+  UNION
+  SELECT user_id, lower(handle) FROM tiktok_account`
+
+/** One link clicked on a day, for the daily-clicks table's link list. */
+export interface DayLinkRow {
+  url: string
+  platform: string | null
+  /** Clicks on it that day (for the product asked about). */
+  clicks: number
+  last: string
+  /** Of our comments the scan found on it (any product); null = never scanned. */
+  ours: number | null
+}
+
+/**
+ * The links clicked on one calendar day for one product ('(none)' = clicks
+ * with no product), most-clicked first. The day is cut the same way the
+ * daily-clicks table cuts it (clicked_at::date), so the list adds up to the
+ * number that was clicked.
+ */
+export async function getDayLinks(day: string, product: string, limit = 5000): Promise<DayLinkRow[]> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error('Bad day')
+  await ensureClickedTable()
+  const { rows } = await pool.query<{
+    url: string
+    platform: string | null
+    clicks: number
+    last: Date
+    ours: number | null
+  }>(
+    `SELECT cl.url, MAX(cl.platform) AS platform, COUNT(*)::int AS clicks, MAX(cl.clicked_at) AS last,
+            MAX(s.our_count)::int AS ours
+       FROM clicked_link cl
+       LEFT JOIN link_comment_scan s ON s.url = cl.url
+      WHERE cl.clicked_at::date = $1::date
+        AND COALESCE(NULLIF(cl.product, ''), '(none)') = $2
+      GROUP BY cl.url
+      ORDER BY clicks DESC, last DESC
+      LIMIT $3`,
+    [day, product, limit]
+  )
+  return rows.map((r) => ({
+    url: r.url,
+    platform: r.platform,
+    clicks: r.clicks,
+    last: new Date(r.last).toISOString(),
+    ours: r.ours === null || r.ours === undefined ? null : Number(r.ours),
+  }))
+}
+
+/**
+ * The TikTok links behind a "with the worker's own comment" cell: clicked on
+ * `day`, and carrying a comment of ours posted by the TikTok account of a
+ * worker who was served the link. Same cut as the table's count —
+ *
+ * - `product` given (a product row): clicks for that product, and the worker's
+ *   comment must name that product;
+ * - `product` null (the TikTok platform row): any product in `products` (null =
+ *   every click), and the comment may name any of ours.
+ *
+ * `handles` are the worker accounts whose comment was found there.
+ */
+export async function getDayOwnLinks(
+  day: string,
+  product: string | null,
+  products: string[] | null,
+  limit = 5000
+): Promise<(DayLinkRow & { handles: string[] })[]> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error('Bad day')
+  await ensureClickedTable()
+  const { rows } = await pool.query<{
+    url: string
+    platform: string | null
+    clicks: number
+    last: Date
+    ours: number | null
+    handles: string[] | null
+  }>(
+    `WITH h AS (${WORKER_HANDLES_SQL}),
+          w AS (SELECT DISTINCT p.url, p.product, h.user_id, lower(p.username) AS handle
+                  FROM link_product_comment p JOIN h ON h.handle = lower(p.username)),
+          c AS (SELECT cl.* FROM clicked_link cl
+                 WHERE cl.clicked_at::date = $1::date
+                   AND cl.platform = 'tiktok'
+                   AND ($2::text IS NULL OR cl.product = $2::text)
+                   AND ($3::text[] IS NULL OR cl.product = ANY($3::text[]))),
+          hit AS (SELECT c.url, array_agg(DISTINCT w.handle) AS handles
+                    FROM c JOIN w ON w.url = c.url AND w.user_id = c.user_id
+                                 AND ($2::text IS NULL OR w.product = c.product)
+                   GROUP BY c.url)
+     SELECT c.url, MAX(c.platform) AS platform, COUNT(*)::int AS clicks, MAX(c.clicked_at) AS last,
+            MAX(s.our_count)::int AS ours, hit.handles
+       FROM c
+       JOIN hit ON hit.url = c.url
+       LEFT JOIN link_comment_scan s ON s.url = c.url
+      GROUP BY c.url, hit.handles
+      ORDER BY clicks DESC, last DESC
+      LIMIT $4`,
+    [day, product, products, limit]
+  )
+  return rows.map((r) => ({
+    url: r.url,
+    platform: r.platform,
+    clicks: r.clicks,
+    last: new Date(r.last).toISOString(),
+    ours: r.ours === null || r.ours === undefined ? null : Number(r.ours),
+    handles: (r.handles ?? []).filter(Boolean),
+  }))
+}
+
+/**
+ * The links one worker clicked on one platform since their reset — the same
+ * window as the card's "clicked" and "commented" counts — most recent first.
+ * For checking a worker's Reddit comment count (Reddit pays more) against what
+ * they actually opened.
+ */
+export async function getUserPlatformLinks(
+  userId: string,
+  platform: string,
+  limit = 5000
+): Promise<{ url: string; clicks: number; first: string; last: string; product: string | null }[]> {
+  await ensureClickedTable()
+  const resetAt = await getResetAt()
+  const { rows } = await pool.query<{ url: string; clicks: number; first: Date; last: Date; product: string | null }>(
+    `SELECT cl.url, COUNT(*)::int AS clicks, MIN(cl.clicked_at) AS first, MAX(cl.clicked_at) AS last,
+            MAX(NULLIF(cl.product, '')) AS product
+       FROM clicked_link cl LEFT JOIN user_reset ur ON ur.user_id = cl.user_id
+      WHERE cl.user_id = $1 AND cl.platform = $2
+        AND cl.clicked_at >= GREATEST($3::timestamptz, COALESCE(ur.reset_at, $3::timestamptz))
+      GROUP BY cl.url
+      ORDER BY last DESC
+      LIMIT $4`,
+    [userId, platform, resetAt, limit]
+  )
+  return rows.map((r) => ({
+    url: r.url,
+    clicks: r.clicks,
+    first: new Date(r.first).toISOString(),
+    last: new Date(r.last).toISOString(),
+    product: r.product,
+  }))
 }
 
 // Clicks per product since `resetAt`, plus the last N days of clicks (total and
@@ -9801,9 +10213,11 @@ async function getClickAggregates(
   dailyClicks: { day: string; count: number }[]
   dailyClicksByProduct: Record<string, { day: string; count: number }[]>
   dailyClicksByPlatform: Record<string, { day: string; count: number }[]>
+  dailyTiktokLinks: TiktokDayLinks[]
+  dailyTiktokLinksByProduct: Record<string, TiktokDayLinks[]>
 }> {
   const days = ADMIN_DAILY_CLICK_DAYS
-  const [totals, daily] = await Promise.all([
+  const [totals, daily, tiktok, tiktokByProduct] = await Promise.all([
     pool.query<{ product: string; n: number }>(
       `SELECT COALESCE(NULLIF(cl.product, ''), '(none)') AS product, COUNT(*)::int AS n
          FROM clicked_link cl LEFT JOIN user_reset ur ON ur.user_id = cl.user_id
@@ -9826,6 +10240,52 @@ async function getClickAggregates(
          LEFT JOIN clicked_link cl ON cl.clicked_at::date = d::date
                AND ($2::text[] IS NULL OR cl.product = ANY($2::text[]))
         GROUP BY 1, 2, 3 ORDER BY 1`,
+      [days, products]
+    ),
+    // TikTok's distinct links per day, and what the comment scan says of them.
+    // "With ours" is any of our products' comments found on the video, whoever
+    // posted it — the question is whether the link carries ours at all.
+    // "With own" — the comment found is by the worker who was SERVED the link
+    // (their TikTok handle), not just anyone's comment naming one of ours.
+    pool.query<{ day: string; uniq: number; scanned: number; ours: number; own: number }>(
+      `WITH h AS (${WORKER_HANDLES_SQL}),
+            w AS (SELECT DISTINCT p.url, h.user_id
+                    FROM link_product_comment p JOIN h ON h.handle = lower(p.username))
+       SELECT d::date::text AS day,
+              COUNT(DISTINCT cl.url)::int AS uniq,
+              COUNT(DISTINCT s.url)::int AS scanned,
+              COUNT(DISTINCT o.url)::int AS ours,
+              COUNT(DISTINCT w.url)::int AS own
+         FROM generate_series(CURRENT_DATE - ($1::int - 1), CURRENT_DATE, '1 day') d
+         LEFT JOIN clicked_link cl ON cl.clicked_at::date = d::date
+               AND cl.platform = 'tiktok'
+               AND ($2::text[] IS NULL OR cl.product = ANY($2::text[]))
+         LEFT JOIN link_comment_scan s ON s.url = cl.url
+         LEFT JOIN (SELECT DISTINCT url FROM link_product_comment) o ON o.url = cl.url
+         LEFT JOIN w ON w.url = cl.url AND w.user_id = cl.user_id
+        GROUP BY 1 ORDER BY 1`,
+      [days, products]
+    ),
+    // Per product: the links clicked FOR it, and how many carry ITS comments.
+    pool.query<{ day: string; product: string; uniq: number; scanned: number; ours: number; own: number }>(
+      `WITH h AS (${WORKER_HANDLES_SQL}),
+            w AS (SELECT DISTINCT p.url, p.product, h.user_id
+                    FROM link_product_comment p JOIN h ON h.handle = lower(p.username))
+       SELECT cl.clicked_at::date::text AS day,
+              cl.product,
+              COUNT(DISTINCT cl.url)::int AS uniq,
+              COUNT(DISTINCT s.url)::int AS scanned,
+              COUNT(DISTINCT o.url)::int AS ours,
+              COUNT(DISTINCT w.url)::int AS own
+         FROM clicked_link cl
+         LEFT JOIN link_comment_scan s ON s.url = cl.url
+         LEFT JOIN (SELECT DISTINCT url, product FROM link_product_comment) o
+                ON o.url = cl.url AND o.product = cl.product
+         LEFT JOIN w ON w.url = cl.url AND w.user_id = cl.user_id AND w.product = cl.product
+        WHERE cl.platform = 'tiktok' AND cl.product IS NOT NULL AND cl.product <> ''
+          AND cl.clicked_at::date >= CURRENT_DATE - ($1::int - 1)
+          AND ($2::text[] IS NULL OR cl.product = ANY($2::text[]))
+        GROUP BY 1, 2`,
       [days, products]
     ),
   ])
@@ -9855,6 +10315,23 @@ async function getClickAggregates(
     dailyClicks: dailyTotals,
     dailyClicksByProduct: byProduct,
     dailyClicksByPlatform: byPlatform,
+    dailyTiktokLinks: tiktok.rows.map((r) => ({
+      day: r.day,
+      unique: r.uniq,
+      scanned: r.scanned,
+      withOurs: r.ours,
+      withOwn: r.own,
+    })),
+    dailyTiktokLinksByProduct: (() => {
+      const out: Record<string, TiktokDayLinks[]> = {}
+      for (const r of tiktokByProduct.rows) {
+        const i = idx.get(r.day)
+        if (i === undefined) continue
+        const series = (out[r.product] ??= allDays.map((day) => ({ day, unique: 0, scanned: 0, withOurs: 0, withOwn: 0 })))
+        series[i] = { day: r.day, unique: r.uniq, scanned: r.scanned, withOurs: r.ours, withOwn: r.own }
+      }
+      return out
+    })(),
   }
 }
 
@@ -10333,7 +10810,10 @@ export async function getAdminData(
     dailyClicks: [] as { day: string; count: number }[],
     dailyClicksByProduct: {} as Record<string, { day: string; count: number }[]>,
     dailyClicksByPlatform: {} as Record<string, { day: string; count: number }[]>,
+    dailyTiktokLinks: [] as TiktokDayLinks[],
+    dailyTiktokLinksByProduct: {} as Record<string, TiktokDayLinks[]>,
   }))
 
-  return { resetAt: resetAt.toISOString(), users: Array.from(byId.values()), ...aggregates }
+  const autoUpdates = await getAutoUpdateTimes().catch(() => null)
+  return { resetAt: resetAt.toISOString(), users: Array.from(byId.values()), ...aggregates, autoUpdates }
 }

@@ -24,7 +24,7 @@
 // PURE: no database, no network. The browser imports this. lib/genreStore.ts is
 // the server half that reads and writes the stored list.
 
-import { BUILTIN_GENRES, GENRES, GENRE_LABELS, PRODUCTS, PRODUCT_GENRE, setProductWords } from './config'
+import { BUILTIN_GENRES, GENRES, GENRE_LABELS, PRODUCTS, PRODUCT_GENRE, setProductNote, setProductWords } from './config'
 import { GENRE_COPY, type GenreCopy } from './prompts'
 import { COMMENTS } from './comments'
 
@@ -56,6 +56,8 @@ export interface CustomGenre {
   addsToBuiltin?: boolean
   /** How each product's name is written in a comment, e.g. "co humanly". */
   words?: Record<string, string>
+  /** How to talk about each product — see setProductNote. */
+  notes?: Record<string, string>
 }
 
 /** A product added to a BUILT-IN genre from the admin (Admin → Genres). */
@@ -70,6 +72,9 @@ export interface ExtraProduct {
   words: string
   /** Base comments; every generated comment is a rewrite of one. */
   seeds: string[]
+  /** Optional: how comments should talk about it (overrides the genre's
+   *  usual message). {PRODUCT} is the name as comments write it. */
+  note?: string
 }
 
 const isBuiltinGenre = (id: string) => (BUILTIN_GENRES as readonly string[]).includes(id)
@@ -90,12 +95,14 @@ export function extraProductsAsGenres(extras: ExtraProduct[]): CustomGenre[] {
         searchPhrases: '',
         addsToBuiltin: true,
         words: {},
+        notes: {},
       }
       by.set(x.genre, g)
     }
     g.products.push({ id: x.id, site: x.site })
     g.seeds[x.id] = x.seeds
     if (x.words) (g.words as Record<string, string>)[x.id] = x.words
+    if (x.note) (g.notes as Record<string, string>)[x.id] = x.note
   }
   return Array.from(by.values())
 }
@@ -188,6 +195,7 @@ function applyHere(list: CustomGenre[]): void {
       delete PRODUCT_GENRE[p.id]
       delete (COMMENTS as Record<string, string[]>)[p.id]
       setProductWords(p.id, null)
+      setProductNote(p.id, null)
     }
   }
   const clean = list.filter(
@@ -206,6 +214,7 @@ function applyHere(list: CustomGenre[]): void {
       PRODUCT_GENRE[p.id] = g.id
       ;(COMMENTS as Record<string, string[]>)[p.id] = g.seeds?.[p.id] ?? []
       setProductWords(p.id, g.words?.[p.id])
+      setProductNote(p.id, g.notes?.[p.id])
     }
   }
   applied = clean
