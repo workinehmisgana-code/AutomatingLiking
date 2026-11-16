@@ -1350,6 +1350,10 @@ export default function AdminLinks({
           // Says WHY a channel was passed over, so "0 of 0" is never a mystery.
           (Number(dt.offPlatform) > 0
             ? ` · ${Number(dt.offPlatform).toLocaleString()} skipped, platform off`
+            : '') +
+          (dt.classifyError
+            ? ` · ⚠ the title check FAILED, so nothing was merged — every new link was left ` +
+              `to verify by hand (${String(dt.classifyError).slice(0, 160)})`
             : ''),
         extract: () => `read ${dt.read} link(s) · ${dt.progress} · ${dt.withOurs} carry ours`,
         categorise: () => `categorised ${dt.processed} · ${dt.remaining} left`,

@@ -104,6 +104,15 @@ export interface HarvestResult {
    * with no related check.
    */
   specMerged: number
+  /**
+   * Why the title check could not run, when it could not ('' = it ran).
+   *
+   * It used to fail in silence: an error read as "nothing is related", so every
+   * new link went to the verify list and nothing was merged — for days, with a
+   * summary that looked like a strict classifier rather than a broken one (an
+   * invalid GEMINI_API_KEY did exactly this).
+   */
+  classifyError: string
   /** Where the next run starts. */
   nextCursor: number
   /** True when this run wrapped past the end of the list. */
@@ -174,6 +183,7 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
     untitled: 0,
     failed: 0,
     specMerged: 0,
+    classifyError: '',
     nextCursor: 0,
     wrapped: false,
   }
@@ -296,10 +306,16 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
   const untitled = rows.length - titled.length
 
   let related: string[] = []
+  let classifyError = ''
   if (titled.length > 0) {
     // Each link judged against its own genre: one harvest pass can cover
     // channels of several genres, and one question would bin the others.
-    related = await classifyRelatedByGenre(titled).catch(() => [] as string[])
+    // A FAILED check leaves every link staged for a person — safe — but says so.
+    related = await classifyRelatedByGenre(titled).catch((e) => {
+      classifyError = String(e instanceof Error ? e.message : e).slice(0, 300)
+      console.error('[harvest] title check failed:', classifyError)
+      return [] as string[]
+    })
   }
 
   // ONE MERGE for both reasons: the pool file is rewritten once per pass.
@@ -333,6 +349,7 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
     untitled,
     failed,
     specMerged,
+    classifyError,
     nextCursor,
     wrapped,
   }

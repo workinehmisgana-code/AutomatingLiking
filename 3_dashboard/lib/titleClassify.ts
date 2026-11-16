@@ -14,7 +14,7 @@
 
 import { llmChat } from './llm'
 import { DEFAULT_GENRE, isGenre, type Genre } from './config'
-import { GENRE_COPY, classifyReasonSystem, classifySystem, classifyUser } from './prompts'
+import { GENRE_COPY, classifyReasonSystem, classifySystem, classifyUser, relatedCriteria } from './prompts'
 import { ensureGenreRegistry } from './genreStore'
 
 export type Item = { url: string; title: string }
@@ -35,8 +35,24 @@ function keywordHit(title: string, genre: Genre): string | null {
   return GENRE_COPY[genre].related.keywords.find((k) => norm.includes(k)) ?? null
 }
 
-/** One title's verdict, with why — for the admin's review. */
-export type Verdict = { url: string; related: boolean; reason: string }
+/**
+ * One title's verdict, with WHICH PART OF THE PROMPT decided it — for the
+ * admin's review.
+ *
+ *   rule      "topic": matched topic `ruleNo` of the genre's related-prompt
+ *             "keyword": the title contains one of the genre's keywords, which
+ *                        makes it related whatever the model says
+ *             "none": matched none of the topics
+ *   ruleText  that topic, or that keyword
+ */
+export type Verdict = {
+  url: string
+  related: boolean
+  reason: string
+  rule: 'topic' | 'keyword' | 'none'
+  ruleNo: number
+  ruleText: string
+}
 
 /**
  * Judge these titles against the genre AND say why, one short sentence each.
@@ -55,14 +71,17 @@ export async function classifyChunkWithReasons(items: Item[], genre: Genre = DEF
       { role: 'user', content: classifyUser(items.map((it) => it.title)) },
     ],
   })
-  let out: { related: boolean; reason: string }[] = []
+  const { topics } = relatedCriteria(genre)
+  let out: { ruleNo: number; reason: string }[] = []
   try {
     const parsed = JSON.parse(content) as { items?: unknown }
     if (Array.isArray(parsed?.items)) {
       out = parsed.items.map((x) => {
-        const o = (x ?? {}) as { related?: unknown; reason?: unknown }
+        const o = (x ?? {}) as { rule?: unknown; reason?: unknown }
+        const n = Math.trunc(Number(o.rule))
+        // A number outside the list is no topic at all.
         return {
-          related: o.related === true || o.related === 'true' || o.related === 1,
+          ruleNo: Number.isFinite(n) && n >= 1 && n <= topics.length ? n : 0,
           reason: String(o.reason ?? '').trim().slice(0, 240),
         }
       })
@@ -70,14 +89,29 @@ export async function classifyChunkWithReasons(items: Item[], genre: Genre = DEF
   } catch {
     /* no verdicts on a parse failure: every title falls back below */
   }
-  return items.map((it, i) => {
+  return items.map((it, i): Verdict => {
     const v = out[i]
-    const kw = keywordHit(it.title, genre)
-    if (kw && !v?.related) {
-      return { url: it.url, related: true, reason: `Mentions "${kw}", one of this genre's keywords` }
+    // RELATED IS THE RULE MATCHED, not a separate flag the model could set
+    // against its own rule number.
+    if (v && v.ruleNo > 0) {
+      return {
+        url: it.url, related: true, reason: v.reason || 'Matches the topic',
+        rule: 'topic', ruleNo: v.ruleNo, ruleText: topics[v.ruleNo - 1],
+      }
     }
-    if (!v) return { url: it.url, related: false, reason: 'The model gave no answer for this title' }
-    return { url: it.url, related: v.related, reason: v.reason || (v.related ? 'Related' : 'Not related') }
+    const kw = keywordHit(it.title, genre)
+    if (kw) {
+      return {
+        url: it.url, related: true,
+        reason: `The title contains "${kw}" — a keyword that always counts as related`,
+        rule: 'keyword', ruleNo: 0, ruleText: kw,
+      }
+    }
+    return {
+      url: it.url, related: false,
+      reason: v ? v.reason || 'Matches none of the topics' : 'The model gave no answer for this title',
+      rule: 'none', ruleNo: 0, ruleText: '',
+    }
   })
 }
 

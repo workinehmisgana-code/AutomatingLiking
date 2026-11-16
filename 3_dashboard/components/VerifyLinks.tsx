@@ -19,6 +19,25 @@ const PAGE_SIZE = 500
 const UPLOAD_CHUNK = 500 // rows per upload request
 const CLASSIFY_BATCHES = 5 // split a page's titles into up to this many Groq batches
 
+/** 🤖 Mark unrelated's verdict on one link, and which part of the related-prompt decided it. */
+interface Verdict {
+  related: boolean
+  reason: string
+  /** topic = matched topic `ruleNo`; keyword = contains `ruleText`; none = no topic matched */
+  rule: 'topic' | 'keyword' | 'none'
+  ruleNo: number
+  ruleText: string
+  genre: string
+}
+
+/** A genre's related-prompt, as the verdicts number it. */
+interface Criteria {
+  label: string
+  head: string
+  topics: string[]
+  keywords: string[]
+}
+
 interface VRow {
   url: string
   account: string | null
@@ -119,8 +138,12 @@ export default function VerifyLinks({
   const [classifying, setClassifying] = useState(false)
   // "Mark unrelated"'s verdict per link, with the model's one-line reason.
   // Kept per URL, so it survives reloading the page the link is on.
-  const [reasons, setReasons] = useState<Record<string, { related: boolean; reason: string }>>({})
+  const [reasons, setReasons] = useState<Record<string, Verdict>>({})
   const hasReasons = Object.keys(reasons).length > 0
+  // The related-prompt each genre was judged against: its numbered topics and
+  // its always-related keywords (from the classify call).
+  const [criteria, setCriteria] = useState<Record<string, Criteria>>({})
+  const [criteriaOpen, setCriteriaOpen] = useState(false)
   // Merge is gated on this: the current page must be run through "Mark humanizer
   // unrelated" before it can be merged. Resets whenever a new page/batch loads.
   const [classifiedThisPage, setClassifiedThisPage] = useState(false)
@@ -688,7 +711,7 @@ export default function VerifyLinks({
         Math.max(1, Math.ceil(items.length / CLASSIFY_BATCHES))
       )
       const related = new Set<string>()
-      const why: Record<string, { related: boolean; reason: string }> = {}
+      const why: Record<string, Verdict> = {}
       for (let i = 0; i < items.length; i += batchSize) {
         const res = await fetch('/api/admin/links/classify', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -699,9 +722,19 @@ export default function VerifyLinks({
         if (res.ok && Array.isArray(d.related)) d.related.forEach((u: string) => related.add(u))
         else if (!res.ok) { alert(d?.error || 'Classification failed.'); return }
         if (Array.isArray(d.verdicts)) {
-          for (const v of d.verdicts as { url: string; related: boolean; reason: string }[]) {
-            why[v.url] = { related: !!v.related, reason: String(v.reason || '') }
+          for (const v of d.verdicts as (Verdict & { url: string })[]) {
+            why[v.url] = {
+              related: !!v.related,
+              reason: String(v.reason || ''),
+              rule: v.rule === 'topic' || v.rule === 'keyword' ? v.rule : 'none',
+              ruleNo: Number(v.ruleNo) || 0,
+              ruleText: String(v.ruleText || ''),
+              genre: items.find((it) => it.url === v.url)?.genre ?? '',
+            }
           }
+        }
+        if (d.criteria && typeof d.criteria === 'object') {
+          setCriteria((prev) => ({ ...prev, ...(d.criteria as Record<string, Criteria>) }))
         }
         // Shown as each batch lands, not only at the end.
         setReasons((prev) => ({ ...prev, ...why }))
@@ -2261,6 +2294,46 @@ export default function VerifyLinks({
       )}
 
 
+      {/* The related-prompt the verdicts in the Why column were measured
+          against: numbered, so "topic 3" in a row can be looked up here. */}
+      {Object.keys(criteria).length > 0 && (
+        <div className="mb-3 rounded-xl border border-zinc-800 bg-zinc-900/40 px-3 py-2 text-xs">
+          <button
+            type="button"
+            onClick={() => setCriteriaOpen((o) => !o)}
+            className="text-zinc-300 hover:text-white"
+          >
+            {criteriaOpen ? '▾' : '▸'} The related-prompt the 🤖 verdicts follow (
+            {Object.values(criteria).map((c) => c.label).join(', ')})
+          </button>
+          {criteriaOpen &&
+            Object.entries(criteria).map(([g, c]) => (
+              <div key={g} className="mt-2">
+                <div className="text-zinc-400">
+                  <span className="text-zinc-200 font-medium">{c.label}</span>
+                  {c.head && <> — a title is related when it is about {c.head}, i.e. one of:</>}
+                </div>
+                <ol className="mt-1 ml-5 list-decimal text-zinc-400 space-y-0.5">
+                  {c.topics.map((t, i) => (
+                    <li key={i}>{t}</li>
+                  ))}
+                </ol>
+                {c.keywords.length > 0 && (
+                  <div className="mt-1 text-zinc-500">
+                    Keyword rule — a title containing any of these is always related:{' '}
+                    <span className="text-zinc-400">{c.keywords.join(', ')}</span>
+                  </div>
+                )}
+              </div>
+            ))}
+          {criteriaOpen && (
+            <p className="mt-2 text-[11px] text-zinc-600">
+              Change the topics (comma-separated) or keywords with ✏️ What counts as related, next to the 🤖 button.
+            </p>
+          )}
+        </div>
+      )}
+
       {/* Table */}
       <div className="rounded-xl border border-zinc-800 overflow-hidden" style={{ overflowAnchor: 'none' }}>
       {/* Header and rows in ONE scroller, at a fixed minimum width, so a
@@ -2444,7 +2517,15 @@ export default function VerifyLinks({
                         <span className={v.related ? 'text-emerald-400 font-medium' : 'text-rose-400 font-medium'}>
                           {v.related ? '✓ related' : '✗ unrelated'}
                         </span>
-                        <span className="block text-zinc-400 line-clamp-2">{v.reason}</span>
+                        {/* WHICH PART OF THE PROMPT decided it. */}
+                        <span className="text-zinc-300">
+                          {v.rule === 'topic'
+                            ? ` · topic ${v.ruleNo}: “${v.ruleText}”`
+                            : v.rule === 'keyword'
+                              ? ` · keyword rule: “${v.ruleText}”`
+                              : ` · matches none of the ${criteria[v.genre]?.topics.length ?? ''} topics`}
+                        </span>
+                        <span className="block text-zinc-500 line-clamp-2">{v.reason}</span>
                       </>
                     ) : (
                       <span className="text-zinc-600">{r.title ? 'not checked yet' : 'no title to check'}</span>

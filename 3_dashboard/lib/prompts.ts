@@ -1142,19 +1142,54 @@ export function classifySystem(genre: Genre): string {
  * see why. The hourly harvest keeps the flags-only form: nobody reads its
  * reasons, and they would only cost tokens.
  */
+/**
+ * The genre's "what counts as related" prompt (related.subject) as the topics
+ * it lists, numbered — so a verdict can say WHICH ONE a title matched.
+ *
+ * The subject is written as "about <what>: topic, topic, …, or topic". The
+ * part before the colon is the headline; the list after it is split on commas
+ * outside parentheses ("Turnitin (the AI detector)" stays one topic), and a
+ * leading "or" is dropped.
+ */
+export function relatedCriteria(genre: Genre): { head: string; topics: string[] } {
+  const subject = GENRE_COPY[genre].related.subject.trim()
+  const colon = subject.indexOf(':')
+  const head = (colon >= 0 ? subject.slice(0, colon) : '').replace(/^about\s+/i, '').trim()
+  const rest = colon >= 0 ? subject.slice(colon + 1) : subject.replace(/^about\s+/i, '')
+  const topics: string[] = []
+  let depth = 0
+  let cur = ''
+  for (const ch of rest) {
+    if (ch === '(') depth++
+    if (ch === ')') depth = Math.max(0, depth - 1)
+    if (ch === ',' && depth === 0) {
+      topics.push(cur)
+      cur = ''
+    } else cur += ch
+  }
+  topics.push(cur)
+  return {
+    head,
+    topics: topics.map((t) => t.trim().replace(/^or\s+/i, '').trim()).filter(Boolean),
+  }
+}
+
 export function classifyReasonSystem(genre: Genre): string {
-  const { subject } = GENRE_COPY[genre].related
   const label = GENRE_LABELS[genre] ?? genre
+  const { head, topics } = relatedCriteria(genre)
   return (
-    'You classify short social-media video titles/captions for the "' + label + '" genre. ' +
-    `A title is RELATED when it is ${subject}. Anything else is NOT related. ` +
-    'Return STRICT JSON {"items":[{"related":true,"reason":"..."}, ...]} with ONE item PER TITLE ' +
-    'IN THE SAME ORDER and exactly as many items as titles. "reason" is ONE short plain sentence ' +
-    '(at most 15 words) saying what in the title makes it related to the genre, or why it is not ' +
-    '— name the actual topic, e.g. "Shows how to pass Turnitin with AI text" or "A cooking video, ' +
-    'nothing about studying". ' +
-    'Example for 2 titles: {"items":[{"related":true,"reason":"Tips for revising before exams"},' +
-    '{"related":false,"reason":"A dance trend, no study or school content"}]}.'
+    `You classify short social-media video titles/captions for the "${label}" genre. ` +
+    `A title is RELATED only when it matches one of these numbered topics from the genre's ` +
+    `related-prompt${head ? ` (all about ${head})` : ''}:\n` +
+    topics.map((t, i) => `${i + 1}. ${t}`).join('\n') +
+    '\nAnything else is NOT related.\n' +
+    'Return STRICT JSON {"items":[{"rule":3,"reason":"..."}, ...]} with ONE item PER TITLE IN THE ' +
+    'SAME ORDER and exactly as many items as titles. "rule" is the NUMBER of the topic above the ' +
+    'title matches (the closest one if several do), or 0 when it matches none. "reason" is ONE ' +
+    'short sentence (at most 15 words): for a match, what in the title fits that numbered topic; ' +
+    'for 0, what the title is about instead. ' +
+    'Example: {"items":[{"rule":2,"reason":"Asks how to make a landing page for a shop"},' +
+    '{"rule":0,"reason":"A dance trend video, none of the topics"}]}.'
   )
 }
 

@@ -109,8 +109,12 @@ async function main(): Promise<void> {
         'essays pass Turnitin and GPTZero. Generate short, catchy social-media video captions/titles about studying ' +
         'smarter, passing exams and essays that never get flagged. Casual, student-to-student tone.',
       related: {
-        subject:
-          (g.copy.related?.subject ?? '') + ', essays and assignments, AI detectors like Turnitin or GPTZero, or making AI writing sound human',
+        // Added ONCE: an earlier version appended these on every run, and
+        // three runs listed each topic three times.
+        subject: /essays and assignments/i.test(g.copy.related?.subject ?? '')
+          ? g.copy.related?.subject ?? ''
+          : (g.copy.related?.subject ?? '') +
+            ', essays and assignments, AI detectors like Turnitin or GPTZero, or making AI writing sound human',
         keywords: Array.from(kw),
       },
       voiceExamples: {

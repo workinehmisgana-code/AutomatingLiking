@@ -166,8 +166,12 @@ def profile_candidates(platform: str) -> list[Slot]:
     lk = liker_profile_dirs()
     if platform in ("tiktok", "instagram"):
         extra = [d for d in lk if liker_site(d) == platform]
+    elif platform == "youtube":
+        # The YouTube logins first; any other profile may be signed in too.
+        extra = [d for d in lk if liker_site(d) == "youtube"] + \
+                [d for d in lk if liker_site(d) != "youtube"]
     else:
-        # YouTube and Reddit search signed out just as well.
+        # Reddit: no liker profile is made for it, but any may be logged in.
         extra = lk
     return own + [Slot(f"liker:{d.name}", d, True) for d in extra]
 
@@ -214,9 +218,15 @@ def dirs_held_now() -> set[str]:
     return found
 
 
-# SIGNED IN OR NOT. TikTok and Instagram search need a logged-in account;
-# YouTube and Reddit search signed out just as well, so they are not checked.
-LOGIN_SITES = {"tiktok": "tiktok.com", "instagram": "instagram.com"}
+# SIGNED IN OR NOT. Every search runs on a logged-in account: (cookie domain,
+# the cookie that exists only while logged in) per site — the same pairs
+# scraper.py checks (SESSION_COOKIE).
+LOGIN_SITES = {
+    "tiktok": ("tiktok.com", "sessionid"),
+    "instagram": ("instagram.com", "sessionid"),
+    "youtube": ("youtube.com", "LOGIN_INFO"),
+    "reddit": ("reddit.com", "reddit_session"),
+}
 # scraper.py's exit code for "this profile is not logged in to the site"
 # (SIGNIN_MODE=exit) — the cue to hand the search to the next profile.
 SIGNED_OUT_EXIT = 5
@@ -234,9 +244,9 @@ def cookie_session(path: Path, site: str) -> bool | None:
     sessionid for tiktok.com" is a plain query. None = could not tell (no
     file yet, or it could not be read) — the run itself then decides.
     """
-    domain = LOGIN_SITES.get(site)
-    if not domain:
+    if site not in LOGIN_SITES:
         return True
+    domain, cookie = LOGIN_SITES[site]
     import shutil
     import sqlite3
     import tempfile
@@ -252,9 +262,9 @@ def cookie_session(path: Path, site: str) -> bool | None:
                 # Chrome time: microseconds since 1601-01-01. 0 = session cookie.
                 now = int((time.time() + 11644473600) * 1_000_000)
                 row = con.execute(
-                    "SELECT 1 FROM cookies WHERE name = 'sessionid' AND host_key LIKE ? "
+                    "SELECT 1 FROM cookies WHERE name = ? AND host_key LIKE ? "
                     "AND (expires_utc = 0 OR expires_utc > ?) LIMIT 1",
-                    (f"%{domain}", now),
+                    (cookie, f"%{domain}", now),
                 ).fetchone()
                 return row is not None
             finally:
@@ -872,19 +882,27 @@ def relay_ledger_set(name: str, **vals: float) -> None:
             pass
 
 
+RELAY_SUMMARY_RE = __import__("re").compile(r"^\s*(\d+) liked, (\d+) failed")
+
+
 class RelayTurn(Job):
     """One relay turn: an ordinary liker run that also remembers every video it
-    started ([relay-video] lines), however long its log grows."""
+    started ([relay-video] lines), however long its log grows, and the
+    "N liked, M failed" summary like.py prints when it has worked its batch."""
 
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.reached: list[str] = []
+        self.summary: tuple[int, int] | None = None
 
     def write(self, text: str) -> None:
         if text.startswith("[relay-video] "):
             parts = text.split(" ", 2)
             if len(parts) == 3:
                 self.reached.append(parts[2].strip())
+        m = RELAY_SUMMARY_RE.match(text)
+        if m:
+            self.summary = (int(m.group(1)), int(m.group(2)))
         super().write(text)
 
 
@@ -909,6 +927,10 @@ class LikerRelay(Job):
 
     # like.py's exit code for "closed: TikTok was dropping this account's likes".
     DROPPED_EXIT = 4
+    # A turn that failed outright rests its account this long, and this many
+    # failures in one run take it out of the run.
+    FAIL_REST_S = 300
+    MAX_FAILS = 3
 
     def __init__(self, s: dict, names: list[str], per: int, at_once: int):
         super().__init__("liker", f"Account liker · relay · {per} links a turn "
@@ -973,7 +995,11 @@ class LikerRelay(Job):
 
         # ── 2. turns ─────────────────────────────────────────────────────
         unused: list[str] = []          # accounts without a turn this round
-        dropped: set[str] = set()       # failed or stopped by hand
+        dropped: set[str] = set()       # stopped by hand, or failed too often
+        # A turn that FAILED (crashed, not signed in) rests its account briefly
+        # and it rejoins; only RELAY_MAX_FAILS of those in one run drop it.
+        fails: dict[str, int] = {}
+        cool: dict[str, float] = {}
         running: dict[str, tuple[RelayTurn, list[str]]] = {}   # account -> (job, its links)
         turn = 0
 
@@ -982,7 +1008,8 @@ class LikerRelay(Job):
         waiting_said = False
 
         def resting(n: str) -> bool:
-            return float(relay_ledger().get(n, {}).get("rest_until", 0)) > time.time()
+            return (float(relay_ledger().get(n, {}).get("rest_until", 0)) > time.time()
+                    or cool.get(n, 0) > time.time())
 
         def pick(replacement: bool = False) -> str | None:
             nonlocal unused
@@ -1017,6 +1044,18 @@ class LikerRelay(Job):
                 relay_ledger_set(name, last=time.time())
                 if job.status == "done":
                     continue
+                # WORKED ITS WHOLE BATCH, SOME LIKES DID NOT LAND. like.py exits 1
+                # when any single like failed, and that used to count as a failed
+                # turn — the account sat out the rest of the run after one missed
+                # heart, and the relay dwindled to the few accounts that never
+                # missed. A turn that printed its summary finished its links: the
+                # account goes straight back into the rotation.
+                if (job.status != "stopped" and job.summary is not None
+                        and job.exit_code not in (None, self.DROPPED_EXIT)):
+                    ok_n, bad_n = job.summary
+                    self.write(f"[*] {name} worked its {len(mine)} link(s) ({ok_n} liked, "
+                               f"{bad_n} failed) — back in the rotation")
+                    continue
                 # Failed, stopped or closed for drops: give back what it never finished.
                 seen = set(job.reached)
                 on = job.reached[-1] if job.reached else None
@@ -1032,10 +1071,23 @@ class LikerRelay(Job):
                                f"resting {rest_s // 60} min; {len(back)} of its {len(mine)} "
                                "link(s) go to the account that has rested longest")
                     continue
-                dropped.add(name)
-                why = "was stopped" if job.status == "stopped" else f"failed (exit {job.exit_code})"
-                self.write(f"[!] {name} {why}; {len(back)} of its {len(mine)} link(s) go to "
-                           f"the next account, and {name} sits out the rest of this run")
+                if job.status == "stopped":
+                    dropped.add(name)
+                    self.write(f"[!] {name} was stopped; {len(back)} of its {len(mine)} link(s) "
+                               f"go to the next account, and {name} sits out the rest of this run")
+                    continue
+                fails[name] = fails.get(name, 0) + 1
+                if fails[name] >= self.MAX_FAILS:
+                    dropped.add(name)
+                    self.write(f"[!] {name} failed (exit {job.exit_code}) for the {fails[name]}th time; "
+                               f"{len(back)} link(s) go to the next account, and {name} sits out "
+                               "the rest of this run")
+                    continue
+                cool[name] = time.time() + self.FAIL_REST_S
+                self.write(f"[!] {name} failed (exit {job.exit_code}); {len(back)} of its {len(mine)} "
+                           f"link(s) go to the next account, and {name} rests "
+                           f"{self.FAIL_REST_S // 60} min before its next turn "
+                           f"(failure {fails[name]} of {self.MAX_FAILS} allowed)")
             if self._stop:
                 break
             # Start turns while there are links, free slots and idle accounts.
@@ -1066,7 +1118,7 @@ class LikerRelay(Job):
                 # Everyone left is resting: wait for the first to be rested.
                 if not waiting_said:
                     led = relay_ledger()
-                    soon = min((float(led.get(n, {}).get("rest_until", 0))
+                    soon = min((max(float(led.get(n, {}).get("rest_until", 0)), cool.get(n, 0))
                                 for n in self.names if n not in dropped), default=0)
                     self.write(f"[*] every account is resting; carrying on at "
                                f"{time.strftime('%H:%M', time.localtime(soon))}")

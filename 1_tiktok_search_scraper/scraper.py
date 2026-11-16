@@ -62,12 +62,17 @@ BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome") or None
 #   "wait" - no profile was logged in: wait, with no time limit, for a manual
 #            login in this window, then search;
 #   ""     - the old behaviour (run from a terminal).
-# Only TikTok and Instagram are checked: YouTube and Reddit search signed out.
+# All four sites are checked: a search never runs signed out.
 SIGNIN_MODE = os.getenv("SIGNIN_MODE", "").strip().lower()
 SIGNED_OUT_EXIT = 5
+# (cookie domain, the cookie that only exists while logged in, login page)
 SESSION_COOKIE = {
     "tiktok": ("tiktok.com", "sessionid", "https://www.tiktok.com/login"),
     "instagram": ("instagram.com", "sessionid", "https://www.instagram.com/accounts/login/"),
+    # LOGIN_INFO is set on youtube.com once a Google account signs in to it.
+    "youtube": ("youtube.com", "LOGIN_INFO",
+                "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F"),
+    "reddit": ("reddit.com", "reddit_session", "https://www.reddit.com/login/"),
 }
 
 
@@ -501,6 +506,8 @@ def scrape_youtube_search(queries: list[str], min_videos: int, max_videos: int,
                     tab.close()
                 except Exception:
                     pass
+
+        require_session(context, page, "youtube")
 
         page.route(
             "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,mp4,webm}",
@@ -1558,6 +1565,8 @@ def scrape_reddit_search(queries: list[str], min_videos: int, max_videos: int, o
                     tab.close()
                 except Exception:
                     pass
+
+        require_session(context, page, "reddit")
 
         # Block fonts/media for speed; keep images so cards render normally.
         page.route(

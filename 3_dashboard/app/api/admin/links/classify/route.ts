@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
-import { CLASSIFY_MAX_ITEMS, isAdminEmail } from '@/lib/config'
+import { CLASSIFY_MAX_ITEMS, DEFAULT_GENRE, GENRE_LABELS, isAdminEmail, isGenre } from '@/lib/config'
+import { GENRE_COPY, relatedCriteria } from '@/lib/prompts'
 import { classifyRelatedByGenre, classifyWithReasonsByGenre, type Item } from '@/lib/titleClassify'
 
 export const dynamic = 'force-dynamic'
@@ -61,7 +62,21 @@ export async function POST(req: NextRequest) {
   try {
     if (withReasons) {
       const verdicts = await classifyWithReasonsByGenre(items)
-      return NextResponse.json({ related: verdicts.filter((v) => v.related).map((v) => v.url), verdicts })
+      // THE PROMPT ITSELF, per genre judged: its numbered topics and its
+      // always-related keywords, so the page can show what each verdict
+      // was measured against. After the call, so added genres are loaded.
+      const criteria: Record<string, { label: string; head: string; topics: string[]; keywords: string[] }> = {}
+      for (const it of items) {
+        const g = isGenre(it.genre) ? it.genre : DEFAULT_GENRE
+        if (criteria[g]) continue
+        const c = relatedCriteria(g)
+        criteria[g] = { label: GENRE_LABELS[g] ?? g, ...c, keywords: GENRE_COPY[g].related.keywords }
+      }
+      return NextResponse.json({
+        related: verdicts.filter((v) => v.related).map((v) => v.url),
+        verdicts,
+        criteria,
+      })
     }
     return NextResponse.json({ related: await classifyRelatedByGenre(items) })
   } catch (e) {

@@ -18,13 +18,24 @@ async function main(): Promise<void> {
      (SELECT url, title, genre FROM verify_link WHERE genre = 'website' AND btrim(coalesce(title,'')) <> '' LIMIT 6)`
   )
   const verdicts = await classifyWithReasonsByGenre(rows)
+  const { relatedCriteria } = await import('../lib/prompts')
+  for (const g of ['study-helper', 'website']) {
+    const c = relatedCriteria(g as never)
+    console.log(`\n${g} related-prompt — about ${c.head || '(no headline)'}:`)
+    c.topics.forEach((t, i) => console.log(`  ${i + 1}. ${t}`))
+  }
+  console.log('')
   let bad = 0
   const byUrl = new Map(verdicts.map((v) => [v.url, v]))
   for (const r of rows) {
     const v = byUrl.get(r.url)
     if (!v || !v.reason) bad++
-    console.log(`[${r.genre}] ${v?.related ? 'RELATED  ' : 'unrelated'} ${r.title.slice(0, 70).replace(/\s+/g, ' ')}`)
-    console.log(`            why: ${v?.reason ?? '(none)'}`)
+    // A related verdict must name the rule it followed.
+    if (v && v.related && !v.ruleText) bad++
+    const rule = !v ? '' : v.rule === 'topic' ? `topic ${v.ruleNo}: "${v.ruleText}"`
+      : v.rule === 'keyword' ? `keyword "${v.ruleText}"` : 'no topic'
+    console.log(`[${r.genre}] ${v?.related ? 'RELATED  ' : 'unrelated'} ${r.title.slice(0, 60).replace(/\s+/g, ' ')}`)
+    console.log(`            rule: ${rule} — ${v?.reason ?? '(none)'}`)
   }
   console.log(bad ? `${bad} without a reason` : `all ${rows.length} have a reason`)
   process.exit(bad ? 1 : 0)
