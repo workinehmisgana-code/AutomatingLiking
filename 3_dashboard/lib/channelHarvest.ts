@@ -73,6 +73,55 @@ export const HARVEST_MIN_ACTIVE_PCT = 50
 const CURSOR_KEY = 'channel_harvest_cursor'
 /** The last run's summary, for the admin page and for "has this ever run?". */
 const LAST_RUN_KEY = 'channel_harvest_last'
+/** Whether the harvest's title check is working — see ClassifyStatus. */
+const CLASSIFY_STATUS_KEY = 'channel_harvest_classify_status'
+
+/**
+ * THE TITLE CHECK'S HEALTH, kept apart from the last slice's summary.
+ *
+ * A slice that finds nothing new classifies nothing, so its summary cannot
+ * say whether the check works — and the next empty slice would overwrite a
+ * failure with a clean record. This is written only when titles were actually
+ * judged: a failure records when it started and how many links it has left
+ * unsorted since, a success clears it. The Links to verify page shows it.
+ */
+export interface ClassifyStatus {
+  ok: boolean
+  /** When the check last ran (either way). */
+  at: string
+  /** Failing: the error, the first failure, and links left unsorted since. */
+  error?: string
+  since?: string
+  unsorted?: number
+}
+
+export async function getClassifyStatus(): Promise<ClassifyStatus | null> {
+  const raw = await getAppState(CLASSIFY_STATUS_KEY).catch(() => null)
+  if (!raw) return null
+  try {
+    return JSON.parse(raw) as ClassifyStatus
+  } catch {
+    return null
+  }
+}
+
+export async function recordClassify(error: string, judged: number): Promise<void> {
+  const now = new Date().toISOString()
+  if (!error) {
+    await setAppState(CLASSIFY_STATUS_KEY, JSON.stringify({ ok: true, at: now })).catch(() => {})
+    return
+  }
+  const prev = await getClassifyStatus()
+  const failing = prev && !prev.ok
+  const next: ClassifyStatus = {
+    ok: false,
+    at: now,
+    error,
+    since: failing ? prev.since ?? now : now,
+    unsorted: (failing ? prev.unsorted ?? 0 : 0) + judged,
+  }
+  await setAppState(CLASSIFY_STATUS_KEY, JSON.stringify(next)).catch(() => {})
+}
 
 /** Channel listings fetched at once. */
 const CHANNEL_CONCURRENCY = 4
@@ -316,6 +365,7 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
       console.error('[harvest] title check failed:', classifyError)
       return [] as string[]
     })
+    await recordClassify(classifyError, titled.length)
   }
 
   // ONE MERGE for both reasons: the pool file is rewritten once per pass.

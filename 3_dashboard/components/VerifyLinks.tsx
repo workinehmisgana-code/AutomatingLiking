@@ -168,6 +168,11 @@ export default function VerifyLinks({
   // against the right question — a slides video is not judged by whether it
   // suits a humanizer. Set by the master switch above the page (a prop).
   const [genreCounts, setGenreCounts] = useState<Record<string, number>>({})
+  // The automatic harvest's title check: failing means everything it finds is
+  // left here unsorted instead of merged. Shown as a warning at the top.
+  const [harvestCheck, setHarvestCheck] = useState<{
+    ok: boolean; at: string; error?: string; since?: string; unsorted?: number
+  } | null>(null)
   // Channels present in the verify list, for the whole-channel merge.
   const [accounts, setAccounts] = useState<{ account: string; platform: string; n: number }[]>([])
   // Channels ticked for merging. A set, so a search's worth can be cleared in
@@ -246,6 +251,7 @@ export default function VerifyLinks({
         if (d.platformCounts && typeof d.platformCounts === 'object') {
           setPlatformCounts(d.platformCounts as Record<string, number>)
         }
+        setHarvestCheck(d.harvestCheck && typeof d.harvestCheck === 'object' ? d.harvestCheck : null)
         if (d.genreCounts && typeof d.genreCounts === 'object') {
           setGenreCounts(d.genreCounts as Record<string, number>)
         }
@@ -1456,6 +1462,34 @@ export default function VerifyLinks({
           Main links →
         </Link>
       </div>
+
+      {/* THE HARVEST CANNOT SORT. Without this the failure was silent: every
+          new link landed here unsorted and the page looked like a strict
+          classifier, not a broken one. */}
+      {harvestCheck && !harvestCheck.ok && (
+        <div className="mt-2 mb-2 rounded-lg border border-rose-500/50 bg-rose-950/40 px-3 py-2 text-xs text-rose-100">
+          <div className="font-semibold text-rose-200">
+            ⚠ The automatic harvest cannot sort new links — its title check is failing
+          </div>
+          <div className="mt-0.5 text-rose-200/90">
+            Failing since {new Date(harvestCheck.since || harvestCheck.at).toLocaleString()} (last try{' '}
+            {new Date(harvestCheck.at).toLocaleString()}).{' '}
+            {(harvestCheck.unsorted ?? 0).toLocaleString()} new link(s) it found since then were left here
+            for you to judge, instead of the related ones being merged into the pool automatically.
+          </div>
+          {harvestCheck.error && (
+            <div className="mt-1 font-mono text-[11px] text-rose-300/80 break-words">{harvestCheck.error}</div>
+          )}
+          <div className="mt-1 text-rose-200/70">
+            {/401|api key|unauthenticated|permission/i.test(harvestCheck.error || '')
+              ? 'The AI key was rejected: set a working GEMINI_API_KEY in the dashboard’s hosting settings and redeploy. '
+              : /429|quota|rate/i.test(harvestCheck.error || '')
+                ? 'The AI provider’s quota or rate limit was hit; it usually clears on its own. '
+                : ''}
+            This warning clears by itself the next time the harvest judges titles successfully.
+          </div>
+        </div>
+      )}
 
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2 my-4">

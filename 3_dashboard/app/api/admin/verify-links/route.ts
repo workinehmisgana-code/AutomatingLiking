@@ -15,6 +15,7 @@ import {
   type TitleFilter,
 } from '@/lib/db'
 import { loadVideosJson } from '@/lib/videos'
+import { getClassifyStatus } from '@/lib/channelHarvest'
 
 export const dynamic = 'force-dynamic'
 
@@ -106,14 +107,17 @@ export async function GET(req: NextRequest) {
     // "every genre" rather than silently matching nothing.
     const genreParam = String(req.nextUrl.searchParams.get('genre') ?? '').trim()
     const genre = isGenre(genreParam) ? genreParam : ''
-    const [{ rows, total, totalAll }, platformCounts, genreCounts] = await Promise.all([
+    const [{ rows, total, totalAll }, platformCounts, genreCounts, harvestCheck] = await Promise.all([
       getVerifyLinks(limit, page * limit, title, accounts, platform, genre),
       getVerifyPlatformCounts().catch(() => ({}) as Record<string, number>),
       getVerifyGenreCounts().catch(() => ({}) as Record<string, number>),
+      // Whether the automatic harvest can still sort what it finds — shown as
+      // a warning on this page while it cannot.
+      getClassifyStatus().catch(() => null),
     ])
     return NextResponse.json({
       rows, total, totalAll, page, limit, title, accounts,
-      platform, platformCounts, genre, genreCounts,
+      platform, platformCounts, genre, genreCounts, harvestCheck,
     })
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 })
