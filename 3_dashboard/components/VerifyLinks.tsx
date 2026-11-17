@@ -5,7 +5,7 @@ import Link from 'next/link'
 import ScrollX from '@/components/ScrollX'
 import RelatedRuleEditor from '@/components/RelatedRuleEditor'
 import {
-  CLASSIFY_BATCH,
+  CLASSIFY_MAX_ITEMS,
   CLICK_PLATFORMS,
   CLICK_PLATFORM_LABELS,
   DEFAULT_GENRE,
@@ -17,14 +17,14 @@ import {
 
 const PAGE_SIZE = 500
 const UPLOAD_CHUNK = 500 // rows per upload request
-const CLASSIFY_BATCHES = 5 // split a page's titles into up to this many Groq batches
 
 /** 🤖 Mark unrelated's verdict on one link, and which part of the related-prompt decided it. */
 interface Verdict {
   related: boolean
   reason: string
-  /** topic = matched topic `ruleNo`; keyword = contains `ruleText`; none = no topic matched */
-  rule: 'topic' | 'keyword' | 'none'
+  /** topic = matched topic `ruleNo`; keyword = contains `ruleText`; none = no topic
+   *  matched; unanswered = the model gave no verdict (not selected for blocking) */
+  rule: 'topic' | 'keyword' | 'none' | 'unanswered'
   ruleNo: number
   ruleText: string
   genre: string
@@ -295,8 +295,11 @@ export default function VerifyLinks({
   }, [])
   useEffect(() => { loadAccounts() }, [loadAccounts, totalAll])
 
-  // Loaded once with the page: it is the number that decides whether a channel is
-  // worth merging at all, so making it opt-in here would just hide it.
+  // Loaded with the page AND AGAIN WHENEVER THE GENRE SWITCH CHANGES: the
+  // counts are per genre (the server reads the switch), and loading them once
+  // left every row of the newly picked genre at "—". It is the number that
+  // decides whether a channel is worth merging at all, so it is not opt-in.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const loadChannelStats = useCallback(() => {
     setStatsState('loading')
     fetch('/api/admin/links/channel-stats')
@@ -310,7 +313,7 @@ export default function VerifyLinks({
         else setStatsState('failed')
       })
       .catch(() => setStatsState('failed'))
-  }, [])
+  }, [genre])
   useEffect(() => { loadChannelStats() }, [loadChannelStats])
 
   // Channels matching the search box. Matching on the handle only (the counts
@@ -709,13 +712,10 @@ export default function VerifyLinks({
     }
     setClassifying(true)
     try {
-      // CAPPED, not just divided. Five batches of a 500-row page is 100 each,
-      // which fits under the endpoint's limit by arithmetic rather than by
-      // intent — raise PAGE_SIZE and the batches silently grow past it.
-      const batchSize = Math.min(
-        CLASSIFY_BATCH,
-        Math.max(1, Math.ceil(items.length / CLASSIFY_BATCHES))
-      )
+      // THE WHOLE PAGE IN ONE REQUEST: the server judges it in one model call
+      // per genre, every answer naming its title. Split only past the
+      // server's limit, which a 500-row page does not reach.
+      const batchSize = CLASSIFY_MAX_ITEMS
       const related = new Set<string>()
       const why: Record<string, Verdict> = {}
       for (let i = 0; i < items.length; i += batchSize) {
@@ -732,7 +732,7 @@ export default function VerifyLinks({
             why[v.url] = {
               related: !!v.related,
               reason: String(v.reason || ''),
-              rule: v.rule === 'topic' || v.rule === 'keyword' ? v.rule : 'none',
+              rule: v.rule === 'topic' || v.rule === 'keyword' || v.rule === 'unanswered' ? v.rule : 'none',
               ruleNo: Number(v.ruleNo) || 0,
               ruleText: String(v.ruleText || ''),
               genre: items.find((it) => it.url === v.url)?.genre ?? '',
@@ -745,7 +745,11 @@ export default function VerifyLinks({
         // Shown as each batch lands, not only at the end.
         setReasons((prev) => ({ ...prev, ...why }))
       }
-      const unrelated = items.filter((it) => !related.has(it.url)).map((it) => it.url)
+      // A title the model never answered is NOT unrelated: it is left unticked,
+      // so Block cannot take a link nobody judged.
+      const unanswered = items.filter((it) => why[it.url]?.rule === 'unanswered').map((it) => it.url)
+      const skip = new Set(unanswered)
+      const unrelated = items.filter((it) => !related.has(it.url) && !skip.has(it.url)).map((it) => it.url)
       setSelected(new Set(unrelated))
       // Frozen here and nowhere else, so the order holds still while the page is
       // reviewed.
@@ -753,7 +757,11 @@ export default function VerifyLinks({
       setClassifiedThisPage(true) // this page is now reviewed → merge is allowed
       alert(
         `Selected ${unrelated.length} unrelated link(s) of ${items.length} ` +
-          `(${markLabel}) — floated to the top. Review, then Block.`
+          `(${markLabel}) — floated to the top. Review, then Block.` +
+          (unanswered.length
+            ? `\n\n${unanswered.length} link(s) got no answer from the model, even when asked again, ` +
+              'and were NOT selected. Press the button again to judge them, or look at them yourself.'
+            : '')
       )
     } finally {
       setClassifying(false)
@@ -2548,8 +2556,14 @@ export default function VerifyLinks({
                   <span className="w-64 shrink-0 text-[11px] leading-tight" title={v?.reason || ''}>
                     {v ? (
                       <>
-                        <span className={v.related ? 'text-emerald-400 font-medium' : 'text-rose-400 font-medium'}>
-                          {v.related ? '✓ related' : '✗ unrelated'}
+                        <span
+                          className={
+                            v.related ? 'text-emerald-400 font-medium'
+                              : v.rule === 'unanswered' ? 'text-amber-400 font-medium'
+                                : 'text-rose-400 font-medium'
+                          }
+                        >
+                          {v.related ? '✓ related' : v.rule === 'unanswered' ? '? not judged' : '✗ unrelated'}
                         </span>
                         {/* WHICH PART OF THE PROMPT decided it. */}
                         <span className="text-zinc-300">
@@ -2557,7 +2571,9 @@ export default function VerifyLinks({
                             ? ` · topic ${v.ruleNo}: “${v.ruleText}”`
                             : v.rule === 'keyword'
                               ? ` · keyword rule: “${v.ruleText}”`
-                              : ` · matches none of the ${criteria[v.genre]?.topics.length ?? ''} topics`}
+                              : v.rule === 'unanswered'
+                                ? ' · no verdict, left unselected'
+                                : ` · matches none of the ${criteria[v.genre]?.topics.length ?? ''} topics`}
                         </span>
                         <span className="block text-zinc-500 line-clamp-2">{v.reason}</span>
                       </>

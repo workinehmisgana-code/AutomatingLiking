@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { isAdminEmail, isGenre, productsInGenre } from '@/lib/config'
-import { getDayLinks, getDayOwnLinks } from '@/lib/db'
+import { getDayLinks, getDayOwnLinks, getDayPlatformLinks } from '@/lib/db'
 import { getAdminGenreScope } from '@/lib/adminGenre'
 
 export const dynamic = 'force-dynamic'
@@ -13,6 +13,10 @@ export const dynamic = 'force-dynamic'
 // &own=1 — only the TikTok links carrying the served worker's own comment (the
 // "with the worker's own comment" rows). Without a product it is the TikTok
 // platform row: every product in the admin's genre scope.
+//
+// &platform=<p> (no product) — a "by platform" row's cell: every link clicked
+// on that platform that day, in the admin's genre scope, with who clicked it
+// and the comment(s) they were handed.
 export async function GET(req: NextRequest) {
   const session = await auth.api.getSession({ headers: await headers() }).catch(() => null)
   if (!isAdminEmail(session?.user?.email)) {
@@ -21,10 +25,16 @@ export async function GET(req: NextRequest) {
   const day = (req.nextUrl.searchParams.get('day') || '').trim()
   const product = (req.nextUrl.searchParams.get('product') || '').trim()
   const own = req.nextUrl.searchParams.get('own') === '1'
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || (!product && !own)) {
+  const platform = (req.nextUrl.searchParams.get('platform') || '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || (!product && !own && !platform)) {
     return NextResponse.json({ error: 'Give a day (YYYY-MM-DD) and a product.' }, { status: 400 })
   }
   try {
+    if (platform && !own && !product) {
+      const scope = await getAdminGenreScope().catch(() => '')
+      const products = scope && isGenre(scope) ? productsInGenre(scope) : null
+      return NextResponse.json({ links: await getDayPlatformLinks(day, platform, products) })
+    }
     if (own) {
       // The same genre cut the dashboard's counts were made with.
       const scope = await getAdminGenreScope().catch(() => '')

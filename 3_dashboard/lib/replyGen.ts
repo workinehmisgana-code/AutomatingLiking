@@ -16,7 +16,7 @@
 // /admin/replies and copies the ones worth using.
 
 import { flatFold } from './lookalike'
-import { llmChat } from './llm'
+import { llmChat, llmTakesBigBatches } from './llm'
 import { PRODUCTS, DEACTIVATED_PRODUCTS, genreOfProduct, type Product } from './config'
 import { REPLY_AFFIRM as AFFIRM, REPLY_RECOMMEND as RECOMMEND, replyUser } from './prompts'
 import type { WordBand } from './db'
@@ -41,8 +41,13 @@ export interface ReplySkip {
   topText: string
 }
 
-/** One prompt's worth. Small enough that a misaligned array is cheap to redo. */
-export const CHUNK = 8
+/**
+ * Comments per request. 30: each reply is keyed by its comment's number, so a
+ * longer list cannot drift out of line (it was 8 while replies were matched by
+ * position). A Groq model gets 8 a call — runMode splits.
+ */
+export const CHUNK = 30
+const GROQ_CHUNK = 8
 
 /** Replies shorter than this cannot both answer a comment and name a product. */
 export const REPLY_WORD_MIN = 8
@@ -121,6 +126,18 @@ async function runMode(
   // Every item here is one genre, so any of their products answers for it.
   const genreProduct = items[0].product
 
+  // Groq's free tier still wants the old small batches, one after another.
+  if (items.length > GROQ_CHUNK && !(await llmTakesBigBatches().catch(() => false))) {
+    const drafts: ReplyDraft[] = []
+    const skips: ReplySkip[] = []
+    for (let i = 0; i < items.length; i += GROQ_CHUNK) {
+      const r = await runMode(mode, items.slice(i, i + GROQ_CHUNK), band)
+      drafts.push(...r.drafts)
+      skips.push(...r.skips)
+    }
+    return { drafts, skips }
+  }
+
   try {
     const { content } = await llmChat({
       temperature: mode === 'affirm' ? 0.7 : 0.85,
@@ -129,7 +146,7 @@ async function runMode(
       // enough for a few short replies but truncated a batch of ten mid-JSON,
       // and Groq rejects the whole call as invalid JSON rather than returning
       // the part it managed — so the entire chunk yielded nothing.
-      maxTokens: Math.min(4000, 400 + items.length * (band.max * 4 + 40)),
+      maxTokens: Math.min(16000, 400 + items.length * (band.max * 4 + 40)),
       messages: [
         {
           role: 'system',
@@ -139,11 +156,18 @@ async function runMode(
       ],
     })
     const parsed = JSON.parse(content) as { replies?: unknown }
-    const arr = Array.isArray(parsed.replies) ? parsed.replies : []
+    const got = parsed.replies
+    // KEYED BY THE COMMENT'S NUMBER ("1": …); a bare array is still read by position.
+    const pick = (i: number): unknown =>
+      Array.isArray(got)
+        ? got[i]
+        : got && typeof got === 'object'
+          ? (got as Record<string, unknown>)[String(i + 1)]
+          : undefined
     const drafts: ReplyDraft[] = []
     const skips: ReplySkip[] = []
     items.forEach((t, i) => {
-      const raw = arr[i]
+      const raw = pick(i)
       if (typeof raw === 'string' && SKIP_RE.test(raw.trim())) {
         skips.push({ url: t.url, topText: t.topText })
         return

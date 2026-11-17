@@ -7,7 +7,7 @@ import { isAdminRequest } from '@/lib/machineAuth'
 import { loadVideosJson } from '@/lib/videos'
 import { saveVerifyLinks, getAllVerifyLinkUrls, getBlockedUrls } from '@/lib/db'
 import { rankChannels, handleOf, unattributedLinks } from '@/lib/channelRank'
-import { fetchChannelListing, fetchVideoDetail } from '@/lib/linkStats'
+import { fetchChannelListing, fetchVideoDetail, tiktokPostedDate } from '@/lib/linkStats'
 import { DEFAULT_GENRE } from '@/lib/config'
 
 export const dynamic = 'force-dynamic'
@@ -292,9 +292,10 @@ export async function POST(req: NextRequest) {
             heart_count: d?.hearts ?? 0,
             comment_count: d?.comments ?? 0,
             share_count: d?.shares ?? 0,
-            posted_date: d?.postedDate || '',
+            // From the id when the detail page gave none — see tiktokPostedDate.
+            posted_date: d?.postedDate || tiktokPostedDate(v.id),
             title: d?.title || v.title || '',
-            bio: d?.bio || '',
+            bio: d?.bio || v.bio || '',
             // THE CHANNEL'S GENRE, inherited by every video of it. This is the
             // only place a staged link gets one: nobody types a genre per
             // video, they pick it once when adding the channel.

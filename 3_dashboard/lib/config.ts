@@ -935,6 +935,15 @@ export interface CommentStyle {
    * rather than the point.
    */
   voice: CommentVoice
+  /**
+   * THE NAME AS PART OF THE SENTENCE, not a brand. On, the name is written the
+   * way a common noun is — the kind of tool, the step you take: "the trick is
+   * running it through a co humanizer", "a purify text is what fixed it" —
+   * instead of announced as a product somebody recommends. How the cohumanizer
+   * comments are written, as a switch any product can use. Optional, so a
+   * style stored before it existed still parses (absent = off).
+   */
+  inSentence?: boolean
 }
 
 export type CommentVoice = 'question' | 'recommendation' | 'informational' | 'curious'
@@ -953,6 +962,7 @@ export const DEFAULT_COMMENT_STYLE: CommentStyle = {
   splitBrand: true,
   quoteBrand: false,
   voice: 'question',
+  inSentence: false,
 }
 
 /**
@@ -1613,7 +1623,10 @@ export const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta
  * than trimming it, because a silently trimmed batch is indistinguishable from a
  * classified one.
  */
-export const CLASSIFY_MAX_ITEMS = 120
+// 500 = a whole verify page in ONE request (the "Mark unrelated" with reasons
+// path). The server judges it as 100-title model calls made at once, every
+// answer naming its title. The Links page keeps sending CLASSIFY_BATCH a time.
+export const CLASSIFY_MAX_ITEMS = 500
 export const CLASSIFY_BATCH = 100
 // Rewrites must be this many words (inclusive) and mention the product name.
 export const COMMENT_WORD_MIN = 3

@@ -41,6 +41,20 @@ async function chosenModel(): Promise<LlmModel> {
   return model
 }
 
+/**
+ * Does the chosen model take BIG batches?
+ *
+ * Gemini does: a 1M-token context and 65k tokens out, and it is the default.
+ * Every small batch size in this codebase was set for Groq's free tier —
+ * 8,000 tokens a minute, and a truncated reply rejected whole as invalid JSON
+ * — so a caller sends Gemini many items per call and a Groq model the old
+ * small batch. A fallback from Gemini to Groq mid-call is the one case a big
+ * batch is sent to Groq; it fails the way a Gemini failure would anyway.
+ */
+export async function llmTakesBigBatches(): Promise<boolean> {
+  return llmProvider(await chosenModel()) === 'gemini'
+}
+
 /** Forget the cached choice — called when the setting is changed. */
 export function forgetLlmModelCache(): void {
   cached = null

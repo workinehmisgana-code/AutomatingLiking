@@ -16,7 +16,7 @@ import {
   isCommentVoice,
   type CommentVoice,
 } from './config'
-import { llmChat } from './llm'
+import { llmChat, llmTakesBigBatches } from './llm'
 import { buildAudiencePrompt } from './prompts'
 import { COMMENTS } from './comments'
 import { audiencesForProduct } from './config'
@@ -42,7 +42,7 @@ const LOCK_LEASE_MS = 2 * 60 * 1000
 const EMOJI =
   /[\u2190-\u21FF\u2300-\u27BF\u2B00-\u2BFF\u2600-\u26FF\uFE0F\u200D]|[\uD800-\uDBFF][\uDC00-\uDFFF]/g
 
-// Upbeat only — the tone is "this worked out", never sarcasm or panic. Picked by
+// Upbeat only â€” the tone is "this worked out", never sarcasm or panic. Picked by
 // position so a batch gets a spread instead of the same face on every line.
 const VIBES = ['\u{1F64C}', '\u2728', '\u{1F4AF}', '\u{1F525}', '\u{1FAF6}', '\u{1F44F}', '\u{1F4AA}', '\u{1F60C}']
 
@@ -90,10 +90,10 @@ function escapeRe(s: string): string {
  *
  * AN INFLECTION SURVIVES, because only the name itself is replaced: \"purifytexted\"
  * matches on its first ten letters and comes back \"purify texted\", \"PurifyTexting\"
- * comes back \"purify texting\". That is the trick — the sentence keeps the grammar
+ * comes back \"purify texting\". That is the trick â€” the sentence keeps the grammar
  * the model wrote and the name stops looking like one.
  */
-function canonicaliseMention(s: string, product: Product, style: CommentStyle): string | null {
+export function canonicaliseMention(s: string, product: Product, style: CommentStyle): string | null {
   // Matched on the SPLIT form so either spelling is recognised, emitted in
   // whichever form the admin chose. Matching and emitting are different jobs.
   const match = productMatchWords(product)
@@ -115,7 +115,7 @@ function canonicaliseMention(s: string, product: Product, style: CommentStyle): 
 // word-count band, and are unique. This is the safety net around the LLM.
 // Target word counts for one batch, spread evenly across the band and shuffled.
 //
-// Asking the model for "3 to 8 words" produces a clump — it settles on one
+// Asking the model for "3 to 8 words" produces a clump â€” it settles on one
 // comfortable length and repeats it. Handing each line its OWN target is what
 // actually yields a mix of short and long comments. Shuffled so the batch does
 // not arrive sorted by length.
@@ -145,7 +145,7 @@ const SEP = '\n\n'
 //
 // These are what the model produced when the prompt asked it to "hype it up":
 // "acoustic text is my league forever", "humlexic takes the obvious #1 spot",
-// "acoustictext is my secret bypass weapon". Every one is a tagline — it crowns
+// "acoustictext is my secret bypass weapon". Every one is a tagline â€” it crowns
 // the product without telling a reader anything they could act on, and a comment
 // section full of them reads as paid promotion at a glance.
 //
@@ -166,7 +166,7 @@ const DANGLING = new RegExp(
 // A question that puts OUR OWN product in doubt.
 //
 // Always rejected, under every voice. "does purify text actually work?" argues
-// the case against us, under our own comment, in our own words — worse than
+// the case against us, under our own comment, in our own words â€” worse than
 // saying nothing. The subject is a bounded gap rather than a fixed word, because
 // the product name sits where "it" would: "is purify text any good" is the same
 // question as "is it any good".
@@ -185,7 +185,7 @@ const SELF_DOUBT = new RegExp(
 //
 // WANTED under the question voice and banned under the curious one, which is
 // why it is separate from SELF_DOUBT. Asking the creator to measure what they
-// are showing against our product is the whole point of that voice — "how does
+// are showing against our product is the whole point of that voice â€” "how does
 // this compare to purify text?" treats it as the benchmark without claiming
 // anything, and nobody argues with a question. The curious voice is the
 // opposite shape (the person is the subject, the product a passing aside), so a
@@ -203,7 +203,7 @@ const COMPARISON = new RegExp(
 //
 // Only applied under the INFORMATIONAL voice, where the whole point is that the
 // comment says what the tool is and stops. The model drifts back to praise
-// within a batch or two — it is what almost every seed comment does — and a
+// within a batch or two â€” it is what almost every seed comment does â€” and a
 // "recommendation with the adjectives removed" is still a recommendation.
 const ENDORSING = new RegExp(
   [
@@ -232,8 +232,8 @@ const SECOND_PERSON = new RegExp(String.raw`\b(you|your|you're|youre|u|ur)\b`, '
 // A comment written by the company rather than by a person.
 //
 // The writer is supposed to be an ordinary user who does not know the jargon.
-// The model knows it perfectly well and drifts back into it — "bypasses every
-// detector", "0% ai output", "this tool humanizes your content" — and a line
+// The model knows it perfectly well and drifts back into it â€” "bypasses every
+// detector", "0% ai output", "this tool humanizes your content" â€” and a line
 // like that is the single clearest tell that a comment was planted, because no
 // classmate has ever described a website that way.
 //
@@ -241,11 +241,11 @@ const SECOND_PERSON = new RegExp(String.raw`\b(you|your|you're|youre|u|ur)\b`, '
 // out of a sentence built around them leaves the same sentence.
 //
 // Deliberately NOT banned: turnitin, gptzero and the other product names, and
-// "ai" on its own. Students say those every day — "turnitin didn't flag it" is
+// "ai" on its own. Students say those every day â€” "turnitin didn't flag it" is
 // exactly the register we want, and banning it would leave nothing concrete to
 // say. What is banned is the register around them.
 // NARROW ON PURPOSE. The first version of this banned "detector", "tool" and any
-// percentage, and it rejected entire batches — a student saying "turnitin
+// percentage, and it rejected entire batches â€” a student saying "turnitin
 // flagged it" or "it came back 0%" is exactly the register we want, and the
 // ai_detector audience has almost nothing else to talk about. A filter that
 // leaves nothing for the model to say produces "No valid rewrites returned",
@@ -256,7 +256,7 @@ const SECOND_PERSON = new RegExp(String.raw`\b(you|your|you're|youre|u|ur)\b`, '
 // PER GENRE, because the giveaway words are. "humanize" is the tell for one
 // product and irrelevant to a slide deck; "drag-and-drop" is the tell for a
 // website builder and means nothing under an essay video. The company's own
-// nouns for itself are shared — see SHARED_JARGON.
+// nouns for itself are shared â€” see SHARED_JARGON.
 //
 // Cached per product: this is called once per candidate comment, and compiling
 // the same regex a few hundred times a batch is work for nothing.
@@ -305,7 +305,7 @@ export function sanitize(
     if (!s) continue
     // MUST mention the product; the name is normalised here rather than trusted
     // to the model, so nothing goes out announcing a brand however the model
-    // chose to write it — split, lowercase, unquoted, un-hashed, with whatever
+    // chose to write it â€” split, lowercase, unquoted, un-hashed, with whatever
     // inflection the sentence needs left alone.
     const named = canonicaliseMention(s, product, style)
     if (named === null) continue
@@ -315,7 +315,7 @@ export function sanitize(
     // Question style is not decoration: the whole point is that the claim is
     // presupposed rather than asserted. A line that is not a question, or one
     // that questions the product instead of assuming it, is thrown away rather
-    // than posted — there is always another line in the batch.
+    // than posted â€” there is always another line in the batch.
     //
     // Only when the product is SET to question style. With it off, a comment
     // ending in a question mark is just a comment, and DOUBTING would be
@@ -328,12 +328,12 @@ export function sanitize(
       // Never allowed either way: our own product questioned.
       if (SELF_DOUBT.test(s)) continue
       // Comparisons are the POINT of the question voice and the ruin of the
-      // curious one — see COMPARISON.
+      // curious one â€” see COMPARISON.
       if (style.voice === 'curious' && COMPARISON.test(s)) continue
     }
     // A curious comment is addressed to a PERSON. Without a second person in it
     // the model has written a rhetorical question again, which is the other
-    // voice — and the whole difference between the two is who is being asked.
+    // voice â€” and the whole difference between the two is who is being asked.
     if (style.voice === 'curious' && !SECOND_PERSON.test(s)) continue
     // Informational means informational: a line that endorses, compares or
     // speaks in the first person is a recommendation wearing a flat tone.
@@ -343,12 +343,12 @@ export function sanitize(
     // comparison words but the MAIN set banned nothing, which is how the
     // taglines above reached the app.
     if (SLOGANS.test(s)) continue
-    // Written by the company rather than by a person — see JARGON. Applies to
+    // Written by the company rather than by a person â€” see JARGON. Applies to
     // every voice: the informational one is the plainest, not the most
     // technical, and it drifts hardest because "state what it is" reads to the
     // model as an invitation to describe the product.
     // Tested with the product's OWN NAME taken out: "co humanizer" contains
-    // "humanizer", which the humanizer genre bans as advert-speak — and every
+    // "humanizer", which the humanizer genre bans as advert-speak â€” and every
     // one of its comments would be rejected for naming it.
     if (jargonFor(product).test(s.replace(nameRe, ' '))) continue
     if (DANGLING.test(stripEmoji(s))) continue
@@ -407,20 +407,27 @@ function baseComments(product: Product): string[] {
 // (8000 tokens/min). Rewriting a rotating sample keeps every request small AND
 // gives day-to-day variety. Bump this if you move to a higher Groq tier.
 const MAX_INPUT = 40
+// On Gemini: the WHOLE bank of base comments in one call (bigger banks are
+// sampled), and an output budget to match. The small numbers above and below
+// were set for Groq's free tier and stay for a Groq model.
+const MAX_INPUT_BIG = 120
+const OUTPUT_BUDGET_BIG = 16000
 
 // Roughly how many completion tokens one rewrite costs: ~2 per word, plus the
-// JSON quoting, comma and whitespace around it. Deliberately generous — the
+// JSON quoting, comma and whitespace around it. Deliberately generous â€” the
 // failure mode of guessing low is the model running out of room mid-array and
 // Groq rejecting the whole response with json_validate_failed.
 const tokensPerItem = (band: WordBand): number => band.max * 4 + 40
 
 // Keep one response comfortably inside a single completion. A wider word band
 // costs more per line, so the BATCH shrinks rather than the token cap growing
-// without limit — which is what broke when the band went from 3-8 to 6-16.
+// without limit â€” which is what broke when the band went from 3-8 to 6-16.
 const OUTPUT_BUDGET = 4000
 
-function batchSize(band: WordBand): number {
-  return Math.max(8, Math.min(MAX_INPUT, Math.floor(OUTPUT_BUDGET / tokensPerItem(band))))
+function batchSize(band: WordBand, big = false): number {
+  const cap = big ? MAX_INPUT_BIG : MAX_INPUT
+  const budget = big ? OUTPUT_BUDGET_BIG : OUTPUT_BUDGET
+  return Math.max(8, Math.min(cap, Math.floor(budget / tokensPerItem(band))))
 }
 
 // The cap sent to Groq: what this batch can actually need, plus room for the
@@ -432,7 +439,7 @@ function batchSize(band: WordBand): number {
  * 38-item batch it spent 2,113-3,105 tokens thinking and about 560 on the
  * answer, and the thinking grows with the prompt. The old cap was sized for the
  * answer alone (600 + 104/item = 4,552 at full batch), which left roughly a
- * thousand tokens of headroom — so a longer prompt tipped it over and Groq
+ * thousand tokens of headroom â€” so a longer prompt tipped it over and Groq
  * returned `json_validate_failed: max completion tokens reached before
  * generating a valid document`, with the whole batch lost.
  *
@@ -443,10 +450,11 @@ function batchSize(band: WordBand): number {
 const REASONING_RESERVE = 4500
 
 function tokenCap(count: number, band: WordBand): number {
-  return Math.min(16000, Math.max(6000, REASONING_RESERVE + count * tokensPerItem(band)))
+  // 32k, not 16k: a whole bank in one Gemini call needs the room (Groq batches stay small).
+  return Math.min(32000, Math.max(6000, REASONING_RESERVE + count * tokensPerItem(band)))
 }
 
-// Pick up to n items at random (Fisher–Yates on a copy). A fresh sample each
+// Pick up to n items at random (Fisherâ€“Yates on a copy). A fresh sample each
 // run means the rewritten set shifts over time even beyond the model's own
 // phrasing variety.
 function sample<T>(arr: T[], n: number): T[] {
@@ -461,8 +469,8 @@ function sample<T>(arr: T[], n: number): T[] {
 
 /**
  * Generate + persist one product's comments for ONE AUDIENCE, replacing what is
- * stored. Every comment served is an audience comment — there is no
- * audience-neutral set any more — so this and appendToCategory are the only two
+ * stored. Every comment served is an audience comment â€” there is no
+ * audience-neutral set any more â€” so this and appendToCategory are the only two
  * ways comments come into existence.
  */
 export async function regenerateCategoryProducts(
@@ -477,7 +485,7 @@ export async function regenerateCategoryProducts(
     // Only the audiences this product's genre uses, intersected with whatever
     // the caller asked for. Generating a 'competitors' set for a slides product
     // is one Groq call per product spent on comments the server will never
-    // reach — fallbackCategory sends those links to 'generic'.
+    // reach â€” fallbackCategory sends those links to 'generic'.
     const wanted = audiencesForProduct(p)
     for (const c of categories.filter((x) => wanted.includes(x))) {
       const key = `${p}/${c}`
@@ -500,8 +508,8 @@ export async function regenerateCategoryProducts(
  * voice is set right now and appends, so a set can be built up from two or three
  * voices by switching the voice and pressing Add again.
  *
- * Deduped against the stored set on the same key sanitize() uses within a batch —
- * text without emoji, lowercased — so running it twice on one voice does not
+ * Deduped against the stored set on the same key sanitize() uses within a batch â€”
+ * text without emoji, lowercased â€” so running it twice on one voice does not
  * double the set, and a line the model happens to repeat is dropped rather than
  * stored twice.
  *
@@ -515,7 +523,8 @@ export async function appendToCategory(
   const base = baseComments(product)
   if (base.length === 0) return { added: 0, total: 0 }
   const { band, style } = await settingsFor(product)
-  const fresh = await callGroqForAudience(product, category, sample(base, batchSize(band)), band, style)
+  const big = await llmTakesBigBatches().catch(() => false)
+  const fresh = await callGroqForAudience(product, category, sample(base, batchSize(band, big)), band, style)
 
   const stored = (await getCategoryComments(product, category).catch(() => null))?.comments ?? []
   const key = (t: string) => stripEmoji(t).toLowerCase()
@@ -537,7 +546,7 @@ export async function appendToCategory(
   return { added: added.length, total: merged.length }
 }
 
-async function callGroqForAudience(
+export async function callGroqForAudience(
   product: Product,
   category: LinkCategory,
   base: string[],
@@ -545,7 +554,7 @@ async function callGroqForAudience(
   style: CommentStyle
 ): Promise<string[]> {
   // The form the model is asked for. canonicaliseMention() normalises whatever
-  // comes back anyway — including stripping quotes the model adds by itself,
+  // comes back anyway â€” including stripping quotes the model adds by itself,
   // which inside a JSON string is also an escaping hazard, and
   // json_validate_failed is how that used to show up.
   const mention = productWords(product, style.splitBrand)
@@ -575,7 +584,7 @@ async function callGroqForAudience(
   const arr = (parsed as { comments?: unknown })?.comments
   // banCliches applies here as well now. It used to be set only for the
   // audience sets, so "takes the obvious #1 spot" was filtered out of one
-  // path and waved through the other — and the other is where most comments
+  // path and waved through the other â€” and the other is where most comments
   // come from.
   const clean = sanitize(product, arr, band, { style, banCliches: true })
   if (clean.length === 0) throw new Error('No valid rewrites returned')
@@ -604,7 +613,7 @@ async function batchForVoice(
       const out = await callGroqForAudience(
         product,
         category,
-        sample(base, batchSize(band)),
+        sample(base, batchSize(band, await llmTakesBigBatches().catch(() => false))),
         band,
         styled
       )
@@ -622,7 +631,7 @@ async function batchForVoice(
  *
  * A set is a deliberate blend: generate on one voice, switch the voice, add
  * another batch. That is the only way a comment section stops reading as one
- * person with several accounts. Regeneration used to throw it away — it made a
+ * person with several accounts. Regeneration used to throw it away â€” it made a
  * single batch in whatever voice happened to be selected, so the nightly cron
  * flattened every mix an admin had built, overnight, silently.
  *
@@ -699,7 +708,7 @@ export async function regenerateCategory(
     return 0
   }
   // Record the voices that ACTUALLY produced something. A voice that failed
-  // tonight stays in the recipe only if it worked — otherwise a permanently
+  // tonight stays in the recipe only if it worked â€” otherwise a permanently
   // broken voice would be retried forever and its absence never noticed.
   await saveCategoryComments(product, category, out, usedVoices)
   return out.length

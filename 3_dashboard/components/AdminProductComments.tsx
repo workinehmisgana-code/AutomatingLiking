@@ -156,6 +156,8 @@ export default function AdminProductComments({
   const [quoteBrand] = useState(style.quoteBrand)
   // Which of the three pitches the comments make.
   const [voice, setVoice] = useState<CommentVoice>(style.voice)
+  // The name as part of the sentence (a concept) rather than a brand.
+  const [inSentence, setInSentence] = useState(style.inSentence === true)
   // What the server currently holds, so an edited-but-unsaved box is visible.
   const [savedBand, setSavedBand] = useState({ min: wordMin, max: wordMax })
 
@@ -296,6 +298,7 @@ export default function AdminProductComments({
           splitBrand,
           quoteBrand,
           voice,
+          inSentence,
         }),
       })
       const d = await res.json().catch(() => ({}))
@@ -331,6 +334,7 @@ export default function AdminProductComments({
     voice?: CommentVoice
     emoji?: boolean
     splitBrand?: boolean
+    inSentence?: boolean
   }) {
     setSavingStyle(true)
     setMsg('')
@@ -349,6 +353,7 @@ export default function AdminProductComments({
           splitBrand: patch.splitBrand ?? splitBrand,
           quoteBrand,
           voice: patch.voice ?? voice,
+          inSentence: patch.inSentence ?? inSentence,
         }),
       })
       const d = await res.json().catch(() => ({}))
@@ -361,6 +366,7 @@ export default function AdminProductComments({
       if (isCommentVoice(d.voice)) setVoice(d.voice)
       if (typeof d.emoji === 'boolean') setEmoji(d.emoji)
       if (typeof d.splitBrand === 'boolean') setSplitBrand(d.splitBrand)
+      if (typeof d.inSentence === 'boolean') setInSentence(d.inSentence)
       setMsg('Saved. It applies to the next regeneration.')
     } catch {
       setErr('Network error.')
@@ -390,7 +396,7 @@ export default function AdminProductComments({
       product as Product,
       category as LinkCategory,
       { min: Number(min) || wordMin, max: Number(max) || wordMax },
-      { emoji, splitBrand, quoteBrand, voice }
+      { emoji, splitBrand, quoteBrand, voice, inSentence }
     )
 
   // Which audience prompts are expanded. Collapsed by default: three of them
@@ -463,7 +469,9 @@ export default function AdminProductComments({
   // a comment will actually read like, and the mention alone hid the bigger of
   // the two changes.
   const preview =
-    (voice === 'question'
+    (inSentence
+      ? `the trick is running it through a ${brand} after chatgpt`
+      : voice === 'question'
       ? `why does nothing else come back 0% like ${brand} does?`
       : voice === 'curious'
         ? `what made you switch to ${brand}? the flow reads really clean`
@@ -827,6 +835,15 @@ export default function AdminProductComments({
               setSplitBrand,
               `Write compound names as two words: ${product} becomes ${splitPreview(product)}.`,
             ],
+            [
+              'Name inside the sentence',
+              inSentence,
+              setInSentence,
+              `Write ${splitPreview(product)} as an ordinary word in the sentence — the kind of tool or ` +
+                `the step ("run it through a ${splitPreview(product)}") — not as a brand being ` +
+                'recommended. The way the cohumanizer comments are written. Reads most naturally ' +
+                'with "Split the brand" on.',
+            ],
             // 'Quote the brand' used to be here and is gone: quoting is no longer
             // applied, so the switch could only lie about what would be sent.
           ] as const).map(([label, value, set, hint]) => (
@@ -842,7 +859,9 @@ export default function AdminProductComments({
                   void commitStyle(
                     label === 'Emoji'
                       ? { emoji: e.target.checked }
-                      : { splitBrand: e.target.checked }
+                      : label === 'Split the brand'
+                        ? { splitBrand: e.target.checked }
+                        : { inSentence: e.target.checked }
                   )
                 }}
                 className="accent-emerald-500"

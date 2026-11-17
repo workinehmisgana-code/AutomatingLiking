@@ -530,6 +530,28 @@ function noteFor(product: Product, mention: string): string {
   )
 }
 
+/**
+ * "Name inside the sentence" (CommentStyle.inSentence): write the name as an
+ * ordinary word in the sentence — the kind of thing, the step — not as a brand.
+ * The general form of the note cohumanizer has. It says it wins over the
+ * message above, because the audience angles are written as recommendations
+ * ("say what you use and why") and would otherwise pull it back to a plug.
+ */
+function inSentenceRule(style: CommentStyle, mention: string): string {
+  if (!style.inSentence) return ''
+  return (
+    `HOW "${mention}" SITS IN THE SENTENCE — THIS OVERRIDES THE MESSAGE ABOVE WHERE THEY DIFFER: ` +
+    `write "${mention}" as an ordinary word inside the sentence, the way people name a KIND of ` +
+    `thing or a step — as a concept, not a brand somebody is recommending. Put it where a ` +
+    `common noun would go and use "a ${mention}" or "the ${mention}" freely: "the trick is ` +
+    `running it through a ${mention}", "a ${mention} is what fixed it for me", "the missing step ` +
+    `was the ${mention}", "that is what a ${mention} is for". Say what a ${mention} does or why ` +
+    `it is the step that matters. Never announce it: no "try ${mention}", no "i recommend", no ` +
+    `"best", no "${mention} is the best", and no story about your own grades or results.` +
+    SEP
+  )
+}
+
 export function productBackground(product: Product): string {
   // WHAT THE PRODUCT IS comes from the genre table, not from here. This used to
   // state the humanizer definition inline, which was invisible while every
@@ -829,6 +851,7 @@ export function buildAudiencePrompt(
     angleFor(product, category) +
     SEP +
     noteFor(product, mention) +
+    inSentenceRule(style, mention) +
     naiveVoice(product) +
     SEP +
     voiceShapeRule(style, mention, product) +
@@ -862,6 +885,7 @@ export function buildSystemPrompt(
     productBackground(product) +
     SEP +
     noteFor(product, mention) +
+    inSentenceRule(style, mention) +
     naiveVoice(product) +
     SEP +
     voiceShapeRule(style, mention, product) +
@@ -900,9 +924,9 @@ export const CATEGORISE_SYSTEM =
   'AI/ChatGPT use, or anything unclear.\n' +
   'If a video fits BOTH competitors and ai_detector, choose "competitors" — naming a rival tool ' +
   'is the stronger signal about what the viewer already wants.\n' +
-  'Return STRICT JSON {"categories":[...]} — a JSON array of strings, ONE PER ITEM IN THE SAME ' +
-  'ORDER, each exactly "competitors", "ai_detector" or "generic", with exactly as many entries ' +
-  'as there are items. Example for 3 items: {"categories":["generic","ai_detector","generic"]}.'
+  'Return STRICT JSON {"categories":{...}} — an object keyed by each item\'s NUMBER from the ' +
+  'numbered list, one entry per item, each value exactly "competitors", "ai_detector" or ' +
+  '"generic". Example for 3 items: {"categories":{"1":"generic","2":"ai_detector","3":"generic"}}.'
 
 // ════════════════════════════════════════════════════════════════════════════
 // REPLIES: what to say under somebody else's comment
@@ -940,8 +964,9 @@ export const REPLY_RECOMMEND = (band: WordBand, product: string) =>
   'asks something, answer it. If it complains, sympathise. Never ignore what it says.\n' +
   `- then mention the given product by name, once, as the thing that helped — ${copyForProduct(product).replyMention}.\n` +
   replyRules(band) +
-  'Return STRICT JSON {"replies":[...]} — one string per item, SAME ORDER, exactly as many ' +
-  'entries as items. Use "SKIP" for items you are not replying to.'
+  'Return STRICT JSON {"replies":{...}} — an object keyed by each item\'s NUMBER from the ' +
+  'numbered list, one reply string per item. Use "SKIP" for items you are not replying to. ' +
+  'Example: {"replies":{"1":"...","2":"SKIP"}}.'
 
 export const REPLY_AFFIRM = (band: WordBand) =>
   'You write short REPLIES agreeing with comments that already recommend a product.\n' +
@@ -953,8 +978,65 @@ export const REPLY_AFFIRM = (band: WordBand) =>
   replyRules(band) +
   'If a comment only mentions the product in passing and is really about something else ' +
   'entirely, return exactly "SKIP" for it instead.\n' +
-  'Return STRICT JSON {"replies":[...]} — one string per item, SAME ORDER, exactly as many ' +
-  'entries as items.'
+  'Return STRICT JSON {"replies":{...}} — an object keyed by each item\'s NUMBER from the ' +
+  'numbered list, one reply string per item. Example: {"replies":{"1":"...","2":"..."}}.'
+
+// ════════════════════════════════════════════════════════════════════════════
+// REDDIT: comments written for ONE post (lib/redditComments)
+// ════════════════════════════════════════════════════════════════════════════
+// A Reddit thread is read, not scrolled past: a comment that could sit under any
+// post is spotted at once, and downvoted or removed. So unlike the per-audience
+// banks above, these are written per post, from its title and body, as a
+// handful of different redditors answering it.
+
+/** How many comments one Reddit post gets (each worker is handed a different one). */
+export const REDDIT_COMMENTS_PER_POST = 10
+
+export function redditCommentSystem(product: Product, style: CommentStyle, count: number): string {
+  const mention = productWords(product, style.splitBrand).toLowerCase()
+  return (
+    `You write top-level comments on Reddit posts, each as a DIFFERENT ordinary redditor.` +
+    SEP +
+    productBackground(product) +
+    SEP +
+    `Write ${count} different comments for the ONE post you are given. Every comment must:\n` +
+    `- RESPOND TO THAT POST: answer its question, react to its situation, or add to its ` +
+    `point, in the post's own terms. Someone reading it must be able to tell which post it is ` +
+    `under — never a comment that would fit any post.\n` +
+    `- read like a real Reddit comment: casual, first person, contractions, lowercase is fine, ` +
+    `plain words. Reddit habits are welcome where natural (addressing "OP", "fwiw", "ngl", ` +
+    `"imo", "honestly", a short second paragraph, an "edit:" line) but never all in one comment.\n` +
+    `- mention "${mention}" exactly once, as something this person actually used or knows ` +
+    `about, where it fits the answer — in the role it really plays (the background above says ` +
+    `what it is and does) and in a good light, as something that helped. Never as a checker ` +
+    `or detector, never as something to avoid or that went wrong. Not an ad: no "check out", ` +
+    `no "highly recommend", no ` +
+    `"best", no "game changer", no superlatives, no features list, no link.\n` +
+    `- be different from the others: different lengths (from one sentence to a short ` +
+    `paragraph or two, about 10 to 90 words), different openings, different angles — a short ` +
+    `personal story, a direct answer, practical steps, mild doubt about the usual advice, a ` +
+    `question back to OP.\n` +
+    `- no emojis, no hashtags, no URLs, no quotes around the name, never mention being paid ` +
+    `or being a bot, never name any other app, site, service or brand that does what it does (no rivals, not even as worse).` +
+    SEP +
+    noteFor(product, mention) +
+    inSentenceRule(style, mention) +
+    `If the post is only loosely related, keep the comment about the post and bring ` +
+    `"${mention}" in as a brief aside — but bring it in.` +
+    SEP +
+    `EVERY ONE of the ${count} comments must contain "${mention}". A comment without it is ` +
+    `thrown away, so do not write any that only react to the post.` +
+    SEP +
+    `Return STRICT JSON {"comments":["...","..."]} with ${count} strings. Nothing else.`
+  )
+}
+
+/** The post a set of Reddit comments answers. */
+export const redditCommentUser = (post: { subreddit: string; title: string; body: string }): string =>
+  `Subreddit: r/${post.subreddit || 'unknown'}\n` +
+  `Post title: ${post.title || '(unknown)'}\n` +
+  (post.body ? `Post text: ${post.body.slice(0, 2500)}\n` : '') +
+  `\nWrite the comments for this post.`
 
 // ════════════════════════════════════════════════════════════════════════════
 // EVERYTHING ELSE: promo captions, and the comment-presence analysis
@@ -1130,9 +1212,12 @@ export function classifySystem(genre: Genre): string {
     'You classify short social-media video titles/captions. A title is RELATED when it is ' +
     `${subject}. ` +
     'Anything else is NOT related. ' +
-    'Return STRICT JSON {"flags":[...]} where flags is a JSON array of booleans, ONE PER TITLE ' +
-    'IN THE SAME ORDER \u2014 true if related, else false \u2014 with exactly as many booleans as titles. ' +
-    'Example for 3 titles: {"flags":[true,false,true]}.'
+    // THE NUMBERS OF THE RELATED ONES, not a boolean per title: a long list
+    // answered by position goes wrong for every title after one the model
+    // skips, and a list of numbers cannot drift out of line.
+    'Return STRICT JSON {"related":[...]} where related is the list of the NUMBERS of the ' +
+    'titles that are related (from the numbered list), and nothing else \u2014 an empty list ' +
+    'if none are. Example: titles 1 and 3 related of 3 \u2192 {"related":[1,3]}.'
   )
 }
 
@@ -1183,13 +1268,14 @@ export function classifyReasonSystem(genre: Genre): string {
     `related-prompt${head ? ` (all about ${head})` : ''}:\n` +
     topics.map((t, i) => `${i + 1}. ${t}`).join('\n') +
     '\nAnything else is NOT related.\n' +
-    'Return STRICT JSON {"items":[{"rule":3,"reason":"..."}, ...]} with ONE item PER TITLE IN THE ' +
-    'SAME ORDER and exactly as many items as titles. "rule" is the NUMBER of the topic above the ' +
+    'Return STRICT JSON {"items":[{"n":1,"rule":3,"reason":"..."}, ...]} with ONE item PER TITLE, ' +
+    'in order, and no title skipped. "n" is the TITLE\'s own number from the numbered list of titles ' +
+    '(so every answer names the title it is about). "rule" is the NUMBER of the topic above the ' +
     'title matches (the closest one if several do), or 0 when it matches none. "reason" is ONE ' +
     'short sentence (at most 15 words): for a match, what in the title fits that numbered topic; ' +
     'for 0, what the title is about instead. ' +
-    'Example: {"items":[{"rule":2,"reason":"Asks how to make a landing page for a shop"},' +
-    '{"rule":0,"reason":"A dance trend video, none of the topics"}]}.'
+    'Example: {"items":[{"n":1,"rule":2,"reason":"Asks how to make a landing page for a shop"},' +
+    '{"n":2,"rule":0,"reason":"A dance trend video, none of the topics"}]}.'
   )
 }
 

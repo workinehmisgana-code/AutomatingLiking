@@ -1519,10 +1519,48 @@ def get_reddit_details(anchor) -> tuple[str, str, str]:
         return "", "", ""
 
 
-def scrape_reddit_search(queries: list[str], min_videos: int, max_videos: int, output_file: str):
+def mentions_name(text: str, name: str) -> bool:
+    """True when `text` names the product exactly: the whole name, any case,
+    not as part of a longer word ("tintfolio" yes, "tintfolios" or
+    "mytintfolio" no)."""
+    if not text or not name:
+        return False
+    pat = r"(?<![a-z0-9])" + re.escape(name.strip().lower()) + r"(?![a-z0-9])"
+    return re.search(pat, text.lower()) is not None
+
+
+# A post whose title does not name the product is opened as JSON (no page load)
+# to read its body. Capped per product so one vague search cannot turn into
+# hundreds of requests.
+REDDIT_BODY_CHECKS_PER_QUERY = 80
+
+
+def reddit_post_text(context, href: str) -> str:
+    """The post's title and body, read from Reddit's JSON view of the post with
+    the profile's own cookies. '' when Reddit does not answer."""
+    try:
+        r = context.request.get(href.rstrip("/") + "/.json?raw_json=1", timeout=15000)
+        if not r.ok:
+            return ""
+        data = r.json()
+        post = data[0]["data"]["children"][0]["data"]
+        return f"{post.get('title') or ''}\n{post.get('selftext') or ''}"
+    except Exception:
+        return ""
+
+
+def scrape_reddit_search(queries: list[str], min_videos: int, max_videos: int, output_file: str,
+                         exact_names: list[str] | None = None):
     """Search Reddit for each query and save post permalinks with their per-keyword
     search rank. Reddit search is public, so no login is needed. Post score and
-    date are read best-effort from the <shreddit-post> element when present."""
+    date are read best-effort from the <shreddit-post> element when present.
+
+    A query that is one of `exact_names` (our product names) is searched for
+    in quotes, and only posts that MENTION THAT NAME EXACTLY are kept: the title
+    is checked first, then the post body. Reddit's search also returns posts
+    that merely look similar; those are skipped. A product nobody has posted
+    about yields nothing and the next query starts."""
+    exact_lc = {n.strip().lower(): n.strip() for n in (exact_names or []) if n.strip()}
 
     all_urls: list[dict] = []  # combined results across all queries
     seen: set[str] = set()     # global dedup: a post saved under one keyword is skipped later
@@ -1586,8 +1624,16 @@ def scrape_reddit_search(queries: list[str], min_videos: int, max_videos: int, o
             query_urls: list[dict] = []   # URLs saved in this query
             positioned: set[str] = set()  # feed slots already counted this keyword
             rank_counter = 0              # position in this keyword's result feed
+            # A product name: quoted search, exact-mention filter.
+            exact_name = exact_lc.get(query.strip().lower())
+            body_checks = 0
+            skipped = 0
 
-            search_url = f"https://www.reddit.com/search/?q={query.replace(' ', '%20')}&type=posts"
+            q_text = f'"{query}"' if exact_name else query
+            search_url = (f"https://www.reddit.com/search/?q="
+                          f"{q_text.replace(' ', '%20').replace(chr(34), '%22')}&type=posts")
+            if exact_name:
+                print(f"[*] Product name: keeping only posts that mention '{exact_name}' exactly.")
             print(f"[*] Navigating to: {search_url}")
             if not goto_search(page, search_url):
                 continue
@@ -1626,6 +1672,8 @@ def scrape_reddit_search(queries: list[str], min_videos: int, max_videos: int, o
                 elapsed_ms += 4500
             if not cards_found:
                 print(f"[!] No posts after {CARDS_LOAD_TIMEOUT_MS // 1000}s – skipping this query.")
+                if exact_name:
+                    print(f"[*] No post mentions '{exact_name}' – moving on to the next.")
                 continue
             time.sleep(1)
 
@@ -1633,7 +1681,7 @@ def scrape_reddit_search(queries: list[str], min_videos: int, max_videos: int, o
                 """Collect post permalinks; each distinct post in this keyword's feed
                 consumes a rank slot, so posts already saved under a previous keyword
                 leave gaps in search_rank."""
-                nonlocal rank_counter
+                nonlocal rank_counter, body_checks, skipped
                 new = 0
                 for anchor in page.locator(REDDIT_POST_LINK_SELECTOR).all():
                     if len(query_urls) >= max_videos:
@@ -1654,9 +1702,18 @@ def scrape_reddit_search(queries: list[str], min_videos: int, max_videos: int, o
 
                         if href in seen:
                             continue
-                        seen.add(href)
 
                         score_text, posted_date, title = get_reddit_details(anchor)
+                        if exact_name and not mentions_name(title, exact_name):
+                            # Not in the title: read the body before deciding.
+                            if body_checks >= REDDIT_BODY_CHECKS_PER_QUERY:
+                                skipped += 1
+                                continue
+                            body_checks += 1
+                            if not mentions_name(reddit_post_text(context, href), exact_name):
+                                skipped += 1
+                                continue
+                        seen.add(href)
                         try:
                             like_count = int(score_text) if score_text else 0
                         except ValueError:
@@ -1703,6 +1760,7 @@ def scrape_reddit_search(queries: list[str], min_videos: int, max_videos: int, o
                 except Exception:
                     pass
                 scroll_attempts += 1
+                looked_before = len(positioned)
 
                 if at_page_bottom():
                     wait = random.uniform(SCROLL_DELAY_MIN * 2, SCROLL_DELAY_MAX * 2)
@@ -1713,7 +1771,13 @@ def scrape_reddit_search(queries: list[str], min_videos: int, max_videos: int, o
                     time.sleep(random.uniform(SCROLL_DELAY_MIN, SCROLL_DELAY_MAX))
                     newly_found = harvest_urls()
 
-                if newly_found == 0:
+                # A product query keeps scrolling while Reddit still shows new
+                # posts, even ones that do not mention the name; it stops when
+                # the results run out.
+                progress = (len(positioned) > looked_before) if exact_name else newly_found > 0
+                if newly_found:
+                    save_progress()
+                if not progress:
                     stale_scrolls += 1
                     print(f"  [~] No new URLs (stale {stale_scrolls}/{MAX_STALE_SCROLLS})")
                     if stale_scrolls >= MAX_STALE_SCROLLS:
@@ -1721,11 +1785,16 @@ def scrape_reddit_search(queries: list[str], min_videos: int, max_videos: int, o
                         break
                 else:
                     stale_scrolls = 0
-                    save_progress()
 
             save_progress()
 
-            if len(query_urls) < min_videos:
+            if exact_name:
+                if not query_urls:
+                    print(f"[*] No post mentions '{exact_name}' – moving on to the next.")
+                elif skipped:
+                    print(f"[*] Skipped {skipped} post(s) that did not mention '{exact_name}'.")
+                print(f"[*] Query '{query}': {len(query_urls)} URLs collected.")
+            elif len(query_urls) < min_videos:
                 print(
                     f"\n[!] Warning: collected {len(query_urls)} URLs for '{query}' "
                     f"but minimum target was {min_videos}."
@@ -1769,6 +1838,11 @@ def main():
         help="YouTube content type: all (default), videos, or shorts",
     )
     parser.add_argument(
+        "--exact-mention", nargs="+", default=[],
+        help="Reddit only: queries that are product names. Each is searched in quotes "
+             "and only posts that mention the name exactly are kept.",
+    )
+    parser.add_argument(
         "--no-login-wait", action="store_true",
         help="Start searching at once instead of waiting for a login + Enter "
              "(Instagram still waits, by itself, if it is signed out)",
@@ -1805,7 +1879,7 @@ def main():
     elif args.platform == "instagram":
         scrape_instagram_search(queries, args.min, args.max, args.output)
     elif args.platform == "reddit":
-        scrape_reddit_search(queries, args.min, args.max, args.output)
+        scrape_reddit_search(queries, args.min, args.max, args.output, args.exact_mention)
     else:
         scrape_tiktok_search(queries, args.min, args.max, args.output)
 

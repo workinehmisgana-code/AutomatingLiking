@@ -100,6 +100,7 @@ export async function POST(req: NextRequest) {
     splitBrand: flag(body?.splitBrand, current.style.splitBrand),
     quoteBrand: flag(body?.quoteBrand, current.style.quoteBrand),
     voice: isCommentVoice(body?.voice) ? body.voice : current.style.voice,
+    inSentence: flag(body?.inSentence, current.style.inSentence === true),
   }
   // Same rule for the top list: only the keys that were sent are changed, so a
   // save from the length form cannot switch the serving source off.

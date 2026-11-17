@@ -12,7 +12,7 @@
 // it looks: a caption like "this saved me 😭" says nothing, while the channel bio
 // ("Cek Plagiasi Turnitin & Parafrase") places the whole account.
 
-import { llmChat } from './llm'
+import { llmChat, llmTakesBigBatches } from './llm'
 import { CATEGORISE_SYSTEM as SYSTEM, categoriseUser } from './prompts'
 import { type LinkCategory, DEFAULT_LINK_CATEGORY, isLinkCategory } from './config'
 
@@ -83,8 +83,13 @@ export function keywordCategory(title: string, bio: string): LinkCategory | null
   return null
 }
 
-/** One prompt's worth of items. Small enough that a misaligned array is cheap. */
-export const CHUNK = 25
+/**
+ * Items per call. 100: the answers are keyed by each item's number, so a long
+ * list cannot drift out of line (it used to be 25 because a misaligned array
+ * was cheap to lose). A Groq model gets 25 a call — categorizeChunk splits.
+ */
+export const CHUNK = 100
+const GROQ_CHUNK = 25
 
 /**
  * Categorise one chunk. Never throws: on any failure every item falls back to
@@ -95,23 +100,39 @@ export const CHUNK = 25
 export async function categorizeChunk(items: Categorizable[]): Promise<LinkCategory[]> {
   const fallback = items.map((it) => keywordCategory(it.title, it.bio) ?? DEFAULT_LINK_CATEGORY)
   if (items.length === 0) return []
+  // Groq's free tier still wants the old small batches.
+  if (items.length > GROQ_CHUNK && !(await llmTakesBigBatches().catch(() => false))) {
+    const out: LinkCategory[] = []
+    for (let i = 0; i < items.length; i += GROQ_CHUNK) {
+      out.push(...(await categorizeChunk(items.slice(i, i + GROQ_CHUNK))))
+    }
+    return out
+  }
 
   try {
     const { content } = await llmChat({
       temperature: 0,
       jsonObject: true,
+      maxTokens: 1200 + items.length * 12,
       messages: [
         { role: 'system', content: SYSTEM },
         { role: 'user', content: categoriseUser(items) },
       ],
     })
     const parsed = JSON.parse(content) as { categories?: unknown }
-    const arr = Array.isArray(parsed.categories) ? parsed.categories : []
+    const raw = parsed.categories
+    // KEYED BY THE ITEM'S NUMBER ("1": …); a bare array is still read by position.
+    const pick = (i: number): unknown =>
+      Array.isArray(raw)
+        ? raw[i]
+        : raw && typeof raw === 'object'
+          ? (raw as Record<string, unknown>)[String(i + 1)]
+          : undefined
     return items.map((it, i) => {
       // A named brand always wins — see COMPETITOR_BRANDS above.
       const forced = keywordCategory(it.title, it.bio)
       if (forced) return forced
-      const v = arr[i]
+      const v = pick(i)
       return isLinkCategory(v) ? v : fallback[i]
     })
   } catch {

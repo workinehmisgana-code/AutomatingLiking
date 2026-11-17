@@ -12,7 +12,7 @@
 // genuinely not about humanizers. What counts as related per genre lives in
 // lib/prompts.ts (classifySystem) beside the rest of the domain copy.
 
-import { llmChat } from './llm'
+import { llmChat, llmTakesBigBatches } from './llm'
 import { DEFAULT_GENRE, isGenre, type Genre } from './config'
 import { GENRE_COPY, classifyReasonSystem, classifySystem, classifyUser, relatedCriteria } from './prompts'
 import { ensureGenreRegistry } from './genreStore'
@@ -49,7 +49,8 @@ export type Verdict = {
   url: string
   related: boolean
   reason: string
-  rule: 'topic' | 'keyword' | 'none'
+  /** unanswered = the model never gave a verdict for it, even when asked again */
+  rule: 'topic' | 'keyword' | 'none' | 'unanswered'
   ruleNo: number
   ruleText: string
 }
@@ -60,37 +61,71 @@ export type Verdict = {
  * The keyword safety net still wins: a title containing a genre keyword is
  * related whatever the model says, and its reason then names the keyword.
  */
-export async function classifyChunkWithReasons(items: Item[], genre: Genre = DEFAULT_GENRE): Promise<Verdict[]> {
+/**
+ * Ask once: the verdicts the model gave, KEYED BY THE TITLE'S OWN NUMBER.
+ *
+ * Every answer names its title ("n"). Matching by position instead was safe
+ * for 25 titles and not for a whole page: measured on 500, one call left a
+ * title out, and by position every verdict after the gap would have landed on
+ * the next link — silently, since a shifted list still has a verdict per row.
+ */
+async function askVerdicts(
+  items: Item[],
+  genre: Genre,
+  topics: string[]
+): Promise<Map<number, { ruleNo: number; reason: string }>> {
   const { content } = await llmChat({
     temperature: 0,
     jsonObject: true,
     // A sentence per title, plus room for a reasoning model's thinking.
-    maxTokens: Math.min(8000, 2500 + items.length * 60),
+    maxTokens: Math.min(60000, 2500 + items.length * 70),
+    // A whole page is ~30 s on Flash-Lite; inside the route's 60.
+    timeoutMs: 55_000,
     messages: [
       { role: 'system', content: classifyReasonSystem(genre) },
       { role: 'user', content: classifyUser(items.map((it) => it.title)) },
     ],
   })
-  const { topics } = relatedCriteria(genre)
-  let out: { ruleNo: number; reason: string }[] = []
+  const got = new Map<number, { ruleNo: number; reason: string }>()
   try {
     const parsed = JSON.parse(content) as { items?: unknown }
     if (Array.isArray(parsed?.items)) {
-      out = parsed.items.map((x) => {
-        const o = (x ?? {}) as { rule?: unknown; reason?: unknown }
-        const n = Math.trunc(Number(o.rule))
-        // A number outside the list is no topic at all.
-        return {
-          ruleNo: Number.isFinite(n) && n >= 1 && n <= topics.length ? n : 0,
+      parsed.items.forEach((x, pos) => {
+        const o = (x ?? {}) as { n?: unknown; rule?: unknown; reason?: unknown }
+        // Its own number when given; position only for a reply without any.
+        const num = Math.trunc(Number(o.n))
+        const idx = Number.isFinite(num) && num >= 1 && num <= items.length ? num - 1 : pos
+        if (got.has(idx)) return // a title answered twice: the first one stands
+        const r = Math.trunc(Number(o.rule))
+        got.set(idx, {
+          // A number outside the list is no topic at all.
+          ruleNo: Number.isFinite(r) && r >= 1 && r <= topics.length ? r : 0,
           reason: String(o.reason ?? '').trim().slice(0, 240),
-        }
+        })
       })
     }
   } catch {
-    /* no verdicts on a parse failure: every title falls back below */
+    /* no verdicts on a parse failure: every title is asked again or falls back */
+  }
+  return got
+}
+
+export async function classifyChunkWithReasons(items: Item[], genre: Genre = DEFAULT_GENRE): Promise<Verdict[]> {
+  const { topics } = relatedCriteria(genre)
+  // A failed call (overloaded, rate-limited, unparseable) is an empty answer,
+  // not an error for the whole page: its titles are asked again below.
+  const got = await askVerdicts(items, genre, topics).catch(() => new Map<number, { ruleNo: number; reason: string }>())
+  // THE ONES IT SKIPPED — a few, or all of them when the call failed — are
+  // asked again, twice at most, after a short pause.
+  for (let round = 0; round < 2; round++) {
+    const missing = items.map((_, i) => i).filter((i) => !got.has(i))
+    if (missing.length === 0) break
+    await new Promise((r) => setTimeout(r, 1500))
+    const again = await askVerdicts(missing.map((i) => items[i]), genre, topics).catch(() => null)
+    again?.forEach((v, j) => got.set(missing[j], v))
   }
   return items.map((it, i): Verdict => {
-    const v = out[i]
+    const v = got.get(i)
     // RELATED IS THE RULE MATCHED, not a separate flag the model could set
     // against its own rule number.
     if (v && v.ruleNo > 0) {
@@ -107,9 +142,16 @@ export async function classifyChunkWithReasons(items: Item[], genre: Genre = DEF
         rule: 'keyword', ruleNo: 0, ruleText: kw,
       }
     }
+    // NO ANSWER IS NOT "UNRELATED". It is kept apart so the page does not
+    // tick a link for blocking that nobody — not even the model — has judged.
+    if (!v) {
+      return {
+        url: it.url, related: false, reason: 'The model gave no answer for this title — not judged',
+        rule: 'unanswered', ruleNo: 0, ruleText: '',
+      }
+    }
     return {
-      url: it.url, related: false,
-      reason: v ? v.reason || 'Matches none of the topics' : 'The model gave no answer for this title',
+      url: it.url, related: false, reason: v.reason || 'Matches none of the topics',
       rule: 'none', ruleNo: 0, ruleText: '',
     }
   })
@@ -125,14 +167,21 @@ export async function classifyWithReasonsByGenre(items: (Item & { genre?: string
     list.push({ url: it.url, title: it.title })
     groups.set(g, list)
   }
-  const CHUNK = 25
-  const out: Verdict[] = []
+  // A WHOLE PAGE IN ONE REQUEST, as 100-title calls made ALL AT ONCE.
+  //
+  // Not one call of 500: measured, it took ~30 s when it worked, and twice in
+  // three tries it did not — once failing outright, once answering 243 of 500.
+  // A reply that long is where these models give out. 100 a call, in parallel,
+  // is one wait of ~10 s; every answer names its title (askVerdicts), and the
+  // few a call skips are asked again.
+  const CHUNK = 100
+  const calls: Promise<Verdict[]>[] = []
   for (const [g, list] of Array.from(groups.entries())) {
     for (let i = 0; i < list.length; i += CHUNK) {
-      out.push(...(await classifyChunkWithReasons(list.slice(i, i + CHUNK), g)))
+      calls.push(classifyChunkWithReasons(list.slice(i, i + CHUNK), g))
     }
   }
-  return out
+  return (await Promise.all(calls)).flat()
 }
 
 // Ask the model which of these titles are related to this genre. Falls back to
@@ -141,23 +190,33 @@ export async function classifyChunk(items: Item[], genre: Genre = DEFAULT_GENRE)
   const { content } = await llmChat({
     temperature: 0,
     jsonObject: true,
-    maxTokens: 1200,
+    // A number per related title, plus room for a reasoning model's thinking.
+    maxTokens: 1200 + items.length * 6,
     messages: [
       { role: 'system', content: classifySystem(genre) },
       { role: 'user', content: classifyUser(items.map((it) => it.title)) },
     ],
   })
-  let flags: boolean[] = []
+  // The NUMBERS of the related titles (classifySystem). An old-style boolean
+  // array is still read, by position, in case a model answers that way.
+  const hit = new Set<number>()
   try {
-    const parsed = JSON.parse(content) as { flags?: unknown }
-    if (Array.isArray(parsed?.flags)) flags = parsed.flags.map((f) => f === true || f === 'true' || f === 1)
+    const parsed = JSON.parse(content) as { related?: unknown; flags?: unknown }
+    if (Array.isArray(parsed?.related)) {
+      for (const n of parsed.related) {
+        const i = Math.trunc(Number(n)) - 1
+        if (i >= 0 && i < items.length) hit.add(i)
+      }
+    } else if (Array.isArray(parsed?.flags)) {
+      parsed.flags.forEach((f, i) => { if (f === true || f === 'true' || f === 1) hit.add(i) })
+    }
   } catch {
-    /* leave flags empty on parse failure */
+    /* nothing related on a parse failure; the keyword net below still applies */
   }
   const urls: string[] = []
   items.forEach((it, i) => {
-    // Related if EITHER the LLM flagged it OR it contains a known keyword.
-    if (flags[i] || keywordRelated(it.title, genre)) urls.push(it.url)
+    // Related if EITHER the LLM named it OR it contains a known keyword.
+    if (hit.has(i) || keywordRelated(it.title, genre)) urls.push(it.url)
   })
   return urls
 }
@@ -172,12 +231,12 @@ export async function classifyRelated(
   items: Item[],
   genre: Genre = DEFAULT_GENRE
 ): Promise<string[]> {
-  const CHUNK = 30
-  const related: string[] = []
-  for (let i = 0; i < items.length; i += CHUNK) {
-    related.push(...(await classifyChunk(items.slice(i, i + CHUNK), genre)))
-  }
-  return related
+  // 100 titles a call on Gemini (30 on a Groq model), and the calls AT ONCE:
+  // the answer is a list of numbers, so a long list cannot drift out of line.
+  const CHUNK = (await llmTakesBigBatches().catch(() => false)) ? 100 : 30
+  const chunks: Item[][] = []
+  for (let i = 0; i < items.length; i += CHUNK) chunks.push(items.slice(i, i + CHUNK))
+  return (await Promise.all(chunks.map((c) => classifyChunk(c, genre)))).flat()
 }
 
 /**
@@ -203,9 +262,8 @@ export async function classifyRelatedByGenre(
     list.push({ url: it.url, title: it.title })
     groups.set(g, list)
   }
-  const related: string[] = []
-  for (const [g, list] of Array.from(groups.entries())) {
-    related.push(...(await classifyRelated(list, g)))
-  }
-  return related
+  // The genres at once too, for the same reason.
+  return (
+    await Promise.all(Array.from(groups.entries()).map(([g, list]) => classifyRelated(list, g)))
+  ).flat()
 }

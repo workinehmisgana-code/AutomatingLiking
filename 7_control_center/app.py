@@ -377,6 +377,11 @@ GENRE_LABELS = {
     "slides": "Slides (pptera)",
 }
 BUILTIN_GENRES = tuple(GENRES)
+# Each genre's product names, from the dashboard (refresh_genres). A Reddit
+# search also searches for these, keeping only posts that name one exactly.
+GENRE_PRODUCTS: dict[str, list[str]] = {}
+# Reddit searches only the first few phrases of the genre's list.
+REDDIT_KEYWORDS = 5
 
 DEFAULTS = {
     "search": {
@@ -396,6 +401,12 @@ DEFAULTS = {
         "content": "all",
         "output": "",
         "upload_after": True,
+        # AND AFTER EVERY KEYWORD: what the search has found so far is uploaded
+        # each time a keyword finishes — always in APPEND mode, whatever
+        # upload_mode says, because a half-finished file in replace mode would
+        # remove the links of the keywords not searched yet. The full upload in
+        # upload_mode still runs at the end.
+        "upload_each_keyword": True,
         "upload_mode": "replace",
         # THE SCRAPER'S CHROME PROFILES, comma-separated directory names inside
         # 1_tiktok_search_scraper. Each search or harvest job takes a free one,
@@ -468,6 +479,10 @@ DEFAULTS = {
         # the ticked ones; when an account's turn ends it stops and another
         # carries on from the next link. See LikerRelay.
         "links_per_account": 0,
+        # ...UP TO this many: each turn draws a random size between the two
+        # (inclusive), so no account works the same number of links every
+        # time. 0, or anything not above links_per_account, is a fixed size.
+        "links_per_account_max": 0,
         # DROPPED LIKES: an account whose likes TikTok drops this many times IN
         # A ROW (pressed, not kept) is closed. 0 = never. In a relay its
         # unfinished links go to the account that has been resting longest,
@@ -906,6 +921,25 @@ class RelayTurn(Job):
         super().write(text)
 
 
+def turn_range(s: dict) -> tuple[int, int]:
+    """(smallest, largest) links per relay turn; (0, 0) when the relay is off."""
+    try:
+        lo = max(0, int(s.get("links_per_account", 0) or 0))
+    except (TypeError, ValueError):
+        lo = 0
+    try:
+        hi = max(0, int(s.get("links_per_account_max", 0) or 0))
+    except (TypeError, ValueError):
+        hi = 0
+    if lo <= 0:
+        return 0, 0
+    return lo, max(lo, hi)
+
+
+def turn_label(lo: int, hi: int) -> str:
+    return f"{lo}" if hi <= lo else f"{lo}–{hi} (random)"
+
+
 class LikerRelay(Job):
     """THE ACCOUNT RELAY: one list, worked through in turns by random accounts.
 
@@ -932,12 +966,15 @@ class LikerRelay(Job):
     FAIL_REST_S = 300
     MAX_FAILS = 3
 
-    def __init__(self, s: dict, names: list[str], per: int, at_once: int):
-        super().__init__("liker", f"Account liker · relay · {per} links a turn "
+    def __init__(self, s: dict, names: list[str], per: int, at_once: int, per_max: int = 0):
+        per_max = max(per, per_max)
+        super().__init__("liker", f"Account liker · relay · {turn_label(per, per_max)} links a turn "
                          f"· {len(names)} account(s)", [], LIKER_DIR)
         self.s = s
         self.names = names
         self.per = per
+        # Each turn's size is drawn between per and per_max (inclusive).
+        self.per_max = per_max
         self.slots = min(len(names), at_once if at_once > 0 else len(names))
         self._stop = False
         self.children: list[Job] = []
@@ -990,7 +1027,7 @@ class LikerRelay(Job):
             self.write("[*] the selection has no links")
             return
         queue_: deque[str] = deque(links)
-        self.write(f"[*] {len(links)} link(s), {self.per} a turn, "
+        self.write(f"[*] {len(links)} link(s), {turn_label(self.per, self.per_max)} a turn, "
                    f"{self.slots} account(s) at once, accounts picked at random")
 
         # ── 2. turns ─────────────────────────────────────────────────────
@@ -1099,8 +1136,12 @@ class LikerRelay(Job):
                     replace_pending -= 1
                     self.write(f"[*] {name} replaces the closed account "
                                "(it has not worked for the longest)")
-                mine = [queue_.popleft() for _ in range(min(self.per, len(queue_)))]
+                size = random.randint(self.per, self.per_max)
+                mine = [queue_.popleft() for _ in range(min(size, len(queue_)))]
                 turn += 1
+                if self.per_max > self.per:
+                    self.write(f"[*] turn {turn}: {name} gets {len(mine)} link(s) "
+                               f"(drawn from {self.per}–{self.per_max})")
                 f = tmp / f"{self.id}-turn{turn}-{name}.txt"
                 f.write_text("\n".join(mine) + "\n", encoding="utf-8")
                 title, tcmd, tcwd = build_liker_for(self.s, name, self.names,
@@ -1326,7 +1367,18 @@ def build_search_for(s: dict, platform: str, content: str = "",
     # Instagram. The Chrome profile keeps the logins; Instagram waits by itself
     # only if it finds itself signed out.
     cmd += ["--no-login-wait"]
-    cmd += ["--query"] + queries
+    # REDDIT: the first REDDIT_KEYWORDS phrases only, then the genre's product
+    # names. A product-name search keeps only posts that mention the name
+    # exactly (scraper.py --exact-mention); one that finds none moves on.
+    products: list[str] = []
+    if platform == "reddit":
+        queries = queries[:REDDIT_KEYWORDS]
+        refresh_genres()
+        products = [p for p in GENRE_PRODUCTS.get(genre_of(s), [])
+                    if p.lower() not in {q.lower() for q in queries}]
+    cmd += ["--query"] + queries + products
+    if products:
+        cmd += ["--exact-mention"] + products
     if int(s.get("min", 0)) > 0:
         cmd += ["--min", str(int(s["min"]))]
     if int(s.get("max", 0)) > 0:
@@ -1340,6 +1392,8 @@ def build_search_for(s: dict, platform: str, content: str = "",
         cmd += ["--output", out]
     what = f"{platform} {content}".strip()
     title = f"Search · {genre_of(s)} · {what} · {len(queries)} phrase(s)"
+    if platform == "reddit":
+        title += f" + {len(products)} product name(s)" if products else " (product names unknown — dashboard not reached)"
     return title, cmd, SCRAPER_DIR
 
 
@@ -1661,12 +1715,12 @@ def preview(tool: str, s: dict) -> str:
             )
         if tool == "liker":
             names = liker_profiles(s)
-            per = int(s.get("links_per_account", 0) or 0)
+            per, per_max = turn_range(s)
             if per > 0:
                 one = " ".join(build_liker_for(s, "<account>", names,
                                                relay_links=Path("<turn links>"))[1][1:])
                 return (f"# relay: fetch the list once ({' '.join(build_liker_for(s, names[0], names)[1][1:])} "
-                        f"--list-only ...), then turns of {per} links, each on a random one of: "
+                        f"--list-only ...), then turns of {turn_label(per, per_max)} links, each on a random one of: "
                         f"{', '.join(names)}\n{one}")
             return "\n".join(
                 " ".join(build_liker_for(s, n, names)[1][1:]) for n in names
@@ -1801,6 +1855,7 @@ def refresh_genres(max_age: float = 60.0) -> None:
     GENRES[:] = keep
     for g in remote:
         gid = str(g["id"])
+        GENRE_PRODUCTS[gid] = [str(p).strip() for p in (g.get("products") or []) if str(p).strip()]
         if gid in BUILTIN_GENRES:
             continue
         products = ", ".join(g.get("products") or [])
@@ -2215,13 +2270,10 @@ class Handler(BaseHTTPRequestHandler):
                     at_once = max(0, int(s["liker"].get("at_once", 0) or 0))
                 except (TypeError, ValueError):
                     at_once = 0
-                try:
-                    per = max(0, int(s["liker"].get("links_per_account", 0) or 0))
-                except (TypeError, ValueError):
-                    per = 0
+                per, per_max = turn_range(s["liker"])
                 if per > 0:
-                    # THE RELAY: one list, random accounts, `per` links a turn.
-                    relay = RUNNER.launch(LikerRelay(dict(s["liker"]), names, per, at_once))
+                    # THE RELAY: one list, random accounts, per..per_max links a turn.
+                    relay = RUNNER.launch(LikerRelay(dict(s["liker"]), names, per, at_once, per_max))
                     self._json({"ok": True, "job": relay.id, "jobs": [relay.id]})
                     return
                 started = [j.id for j in RUNNER.start_limited(tool, built, at_once)]
@@ -2253,7 +2305,7 @@ class Handler(BaseHTTPRequestHandler):
                     # the scrape that is still running next to it.
                     if s["search"].get("upload_after"):
                         threading.Thread(
-                            target=_chain_upload,
+                            target=_watch_search,
                             args=(job, dict(s["search"]), plat),
                             daemon=True,
                         ).start()
@@ -2342,7 +2394,94 @@ def written_file(job: Job) -> str:
     return ""
 
 
-def _chain_upload(search_job: Job, settings: dict, platform: str = "") -> None:
+# scraper.py says where it writes when it starts, and says each keyword is
+# done. The file is rewritten as it goes, so these two lines are all the
+# per-keyword upload needs.
+SAVING_RE = __import__("re").compile(r"Saving to '([^']+)' in real time")
+QUERY_DONE_RE = __import__("re").compile(
+    r"^(\[\*\] Query '.*': [\d,]+ URLs collected|\[!\] No posts after \d+s|\[!\] Warning: collected [\d,]+ URLs for )")
+
+
+def _snapshot_csv(path: Path, at_least: int) -> tuple[Path | None, int]:
+    """A copy of the scraper's CSV, safe to upload while it keeps writing.
+
+    The scraper rewrites the whole file every few results, so the live file can
+    be caught empty or half-written. Read it until it looks whole — ends on a
+    line break and holds at least what the last snapshot did — drop any torn
+    last line, and write the copy next to it under results/_partial/.
+    """
+    for _ in range(5):
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            text = ""
+        if text and not text.endswith("\n"):
+            text = text[: text.rfind("\n") + 1]
+        rows = max(0, text.count("\n") - 1)
+        if text and rows >= at_least:
+            snap_dir = path.parent / "_partial"
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            # THE SAME NAME, in its own folder: upload.py reads the search
+            # phrase and the platform from the file name.
+            snap = snap_dir / path.name
+            snap.write_text(text, encoding="utf-8")
+            return snap, rows
+        time.sleep(0.5)
+    return None, 0
+
+
+def _watch_search(search_job: Job, settings: dict, platform: str = "") -> None:
+    """Upload what a search has found EVERY TIME ONE OF ITS KEYWORDS FINISHES,
+    then the whole file once it is done (_chain_upload).
+
+    Per-keyword uploads are APPEND mode, always — see upload_each_keyword. They
+    never overlap: a keyword that finishes while the last upload is still
+    running is folded into the next one, which sends everything found so far
+    (the file is cumulative, so nothing is skipped and the pool dedups by URL).
+    """
+    each = bool(settings.get("upload_each_keyword", True))
+    seen = 0
+    path: Path | None = None
+    done_q = 0          # keywords finished
+    sent_q = 0          # keywords covered by an upload already started
+    sent_rows = 0       # rows in the last snapshot uploaded
+    current: Job | None = None
+    while True:
+        lines, seen = search_job.tail(seen)
+        for ln in lines:
+            m = SAVING_RE.search(ln)
+            if m:
+                raw = Path(m.group(1).strip())
+                # A new file — a new run (another browser profile) starts over.
+                path = raw if raw.is_absolute() else (Path(search_job.cwd) / raw).resolve()
+                done_q = sent_q = sent_rows = 0
+            elif QUERY_DONE_RE.match(ln.strip()):
+                done_q += 1
+        over = search_job.finished()
+        if (each and not over and path is not None and done_q > sent_q
+                and (current is None or current.finished())):
+            snap, rows = _snapshot_csv(path, sent_rows)
+            sent_q = done_q
+            if snap is not None and rows > sent_rows:
+                title, cmd, cwd = build_upload({
+                    "csv": str(snap), "platform": platform, "upload_mode": "append",
+                    "genre": settings.get("genre", ""),
+                })
+                search_job.write(f"[*] keyword {done_q} done — uploading the {rows:,} link(s) "
+                                 "found so far (append)")
+                current = RUNNER.start("upload", f"{title} · after keyword {done_q}", cmd, cwd)
+                sent_rows = rows
+        if over:
+            break
+        time.sleep(2)
+    # The final upload goes AFTER any per-keyword one still running, never beside it.
+    while current is not None and not current.finished():
+        time.sleep(1)
+    _chain_upload(search_job, settings, platform, appended=sent_rows)
+
+
+def _chain_upload(search_job: Job, settings: dict, platform: str = "",
+                  appended: int = 0) -> None:
     """Upload what one search found, once it has finished and only if it worked.
 
     A failed scrape has nothing to upload and a stopped one has half a file;
@@ -2370,6 +2509,11 @@ def _chain_upload(search_job: Job, settings: dict, platform: str = "") -> None:
         csv = written_file(search_job)
         rows = csv_rows(csv)
         search_job.write(f"[*] not uploading: the search {search_job.status}")
+        if appended > 0:
+            search_job.write(
+                f"[*] {appended:,} link(s) found before it stopped were already uploaded "
+                "keyword by keyword (append mode), so they are in the pool.")
+            return
         if rows > 0:
             search_job.write(
                 f"[*] {rows:,} link(s) were written before it stopped: {csv}")

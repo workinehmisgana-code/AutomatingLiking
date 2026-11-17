@@ -18,6 +18,8 @@ import {
   type LinkCategory,
 } from './config'
 import { genreOfUrl } from './videos'
+import { pickRedditComment } from './redditComments'
+import type { Product } from './config'
 
 /**
  * Choose the comment to serve for one link.
@@ -69,6 +71,29 @@ import { genreOfUrl } from './videos'
 export async function serveCommentForUrl(
   url: string
 ): Promise<{ product: string | null; comment: string | null; category: LinkCategory }> {
+  const { category, order } = await productOrderForUrl(url)
+  if (order.length === 0) return { product: null, comment: null, category }
+
+  // ── REDDIT: a comment written for THIS post (lib/redditComments) ──
+  // Ahead of the top list and the bank: a Reddit thread is read, and a comment
+  // that does not answer the post is spotted. Only the winning product is
+  // tried — a failure here means the model is unreachable, and asking again for
+  // the next product would only double the wait before the bank below.
+  if (platformFromUrl(url) === 'reddit') {
+    const product = order[0]
+    const comment = await pickRedditComment(url, product as Product).catch(() => null)
+    if (comment) return { product, comment, category }
+  }
+  return serveFromBank(order, category)
+}
+
+/**
+ * Which products may be served on this link, the fair pick first, and the
+ * audience it is served for. [] when none may.
+ */
+export async function productOrderForUrl(
+  url: string
+): Promise<{ category: LinkCategory; order: string[] }> {
   // The genre first: it decides which products may be served AND which audience
   // an uncategorised link falls back to. A website link has never been through
   // the classifier — see fallbackCategory — so without this it would fall back
@@ -105,15 +130,21 @@ export async function serveCommentForUrl(
     url,
     allowed.filter((p) => inGenre.has(p))
   ).catch(() => allowed.filter((p) => inGenre.has(p)))
-  if (products.length === 0) return { product: null, comment: null, category }
+  if (products.length === 0) return { category, order: [] }
 
   const first = await pickFairProductForUrl(url, products).catch(() => null)
-  if (!first) return { product: null, comment: null, category }
+  if (!first) return { category, order: [] }
 
-  // The fair pick first, then the rest in their configured order. Each is asked
-  // for THIS audience only; getFreshCategoryComments regenerates a stale set on
-  // the way.
-  const order = [first, ...products.filter((p) => p !== first)]
+  // The fair pick first, then the rest in their configured order.
+  return { category, order: [first, ...products.filter((p) => p !== first)] }
+}
+
+/** The top list or the audience bank, product by product. Each is asked for
+ *  THIS audience only; getFreshCategoryComments regenerates a stale set on the way. */
+async function serveFromBank(
+  order: string[],
+  category: LinkCategory
+): Promise<{ product: string | null; comment: string | null; category: LinkCategory }> {
   for (const product of order) {
     // The measured list first, when this product is set to use one.
     const { top } = await getProductCommentSettings(product, {

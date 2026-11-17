@@ -47,7 +47,8 @@ check('  and the batch fits inside the limit', BATCH <= MAX, true)
 const PAGE = Number(links.match(/const PAGE_SIZE = (\d+)/)?.[1] ?? 0)
 check('  the Links page shows a page this big', PAGE, 500)
 
-const unseenOld = Math.max(0, PAGE - MAX) // one request, server trims the rest
+// The route used to trim every request to 120 titles; that is the "before".
+const unseenOld = Math.max(0, PAGE - 120) // one request, server trims the rest
 const requestsNew = Math.ceil(PAGE / BATCH)
 const unseenNew = PAGE - requestsNew * BATCH > 0 ? PAGE - requestsNew * BATCH : 0
 console.log(`\na full page of ${PAGE} titles:`)
@@ -56,14 +57,13 @@ console.log(`   after : ${requestsNew} requests, ${PAGE} classified, ${unseenNew
 check('  nothing is left unclassified now', unseenNew, 0)
 check('  and it used to be most of the page', unseenOld > PAGE / 2, true)
 
-// The verify page derives its batch from a batch COUNT, which only landed under
-// the limit because 500/5 = 100. It is capped now, so a bigger page cannot walk
-// past the limit unnoticed.
-const BATCHES = Number(verify.match(/CLASSIFY_BATCHES = (\d+)/)?.[1] ?? 0)
-const verifyBatch = (n) => Math.min(BATCH, Math.max(1, Math.ceil(n / BATCHES)))
-console.log('\nthe verify page stays under the limit at any page size:')
-for (const n of [20, 500, 1000, 5000])
-  check(`  ${n} titles -> ${verifyBatch(n)} per request`, verifyBatch(n) <= MAX, true)
+// The verify page sends its WHOLE PAGE in one request (the server splits it
+// into 100-title model calls made at once). Its batch is the limit itself, so
+// it can never send more than the route accepts, and a page fits in one.
+const VPAGE = Number(verify.match(/const PAGE_SIZE = (\d+)/)?.[1] ?? 0)
+console.log('\nthe verify page sends a whole page in one request:')
+check('  its batch is the route limit', /const batchSize = CLASSIFY_MAX_ITEMS/.test(verify), true)
+check(`  and a page (${VPAGE}) fits in one request`, VPAGE > 0 && VPAGE <= MAX, true)
 
 // ── the route ──────────────────────────────────────────────────────────────
 console.log('\nthe route refuses an oversized request instead of trimming it:')
@@ -80,7 +80,7 @@ console.log('\nevery caller batches, by the same number:')
 check('  there are three of them', callers, 3)
 check('  the Links page button batches', /i \+= CLASSIFY_BATCH/.test(links), true)
 check('  twice (rank-only panel too)', (links.match(/i \+= CLASSIFY_BATCH/g) ?? []).length, 2)
-check('  the verify page caps its batch', /Math\.min\(\s*CLASSIFY_BATCH/.test(verify), true)
+check('  the verify page sends at most the limit', /const batchSize = CLASSIFY_MAX_ITEMS/.test(verify), true)
 check('  and nobody hardcodes 100', /const BATCH = 100/.test(links), false)
 
 // ── and what the button does with the answer ───────────────────────────────
@@ -102,9 +102,20 @@ check('  and the verify page still asks too',
 // The rule itself is shared, which is why only the plumbing differed.
 console.log('\nthe rules they apply are one copy:')
 const lib = read('lib/titleClassify.ts')
-check('  one prompt', (lib.match(/const SYSTEM =/g) ?? []).length, 1)
-check('  one keyword net', (lib.match(/const RELATED_KEYWORDS = \[/g) ?? []).length, 1)
-check('  the route uses it', /classifyRelated\(items\)/.test(route), true)
+const prompts = read('lib/prompts.ts')
+check('  one question per genre (prompts.ts)', /export function classifySystem\(/.test(prompts), true)
+check('  and its with-reasons form beside it', /export function classifyReasonSystem\(/.test(prompts), true)
+check('  one keyword net', (lib.match(/function keywordHit\(/g) ?? []).length, 1)
+check('  the route uses it', /classifyRelatedByGenre\(items\)/.test(route) && /classifyWithReasonsByGenre\(items\)/.test(route), true)
+
+// A long list judged in one go must not drift: every answer names its title.
+console.log('\na whole page is judged safely:')
+check('  answers are matched by the title number they name', /num - 1/.test(lib), true)
+check('  the model is asked to name it', /"n" is the TITLE/.test(prompts), true)
+check('  skipped titles are asked again', /for \(let round = 0; round < 2; round\+\+\)/.test(lib), true)
+check('  a title never answered is marked unanswered', /rule: 'unanswered'/.test(lib), true)
+check('  and the verify page does not tick it for blocking',
+      /!related\.has\(it\.url\) && !skip\.has\(it\.url\)/.test(verify), true)
 
 console.log(`\n${fails === 0 ? 'all correct' : fails + ' FAILED'}`)
 process.exit(fails === 0 ? 0 : 1)

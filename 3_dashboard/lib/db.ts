@@ -6514,6 +6514,8 @@ export function ensureAdminTables(): Promise<void> {
         ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS emoji BOOLEAN NOT NULL DEFAULT true;
         ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS split_brand BOOLEAN NOT NULL DEFAULT true;
         ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS quote_brand BOOLEAN NOT NULL DEFAULT true;
+        -- The name written as part of the sentence, not as a brand (off = as before).
+        ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS in_sentence BOOLEAN NOT NULL DEFAULT false;
         -- Question style vs plain statements. Defaults TRUE because that is what
         -- the generator was switched to; a row written before this column existed
         -- picks it up as well, which is intended - the two styles are a choice to
@@ -6822,13 +6824,14 @@ export async function getProductCommentSettings(
     split_brand: boolean
     quote_brand: boolean
     voice: string
+    in_sentence: boolean | null
     top_enabled: boolean
     top_count: number
     top_rank: string
     top_days: number
     top_aliases: string[] | null
   }>(
-    `SELECT word_min, word_max, emoji, split_brand, quote_brand, voice,
+    `SELECT word_min, word_max, emoji, split_brand, quote_brand, voice, in_sentence,
             top_enabled, top_count, top_rank, top_days, top_aliases
        FROM product_comment_setting WHERE product = $1`,
     [product]
@@ -6851,6 +6854,7 @@ export async function getProductCommentSettings(
       splitBrand: r.split_brand,
       quoteBrand: r.quote_brand,
       voice: isCommentVoice(r.voice) ? r.voice : DEFAULT_COMMENT_STYLE.voice,
+      inSentence: r.in_sentence === true,
     },
   }
 }
@@ -6883,16 +6887,17 @@ export async function setProductCommentStyle(product: string, style: CommentStyl
   // The row may not exist yet — a product whose band was never touched still
   // needs somewhere to put the style, so this inserts the defaults alongside it.
   await pool.query(
-    `INSERT INTO product_comment_setting (product, word_min, word_max, emoji, split_brand, quote_brand, voice, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+    `INSERT INTO product_comment_setting (product, word_min, word_max, emoji, split_brand, quote_brand, voice, in_sentence, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
      ON CONFLICT (product) DO UPDATE SET
        emoji = EXCLUDED.emoji,
        split_brand = EXCLUDED.split_brand,
        quote_brand = EXCLUDED.quote_brand,
        voice = EXCLUDED.voice,
+       in_sentence = EXCLUDED.in_sentence,
        updated_at = now()`,
     [product, COMMENT_WORD_MIN, COMMENT_WORD_MAX, style.emoji, style.splitBrand, style.quoteBrand,
-     style.voice]
+     style.voice, style.inSentence === true]
   )
 }
 
@@ -9116,6 +9121,8 @@ export async function deleteUser(userId: string): Promise<void> {
 
 // Everything needed to reverse a markUserPaid.
 export interface MarkPaidUndo {
+  /** This payment's pay_log row, removed by the undo. */
+  payLogId?: number
   videoIds: number[]
   promoIds: number[]
   /** The "you have been paid" message sent with this payment, so undo can
@@ -9139,6 +9146,97 @@ export interface MarkPaidUndo {
 // Admin marks a user paid: reset all pending counters and record the paid
 // amount so the user sees it once on next login. Returns the amount paid plus
 // an undo descriptor capturing exactly what changed.
+// ── PAYMENT LOG: every "Mark paid", for the admin's "last 10 payment days" ──
+//
+// user_pay_status keeps only a worker's LAST payment, so nothing could say what
+// was paid out on a given day. Every payment is now a row here; undoing it
+// deletes the row. The payments made before the log existed are read back once
+// from the snapshot the dashboard saves just before each payment (its
+// pendingTotal), so the history does not start empty.
+
+/** The timezone payment days are counted in. */
+const PAY_DAY_TZ = 'Africa/Addis_Ababa'
+/** A snapshot total above this is not a real payment (one test row holds 1.3 billion). */
+const PAY_BACKFILL_MAX = 100_000
+
+let payLogReady: Promise<void> | null = null
+function ensurePayLog(): Promise<void> {
+  if (!payLogReady) {
+    payLogReady = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS pay_log (
+          id       BIGSERIAL PRIMARY KEY,
+          user_id  TEXT NOT NULL,
+          amount   NUMERIC NOT NULL,
+          paid_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+          source   TEXT NOT NULL DEFAULT 'paid'
+        );
+        CREATE INDEX IF NOT EXISTS pay_log_paid_at ON pay_log (paid_at DESC);
+      `)
+      // The backfill, once: snapshots older than the first logged payment.
+      await ensureSnapshotTable()
+      await pool.query(
+        `INSERT INTO pay_log (user_id, amount, paid_at, source)
+         SELECT s.user_id, (s.snapshot->>'pendingTotal')::numeric, s.created_at, 'snapshot'
+           FROM user_snapshot s
+          WHERE NOT EXISTS (SELECT 1 FROM pay_log WHERE source = 'snapshot')
+            AND jsonb_typeof(s.snapshot->'pendingTotal') = 'number'
+            AND (s.snapshot->>'pendingTotal')::numeric > 0
+            AND (s.snapshot->>'pendingTotal')::numeric <= $1
+            AND s.created_at < COALESCE((SELECT min(paid_at) FROM pay_log WHERE source = 'paid'), now())`,
+        [PAY_BACKFILL_MAX]
+      )
+    })().catch((e) => {
+      payLogReady = null
+      throw e
+    })
+  }
+  return payLogReady
+}
+
+export interface PayDay {
+  /** YYYY-MM-DD, Addis Ababa time. */
+  day: string
+  /** Birr paid out that day. */
+  total: number
+  /** How many workers were paid. */
+  workers: number
+  payments: number
+  /** Who, and how much, biggest first. */
+  people: { name: string; amount: number }[]
+}
+
+/** The last `n` days on which any payment was made, newest first. */
+export async function getRecentPayDays(n = 10): Promise<PayDay[]> {
+  await ensurePayLog()
+  const { rows } = await pool.query<{ day: string; user_id: string; name: string | null; amount: string; k: number }>(
+    `WITH d AS (
+       SELECT DISTINCT (paid_at AT TIME ZONE $2)::date AS day FROM pay_log ORDER BY 1 DESC LIMIT $1
+     )
+     SELECT (l.paid_at AT TIME ZONE $2)::date::text AS day, l.user_id,
+            max(COALESCE(NULLIF(u.name, ''), u.email)) AS name,
+            sum(l.amount)::text AS amount, count(*)::int AS k
+       FROM pay_log l
+       JOIN d ON d.day = (l.paid_at AT TIME ZONE $2)::date
+       LEFT JOIN "user" u ON u.id = l.user_id
+      GROUP BY 1, 2`,
+    [n, PAY_DAY_TZ]
+  )
+  const byDay = new Map<string, PayDay>()
+  for (const r of rows) {
+    const d = byDay.get(r.day) ?? { day: r.day, total: 0, workers: 0, payments: 0, people: [] }
+    const amt = Math.round(Number(r.amount) * 100) / 100
+    d.total += amt
+    d.workers += 1
+    d.payments += r.k
+    d.people.push({ name: r.name ?? r.user_id.slice(0, 8), amount: amt })
+    byDay.set(r.day, d)
+  }
+  return Array.from(byDay.values())
+    .map((d) => ({ ...d, total: Math.round(d.total * 100) / 100, people: d.people.sort((a, b) => b.amount - a.amount) }))
+    .sort((a, b) => b.day.localeCompare(a.day))
+}
+
 export async function markUserPaid(userId: string): Promise<{ amount: number; undo: MarkPaidUndo }> {
   await Promise.all([ensureAdminTables(), ensurePromoTables()])
   const pending = await getUserPendingPayments(userId) // amount BEFORE resetting
@@ -9203,9 +9301,17 @@ export async function markUserPaid(userId: string): Promise<{ amount: number; un
        last_paid_amount = $2, last_paid_at = now(), paid_ack = false, approved_at = NULL, approved_amount = NULL`,
     [userId, amount]
   )
+  // The payment log. Never allowed to fail the payment itself.
+  const logged = await ensurePayLog()
+    .then(() =>
+      pool.query<{ id: string }>('INSERT INTO pay_log (user_id, amount) VALUES ($1, $2) RETURNING id', [userId, amount])
+    )
+    .then((r) => Number(r.rows[0]?.id ?? 0))
+    .catch(() => 0)
   return {
     amount,
     undo: {
+      payLogId: logged || undefined,
       videoIds: v.rows.map((r) => r.id),
       promoIds: p.rows.map((r) => r.id),
       prevMarkerPaidAt,
@@ -9218,6 +9324,11 @@ export async function markUserPaid(userId: string): Promise<{ amount: number; un
 // Reverse a markUserPaid using its undo descriptor.
 export async function undoMarkPaid(userId: string, u: MarkPaidUndo): Promise<void> {
   await Promise.all([ensureAdminTables(), ensurePromoTables()])
+  if (u.payLogId) {
+    await ensurePayLog()
+      .then(() => pool.query('DELETE FROM pay_log WHERE id = $1 AND user_id = $2', [u.payLogId, userId]))
+      .catch(() => {})
+  }
   if (u.videoIds.length) {
     await pool.query('UPDATE video_submission SET paid = false WHERE id = ANY($1::bigint[])', [u.videoIds])
   }
@@ -9992,6 +10103,8 @@ export interface AdminData {
    *  THAT product's comments (not just any of ours). */
   dailyTiktokLinksByProduct: Record<string, TiktokDayLinks[]>
   autoUpdates: AutoUpdateTimes | null
+  /** The last 10 days a payment was made on, newest first. */
+  payDays: PayDay[]
 }
 
 /** When the automatic comment reads last ran — shown on the daily-clicks table,
@@ -10098,6 +10211,54 @@ export async function getDayLinks(day: string, product: string, limit = 5000): P
     clicks: r.clicks,
     last: new Date(r.last).toISOString(),
     ours: r.ours === null || r.ours === undefined ? null : Number(r.ours),
+  }))
+}
+
+/**
+ * The links behind a "by platform" cell of the daily-clicks table: clicked on
+ * `day` on `platform`, by products in `products` (null = every click) — the
+ * same cut the cell's count was made with. Each link carries who clicked it and
+ * the comment(s) they were handed, which is what a Reddit post is checked for.
+ */
+export async function getDayPlatformLinks(
+  day: string,
+  platform: string,
+  products: string[] | null,
+  limit = 5000
+): Promise<(DayLinkRow & { workers: string[]; comments: string[] })[]> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error('Bad day')
+  await ensureClickedTable()
+  const { rows } = await pool.query<{
+    url: string
+    clicks: number
+    last: Date
+    ours: number | null
+    workers: string[] | null
+    comments: string[] | null
+  }>(
+    `SELECT cl.url, COUNT(*)::int AS clicks, MAX(cl.clicked_at) AS last,
+            MAX(s.our_count)::int AS ours,
+            array_remove(array_agg(DISTINCT COALESCE(NULLIF(u.name, ''), u.email)), NULL) AS workers,
+            array_remove(array_agg(DISTINCT NULLIF(btrim(cl.served_comment), '')), NULL) AS comments
+       FROM clicked_link cl
+       LEFT JOIN link_comment_scan s ON s.url = cl.url
+       LEFT JOIN "user" u ON u.id = cl.user_id
+      WHERE cl.clicked_at::date = $1::date
+        AND COALESCE(NULLIF(cl.platform, ''), '(none)') = $2
+        AND ($3::text[] IS NULL OR cl.product = ANY($3::text[]))
+      GROUP BY cl.url
+      ORDER BY last DESC
+      LIMIT $4`,
+    [day, platform, products, limit]
+  )
+  return rows.map((r) => ({
+    url: r.url,
+    platform,
+    clicks: r.clicks,
+    last: new Date(r.last).toISOString(),
+    ours: r.ours === null || r.ours === undefined ? null : Number(r.ours),
+    workers: r.workers ?? [],
+    comments: r.comments ?? [],
   }))
 }
 
@@ -10815,5 +10976,6 @@ export async function getAdminData(
   }))
 
   const autoUpdates = await getAutoUpdateTimes().catch(() => null)
-  return { resetAt: resetAt.toISOString(), users: Array.from(byId.values()), ...aggregates, autoUpdates }
+  const payDays = await getRecentPayDays(10).catch(() => [] as PayDay[])
+  return { resetAt: resetAt.toISOString(), users: Array.from(byId.values()), ...aggregates, autoUpdates, payDays }
 }

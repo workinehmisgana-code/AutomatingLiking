@@ -43,7 +43,7 @@
 // stored, and each run picks up where the last stopped and wraps around.
 
 import { rankChannels } from './channelRank'
-import { fetchChannelVideos, fetchVideoDetail } from './linkStats'
+import { fetchChannelVideos, fetchVideoDetail, tiktokPostedDate } from './linkStats'
 import { classifyRelatedByGenre, type Item } from './titleClassify'
 import { mergeVerifyLinks } from './verifyMerge'
 import { urlsMatchingSpecs } from './autoMerge'
@@ -315,9 +315,10 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
             heart_count: d?.hearts ?? 0,
             comment_count: d?.comments ?? 0,
             share_count: d?.shares ?? 0,
-            posted_date: d?.postedDate || '',
+            // From the id when the detail page gave none — see tiktokPostedDate.
+            posted_date: d?.postedDate || tiktokPostedDate(v.id),
             title: d?.title || v.title || '',
-            bio: d?.bio || '',
+            bio: d?.bio || v.bio || '',
             genre: genreOfChannel.get(String(handle).toLowerCase()) ?? DEFAULT_GENRE,
           })
         })

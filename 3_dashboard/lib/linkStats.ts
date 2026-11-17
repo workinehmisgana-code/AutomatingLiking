@@ -421,6 +421,30 @@ export interface ChannelVideo {
   url: string
   title: string
   views: number | null
+  /** The channel's bio, from the same listing (the same for every video). */
+  bio?: string
+}
+
+/**
+ * A TikTok video's upload date (YYYY-MM-DD), read from its id.
+ *
+ * The id's top 32 bits ARE the upload time in Unix seconds, so this needs no
+ * fetch at all. It is how the verify list keeps a posted date now that the
+ * per-video embed page (fetchVideoDetail) comes back as an empty shell: in
+ * November 2026 TikTok moved its data client-side, every detail fetch returned
+ * null, and every harvested link was staged with no posted date. '' when the
+ * id does not decode to a plausible date.
+ */
+export function tiktokPostedDate(id: string): string {
+  if (!/^\d{15,25}$/.test(id)) return ''
+  try {
+    const secs = Number(BigInt(id) >> BigInt(32))
+    // TikTok began in 2016; nothing is posted in the future.
+    if (secs < 1451606400 || secs > Date.now() / 1000 + 86400) return ''
+    return new Date(secs * 1000).toISOString().slice(0, 10)
+  } catch {
+    return ''
+  }
 }
 
 /**
@@ -541,6 +565,10 @@ async function listOnce(clean: string, timeoutMs: number): Promise<ChannelListin
     const key = Object.keys(data).find((k) => k.toLowerCase().startsWith('/embed/@'))
     const list = key ? data[key]?.videoList : null
     if (!Array.isArray(list)) return { videos: [], throttled: false }
+    // The channel's bio rides along in the same payload.
+    const info = (key ? (data[key] as { userInfo?: { signature?: unknown } })?.userInfo : null) ?? null
+    const bio = typeof info?.signature === 'string' ? info.signature : ""
+
     const out: ChannelVideo[] = []
     for (const v of list) {
       const row = v as { id?: unknown; desc?: unknown; playCount?: unknown }
@@ -552,6 +580,7 @@ async function listOnce(clean: string, timeoutMs: number): Promise<ChannelListin
         url: `https://www.tiktok.com/@${clean}/video/${id}`,
         title: typeof row.desc === 'string' ? row.desc : '',
         views: Number.isFinite(views) && views >= 0 ? views : null,
+        bio,
       })
     }
     return { videos: out, throttled: false }

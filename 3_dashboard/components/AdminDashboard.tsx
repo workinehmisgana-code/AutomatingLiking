@@ -32,6 +32,7 @@ import type {
   GuideVideo,
   ReferralEarnings,
   PayAdjustment,
+  PayDay,
 } from '@/lib/db'
 import ApkAdmin from '@/components/ApkAdmin'
 import GuideVideosAdmin from '@/components/GuideVideosAdmin'
@@ -2089,6 +2090,9 @@ export default function AdminDashboard({
           </div>
         </div>
       )}
+
+      {/* What was paid out, on each of the last 10 days a payment was made. */}
+      <PayDaysTable days={data.payDays ?? []} />
 
       {/* Clicks per day, last 7 days (rolling — NOT scoped to the reset) */}
       <DailyClicksTable
@@ -5010,6 +5014,66 @@ function TiktokAgeReport({
   )
 }
 
+/**
+ * 💸 The last 10 payment days: what "Mark paid" sent out on each, newest first.
+ * Click a day for who was paid and how much. Days are Addis Ababa time.
+ */
+function PayDaysTable({ days }: { days: PayDay[] }) {
+  const [openDay, setOpenDay] = useState<string | null>(null)
+  if (days.length === 0) return null
+  const sum = days.reduce((n, d) => n + d.total, 0)
+  const top = Math.max(...days.map((d) => d.total), 1)
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Addis_Ababa' })
+  const open = days.find((d) => d.day === openDay) ?? null
+  return (
+    <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3 mb-4">
+      <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2">
+        <div className="text-sm font-semibold text-white">💸 Paid out — last {days.length} payment days</div>
+        <div className="text-[11px] text-zinc-500">{fmtBirr(sum)} birr in all</div>
+      </div>
+      <div className="space-y-1">
+        {days.map((d) => (
+          <button
+            key={d.day}
+            type="button"
+            onClick={() => setOpenDay(openDay === d.day ? null : d.day)}
+            className="w-full flex items-center gap-3 text-xs text-left hover:bg-zinc-800/40 rounded px-1 py-0.5"
+            title="Show who was paid that day"
+          >
+            <span className={`w-28 shrink-0 tabular-nums ${d.day === today ? 'text-emerald-300 font-semibold' : 'text-zinc-400'}`}>
+              {d.day}
+              <span className="text-[10px] text-zinc-600">
+                {' '}
+                {d.day === today
+                  ? 'today'
+                  : new Date(`${d.day}T00:00:00`).toLocaleDateString(undefined, { weekday: 'short' })}
+              </span>
+            </span>
+            <span className="flex-1 h-2 rounded bg-zinc-800 overflow-hidden">
+              <span className="block h-full bg-emerald-600/70" style={{ width: `${(d.total / top) * 100}%` }} />
+            </span>
+            <span className="w-28 shrink-0 text-right tabular-nums text-zinc-100 font-medium">{fmtBirr(d.total)} birr</span>
+            <span className="w-20 shrink-0 text-right text-[11px] text-zinc-500">{d.workers} worker(s)</span>
+          </button>
+        ))}
+      </div>
+      {open && (
+        <div className="mt-2 border-t border-zinc-800 pt-2">
+          <div className="text-[11px] text-zinc-500 mb-1">Paid on {open.day}</div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-0.5 text-xs">
+            {open.people.map((p, i) => (
+              <div key={`${p.name}-${i}`} className="flex justify-between gap-2">
+                <span className="text-zinc-300 truncate">{p.name}</span>
+                <span className="tabular-nums text-zinc-400">{fmtBirr(p.amount)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function DailyClicksTable({
   days,
   byProduct,
@@ -5040,7 +5104,7 @@ function DailyClicksTable({
   // The cell clicked in a product row: its links open in a modal.
   // own: only the links carrying the served worker's own comment; product null
   // = the TikTok platform row (every product).
-  const [open, setOpen] = useState<{ product: string | null; day: string; own?: boolean } | null>(null)
+  const [open, setOpen] = useState<{ product: string | null; day: string; own?: boolean; platform?: string } | null>(null)
   if (days.length === 0) return null
   /** A count that opens its links when clicked (0 stays plain text). */
   const ownCell = (n: number, product: string | null, day: string) =>
@@ -5289,14 +5353,28 @@ function DailyClicksTable({
                     {CLICK_PLATFORM_LABELS[key] ?? key}
                   </span>
                 </td>
-                {days.map((d, i) => (
-                  <td
-                    key={d.day}
-                    className="text-zinc-400 px-2 py-1 border-l border-t border-zinc-800 text-center tabular-nums"
-                  >
-                    {(series[i]?.count ?? 0).toLocaleString()}
-                  </td>
-                ))}
+                {days.map((d, i) => {
+                  const n = series[i]?.count ?? 0
+                  return (
+                    <td
+                      key={d.day}
+                      className="text-zinc-400 px-2 py-1 border-l border-t border-zinc-800 text-center tabular-nums"
+                    >
+                      {n > 0 ? (
+                        <button
+                          type="button"
+                          onClick={() => setOpen({ product: null, day: d.day, platform: key })}
+                          className="underline decoration-dotted decoration-zinc-600 underline-offset-2 hover:text-white"
+                          title={`See the ${CLICK_PLATFORM_LABELS[key] ?? key} links clicked on ${d.day}`}
+                        >
+                          {n.toLocaleString()}
+                        </button>
+                      ) : (
+                        n.toLocaleString()
+                      )}
+                    </td>
+                  )
+                })}
               </tr>
             )).flatMap((row, idx) =>
               // UNDER TIKTOK: its distinct links, and how many carry ours.
@@ -5369,7 +5447,13 @@ function DailyClicksTable({
         </table>
       </div>
       {open && (
-        <DayLinksModal product={open.product} day={open.day} own={!!open.own} onClose={() => setOpen(null)} />
+        <DayLinksModal
+          product={open.product}
+          day={open.day}
+          own={!!open.own}
+          platform={open.platform}
+          onClose={() => setOpen(null)}
+        />
       )}
     </div>
   )
@@ -5558,6 +5642,7 @@ function DayLinksModal({
   product,
   day,
   own = false,
+  platform,
   onClose,
 }: {
   /** null with `own`: the TikTok platform row, every product. */
@@ -5565,17 +5650,30 @@ function DayLinksModal({
   day: string
   /** Only the TikTok links carrying the served worker's own comment. */
   own?: boolean
+  /** A "by platform" row: every link clicked on this platform that day. */
+  platform?: string
   onClose: () => void
 }) {
   const [rows, setRows] = useState<
-    { url: string; platform: string | null; clicks: number; last: string; ours: number | null; handles?: string[] }[] | null
+    {
+      url: string
+      platform: string | null
+      clicks: number
+      last: string
+      ours: number | null
+      handles?: string[]
+      workers?: string[]
+      comments?: string[]
+    }[] | null
   >(null)
+  const byPlatform = !!platform && !product && !own
   const [error, setError] = useState('')
 
   useEffect(() => {
     const q = new URLSearchParams({ day })
     if (product) q.set('product', product)
     if (own) q.set('own', '1')
+    if (platform) q.set('platform', platform)
     fetch(`/api/admin/day-links?${q}`, { cache: 'no-store' })
       .then(async (r) => {
         const d = await r.json().catch(() => ({}))
@@ -5583,7 +5681,7 @@ function DayLinksModal({
         setRows(d.links ?? [])
       })
       .catch((e) => setError(String(e?.message ?? e)))
-  }, [day, product, own])
+  }, [day, product, own, platform])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
@@ -5601,7 +5699,10 @@ function DayLinksModal({
         <div className="flex items-baseline justify-between gap-3 border-b border-zinc-800 px-4 py-3">
           <div>
             <div className="text-sm font-semibold text-white">
-              <span className="capitalize">{product ?? 'TikTok'}</span> · {day}
+              <span className="capitalize">
+                {product ?? (byPlatform ? CLICK_PLATFORM_LABELS[platform!] ?? platform : 'TikTok')}
+              </span>{' '}
+              · {day}
               {own && <span className="text-zinc-400 font-normal"> · with the worker&apos;s own comment</span>}
             </div>
             {rows && (
@@ -5628,6 +5729,11 @@ function DayLinksModal({
                       Worker
                     </th>
                   )}
+                  {byPlatform && (
+                    <th className="text-left font-medium py-1 px-2" title="Who clicked it, and the comment each was handed">
+                      Workers · comment handed out
+                    </th>
+                  )}
                   <th className="text-right font-medium py-1 px-2">Clicks</th>
                   <th className="text-right font-medium py-1" title="Our comments the scan found on the video">
                     Ours
@@ -5651,6 +5757,16 @@ function DayLinksModal({
                     {own && (
                       <td className="py-1 px-2 whitespace-nowrap text-zinc-300">
                         {(r.handles ?? []).map((h) => `@${h}`).join(', ')}
+                      </td>
+                    )}
+                    {byPlatform && (
+                      <td className="py-1 px-2 text-zinc-300 align-top min-w-[14rem]">
+                        <div className="text-zinc-400">{(r.workers ?? []).join(', ') || '—'}</div>
+                        {(r.comments ?? []).map((c) => (
+                          <div key={c} className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
+                            &ldquo;{c}&rdquo;
+                          </div>
+                        ))}
                       </td>
                     )}
                     <td className="py-1 px-2 text-right tabular-nums text-zinc-300">{r.clicks}</td>
