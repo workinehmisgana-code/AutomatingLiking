@@ -51,6 +51,9 @@ interface VRow {
   posted_date: string | null
   title: string | null
   bio: string | null
+  /** Set for a link from a keyword search upload held back as unrelated. */
+  search_query?: string | null
+  search_rank?: number
 }
 
 /** The channel's own page, from the platform the row was scraped for. */
@@ -2548,6 +2551,14 @@ export default function VerifyLinks({
               </span>
               <span className="flex-1 min-w-0">
                 <span className="block text-zinc-200 text-xs leading-tight line-clamp-2" title={r.title || ''}>{r.title || '—'}</span>
+                {(r.search_rank ?? 0) > 0 && (
+                  <span
+                    className="inline-block mt-0.5 text-[10px] text-sky-300 bg-sky-950/60 border border-sky-800 rounded px-1"
+                    title="From a keyword search upload; the title check judged it unrelated. Verifying it adds it to the SEARCH clusters with this keyword and rank."
+                  >
+                    🔎 search “{r.search_query || '?'}” #{r.search_rank}
+                  </span>
+                )}
                 <a href={r.url} target="_blank" rel="noopener noreferrer" className="block text-[11px] text-zinc-500 hover:text-emerald-400 truncate">{r.url}</a>
               </span>
               {hasReasons && (() => {

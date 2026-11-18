@@ -665,6 +665,11 @@
               <input type="number" id="k_links_per_account_max" min="0" step="1" style="flex:1"
                 title="The most links one turn may take. Each turn draws a random number between FROM and this. 0 = always exactly FROM.">
             </span></label>
+          <label class="c" style="grid-column:1/-1"
+            title="ON (the default): every ticked account works its OWN COPY of the whole list, so every account likes every link. Accounts still take turns: when one finishes its batch it gives way to another, and on its next turn it carries on in its copy from where it stopped (the first turn starts at the beginning).&#10;&#10;OFF: one shared list; each link is worked by ONE account, and an account that stops early hands its unfinished links to the next.">
+            <input type="checkbox" id="k_relay_own_copy">
+            Each account works its own copy of every link
+            <small>— in turns, picking up where it left off</small></label>
           <label class="f"><span>Close an account after this many dropped likes in a row (0 = never)</span>
             <input type="number" id="k_drop_limit" min="0" step="1"
               title="A DROPPED like: the heart was pressed and TikTok did not keep it (checked by reading it back). This many in a row and the account's browser is closed.&#10;&#10;In relay mode (links per account turn above 0) its unfinished links go straight to the ticked account that has not worked for the longest, and the closed account rests for the minutes below before it can be picked again."></label>
@@ -765,7 +770,7 @@ const FIELDS = {
             clusters:'k_clusters', platform:'k_platform', genre:'k_genre',
             category:'k_category', max_links:'k_max_links',
             target:'k_target', users:'k_users', profiles:'k_profiles', at_once:'k_at_once',
-            links_per_account:'k_links_per_account', links_per_account_max:'k_links_per_account_max',
+            links_per_account:'k_links_per_account', links_per_account_max:'k_links_per_account_max', relay_own_copy:'k_relay_own_copy',
             drop_limit:'k_drop_limit', rest_minutes:'k_rest_minutes',
             keywords:'k_keywords',
             mode:'k_mode', pages:'k_pages', scrolls:'k_scrolls',

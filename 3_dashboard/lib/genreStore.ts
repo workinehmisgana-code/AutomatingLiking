@@ -11,7 +11,8 @@
 // they reach every bundle and the browser exactly as an added genre does.
 
 import { getAppState, setAppState } from './db'
-import { PRODUCTS } from './config'
+import { BUILTIN_GENRES, PRODUCTS } from './config'
+import { GENRE_COPY } from './prompts'
 import {
   applyGenreRegistry,
   completeCopy,
@@ -24,6 +25,48 @@ import {
 
 const KEY = 'custom_genres'
 const EXTRA_KEY = 'builtin_genre_products'
+/**
+ * A BUILT-IN genre's "what counts as related", when the admin has changed it
+ * (Links to verify → ✏️ What counts as related). { [genre]: {subject, keywords} }.
+ * The code's own definition stays in lib/prompts.ts as the default, and
+ * "Reset to default" removes the entry.
+ */
+const BUILTIN_RELATED_KEY = 'builtin_genre_related'
+type Related = { subject: string; keywords: string[] }
+
+/** The built-in genres' related rules as written in code, before any edit. */
+const BUILTIN_RELATED_DEFAULT: Record<string, Related> = Object.fromEntries(
+  BUILTIN_GENRES.map((g) => [g, { ...GENRE_COPY[g].related, keywords: [...GENRE_COPY[g].related.keywords] }])
+)
+
+async function readBuiltinRelated(): Promise<Record<string, Related>> {
+  const raw = await getAppState(BUILTIN_RELATED_KEY).catch(() => null)
+  if (!raw) return {}
+  try {
+    const o = JSON.parse(raw) as unknown
+    return o && typeof o === 'object' && !Array.isArray(o) ? (o as Record<string, Related>) : {}
+  } catch {
+    return {}
+  }
+}
+
+/** Put each built-in genre's rule in force: the admin's edit, else the code's. */
+function applyBuiltinRelated(over: Record<string, Related>): void {
+  for (const g of BUILTIN_GENRES) {
+    const o = over[g]
+    const related =
+      o && typeof o.subject === 'string' && o.subject.trim() && Array.isArray(o.keywords) && o.keywords.length
+        ? { subject: o.subject, keywords: o.keywords.map(String) }
+        : BUILTIN_RELATED_DEFAULT[g]
+    GENRE_COPY[g] = { ...GENRE_COPY[g], related }
+  }
+}
+let builtinRelated: Record<string, Related> = {}
+
+/** Has the admin changed this built-in genre's related rule? */
+export function builtinRelatedIsCustom(g: string): boolean {
+  return Boolean(builtinRelated[g])
+}
 /** How stale the applied list may get before a request reloads it. */
 const MAX_AGE_MS = 60_000
 
@@ -63,9 +106,11 @@ async function readAll(): Promise<CustomGenre[]> {
 export async function ensureGenreRegistry(force = false): Promise<CustomGenre[]> {
   if (!force && Date.now() - loadedAt < MAX_AGE_MS) return currentList
   if (!inflight) {
-    inflight = readAll()
-      .then((list) => {
+    inflight = Promise.all([readAll(), readBuiltinRelated()])
+      .then(([list, over]) => {
         applyGenreRegistry(list)
+        builtinRelated = over
+        applyBuiltinRelated(over)
         currentList = list
         loadedAt = Date.now()
         return list
@@ -180,9 +225,6 @@ export async function saveGenreRelated(
   subject: string,
   keywords: string[]
 ): Promise<{ ok: true; related: { subject: string; keywords: string[] } } | { ok: false; error: string }> {
-  const list = await readStored()
-  const g = list.find((x) => x.id === id)
-  if (!g) return { ok: false, error: `"${id}" is not an added genre, so it is not stored in the database.` }
   const s = subject.trim().replace(/\s+/g, ' ')
   const k = Array.from(
     new Set(keywords.map((w) => w.toLowerCase().replace(/[^a-z0-9]/g, '')).filter(Boolean))
@@ -190,10 +232,31 @@ export async function saveGenreRelated(
   if (!s) return { ok: false, error: 'Say what a related video is about.' }
   if (k.length === 0) return { ok: false, error: 'Give at least one related keyword.' }
   const related = { subject: s, keywords: k }
+  // A BUILT-IN genre (humanizer, website, slides): stored as an override of
+  // the code's definition, which stays as the default.
+  if ((BUILTIN_GENRES as readonly string[]).includes(id)) {
+    const over = await readBuiltinRelated()
+    over[id] = related
+    await setAppState(BUILTIN_RELATED_KEY, JSON.stringify(over))
+    await ensureGenreRegistry(true)
+    return { ok: true, related }
+  }
+  const list = await readStored()
+  const g = list.find((x) => x.id === id)
+  if (!g) return { ok: false, error: `There is no genre "${id}".` }
   g.copy = { ...g.copy, related }
   await setAppState(KEY, JSON.stringify(list))
   await ensureGenreRegistry(true)
   return { ok: true, related }
+}
+
+/** A built-in genre back to the related rule written in code. */
+export async function resetBuiltinRelated(id: string): Promise<Related> {
+  const over = await readBuiltinRelated()
+  delete over[id]
+  await setAppState(BUILTIN_RELATED_KEY, JSON.stringify(over))
+  await ensureGenreRegistry(true)
+  return BUILTIN_RELATED_DEFAULT[id] ?? GENRE_COPY[id].related
 }
 
 /**

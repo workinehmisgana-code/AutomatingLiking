@@ -702,6 +702,13 @@ export function ensureVerifyLinkTable(): Promise<void> {
         -- NULL reads as DEFAULT_GENRE, the same convention the pool uses, so
         -- every row staged before this stays correct without being rewritten.
         ALTER TABLE verify_link ADD COLUMN IF NOT EXISTS genre TEXT;
+        -- A link from a KEYWORD SEARCH (the Control Center upload) that the
+        -- title check judged unrelated: staged here instead of going straight
+        -- into the pool. It keeps its keyword and rank, so verifying it by hand
+        -- puts it in the SEARCH clusters, not the posted-date ones. 0/NULL is a
+        -- channel-harvested link, which merges date-only as before.
+        ALTER TABLE verify_link ADD COLUMN IF NOT EXISTS search_query TEXT;
+        ALTER TABLE verify_link ADD COLUMN IF NOT EXISTS search_rank INT;
         -- A hand-added channel belongs to a genre, and its videos inherit it.
         -- This is where the genre of a staged link actually comes from: nobody
         -- types it per link, they type it once per channel.
@@ -826,12 +833,16 @@ export interface VerifyLinkRow {
   posted_date: string | null
   title: string | null
   bio: string | null
+  /** The keyword it was found under, for a link staged from a search upload. */
+  search_query: string | null
+  /** Its place in that search; 0 for a channel-harvested link. */
+  search_rank: number
 }
 
 type RawVerifyRow = {
   url?: unknown; account?: unknown; view_count?: unknown; heart_count?: unknown
   comment_count?: unknown; share_count?: unknown; posted_date?: unknown; title?: unknown
-  bio?: unknown; genre?: unknown
+  bio?: unknown; genre?: unknown; search_query?: unknown; search_rank?: unknown
 }
 
 // Bulk upsert uploaded rows (the client sends chunks). Returns rows written.
@@ -853,13 +864,15 @@ export async function saveVerifyLinks(rows: RawVerifyRow[]): Promise<number> {
       title: r?.title != null ? String(r.title).slice(0, 500) : null,
       bio: r?.bio != null ? String(r.bio).slice(0, 500) : null,
       genre: isGenre(r?.genre) ? r.genre : DEFAULT_GENRE,
+      search_query: r?.search_query != null ? String(r.search_query).slice(0, 200) : null,
+      search_rank: Math.max(0, Math.trunc(Number(r?.search_rank) || 0)),
     }))
     .filter((r) => r.url.startsWith('http'))
   if (clean.length === 0) return 0
   await ensureVerifyLinkTable()
   const { rowCount } = await pool.query(
-    `INSERT INTO verify_link (url, account, platform, view_count, heart_count, comment_count, share_count, posted_date, title, bio, genre)
-     SELECT * FROM unnest($1::text[], $2::text[], $10::text[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[], $7::text[], $8::text[], $9::text[], $11::text[])
+    `INSERT INTO verify_link (url, account, platform, view_count, heart_count, comment_count, share_count, posted_date, title, bio, genre, search_query, search_rank)
+     SELECT * FROM unnest($1::text[], $2::text[], $10::text[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[], $7::text[], $8::text[], $9::text[], $11::text[], $12::text[], $13::int[])
      ON CONFLICT (url) DO UPDATE SET
        account       = COALESCE(NULLIF(EXCLUDED.account, ''), verify_link.account),
        platform      = EXCLUDED.platform,
@@ -872,7 +885,10 @@ export async function saveVerifyLinks(rows: RawVerifyRow[]): Promise<number> {
        bio           = COALESCE(NULLIF(EXCLUDED.bio, ''), verify_link.bio),
        -- Set, never cleared: a re-stage that did not say which genre must not
        -- blank one that is already right.
-       genre         = COALESCE(NULLIF(EXCLUDED.genre, ''), verify_link.genre)`,
+       genre         = COALESCE(NULLIF(EXCLUDED.genre, ''), verify_link.genre),
+       -- A search upload's keyword and rank; a channel re-stage (no rank) keeps them.
+       search_query  = CASE WHEN EXCLUDED.search_rank > 0 THEN EXCLUDED.search_query ELSE verify_link.search_query END,
+       search_rank   = CASE WHEN EXCLUDED.search_rank > 0 THEN EXCLUDED.search_rank ELSE verify_link.search_rank END`,
     [
       clean.map((r) => r.url), clean.map((r) => r.account),
       clean.map((r) => r.view_count), clean.map((r) => r.heart_count),
@@ -881,6 +897,8 @@ export async function saveVerifyLinks(rows: RawVerifyRow[]): Promise<number> {
       clean.map((r) => r.bio),
       clean.map((r) => platformFromUrl(r.url)),
       clean.map((r) => r.genre),
+      clean.map((r) => r.search_query),
+      clean.map((r) => r.search_rank),
     ]
   )
   return rowCount ?? 0
@@ -899,6 +917,8 @@ function mapVerifyRow(r: Record<string, unknown>): VerifyLinkRow {
     posted_date: r.posted_date != null ? String(r.posted_date) : null,
     title: r.title != null ? String(r.title) : null,
     bio: r.bio != null ? String(r.bio) : null,
+    search_query: r.search_query != null ? String(r.search_query) : null,
+    search_rank: Number(r.search_rank) || 0,
   }
 }
 
@@ -997,7 +1017,7 @@ export async function getVerifyLinks(
       // which is the order the admin is working through, while still putting
       // each channel's links in one run. A channel wider than a page continues
       // onto the next one under the same heading.
-      `SELECT url, account, platform, genre, view_count, heart_count, comment_count, share_count, posted_date, title, bio
+      `SELECT url, account, platform, genre, view_count, heart_count, comment_count, share_count, posted_date, title, bio, search_query, search_rank
          FROM (
            SELECT *, min(added_at) OVER (PARTITION BY lower(coalesce(account, ''))) AS chan_first
              FROM verify_link WHERE ${predicate}
@@ -1023,7 +1043,7 @@ export async function getVerifyLinksByUrls(urls: string[]): Promise<VerifyLinkRo
   if (urls.length === 0) return []
   await ensureVerifyLinkTable()
   const { rows } = await pool.query(
-    `SELECT url, account, platform, genre, view_count, heart_count, comment_count, share_count, posted_date, title, bio
+    `SELECT url, account, platform, genre, view_count, heart_count, comment_count, share_count, posted_date, title, bio, search_query, search_rank
        FROM verify_link WHERE url = ANY($1::text[])`,
     [urls]
   )
@@ -1105,7 +1125,7 @@ export async function getVerifyLinksByAccounts(accounts: string[]): Promise<Veri
   if (clean.length === 0) return []
   await ensureVerifyLinkTable()
   const { rows } = await pool.query(
-    `SELECT url, account, platform, genre, view_count, heart_count, comment_count, share_count, posted_date, title, bio
+    `SELECT url, account, platform, genre, view_count, heart_count, comment_count, share_count, posted_date, title, bio, search_query, search_rank
        FROM verify_link WHERE lower(account) = ANY($1::text[])`,
     [clean]
   )

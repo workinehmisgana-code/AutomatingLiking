@@ -37,6 +37,7 @@ import {
   type LinkStat,
   getLinkCategories,
   getChannelBios,
+  ourRatioRetiredSet,
 } from './db'
 import { overlayStats } from './linkStats'
 import { parsePostedDate } from './cluster'
@@ -55,6 +56,12 @@ export interface AdminLinkRow {
   unrelated: number
   blocked: boolean
   retireAt: number
+  /**
+   * Retired by "🎯 TikTok: retire by our comment share" — our comments are at
+   * least that share of its comments at the last scan. The feeds already
+   * leave these out; this makes the Links page say so too.
+   */
+  ratioRetired: boolean
   rankCluster: number
   dateCluster: number
   combinedCluster: number
@@ -374,6 +381,10 @@ async function buildAdminLinksUncached(product: string): Promise<{
   // Channel bios, by bare handle. Only ~4k channels have one, so most links
   // carry '' here and simply never match a bio search.
   const bios = await getChannelBios().catch(() => ({}) as Record<string, string>)
+  // The same set the feeds subtract (any genre; TikTok only).
+  const ratioRetired = await ourRatioRetiredSet(videos as { url?: unknown; platform?: unknown }[]).catch(
+    () => new Set<string>()
+  )
   // Refreshed engagement counts live in their own table; fold them onto the pool
   // rows before anything reads like_count, so the table, the retire threshold and
   // the cluster scores all see the same number.
@@ -413,6 +424,7 @@ async function buildAdminLinksUncached(product: string): Promise<{
       scanComplete: coverage[url]?.complete ?? false,
       blocked: blockedSet.has(url),
       retireAt: retireThreshold(platform, like),
+      ratioRetired: ratioRetired.has(url),
       rankCluster: 0,
       dateCluster: 0,
       rankPos: 0,
@@ -520,7 +532,7 @@ async function buildAdminLinksUncached(product: string): Promise<{
   }
   for (const l of rows) {
     counts.byPlatform[l.platform] = (counts.byPlatform[l.platform] ?? 0) + 1
-    if (retireSet.has(l.platform) && l.clicks >= l.retireAt) counts.retired++
+    if (l.ratioRetired || (retireSet.has(l.platform) && l.clicks >= l.retireAt)) counts.retired++
     if (l.unrelated > 0) counts.unrelated++
     if (l.blocked) counts.blocked++
     else if (l.date_only) counts.dateOnly++
@@ -706,7 +718,8 @@ export function filterAdminLinks(
   const clusterBy: ClusterBy = qy.clusterBy ?? 'rank'
   const clusterOf = (l: AdminLinkRow) =>
     clusterBy === 'rank' ? l.rankCluster : clusterBy === 'date' ? l.dateCluster : l.combinedCluster
-  const isRetired = (l: AdminLinkRow) => retireSet.has(l.platform) && l.clicks >= l.retireAt
+  const isRetired = (l: AdminLinkRow) =>
+    l.ratioRetired || (retireSet.has(l.platform) && l.clicks >= l.retireAt)
 
   return rows.filter((l) => {
     // "Cluster by: Search rank" means exactly that: only links that HAVE a

@@ -16,8 +16,30 @@ import { llmChat, llmTakesBigBatches } from './llm'
 import { DEFAULT_GENRE, isGenre, type Genre } from './config'
 import { GENRE_COPY, classifyReasonSystem, classifySystem, classifyUser, relatedCriteria } from './prompts'
 import { ensureGenreRegistry } from './genreStore'
+import { getChannelBios } from './db'
+import { channelOf } from './dateScore'
 
-export type Item = { url: string; title: string }
+/** bio: the posting channel's profile description, '' or absent when unknown. */
+export type Item = { url: string; title: string; bio?: string | null }
+
+/**
+ * THE CHANNEL BIO, beside the title. A caption like "pov: finals week" says
+ * nothing; the same video from a channel whose bio is "AI humanizer tips for
+ * students" is plainly our audience. Bios the caller did not send are read
+ * from channel_bio by the URL's handle (cached), so every caller — the Mark
+ * unrelated button, the rank-only panel, the verify page, the hourly harvest —
+ * judges with it.
+ */
+async function withBios<T extends Item>(items: T[]): Promise<T[]> {
+  if (items.every((it) => it.bio)) return items
+  const bios = await getChannelBios().catch(() => ({}) as Record<string, string>)
+  return items.map((it) => {
+    if (it.bio) return it
+    const h = channelOf(it.url)?.replace(/^[a-z]+:/, '')
+    const bio = h ? bios[h] ?? '' : ''
+    return bio ? { ...it, bio } : it
+  })
+}
 
 // Deterministic safety net: a title literally containing one of its genre's
 // terms is ALWAYS related, no matter what the LLM says. This stops obviously-
@@ -83,7 +105,7 @@ async function askVerdicts(
     timeoutMs: 55_000,
     messages: [
       { role: 'system', content: classifyReasonSystem(genre) },
-      { role: 'user', content: classifyUser(items.map((it) => it.title)) },
+      { role: 'user', content: classifyUser(items) },
     ],
   })
   const got = new Map<number, { ruleNo: number; reason: string }>()
@@ -161,10 +183,10 @@ export async function classifyChunkWithReasons(items: Item[], genre: Genre = DEF
 export async function classifyWithReasonsByGenre(items: (Item & { genre?: string })[]): Promise<Verdict[]> {
   await ensureGenreRegistry().catch(() => {})
   const groups = new Map<Genre, Item[]>()
-  for (const it of items) {
+  for (const it of await withBios(items)) {
     const g = isGenre(it.genre) ? it.genre : DEFAULT_GENRE
     const list = groups.get(g) ?? []
-    list.push({ url: it.url, title: it.title })
+    list.push({ url: it.url, title: it.title, bio: it.bio })
     groups.set(g, list)
   }
   // A WHOLE PAGE IN ONE REQUEST, as 100-title calls made ALL AT ONCE.
@@ -194,7 +216,7 @@ export async function classifyChunk(items: Item[], genre: Genre = DEFAULT_GENRE)
     maxTokens: 1200 + items.length * 6,
     messages: [
       { role: 'system', content: classifySystem(genre) },
-      { role: 'user', content: classifyUser(items.map((it) => it.title)) },
+      { role: 'user', content: classifyUser(items) },
     ],
   })
   // The NUMBERS of the related titles (classifySystem). An old-style boolean
@@ -256,10 +278,10 @@ export async function classifyRelatedByGenre(
   // the time, and not on a warm one, which is why it looked random.
   await ensureGenreRegistry().catch(() => {})
   const groups = new Map<Genre, Item[]>()
-  for (const it of items) {
+  for (const it of await withBios(items)) {
     const g = isGenre(it.genre) ? it.genre : DEFAULT_GENRE
     const list = groups.get(g) ?? []
-    list.push({ url: it.url, title: it.title })
+    list.push({ url: it.url, title: it.title, bio: it.bio })
     groups.set(g, list)
   }
   // The genres at once too, for the same reason.

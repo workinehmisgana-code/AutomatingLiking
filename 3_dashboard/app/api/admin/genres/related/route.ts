@@ -3,18 +3,19 @@ import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { BUILTIN_GENRES, GENRE_LABELS, isAdminEmail, isGenre } from '@/lib/config'
 import { GENRE_COPY } from '@/lib/prompts'
-import { ensureGenreRegistry, saveGenreRelated } from '@/lib/genreStore'
+import { builtinRelatedIsCustom, ensureGenreRegistry, resetBuiltinRelated, saveGenreRelated } from '@/lib/genreStore'
 
 export const dynamic = 'force-dynamic'
 
 // What counts as RELATED for one genre — what "Mark unrelated" asks about.
 //
-//   GET  ?genre=<id>                      { genre, label, subject, keywords, editable }
-//   POST { genre, subject, keywords[] }   save it (added genres only)
+//   GET  ?genre=<id>                      { genre, label, subject, keywords, editable, builtin, custom }
+//   POST { genre, subject, keywords[] }   save it
+//   POST { genre, reset: true }           a built-in genre back to its code default
 //
-// An added genre's definition lives in the database (app_kv 'custom_genres')
-// and is edited here. A built-in genre's is code (lib/prompts.ts), so it is
-// shown but not editable.
+// An added genre's definition lives in the database (app_kv 'custom_genres').
+// A built-in genre's is code (lib/prompts.ts); an edit to it is stored as an
+// override (app_kv 'builtin_genre_related') and can be reset to the code's.
 
 async function requireAdmin(): Promise<boolean> {
   const session = await auth.api.getSession({ headers: await headers() }).catch(() => null)
@@ -34,7 +35,9 @@ export async function GET(req: NextRequest) {
     label: GENRE_LABELS[genre] ?? genre,
     subject,
     keywords,
-    editable: !isBuiltin(genre),
+    editable: true,
+    builtin: isBuiltin(genre),
+    custom: isBuiltin(genre) && builtinRelatedIsCustom(genre),
   })
 }
 
@@ -44,18 +47,21 @@ export async function POST(req: NextRequest) {
     genre?: unknown
     subject?: unknown
     keywords?: unknown
+    reset?: unknown
   }
   const genre = String(b.genre ?? '').trim()
-  if (isBuiltin(genre)) {
-    return NextResponse.json(
-      { error: 'A built-in genre is defined in code (lib/prompts.ts), not the database.' },
-      { status: 400 }
-    )
+  await ensureGenreRegistry().catch(() => {})
+  if (b.reset === true) {
+    if (!isBuiltin(genre)) {
+      return NextResponse.json({ error: 'Only a built-in genre has a default to reset to.' }, { status: 400 })
+    }
+    const related = await resetBuiltinRelated(genre)
+    return NextResponse.json({ ok: true, genre, ...related, custom: false })
   }
   const keywords = Array.isArray(b.keywords)
     ? b.keywords.map(String)
     : String(b.keywords ?? '').split(/[\n,]+/)
   const r = await saveGenreRelated(genre, String(b.subject ?? ''), keywords)
   if (!r.ok) return NextResponse.json({ error: r.error }, { status: 400 })
-  return NextResponse.json({ ok: true, genre, ...r.related })
+  return NextResponse.json({ ok: true, genre, ...r.related, custom: isBuiltin(genre) })
 }

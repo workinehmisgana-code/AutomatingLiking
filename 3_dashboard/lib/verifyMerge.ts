@@ -14,6 +14,7 @@ import {
   deleteVerifyLinks,
   saveLinkTitles,
   getBlockedIndex,
+  type VerifyLinkRow,
 } from './db'
 
 export type Video = Record<string, unknown> & { url?: unknown }
@@ -42,6 +43,42 @@ export async function loadVideos(): Promise<Video[]> {
   if (!res.ok) return []
   const data = await res.json()
   return Array.isArray(data) ? (data as Video[]) : []
+}
+
+/** The pool row a staged link becomes when it is merged. */
+export function verifyRowToVideo(r: VerifyLinkRow, now: string): Video {
+    // FROM A KEYWORD SEARCH (a Control Center upload the title check held
+    // back): it joins the SEARCH clusters, with its keyword and rank, exactly
+    // as it would have had the check passed it. A channel-harvested link has
+    // no rank and stays posted-date only.
+    const fromSearch = r.search_rank > 0
+    return {
+    url: r.url,
+    platform: platformFromUrl(r.url),
+    author: (r.account ?? '').replace(/^@/, ''),
+    search_query: fromSearch ? r.search_query ?? '' : '',
+    search_rank: fromSearch ? r.search_rank : 0, // no rank — clusters by posted date only
+    // A search link's like_count is what the search grid showed (views on
+    // TikTok), as for every other search link in the pool.
+    like_count: fromSearch && r.view_count > 0 ? r.view_count : r.heart_count,
+    // Explicit LIKE count. TikTok's search grid only exposes views, so a link's
+    // like_count means views for search-scraped links and likes for these —
+    // indistinguishable once stored. Channel scrapes give the real diggCount, so
+    // record it under its own name and let the scoring rely on it.
+    heart_count: r.heart_count,
+    posted_date: r.posted_date ?? '',
+    scraped_at: now,
+    // Search links are not date-only: they belong in the rank clusters.
+    ...(fromSearch ? { source: 'search' } : { date_only: true }), // date_only: exclude from rank clusters
+    // THE STAGED ROW'S OWN GENRE, inherited from the channel it came from when
+    // that channel was added by hand. It was a constant here while verify_link
+    // had no genre column; it has one now, so a cocodly channel's videos reach
+    // the cocodly pool instead of the humanizer one.
+    //
+    // A row staged before the column existed reads as the default, which is
+    // what every channel harvested so far actually is.
+    genre: r.genre || DEFAULT_GENRE,
+  }
 }
 
 /**
@@ -87,30 +124,7 @@ export async function mergeVerifyLinks(opts: {
   const mergedUrls = allRows.map((r) => r.url)
 
   const now = new Date().toISOString()
-  const incoming: Video[] = verifyRows.map((r) => ({
-    url: r.url,
-    platform: platformFromUrl(r.url),
-    author: (r.account ?? '').replace(/^@/, ''),
-    search_query: '',
-    search_rank: 0, // no rank — clusters by posted date only
-    like_count: r.heart_count,
-    // Explicit LIKE count. TikTok's search grid only exposes views, so a link's
-    // like_count means views for search-scraped links and likes for these —
-    // indistinguishable once stored. Channel scrapes give the real diggCount, so
-    // record it under its own name and let the scoring rely on it.
-    heart_count: r.heart_count,
-    posted_date: r.posted_date ?? '',
-    scraped_at: now,
-    date_only: true, // exclude from rank clusters, keep in date clusters
-    // THE STAGED ROW'S OWN GENRE, inherited from the channel it came from when
-    // that channel was added by hand. It was a constant here while verify_link
-    // had no genre column; it has one now, so a cocodly channel's videos reach
-    // the cocodly pool instead of the humanizer one.
-    //
-    // A row staged before the column existed reads as the default, which is
-    // what every channel harvested so far actually is.
-    genre: r.genre || DEFAULT_GENRE,
-  }))
+  const incoming: Video[] = verifyRows.map((r) => verifyRowToVideo(r, now))
 
   // Append, de-duped by URL. A URL already in the pool keeps its stored row
   // (clicks, title, search rank and the rest stay intact) and only has its
@@ -144,6 +158,12 @@ export async function mergeVerifyLinks(opts: {
     const nextHearts = Number(v.heart_count)
     if (Number.isFinite(nextHearts) && nextHearts > 0 && nextHearts !== Number(stored.heart_count)) {
       stored.heart_count = nextHearts
+      changed = true
+    }
+    if (Number(v.search_rank) > 0 && !(Number(stored.search_rank) > 0)) {
+      stored.search_rank = v.search_rank
+      stored.search_query = v.search_query
+      delete stored.date_only
       changed = true
     }
     if (!String(stored.posted_date ?? '') && String(v.posted_date ?? '')) {

@@ -483,6 +483,11 @@ DEFAULTS = {
         # (inclusive), so no account works the same number of links every
         # time. 0, or anything not above links_per_account, is a fixed size.
         "links_per_account_max": 0,
+        # EACH ACCOUNT ITS OWN COPY OF THE LIST (the default): every account
+        # works EVERY link, in turns. When an account's turn ends it gives way
+        # to another, and on its next turn it carries on in ITS copy from where
+        # it stopped. Off: one shared list, each link worked by ONE account.
+        "relay_own_copy": True,
         # DROPPED LIKES: an account whose likes TikTok drops this many times IN
         # A ROW (pressed, not kept) is closed. 0 = never. In a relay its
         # unfinished links go to the account that has been resting longest,
@@ -1026,9 +1031,25 @@ class LikerRelay(Job):
         if not links:
             self.write("[*] the selection has no links")
             return
-        queue_: deque[str] = deque(links)
+        # THE QUEUES. Own copy: every account gets its own queue of the whole
+        # list, so every account likes every link, and an account's next turn
+        # starts where its last one stopped (the first from the beginning).
+        # Shared: one queue that every name points at, so each link is worked
+        # by one account — the same code serves both.
+        own = bool(self.s.get("relay_own_copy", True))
+        if own:
+            queues: dict[str, deque[str]] = {n: deque(links) for n in self.names}
+        else:
+            shared: deque[str] = deque(links)
+            queues = {n: shared for n in self.names}
+
+        def pending() -> bool:
+            return any(queues[n] for n in self.names if n not in dropped)
+
         self.write(f"[*] {len(links)} link(s), {turn_label(self.per, self.per_max)} a turn, "
-                   f"{self.slots} account(s) at once, accounts picked at random")
+                   f"{self.slots} account(s) at once, accounts picked at random"
+                   + (f"; EACH of the {len(self.names)} account(s) works its own copy of all "
+                      f"{len(links)} link(s)" if own else "; each link worked by one account"))
 
         # ── 2. turns ─────────────────────────────────────────────────────
         unused: list[str] = []          # accounts without a turn this round
@@ -1048,10 +1069,14 @@ class LikerRelay(Job):
             return (float(relay_ledger().get(n, {}).get("rest_until", 0)) > time.time()
                     or cool.get(n, 0) > time.time())
 
+        def idle_now() -> list[str]:
+            # Only an account with links left in its queue can take a turn.
+            return [n for n in self.names
+                    if n not in running and n not in dropped and not resting(n) and queues[n]]
+
         def pick(replacement: bool = False) -> str | None:
             nonlocal unused
-            idle = [n for n in self.names
-                    if n not in running and n not in dropped and not resting(n)]
+            idle = idle_now()
             if not idle:
                 return None
             if replacement:
@@ -1064,7 +1089,7 @@ class LikerRelay(Job):
             fresh = [n for n in unused if n in idle]
             if not fresh:
                 # New round: everyone idle is eligible again.
-                unused = [n for n in self.names if n not in dropped and not resting(n)]
+                unused = [n for n in self.names if n not in dropped and not resting(n) and queues[n]]
                 fresh = [n for n in unused if n in idle] or idle
             name = random.choice(fresh)
             if name in unused:
@@ -1072,7 +1097,7 @@ class LikerRelay(Job):
             return name
 
 
-        while (queue_ or running) and not self._stop:
+        while (pending() or running) and not self._stop:
             # Collect finished turns.
             for name, (job, mine) in list(running.items()):
                 if not job.finished():
@@ -1097,38 +1122,46 @@ class LikerRelay(Job):
                 seen = set(job.reached)
                 on = job.reached[-1] if job.reached else None
                 back = [u for u in mine if u not in seen or u == on]
+                # Back to the front of ITS OWN queue (own copy: it resumes there
+                # on its next turn; shared: the next account takes them).
                 for u in reversed(back):
-                    queue_.appendleft(u)
+                    queues[name].appendleft(u)
                 if job.exit_code == self.DROPPED_EXIT and job.status != "stopped":
                     # TikTok is dropping its likes: rest it, and put the account
                     # that has been resting longest in its place.
                     relay_ledger_set(name, rest_until=time.time() + rest_s)
                     replace_pending += 1
                     self.write(f"[!] {name}: TikTok kept dropping its likes — closed, "
-                               f"resting {rest_s // 60} min; {len(back)} of its {len(mine)} "
-                               "link(s) go to the account that has rested longest")
+                               f"resting {rest_s // 60} min; "
+                               + (f"it picks up its copy again from where it stopped after the rest "
+                                  f"({len(queues[name])} link(s) left in it)" if own else
+                                  f"{len(back)} of its {len(mine)} link(s) go to the account that has rested longest"))
                     continue
                 if job.status == "stopped":
                     dropped.add(name)
-                    self.write(f"[!] {name} was stopped; {len(back)} of its {len(mine)} link(s) "
-                               f"go to the next account, and {name} sits out the rest of this run")
+                    self.write(f"[!] {name} was stopped and sits out the rest of this run; "
+                               + (f"{len(queues[name])} link(s) of its copy are not worked" if own else
+                                  f"{len(back)} of its {len(mine)} link(s) go to the next account"))
                     continue
                 fails[name] = fails.get(name, 0) + 1
                 if fails[name] >= self.MAX_FAILS:
                     dropped.add(name)
-                    self.write(f"[!] {name} failed (exit {job.exit_code}) for the {fails[name]}th time; "
-                               f"{len(back)} link(s) go to the next account, and {name} sits out "
-                               "the rest of this run")
+                    self.write(f"[!] {name} failed (exit {job.exit_code}) for the {fails[name]}th time "
+                               f"and sits out the rest of this run; "
+                               + (f"{len(queues[name])} link(s) of its copy are not worked" if own else
+                                  f"{len(back)} link(s) go to the next account"))
                     continue
                 cool[name] = time.time() + self.FAIL_REST_S
-                self.write(f"[!] {name} failed (exit {job.exit_code}); {len(back)} of its {len(mine)} "
-                           f"link(s) go to the next account, and {name} rests "
+                self.write(f"[!] {name} failed (exit {job.exit_code}); "
+                           + (f"it resumes its copy where it stopped" if own else
+                              f"{len(back)} of its {len(mine)} link(s) go to the next account")
+                           + f", and {name} rests "
                            f"{self.FAIL_REST_S // 60} min before its next turn "
                            f"(failure {fails[name]} of {self.MAX_FAILS} allowed)")
             if self._stop:
                 break
             # Start turns while there are links, free slots and idle accounts.
-            while queue_ and len(running) < self.slots:
+            while pending() and len(running) < self.slots:
                 name = pick(replacement=replace_pending > 0)
                 if name is None:
                     break
@@ -1137,7 +1170,8 @@ class LikerRelay(Job):
                     self.write(f"[*] {name} replaces the closed account "
                                "(it has not worked for the longest)")
                 size = random.randint(self.per, self.per_max)
-                mine = [queue_.popleft() for _ in range(min(size, len(queue_)))]
+                q = queues[name]
+                mine = [q.popleft() for _ in range(min(size, len(q)))]
                 turn += 1
                 if self.per_max > self.per:
                     self.write(f"[*] turn {turn}: {name} gets {len(mine)} link(s) "
@@ -1149,13 +1183,15 @@ class LikerRelay(Job):
                 job = RUNNER.launch(RelayTurn("liker", f"{title} · turn {turn}", tcmd, tcwd))
                 self.children.append(job)
                 running[name] = (job, mine)
+                done_n = len(links) - len(queues[name])
                 self.write(f"[*] turn {turn}: {name} takes {len(mine)} link(s); "
-                           f"{len(queue_)} left after it")
-            if queue_ and not running and len(dropped) >= len(self.names):
-                self.write(f"[!] every account dropped out; {len(queue_)} link(s) not worked")
+                           + (f"its copy: {done_n}/{len(links)} handed out, {len(queues[name])} left"
+                              if own else f"{len(queues[name])} left after it"))
+            if not running and len(dropped) >= len(self.names) and any(queues[n] for n in self.names):
+                self.write("[!] every account dropped out; links left not worked")
                 self.status = "failed"
                 return
-            if queue_ and not running and pick() is None:
+            if pending() and not running and not idle_now():
                 # Everyone left is resting: wait for the first to be rested.
                 if not waiting_said:
                     led = relay_ledger()
@@ -1168,7 +1204,12 @@ class LikerRelay(Job):
                 waiting_said = False
             time.sleep(1)
         if not self._stop:
-            self.write(f"[*] all {len(links)} link(s) handed out and worked")
+            if own:
+                full = [n for n in self.names if n not in dropped]
+                self.write(f"[*] {len(full)} account(s) each worked all {len(links)} link(s)"
+                           + (f"; {len(dropped)} dropped out before finishing their copy" if dropped else ""))
+            else:
+                self.write(f"[*] all {len(links)} link(s) handed out and worked")
 
 
 class Runner:
@@ -1721,6 +1762,7 @@ def preview(tool: str, s: dict) -> str:
                                                relay_links=Path("<turn links>"))[1][1:])
                 return (f"# relay: fetch the list once ({' '.join(build_liker_for(s, names[0], names)[1][1:])} "
                         f"--list-only ...), then turns of {turn_label(per, per_max)} links, each on a random one of: "
+                        f"{'(each account works its own copy of the whole list) ' if s.get('relay_own_copy', True) else ''}"
                         f"{', '.join(names)}\n{one}")
             return "\n".join(
                 " ".join(build_liker_for(s, n, names)[1][1:]) for n in names

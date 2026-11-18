@@ -273,10 +273,17 @@ def upload(videos: list[dict], mode: str = "replace", genre: str = DEFAULT_GENRE
         url,
         json=videos,
         headers={"x-upload-secret": UPLOAD_SECRET, "Content-Type": "application/json"},
-        timeout=60,
+        # The server now judges each new link's title before adding it.
+        timeout=120,
     )
     if r.ok:
         data = r.json()
+        if data.get("checked") or data.get("stagedUnrelated"):
+            print(f"[*] Title check: {data.get('checked', 0)} new link(s) judged; "
+                  f"{data.get('stagedUnrelated', 0)} not related to {genre} → held in Links to verify "
+                  f"(verify them there to add them to the search clusters).")
+        if data.get("checkError"):
+            print(f"[!] Title check skipped, links added unchecked: {data['checkError']}")
         if mode == "dedupe":
             print(f"[+] Dedupe complete – removed {data.get('removed', '?')} duplicate link(s); "
                   f"{data.get('count', '?')} unique videos remain.")

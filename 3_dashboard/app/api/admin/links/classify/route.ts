@@ -31,11 +31,13 @@ export async function POST(req: NextRequest) {
     if (Array.isArray(b?.items)) {
       items = b.items
         .map((it: unknown) => {
-          const o = it as { url?: unknown; title?: unknown; genre?: unknown }
+          const o = it as { url?: unknown; title?: unknown; genre?: unknown; bio?: unknown }
           return {
             url: String(o?.url ?? '').trim(),
             title: String(o?.title ?? '').trim(),
             genre: String(o?.genre ?? '').trim(),
+            // The channel's bio, when the page has it; otherwise looked up by handle.
+            bio: String(o?.bio ?? '').trim().slice(0, 400),
           }
         })
         .filter((it: Item) => it.url && it.title)

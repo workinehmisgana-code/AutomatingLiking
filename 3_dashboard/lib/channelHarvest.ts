@@ -352,6 +352,7 @@ export async function harvestOnce(deadline: number): Promise<HarvestResult> {
       url: String(r.url),
       title: String(r.title),
       genre: String((r as { genre?: unknown }).genre ?? ''),
+      bio: String((r as { bio?: unknown }).bio ?? ''),
     }))
   const untitled = rows.length - titled.length
 

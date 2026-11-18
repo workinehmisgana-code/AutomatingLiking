@@ -1,11 +1,27 @@
 import { list, put } from '@vercel/blob'
 import { NextRequest, NextResponse } from 'next/server'
 import { invalidatePoolFile } from '@/lib/videos'
-import { saveLinkTitles, getBlockedIndex, getDateWeights, getLinkStats, type LinkStat } from '@/lib/db'
+import {
+  saveLinkTitles,
+  getBlockedIndex,
+  getDateWeights,
+  getLinkStats,
+  getAllVerifyLinkUrls,
+  saveVerifyLinks,
+  type LinkStat,
+} from '@/lib/db'
+import { classifyRelatedByGenre } from '@/lib/titleClassify'
 import { overlayStats } from '@/lib/linkStats'
 import { computeDateScores } from '@/lib/dateScore'
 import { DEFAULT_DATE_WEIGHTS, DEFAULT_GENRE, genreOfRow, isGenre, repairRowPlatform } from '@/lib/config'
 import { ensureGenreRegistry } from '@/lib/genreStore'
+
+// The title check (below) can take a while on a big batch: up to 100 titles a
+// model call, all calls at once.
+export const maxDuration = 60
+
+/** How long the title check may take before the upload goes ahead without it. */
+const CHECK_BUDGET_MS = 35_000
 
 type Video = Record<string, unknown> & {
   url?: unknown
@@ -162,6 +178,78 @@ export async function POST(req: NextRequest) {
     repairRowPlatform(v)
   }
 
+  // ── THE TITLE CHECK: is each NEW link related to its genre? ──
+  //
+  // A keyword search brings back plenty that is not ours. Every link this upload
+  // would ADD is judged by its title (and its channel's bio) with the same rule
+  // as "Mark unrelated". Related ones go into the pool, in the search clusters,
+  // as always. Unrelated ones are STAGED in Links to verify instead, keeping
+  // their keyword and rank: verifying one by hand merges it into the SEARCH
+  // clusters (lib/verifyMerge), not the posted-date ones.
+  //
+  // Not judged, and so going in as before: links already in the pool (they were
+  // accepted once), links with no title (nothing to judge), and the whole batch
+  // when the check fails or runs out of time — an upload never loses links to a
+  // model outage. A link ALREADY waiting in Links to verify stays there (its
+  // rank refreshed) rather than slipping in through a re-upload.
+  const existingPool = mode === 'dedupe' ? [] : await loadExisting()
+  const loadExistingOnce = async (): Promise<Video[]> => existingPool
+  let staged = 0
+  let checked = 0
+  let checkError = ''
+  if (mode !== 'dedupe' && incoming.length > 0) {
+    const inPool = new Set(existingPool.map(urlKey).filter(Boolean))
+    const waiting = new Set(await getAllVerifyLinkUrls().catch(() => [] as string[]))
+    const toStage = new Set<string>()
+    const candidates: { url: string; title: string; genre: string }[] = []
+    for (const v of incoming) {
+      const url = String(v.url ?? '').trim()
+      if (!url || inPool.has(urlKey(v))) continue
+      if (waiting.has(url)) toStage.add(url)
+      else if (titles[url]) candidates.push({ url, title: titles[url], genre })
+    }
+    if (candidates.length > 0) {
+      try {
+        const related = await Promise.race([
+          classifyRelatedByGenre(candidates),
+          new Promise<never>((_, rej) =>
+            setTimeout(() => rej(new Error(`the title check took over ${CHECK_BUDGET_MS / 1000} s`)), CHECK_BUDGET_MS)
+          ),
+        ])
+        const rel = new Set(related)
+        checked = candidates.length
+        for (const c of candidates) if (!rel.has(c.url)) toStage.add(c.url)
+      } catch (e) {
+        checkError = String(e instanceof Error ? e.message : e).slice(0, 300)
+      }
+    }
+    if (toStage.size > 0) {
+      const rows = incoming.filter((v) => toStage.has(String(v.url ?? '').trim()))
+      const written = await saveVerifyLinks(
+        rows.map((v) => ({
+          url: String(v.url ?? '').trim(),
+          account: String(v.author ?? ''),
+          // A search grid's like_count is views on TikTok (see upload.py).
+          view_count: v.like_count,
+          heart_count: v.heart_count,
+          posted_date: v.posted_date,
+          title: titles[String(v.url ?? '').trim()] ?? '',
+          genre,
+          search_query: v.search_query,
+          search_rank: Number(v.search_rank) > 0 ? v.search_rank : 1,
+        }))
+      ).catch((e) => {
+        checkError = checkError || `could not stage: ${String(e).slice(0, 200)}`
+        return -1
+      })
+      // Only held back once they are safely staged; otherwise they go in as before.
+      if (written >= 0) {
+        incoming = incoming.filter((v) => !toStage.has(String(v.url ?? '').trim()))
+        staged = toStage.size
+      }
+    }
+  }
+
   let videos: Video[]
   let replacedPlatforms: string[] = []
   let added = 0
@@ -189,7 +277,7 @@ export async function POST(req: NextRequest) {
     // Add genuinely new URLs; for URLs already stored, refresh their like/view
     // count and search rank if the new upload has different (valid) values —
     // otherwise leave the existing row untouched (never duplicated).
-    const existing = await loadExisting()
+    const existing = await loadExistingOnce()
     const byUrl = new Map<string, Video>()
     for (const v of existing) {
       const k = urlKey(v)
@@ -221,7 +309,7 @@ export async function POST(req: NextRequest) {
     // date_only, source_file … — survives) and only its like/view count and
     // search rank are refreshed from the new scrape. Stored links of these
     // platforms that are absent from the batch are dropped, as "replace" implies.
-    const existing = await loadExisting()
+    const existing = await loadExistingOnce()
     const incomingPlatforms = new Set(incoming.map(platformOf))
     replacedPlatforms = Array.from(incomingPlatforms)
     // Kept: every link of an untouched platform, AND every posted-date-only
@@ -338,8 +426,13 @@ export async function POST(req: NextRequest) {
       ok: true,
       mode,
       genre,
-      received: incoming.length,
+      received: incoming.length + staged,
       added,
+      // The title check: new links judged, those held back in Links to verify
+      // as unrelated, and why the check did not run when it did not.
+      checked,
+      stagedUnrelated: staged,
+      checkError,
       updated,
       removed,
       // Posted-date-only links this upload deliberately did not touch. Worth

@@ -5,9 +5,9 @@ import { GENRE_LABELS } from '@/lib/config'
 
 /**
  * What counts as RELATED for a genre, editable beside the "Mark unrelated"
- * button it steers. Saves to the database (app_kv 'custom_genres') for an
- * added genre such as Study helper; a built-in genre's definition is code, so
- * it is shown read-only.
+ * button it steers. Saves to the database: an added genre's own entry, or for a
+ * built-in genre (humanizer, website, slides) an override of the definition in
+ * code, which "Reset to default" brings back.
  */
 export default function RelatedRuleEditor({ genres }: { genres: readonly string[] }) {
   const [open, setOpen] = useState(false)
@@ -16,6 +16,8 @@ export default function RelatedRuleEditor({ genres }: { genres: readonly string[
   const [keywords, setKeywords] = useState('')
   const [saved, setSaved] = useState({ subject: '', keywords: '' })
   const [editable, setEditable] = useState(false)
+  const [builtin, setBuiltin] = useState(false)
+  const [custom, setCustom] = useState(false)
   const [loading, setLoading] = useState(false)
   const [busy, setBusy] = useState(false)
   const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null)
@@ -43,6 +45,8 @@ export default function RelatedRuleEditor({ genres }: { genres: readonly string[
         setKeywords(kw)
         setSaved({ subject: d.subject, keywords: kw })
         setEditable(Boolean(d.editable))
+        setBuiltin(Boolean(d.builtin))
+        setCustom(Boolean(d.custom))
       })
       .finally(() => live && setLoading(false))
     return () => {
@@ -50,14 +54,17 @@ export default function RelatedRuleEditor({ genres }: { genres: readonly string[
     }
   }, [open, genre])
 
-  async function save() {
+  async function save(reset = false) {
+    if (reset && !confirm(`Put ${GENRE_LABELS[genre] ?? genre} back to the rule written in code?`)) return
     setBusy(true)
     setNote(null)
     try {
       const res = await fetch('/api/admin/genres/related', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ genre, subject, keywords: keywords.split(/[\n,]+/) }),
+        body: JSON.stringify(
+          reset ? { genre, reset: true } : { genre, subject, keywords: keywords.split(/[\n,]+/) }
+        ),
       })
       const d = await res.json().catch(() => ({}))
       if (!res.ok) {
@@ -68,7 +75,11 @@ export default function RelatedRuleEditor({ genres }: { genres: readonly string[
       setSubject(d.subject)
       setKeywords(kw)
       setSaved({ subject: d.subject, keywords: kw })
-      setNote({ ok: true, text: 'Saved. Run “Mark unrelated” again to use it.' })
+      setCustom(Boolean(d.custom))
+      setNote({
+        ok: true,
+        text: reset ? 'Back to the default. Run “Mark unrelated” again to use it.' : 'Saved. Run “Mark unrelated” again to use it.',
+      })
     } finally {
       setBusy(false)
     }
@@ -109,9 +120,9 @@ export default function RelatedRuleEditor({ genres }: { genres: readonly string[
             ) : (
               <span className="text-white">{label}</span>
             )}
-            {!loading && !editable && (
+            {!loading && builtin && (
               <span className="text-[11px] text-zinc-500">
-                built-in genre — defined in code (lib/prompts.ts), read-only here
+                built-in genre — {custom ? 'your edited version (the default is kept)' : 'the default rule'}
               </span>
             )}
           </div>
@@ -150,6 +161,15 @@ export default function RelatedRuleEditor({ genres }: { genres: readonly string[
                   >
                     {busy ? 'Saving…' : 'Save'}
                   </button>
+                  {builtin && custom && !busy && (
+                    <button
+                      type="button"
+                      onClick={() => void save(true)}
+                      className="text-xs text-zinc-400 hover:text-zinc-200 border border-zinc-700 rounded-lg px-3 py-1"
+                    >
+                      Reset to default
+                    </button>
+                  )}
                   {changed && !busy && (
                     <button
                       type="button"

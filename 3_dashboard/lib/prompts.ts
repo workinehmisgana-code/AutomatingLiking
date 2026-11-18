@@ -1206,12 +1206,27 @@ export const GENRE_DRAFT_SYSTEM = [
  * `related.subject` in GENRE_COPY above, so a website title is judged against
  * websites, never against humanizers.
  */
+/**
+ * "Mark unrelated" and the channel bio (see classifyUser): the bio rescues a
+ * title that says nothing, never one that is plainly about something else.
+ */
+const CLASSIFY_BIO_RULE =
+  'Some titles are followed by "| channel bio: ...", the profile description of the account that ' +
+  'posted it. Judge in two steps. STEP 1, the title alone: if it fits a topic, it is RELATED; if it ' +
+  'names a clearly different subject (a recipe, a dance, a game, a product or topic outside the list), ' +
+  'it is NOT related and the bio is IGNORED. STEP 2, only for a title that says nothing about its ' +
+  'subject (a trend caption, a joke, a feeling, "pov", "this saved me", hashtags like #fyp): it is ' +
+  'RELATED when the bio shows the channel is clearly about one of the topics, otherwise NOT related. ' +
+  'Examples with a bio about AI humanizers: "pov: finals week #fyp" -> related (step 2); ' +
+  '"my favourite pasta recipe #cooking" -> NOT related (step 1). '
+
 export function classifySystem(genre: Genre): string {
   const { subject } = GENRE_COPY[genre].related
   return (
     'You classify short social-media video titles/captions. A title is RELATED when it is ' +
     `${subject}. ` +
     'Anything else is NOT related. ' +
+    CLASSIFY_BIO_RULE +
     // THE NUMBERS OF THE RELATED ONES, not a boolean per title: a long list
     // answered by position goes wrong for every title after one the model
     // skips, and a list of numbers cannot drift out of line.
@@ -1268,6 +1283,8 @@ export function classifyReasonSystem(genre: Genre): string {
     `related-prompt${head ? ` (all about ${head})` : ''}:\n` +
     topics.map((t, i) => `${i + 1}. ${t}`).join('\n') +
     '\nAnything else is NOT related.\n' +
+    CLASSIFY_BIO_RULE +
+    'When the bio decided it, start the reason with "Bio:". ' +
     'Return STRICT JSON {"items":[{"n":1,"rule":3,"reason":"..."}, ...]} with ONE item PER TITLE, ' +
     'in order, and no title skipped. "n" is the TITLE\'s own number from the numbered list of titles ' +
     '(so every answer names the title it is about). "rule" is the NUMBER of the topic above the ' +
@@ -1288,9 +1305,19 @@ export function classifyReasonSystem(genre: Genre): string {
 // words as closely as the system prompt. So they live here too: a generator
 // hands over its data and sends whatever comes back.
 
-/** "Mark unrelated": the numbered titles. */
-export const classifyUser = (titles: string[]): string =>
-  `Titles:\n${titles.map((t, i) => `${i + 1}. ${t.slice(0, 200)}`).join('\n')}`
+/**
+ * "Mark unrelated": the numbered titles, each with its channel's bio when we
+ * have one — a vague caption from a channel that is plainly about the genre is
+ * still that genre's audience.
+ */
+export const classifyUser = (items: (string | { title: string; bio?: string | null })[]): string =>
+  `Titles:\n${items
+    .map((it, i) => {
+      const { title, bio } = typeof it === 'string' ? { title: it, bio: '' } : it
+      const b = String(bio ?? '').replace(/\s+/g, ' ').trim()
+      return `${i + 1}. ${title.slice(0, 200)}${b ? ` | channel bio: ${b.slice(0, 200)}` : ''}`
+    })
+    .join('\n')}`
 
 /** The audience categoriser: each link's caption, and its channel bio if known. */
 export const categoriseUser = (items: { title: string; bio: string }[]): string =>

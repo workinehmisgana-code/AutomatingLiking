@@ -15,7 +15,7 @@
 // into the merge it already makes, so the pool file is written once), and on
 // demand from the page's "Run now".
 
-import { getAppState, setAppState, pool } from './db'
+import { getAppState, setAppState, pool, ensureVerifyLinkTable } from './db'
 import type { ChannelRow } from './channelRank'
 
 /** [min, max]; null means no bound on that side. */
@@ -132,6 +132,7 @@ export async function urlsMatchingSpecs(
   /** Count a switched-off spec too — the page's preview of turning it on. */
   opts: { ignoreEnabled?: boolean } = {}
 ): Promise<{ urls: string[]; channels: number; byGenre: Record<string, number> }> {
+  await ensureVerifyLinkTable() // the search_rank column
   const { rows: genres } = await pool.query<{ genre: string }>(
     `SELECT DISTINCT coalesce(genre, 'humanizer') AS genre FROM verify_link`
   )
@@ -151,7 +152,10 @@ export async function urlsMatchingSpecs(
     if (ok.size === 0) continue
     const { rows } = await pool.query<{ url: string; account: string; platform: string }>(
       `SELECT url, lower(account) AS account, platform FROM verify_link
-        WHERE coalesce(genre, 'humanizer') = $1 AND account IS NOT NULL AND account <> ''`,
+        WHERE coalesce(genre, 'humanizer') = $1 AND account IS NOT NULL AND account <> ''
+          -- Not a search link the upload's title check held back as unrelated:
+          -- those wait for a person, whatever their channel's numbers say.
+          AND coalesce(search_rank, 0) = 0`,
       [genre]
     )
     const hit = new Set<string>()

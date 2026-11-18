@@ -85,6 +85,8 @@ export interface LinkRow {
   unrelated: number
   blocked: boolean
   retireAt: number
+  /** Retired by our comment share (🎯), whatever its clicks. */
+  ratioRetired?: boolean
   rankCluster: number
   dateCluster: number
   combinedCluster: number
@@ -1184,7 +1186,8 @@ export default function AdminLinks({
   // The per-platform hourly quotas are separate and don't affect this.
   const retireSet = useMemo(() => new Set(retirePlatforms), [retirePlatforms])
   const anyRetireOn = retireSet.size > 0
-  const isRetired = (l: LinkRow) => retireSet.has(l.platform) && clicksOf(l) >= l.retireAt
+  const isRetired = (l: LinkRow) =>
+    Boolean(l.ratioRetired) || (retireSet.has(l.platform) && clicksOf(l) >= l.retireAt)
 
   async function setBlocked(url: string, block: boolean, skipConfirm = false) {
     if (block && !skipConfirm && !confirm('Block this link forever? It stays hidden from all users even if a future upload re-adds it. (It is not deleted — you can unblock later.)')) return
@@ -2411,6 +2414,8 @@ export default function AdminLinks({
   async function markByTitle(mode: 'related' | 'unrelated') {
     // Each with its own genre (see classifyRelatedByGenre): in the switch's All
     // the page holds several, and one question for all would misjudge the rest.
+    // The channel's bio is added on the server (lib/titleClassify withBios):
+    // a vague caption from a channel plainly about the genre is still related.
     const items = shown.filter((l) => titles[l.url]).map((l) => ({ url: l.url, title: titles[l.url], genre: l.genre }))
     if (items.length === 0) { alert('Fetch titles first (Process).'); return }
     setClassifying(`0/${items.length}`)
@@ -4039,9 +4044,13 @@ export default function AdminLinks({
                           ? 'border-amber-500/50 bg-amber-500/15 text-amber-200 font-semibold'
                           : 'border-zinc-700 text-zinc-400'
                       }`}
-                      title={retired ? 'Finished quota — retired' : `${clicksOf(l)}/${l.retireAt} users`}
+                      title={
+                        l.ratioRetired
+                          ? 'Retired by our comment share — our comments are at least the 🎯 share of its comments (last scan)'
+                          : retired ? 'Finished quota — retired' : `${clicksOf(l)}/${l.retireAt} users`
+                      }
                     >
-                      {retired ? `🔒 ${clicksOf(l)}` : `${clicksOf(l)}/${l.retireAt}`}
+                      {l.ratioRetired ? `🎯 ${clicksOf(l)}` : retired ? `🔒 ${clicksOf(l)}` : `${clicksOf(l)}/${l.retireAt}`}
                     </span>
                   </span>
                 )}
