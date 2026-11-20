@@ -51,10 +51,41 @@ function keywordRelated(title: string, genre: Genre): boolean {
   return keywordHit(title, genre) !== null
 }
 
-/** The genre keyword the title contains, or null. */
+/**
+ * The genre keyword the title contains, or null.
+ *
+ * WORD BOUNDARIES MATTER. This used to strip every space and look for the
+ * keyword anywhere, so "Claude can turn it into a spreadsheet" became
+ * "...turnitinto..." and matched "turnitin" — a post about Claude filed as
+ * humanizer. Now a keyword matches either INSIDE ONE WORD ("#turnitin",
+ * "#bestaihumanizer", "humanizing") or as consecutive WHOLE WORDS joined
+ * ("AI detector", "ai-detectors", "walter writes"), where the last word may
+ * only add a plain ending (s, es, ed, ing…), never another word's letters.
+ */
+const JOIN_ENDINGS = new Set(['', 's', 'es', 'd', 'ed', 'r', 'rs', 'er', 'ers', 'ing', 'ion', 'ions'])
+
 function keywordHit(title: string, genre: Genre): string | null {
-  const norm = title.toLowerCase().replace(/[^a-z0-9]/g, '')
-  return GENRE_COPY[genre].related.keywords.find((k) => norm.includes(k)) ?? null
+  const words = title.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+  const keywords = GENRE_COPY[genre].related.keywords
+  for (const w of words) {
+    const k = keywords.find((kw) => w.includes(kw))
+    if (k) return k
+  }
+  for (let i = 0; i < words.length; i++) {
+    let joined = words[i]
+    for (let j = i + 1; j < Math.min(words.length, i + 5); j++) {
+      const lastStart = joined.length
+      joined += words[j]
+      // Three or more short everyday words ("turn it in") are a phrase, not a
+      // brand typed with spaces: such a join needs one word of 5+ letters.
+      if (j - i >= 2 && !words.slice(i, j + 1).some((w) => w.length >= 5)) continue
+      const k = keywords.find(
+        (kw) => kw.length > lastStart && joined.startsWith(kw) && JOIN_ENDINGS.has(joined.slice(kw.length)),
+      )
+      if (k) return k
+    }
+  }
+  return null
 }
 
 /**

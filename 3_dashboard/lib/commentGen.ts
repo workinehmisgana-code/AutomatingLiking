@@ -108,6 +108,13 @@ export function canonicaliseMention(s: string, product: Product, style: CommentS
     .replace(/["'\u201C\u2018]$/, '')
     .replace(/#$/, '')
   const after = s.slice(m.index + m[0].length).replace(/^["'\u201D\u2019]/, '')
+  if (style.quoteBrand) {
+    // "Quote the brand": the quotes go round the whole word, an inflection
+    // included \u2014 "purify texting", never "purify text"ing.
+    const tail = /^[a-z]+/i.exec(after)?.[0] ?? ''
+    const words = productMention(product, { ...style, quoteBrand: false })
+    return before + `"${words}${tail.toLowerCase()}"` + after.slice(tail.length)
+  }
   return before + productMention(product, style) + after
 }
 

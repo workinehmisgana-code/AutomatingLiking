@@ -141,6 +141,24 @@
   .job-head:hover { background:var(--panel-2); }
   .job-title { font-size:13px; font-weight:600; }
   .job-meta { font-size:11.5px; color:var(--ink-faint); }
+  /* Account liker: the batch's progress, on the row itself. */
+  .jprog { display:flex; align-items:center; gap:8px; min-width:0; flex:1; max-width:460px; }
+  .jprog:empty { display:none; }
+  .jprog .bar { flex:1; min-width:80px; height:7px; background:var(--panel-2); border:1px solid var(--line);
+                border-radius:6px; overflow:hidden; }
+  .jprog .bar i { display:block; height:100%; width:0; background:var(--run); transition:width .6s; }
+  .jprog .txt { font-size:11.5px; color:var(--ink-dim); white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .jprog .txt b.ok { color:var(--ok); font-weight:600; } .jprog .txt b.bad { color:var(--bad); font-weight:600; }
+  .rep { border-top:1px solid var(--line); }
+  .rep-head { padding:8px 14px; font-size:12px; color:var(--ink-dim); cursor:pointer; display:flex; gap:8px; }
+  .rep-head:hover { background:var(--panel-2); }
+  .rep-body { padding:4px 14px 12px; display:flex; flex-direction:column; gap:10px; }
+  .rep-hour { border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  .rep-hour h4 { margin:0 0 6px; font-size:12px; font-weight:600; }
+  .rep-hour table { border-collapse:collapse; font-size:12px; font-variant-numeric:tabular-nums; }
+  .rep-hour td, .rep-hour th { padding:2px 14px 2px 0; text-align:left; }
+  .rep-hour th { color:var(--ink-faint); font-weight:500; }
+  .rep-hour .note { font-size:11.5px; color:var(--warn); margin-top:4px; }
   .pill { font-size:10.5px; font-weight:700; letter-spacing:.4px; text-transform:uppercase;
           padding:2px 8px; border-radius:20px; }
   .pill.running { background:rgba(88,166,255,.14); color:var(--run); }
@@ -450,6 +468,14 @@
           <label class="c"><input type="checkbox" id="z_share">
             Work the same list together <small>— neither repeats the other</small></label>
         </div>
+        <div class="checks" style="margin-top:12px">
+          <label class="c" title="Every change on the Zefoy page (the full page of every new screen: captcha, cooldown, ad, error, form) and this run's log are saved together in 2_comment_automation/zefoy-recordings/, so every screen Zefoy shows can be studied and handled.">
+            <input type="checkbox" id="z_record">
+            Record every Zefoy screen and the log <small>— zefoy-recordings/</small></label>
+          <label class="c" title="ON: the script handles Zefoy's ads itself — on the 'Unlock more content' offer it presses 'View a short ad' and watches the reward video to the end before closing it (closing early loses the reward); full-screen vignette ads are closed as soon as their close button appears. OFF: you are called (sound, notification, window to the front) and the run waits for you to deal with the ad.">
+            <input type="checkbox" id="z_ads_auto">
+            Watch and close ads automatically <small>— no need to be at the PC</small></label>
+        </div>
         <p class="note" id="z_whereNote"></p>
       </div>
 
@@ -665,6 +691,9 @@
               <input type="number" id="k_links_per_account_max" min="0" step="1" style="flex:1"
                 title="The most links one turn may take. Each turn draws a random number between FROM and this. 0 = always exactly FROM.">
             </span></label>
+          <label class="f"><span>Warm-up: first, every account likes this many comments (0 = off)</span>
+            <input type="number" id="k_warmup_likes" min="0" step="1"
+              title="Relay mode only. Before the ordinary turns, every ticked account takes one WARM-UP turn that stops as soon as it has liked this many comments, running 'Accounts at once' at a time. Only when every account has warmed up do the turns of 'Links per account turn' begin. Links a warm-up did not reach go back to that account's list, so nothing is skipped."></label>
           <label class="c" style="grid-column:1/-1"
             title="ON (the default): every ticked account works its OWN COPY of the whole list, so every account likes every link. Accounts still take turns: when one finishes its batch it gives way to another, and on its next turn it carries on in its copy from where it stopped (the first turn starts at the beginning).&#10;&#10;OFF: one shared list; each link is worked by ONE account, and an account that stops early hands its unfinished links to the next.">
             <input type="checkbox" id="k_relay_own_copy">
@@ -770,7 +799,7 @@ const FIELDS = {
             clusters:'k_clusters', platform:'k_platform', genre:'k_genre',
             category:'k_category', max_links:'k_max_links',
             target:'k_target', users:'k_users', profiles:'k_profiles', at_once:'k_at_once',
-            links_per_account:'k_links_per_account', links_per_account_max:'k_links_per_account_max', relay_own_copy:'k_relay_own_copy',
+            links_per_account:'k_links_per_account', links_per_account_max:'k_links_per_account_max', relay_own_copy:'k_relay_own_copy', warmup_likes:'k_warmup_likes',
             drop_limit:'k_drop_limit', rest_minutes:'k_rest_minutes',
             keywords:'k_keywords',
             mode:'k_mode', pages:'k_pages', scrolls:'k_scrolls',
@@ -785,7 +814,7 @@ const FIELDS = {
             floor:'z_floor',
             workers:'z_workers', delay:'z_delay', loop:'z_loop',
             loop_delay:'z_loop_delay', resume:'z_resume', fresh:'z_fresh',
-            tag:'z_tag', cdp:'z_cdp', recover:'z_recover', share:'z_share',
+            tag:'z_tag', cdp:'z_cdp', recover:'z_recover', share:'z_share', record:'z_record', ads_auto:'z_ads_auto',
             on_pc:'z_on_pc', on_phone:'z_on_phone' },
 };
 const CMD_BOX = { search:'s_cmd', harvest:'h_cmd', hearts:'z_cmd', liker:'k_cmd' };
@@ -1414,6 +1443,7 @@ function renderJobs() {
         <div class="job-head" onclick="toggleLog('${j.id}')">
           <span class="pill ${j.status}">${j.status}</span>
           <span class="job-title">${escapeHtml(j.title)}</span>
+          ${j.tool === 'liker' ? `<span class="jprog" id="prog-${j.id}"></span>` : ''}
           <span class="job-meta">${j.status === 'running' ? 'for ' + ago(j.started)
                                   : j.ended ? 'ran ' + ago(j.started) : ''}
             ${j.exit !== null && j.exit !== undefined ? ' · exit ' + j.exit : ''}</span>
@@ -1421,6 +1451,15 @@ function renderJobs() {
           ${(j.status === 'running' || j.status === 'starting')
             ? `<button class="btn ghost" onclick="stopJob('${j.id}',event)">Stop</button>` : ''}
         </div>
+        ${j.tool === 'liker' ? `
+        <div class="rep hidden" id="repwrap-${j.id}">
+          <div class="rep-head" onclick="toggleRep('${j.id}')">
+            <span id="repcaret-${j.id}">${REP_OPEN.has(j.id) ? '▾' : '▸'}</span>
+            <span>📊 Hourly report — likes per account, each hour on its own</span>
+            <span id="repsum-${j.id}" style="color:var(--ink-faint)"></span>
+          </div>
+          <div class="rep-body ${REP_OPEN.has(j.id) ? '' : 'hidden'}" id="rep-${j.id}"></div>
+        </div>` : ''}
         <div class="log-wrap ${OPEN === j.id ? '' : 'hidden'}">
           <div class="log-bar">
             <button class="mini" onclick="copyLog('${j.id}',event)" id="copy-${j.id}">Copy</button>
@@ -1442,6 +1481,67 @@ function renderJobs() {
           </div>` : ''}
         </div>
       </div>`).join('');
+  }
+}
+
+// ── Account liker: progress bars and the hourly report, filled in place ──
+const REP_OPEN = new Set();
+function toggleRep(id) {
+  const body = $('rep-' + id), caret = $('repcaret-' + id);
+  if (!body) return;
+  if (REP_OPEN.has(id)) REP_OPEN.delete(id); else REP_OPEN.add(id);
+  body.classList.toggle('hidden', !REP_OPEN.has(id));
+  if (caret) caret.textContent = REP_OPEN.has(id) ? '▾' : '▸';
+}
+function hhmm(t) {
+  return new Date(t * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+function updateLiker() {
+  for (const j of STATE.jobs || []) {
+    if (j.tool !== 'liker') continue;
+    const prog = $('prog-' + j.id);
+    if (prog) {
+      const p = j.progress;
+      if (p && p.total > 0) {
+        const pct = Math.max(0, Math.min(100, (p.done / p.total) * 100));
+        if (!prog.firstChild) prog.innerHTML = '<span class="bar"><i></i></span><span class="txt"></span>';
+        prog.querySelector('i').style.width = pct.toFixed(1) + '%';
+        prog.querySelector('.txt').innerHTML =
+          `${p.done.toLocaleString()}/${p.total.toLocaleString()} links · ` +
+          `<b class="ok">❤ ${p.ok.toLocaleString()}</b> · <b class="bad">✗ ${p.failed.toLocaleString()}</b>`;
+        prog.title = `${pct.toFixed(0)}% of this batch's links worked — ${p.ok} comment(s) liked, ${p.failed} failed`;
+      } else if (prog.firstChild) {
+        prog.innerHTML = '';
+      }
+    }
+    const wrap = $('repwrap-' + j.id);
+    if (!wrap) continue;
+    const r = j.report;
+    wrap.classList.toggle('hidden', !r);
+    if (!r) continue;
+    const tot = r.hours.reduce((a, h) => [a[0] + h.ok, a[1] + h.failed], [0, 0]);
+    const resting = Object.entries(r.resting || {});
+    $('repsum-' + j.id).textContent =
+      `· ${r.hours.length} hour(s) · ${tot[0].toLocaleString()} liked, ${tot[1].toLocaleString()} failed` +
+      (resting.length ? ` · ${resting.length} paused` : '');
+    const body = $('rep-' + j.id);
+    if (!body || !REP_OPEN.has(j.id)) continue;
+    const html = (resting.length
+        ? `<div class="note" style="color:var(--warn);font-size:12px">⏸ paused (TikTok not keeping their likes): ` +
+          resting.map(([a, t]) => `${escapeHtml(a)} until ${hhmm(t)}`).join(', ') + '</div>'
+        : '') +
+      r.hours.map(h => `
+        <div class="rep-hour">
+          <h4>Hour ${h.h} · ${hhmm(h.from)}–${hhmm(h.to)} ·
+            <span style="color:var(--ok)">${h.ok.toLocaleString()} liked</span> ·
+            <span style="color:var(--bad)">${h.failed.toLocaleString()} failed</span></h4>
+          ${h.rows.length ? `<table><tr><th>Account</th><th>Liked</th><th>Failed</th></tr>${
+            h.rows.map(([a, ok, bad]) =>
+              `<tr><td>${escapeHtml(a)}</td><td style="color:var(--ok)">${ok}</td><td style="color:var(--bad)">${bad}</td></tr>`).join('')
+          }</table>` : '<div style="color:var(--ink-faint);font-size:12px">nothing liked in this hour</div>'}
+          ${h.notes.map(n => `<div class="note">${escapeHtml(n)}</div>`).join('')}
+        </div>`).join('');
+    if (body.dataset.html !== html) { body.dataset.html = html; body.innerHTML = html; }
   }
 }
 
@@ -1535,6 +1635,7 @@ async function refresh() {
 
 refresh();
 setInterval(refresh, 1500);
+setInterval(() => { try { updateLiker(); } catch (e) {} }, 1500);
 setInterval(pumpLog, 700);
 </script>
 </body>

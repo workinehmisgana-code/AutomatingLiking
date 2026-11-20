@@ -505,7 +505,9 @@ export default function VerifyLinks({
    * has had no verdict and is the one still needing a human. Leaving them mixed
    * in among hundreds of judged rows is how they got missed.
    *
-   * Original order is kept inside each block, which keeps a channel's links
+   * Inside each block rows are sorted by the channel's active links × Active % (selected:
+   * highest first, no-% last; unselected: lowest first, no-% first), ties by
+   * channel and then original order, which keeps a channel's links
    * together there — the headings come from runs of the same account, so
    * reordering inside a block rather than across one is what stops a channel
    * being split into several headings.
@@ -527,13 +529,38 @@ export default function VerifyLinks({
       else if (!r.title || !r.title.trim()) untitled.push(r)
       else titled.push(r)
     }
+    // Inside each block, order by the channel's active links × Active %: the selected
+    // (unrelated) links highest first with no-% last, the unselected ones lowest
+    // first with no-% first. Ties go by channel, then the original order (the
+    // sort is stable), so one channel's links stay in one run under one heading.
+    const pctOf = (r: VRow): number | null => {
+      if (!r.account) return null
+      const st = channelStats?.[`${r.platform || 'tiktok'}:${r.account.toLowerCase().replace(/^@/, '')}`]
+      const tot = st ? st.active + st.blocked : 0
+      // Active links × Active %, so a channel with many active links outranks a
+      // tiny one with the same percentage.
+      return tot > 0 ? st!.active * ((st!.active / tot) * 100) : null
+    }
+    const chan = (r: VRow) => `${r.platform || 'tiktok'}:${(r.account || '').toLowerCase().replace(/^@/, '')}`
+    const byPct = (desc: boolean) => (a: VRow, b: VRow) => {
+      const pa = pctOf(a), pb = pctOf(b)
+      if (pa === null || pb === null) {
+        if (pa !== pb) return (pa === null ? 1 : -1) * (desc ? 1 : -1)
+      } else if (pa !== pb) {
+        return desc ? pb - pa : pa - pb
+      }
+      return chan(a).localeCompare(chan(b))
+    }
+    pinned.sort(byPct(true))
+    untitled.sort(byPct(false))
+    titled.sort(byPct(false))
     return [...pinned, ...untitled, ...titled]
     // NOT pinnedUrls ALONE. Blocking the unrelated links clears the snapshot -
     // those rows have left the page - and keying the whole order on it would
     // take the untitled ones back out of the top at the exact moment they
     // become the only thing left to review. classifiedThisPage survives a
     // block and is reset by a fresh page, which is the life this order wants.
-  }, [rows, selected, classifiedThisPage])
+  }, [rows, selected, classifiedThisPage, channelStats])
 
   // Consecutive rows of the same channel, so the table can print one heading per
   // channel instead of repeating the account on every line. The query already

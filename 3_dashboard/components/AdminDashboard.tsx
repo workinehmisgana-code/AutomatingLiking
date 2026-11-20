@@ -76,6 +76,62 @@ function post(url: string, body: unknown) {
   })
 }
 
+/** Why a request failed, in words: the server's {error}, or the HTTP status. */
+async function failText(res: Response): Promise<string> {
+  const d = await res.clone().json().catch(() => ({} as { error?: string }))
+  return d?.error ? String(d.error) : `HTTP ${res.status}`
+}
+
+/** Put text on the clipboard. The Clipboard API needs a secure page and a
+ *  recent browser; older phone browsers get the textarea-and-copy fallback. */
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    /* fall through */
+  }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.setAttribute('readonly', '')
+    ta.style.position = 'fixed'
+    ta.style.top = '-1000px'
+    document.body.appendChild(ta)
+    ta.select()
+    ta.setSelectionRange(0, text.length) // iOS
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok
+  } catch {
+    return false
+  }
+}
+
+/** A value that copies itself when tapped (the number, or the 📋 beside it). */
+function CopyText({ text }: { text: string }) {
+  const [state, setState] = useState<'idle' | 'ok' | 'fail'>('idle')
+  const copy = async () => {
+    setState((await copyToClipboard(text)) ? 'ok' : 'fail')
+    setTimeout(() => setState('idle'), 1600)
+  }
+  return (
+    <button
+      type="button"
+      onClick={copy}
+      title="Copy the account number"
+      className="inline-flex items-center gap-1.5 align-middle text-zinc-100 font-mono tabular-nums rounded px-1.5 py-1 -my-1 hover:bg-zinc-800 active:bg-zinc-700"
+    >
+      <span className="break-all text-left">{text}</span>
+      <span className="text-[11px] font-sans shrink-0" aria-hidden>
+        {state === 'ok' ? '✅ copied' : state === 'fail' ? '⚠ copy failed' : '📋'}
+      </span>
+    </button>
+  )
+}
+
 const PLATFORMS: { key: string; label: string; dot: string }[] = [
   { key: 'tiktok', label: 'TikTok', dot: 'bg-pink-500' },
   { key: 'youtube_shorts', label: 'YT Shorts', dot: 'bg-orange-500' },
@@ -598,10 +654,21 @@ export default function AdminDashboard({
     }
   }
 
+  // What the last pay action did, shown in the user's card: the page refresh
+  // after it can take several seconds on a phone, and with nothing on screen
+  // meanwhile a tap that worked looked exactly like one that did not.
+  const [payNote, setPayNote] = useState<{ userId: string; ok: boolean; text: string } | null>(null)
+
   async function approvePay(userId: string) {
     setPayingUser(userId)
     try {
-      await post('/api/admin/pay', { userId, action: 'approve' })
+      const res = await post('/api/admin/pay', { userId, action: 'approve' }).catch(() => null)
+      if (!res || !res.ok) {
+        const why = res ? await failText(res) : 'no connection'
+        setPayNote({ userId, ok: false, text: `Approve failed: ${why}` })
+        return
+      }
+      setPayNote({ userId, ok: true, text: '✓ Approved' })
       router.refresh()
       pushCmd({
         label: 'approve pay',
@@ -621,8 +688,14 @@ export default function AdminDashboard({
       const snapshot = u
         ? { ...u, pendingTotal: pendingByUser[userId]?.total ?? 0, snapshotAt: new Date().toISOString() }
         : undefined
-      const res = await post('/api/admin/pay', { userId, action: 'paid', snapshot })
+      const res = await post('/api/admin/pay', { userId, action: 'paid', snapshot }).catch(() => null)
+      if (!res || !res.ok) {
+        const why = res ? await failText(res) : 'no connection'
+        setPayNote({ userId, ok: false, text: `Mark paid failed: ${why}` })
+        return
+      }
       const d = await res.json().catch(() => ({}))
+      setPayNote({ userId, ok: true, text: `✓ Paid${d.amount != null ? ` ${fmtBirr(Number(d.amount))} birr` : ''} — the user has been told` })
       router.refresh()
       // Descriptor is refreshed on redo so a later undo reverses the new payout.
       const holder = { undo: d.undo }
@@ -1491,10 +1564,17 @@ export default function AdminDashboard({
     const isAll = resetTarget === 'all'
     const body = isAll ? {} : { userId: resetTarget }
     try {
-      const res = await post('/api/admin/reset', body)
+      const res = await post('/api/admin/reset', body).catch(() => null)
+      if (!res || !res.ok) {
+        // Said out loud: the dialog closes either way, and a reset that failed
+        // used to look exactly like one that worked.
+        alert(`Reset failed: ${res ? await failText(res) : 'no connection'}`)
+        return
+      }
       const d = await res.json().catch(() => ({}))
+      if (!isAll) setPayNote({ userId: resetTarget, ok: true, text: '✓ Reset — counters back to 0' })
       router.refresh()
-      if (res.ok && d?.undo) {
+      if (d?.undo) {
         const holder = { undo: d.undo }
         pushCmd({
           label: isAll ? 'reset all' : 'reset user',
@@ -2147,7 +2227,7 @@ export default function AdminDashboard({
           <div className="text-[10px] uppercase tracking-wide text-zinc-600 pt-1">
             Settings below apply to all genres
           </div>
-          <div className="grid gap-3 md:grid-cols-2">
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
             <TaskToggle
               title="🎬 Video task (150 birr work)"
               on={videoEnabled}
@@ -2276,6 +2356,7 @@ export default function AdminDashboard({
               onReviewVideo={reviewVideo}
               onApprove={() => approvePay(u.id)}
               onMarkPaid={() => markPaidPay(u.id)}
+              payNote={payNote?.userId === u.id ? payNote : null}
               onMessage={() => {
                 setMsgBody('')
                 setComposeTarget({ userId: u.id, label: u.profile?.name || u.name || u.email })
@@ -2353,14 +2434,14 @@ export default function AdminDashboard({
             <div className="flex justify-end gap-2 mt-5">
               <button
                 onClick={() => setResetTarget(null)}
-                className="px-3 py-1.5 text-sm rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
+                className="px-4 py-2 min-h-[40px] text-sm rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
               >
                 Cancel
               </button>
               <button
                 onClick={doReset}
                 disabled={resetting}
-                className="px-3 py-1.5 text-sm rounded-lg bg-red-600 text-white hover:bg-red-500 disabled:opacity-50"
+                className="px-4 py-2 min-h-[40px] text-sm rounded-lg bg-red-600 text-white hover:bg-red-500 disabled:opacity-50"
               >
                 {resetting ? 'Resetting…' : resetTarget === 'all' ? 'Reset everything' : 'Reset user'}
               </button>
@@ -3402,6 +3483,7 @@ function UserCard({
   onReviewVideo,
   onApprove,
   onMarkPaid,
+  payNote,
   onMessage,
   onDeleteReply,
   onDeleteMessage,
@@ -3464,6 +3546,8 @@ function UserCard({
   onReviewVideo: (id: number, status: 'approved' | 'rejected') => void
   onApprove: () => void
   onMarkPaid: () => void
+  /** What the last Approve / Mark paid / Reset on this user did. */
+  payNote: { ok: boolean; text: string } | null
   onMessage: () => void
   onDeleteReply: (replyId: number) => void
   onDeleteMessage: (messageId: number) => void
@@ -3474,7 +3558,13 @@ function UserCard({
   // user. It follows the cursor over the row and freezes once you move onto it.
   const [verifyPop, setVerifyPop] = useState<{ x: number; y: number } | null>(null)
   const verifyHideTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const showVerifyPop = (e: React.MouseEvent) => {
+  // A MOUSE ONLY. On a phone the first tap is also a "hover": the popup
+  // appeared under the finger and, with no mouse to leave, stayed there —
+  // fixed on the screen, over whatever was scrolled beneath it — and on an
+  // iPhone that first tap opened the popup instead of the row. Phones get the
+  // Verify button inside the expanded card instead.
+  const showVerifyPop = (e: React.PointerEvent) => {
+    if (e.pointerType !== 'mouse') return
     if (verifyHideTimer.current) { clearTimeout(verifyHideTimer.current); verifyHideTimer.current = null }
     setVerifyPop({ x: e.clientX, y: e.clientY })
   }
@@ -3648,8 +3738,8 @@ function UserCard({
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2 p-3">
         <button
           onClick={() => setOpen((o) => !o)}
-          onMouseEnter={showVerifyPop}
-          onMouseLeave={scheduleHideVerify}
+          onPointerEnter={showVerifyPop}
+          onPointerLeave={(e) => { if (e.pointerType === 'mouse') scheduleHideVerify() }}
           className="flex items-center gap-2.5 min-w-0 flex-1 text-left"
           aria-expanded={open}
         >
@@ -3971,7 +4061,7 @@ function UserCard({
           </div>
 
           {/* Account + payout — two compact info blocks */}
-          <div className="grid sm:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             {/* Account */}
             <div className="rounded-lg border border-zinc-800 p-2.5 text-xs text-zinc-400 space-y-1">
               <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Account</div>
@@ -4109,7 +4199,11 @@ function UserCard({
               <div className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Payout</div>
               <div>
                 <span className="text-zinc-500">Bank:</span>{' '}
-                <span className="text-zinc-200">{u.profile?.bank_account || '—'}</span>
+                {u.profile?.bank_account ? (
+                  <CopyText text={u.profile.bank_account} />
+                ) : (
+                  <span className="text-zinc-200">—</span>
+                )}
                 {' · '}
                 <span className={u.profile?.bank_name ? 'text-zinc-200' : 'text-amber-400'}>
                   {u.profile?.bank_name || 'bank not given yet'}
@@ -4234,7 +4328,7 @@ function UserCard({
           )}
 
           {/* Daily clicks & comments — Comments table carries the pay column */}
-          <div className="grid lg:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div>
               <div className="text-xs text-zinc-500 mb-1">Links clicked per day (since reset)</div>
               <DayTable title="Clicks" rows={u.dailyClicks} />
@@ -4254,7 +4348,7 @@ function UserCard({
           </div>
 
           {/* Login days + screenshots side by side */}
-          <div className="grid sm:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <div className="text-xs text-zinc-500 mb-1">Login days (since reset) · {u.loginDays.length}</div>
               <div className="text-xs text-zinc-400">
@@ -4790,7 +4884,7 @@ function UserCard({
               <button
                 onClick={onApprove}
                 disabled={paying || pendingTotal <= 0 || pending?.approved}
-                className="text-xs text-emerald-300 border border-emerald-500/50 hover:bg-emerald-600/10 rounded-lg px-3 py-1.5 disabled:opacity-50 transition-colors"
+                className="text-sm text-emerald-300 border border-emerald-500/50 hover:bg-emerald-600/10 rounded-lg px-4 py-2 min-h-[40px] disabled:opacity-50 transition-colors"
                 title="Approve this pay — the user sees (Approved). Does not reset counters."
               >
                 {pending?.approved ? 'Approved ✓' : paying ? 'Approving…' : 'Approve'}
@@ -4798,20 +4892,48 @@ function UserCard({
               <button
                 onClick={onMarkPaid}
                 disabled={paying || pendingTotal <= 0}
-                className="text-xs text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg px-3 py-1.5 disabled:opacity-50 transition-colors"
+                className="text-sm text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg px-4 py-2 min-h-[40px] disabled:opacity-50 transition-colors"
                 title="Mark paid — records the payout and resets this user's pending counters to 0."
               >
                 {paying ? 'Saving…' : 'Mark paid'}
               </button>
             </div>
+            {payNote && (
+              <div
+                role="status"
+                className={`text-sm rounded-lg px-3 py-2 border ${
+                  payNote.ok
+                    ? 'text-emerald-200 border-emerald-500/40 bg-emerald-500/10'
+                    : 'text-red-200 border-red-500/40 bg-red-500/10'
+                }`}
+              >
+                {payNote.text}
+              </div>
+            )}
           </div>
 
-          {/* Actions */}
-          <div className="flex items-center gap-4 border-t border-zinc-800 pt-3">
-            <button onClick={onMessage} className="text-xs text-emerald-400 hover:text-emerald-300">
-              Message
+          {/* Actions — finger-sized: these were bare 12px words, a hard target
+              on a phone. Verify is here too: on a phone there is no hover to
+              bring up the floating Verify button. */}
+          <div className="flex flex-wrap items-center gap-2 border-t border-zinc-800 pt-3">
+            <button
+              onClick={onMessage}
+              className="text-sm text-emerald-300 border border-emerald-500/40 hover:bg-emerald-600/10 rounded-lg px-3 py-2 min-h-[40px]"
+            >
+              ✉️ Message
             </button>
-            <button onClick={onReset} className="text-xs text-red-400 hover:text-red-300">
+            <button
+              onClick={onVerify}
+              disabled={verifying}
+              title="Read the comments on this user's TikTok sample links and check whether their own @username is among the commenters."
+              className="text-sm text-sky-300 border border-sky-500/40 hover:bg-sky-600/10 rounded-lg px-3 py-2 min-h-[40px] disabled:opacity-60"
+            >
+              {verifying ? '⏳ Verifying…' : '🔍 Verify'}
+            </button>
+            <button
+              onClick={onReset}
+              className="text-sm text-red-300 border border-red-500/40 hover:bg-red-600/10 rounded-lg px-3 py-2 min-h-[40px]"
+            >
               Reset this user
             </button>
           </div>

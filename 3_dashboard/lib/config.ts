@@ -904,10 +904,10 @@ export interface CommentStyle {
   /** Write compound names as two words: purifytext -> purify text. */
   splitBrand: boolean
   /**
-   * No longer honoured: a quoted name is a name being announced, which is what
-   * a comment must not do. Kept so stored settings and the API still parse.
-   *
-   * @deprecated
+   * Put the name in double quotes: i use "purify text" now. OFF by default —
+   * a quoted name reads as a brand being announced, and it was switched off
+   * for that reason once — but it is the admin's call per product, so it is
+   * a switch again ("Quote the brand" on the comments page).
    */
   quoteBrand: boolean
   /**
@@ -968,14 +968,15 @@ export const DEFAULT_COMMENT_STYLE: CommentStyle = {
 /**
  * The brand exactly as it should appear in a comment, under these settings.
  *
- * QUOTING IS GONE, whatever the stored style says. It was on by default, so
- * every comment generated up to now announced its product in double quotes —
- * the most brand-like way there is to write a name, and unlike the splitting
- * it fooled nobody. The switch is left in the type and the table only because
- * rows already hold it.
+ * Quoted only when the product's "Quote the brand" switch is on (it is off by
+ * default: it used to be on for everyone, and every comment announced its
+ * product in quotes). canonicaliseMention() strips any quotes the model added
+ * and then writes the name in this one form, so on means every comment is
+ * quoted and off means none is.
  */
 export function productMention(product: string, style: CommentStyle = DEFAULT_COMMENT_STYLE): string {
-  return productWords(product, style.splitBrand).toLowerCase()
+  const words = productWords(product, style.splitBrand).toLowerCase()
+  return style.quoteBrand ? `"${words}"` : words
 }
 
 // ── AUTO-BLOCK RULES, as settings rather than as constants ────────────────

@@ -18,6 +18,8 @@ profile/
 profile-*/
 browser_profile/
 captcha-dump/
+# Zefoy page recordings (page_recorder.py): large, and they hold the links worked.
+zefoy-recordings/
 # A throwaway one, made by check_focus.py and left behind. Same contents, same
 # reason not to commit it.
 .focus-test-profile/

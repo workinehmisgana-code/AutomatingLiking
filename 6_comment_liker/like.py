@@ -445,6 +445,7 @@ def clicked_but_not_kept(profile: str, account: str) -> bool:
     if _discard_said:
         return True
     _discard_said = True
+    DROPPED_OUT = True
     print(
         f"\n  {_clicked_nothing} hearts pressed on profile '{profile}'"
         f"{f' (@{account})' if account else ''} and not one like was kept.\n"
@@ -455,6 +456,8 @@ def clicked_but_not_kept(profile: str, account: str) -> bool:
         f"    python open_profile.py --profile {profile}\n"
         "  Stopping this profile: there is nothing here to keep going for, and the\n"
         "  browser it is using is one the working accounts need.\n"
+        "[relay-dropped]",
+        flush=True,
     )
     return True
 
@@ -3035,7 +3038,8 @@ def main() -> int:
                          "the control center can swap in a rested account. 0 = off")
     ap.add_argument("--progress-marks", action="store_true",
                     help="print '[relay-video] N url' as each video starts, so the "
-                         "control center's relay knows where a stopped account got to")
+                         "control center's relay knows where a stopped account got to, "
+                         "and '[like-tally] done total liked failed' for its progress bar")
     ap.add_argument("--list-only", type=Path, default=None,
                     help="work out the link list and the product words exactly as a "
                          "run would, write them to this JSON file and exit — no "
@@ -3582,6 +3586,8 @@ def main() -> int:
 
                 for vn, (url, aweme) in enumerate(targets_videos, 1):
                     if args.progress_marks:
+                        # The control center's progress bar and hourly report.
+                        print(f"[like-tally] {vn - 1} {total_videos} {ok} {failed}", flush=True)
                         print(f"[relay-video] {vn} {url}", flush=True)
                     # One authenticated read serves as discovery AND as the
                     # already-liked check, because user_digged comes with it.
@@ -3649,6 +3655,8 @@ def main() -> int:
                         break
                 ctx.close()
                 f.close()
+                if args.progress_marks:
+                    print(f"[like-tally] {vn} {total_videos} {ok} {failed}", flush=True)
                 print(f"\n{ok} liked, {failed} failed{recovered_note()}. Log: {DONE}")
                 return 0 if failed == 0 else 1
 
@@ -3659,6 +3667,8 @@ def main() -> int:
                 total_videos = len(targets_videos)
                 for vn, (url, aweme) in enumerate(targets_videos, 1):
                     if args.progress_marks:
+                        # The control center's progress bar and hourly report.
+                        print(f"[like-tally] {vn - 1} {total_videos} {ok} {failed}", flush=True)
                         print(f"[relay-video] {vn} {url}", flush=True)
                     # Everything a video needs is inside this try.
                     #
@@ -4162,6 +4172,8 @@ def main() -> int:
                         continue
                 ctx.close()
                 f.close()
+                if args.progress_marks:
+                    print(f"[like-tally] {vn} {total_videos} {ok} {failed}", flush=True)
                 print(f"\n{ok} liked, {failed} failed{recovered_note()}. Log: {DONE}")
                 return 0 if failed == 0 else 1
 

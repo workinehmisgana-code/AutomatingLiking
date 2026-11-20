@@ -151,9 +151,8 @@ export default function AdminProductComments({
   // stored comments are not rewritten in place.
   const [emoji, setEmoji] = useState(style.emoji)
   const [splitBrand, setSplitBrand] = useState(style.splitBrand)
-  // Still sent and still stored, so an older row round-trips unchanged; no
-  // longer shown, because productMention() stopped honouring it.
-  const [quoteBrand] = useState(style.quoteBrand)
+  // Put the name in quotation marks ("purify text").
+  const [quoteBrand, setQuoteBrand] = useState(style.quoteBrand === true)
   // Which of the three pitches the comments make.
   const [voice, setVoice] = useState<CommentVoice>(style.voice)
   // The name as part of the sentence (a concept) rather than a brand.
@@ -308,7 +307,7 @@ export default function AdminProductComments({
       setSavedBand({ min: Number(d.min), max: Number(d.max) })
       if (typeof d.emoji === 'boolean') setEmoji(d.emoji)
       if (typeof d.splitBrand === 'boolean') setSplitBrand(d.splitBrand)
-      // quoteBrand is no longer honoured, so there is nothing to put it into.
+      if (typeof d.quoteBrand === 'boolean') setQuoteBrand(d.quoteBrand)
       if (isCommentVoice(d.voice)) setVoice(d.voice)
       return true
     } catch {
@@ -334,6 +333,7 @@ export default function AdminProductComments({
     voice?: CommentVoice
     emoji?: boolean
     splitBrand?: boolean
+    quoteBrand?: boolean
     inSentence?: boolean
   }) {
     setSavingStyle(true)
@@ -351,7 +351,7 @@ export default function AdminProductComments({
           max: Number(max) || wordMax,
           emoji: patch.emoji ?? emoji,
           splitBrand: patch.splitBrand ?? splitBrand,
-          quoteBrand,
+          quoteBrand: patch.quoteBrand ?? quoteBrand,
           voice: patch.voice ?? voice,
           inSentence: patch.inSentence ?? inSentence,
         }),
@@ -366,6 +366,7 @@ export default function AdminProductComments({
       if (isCommentVoice(d.voice)) setVoice(d.voice)
       if (typeof d.emoji === 'boolean') setEmoji(d.emoji)
       if (typeof d.splitBrand === 'boolean') setSplitBrand(d.splitBrand)
+      if (typeof d.quoteBrand === 'boolean') setQuoteBrand(d.quoteBrand)
       if (typeof d.inSentence === 'boolean') setInSentence(d.inSentence)
       setMsg('Saved. It applies to the next regeneration.')
     } catch {
@@ -461,10 +462,8 @@ export default function AdminProductComments({
   // What a mention will look like under the current switches, so the effect is
   // visible before spending a regeneration to find out.
   const words = splitBrand ? splitPreview(product) : product
-  // NO QUOTES, whatever the stored setting says — see productMention(). A name
-  // in quotation marks is a name being announced, and the preview has to show
-  // what will really be sent.
-  const brand = words
+  // Quoted when "Quote the brand" is on — the same form productMention() sends.
+  const brand = quoteBrand ? `"${words}"` : words
   // Show the VOICE as well as the mention: the two switches together are what
   // a comment will actually read like, and the mention alone hid the bigger of
   // the two changes.
@@ -844,8 +843,13 @@ export default function AdminProductComments({
                 'recommended. The way the cohumanizer comments are written. Reads most naturally ' +
                 'with "Split the brand" on.',
             ],
-            // 'Quote the brand' used to be here and is gone: quoting is no longer
-            // applied, so the switch could only lie about what would be sent.
+            [
+              'Quote the brand',
+              quoteBrand,
+              setQuoteBrand,
+              `Put the name in quotation marks: i use "${splitBrand ? splitPreview(product) : product}" now. ` +
+                'Applies to the next regeneration.',
+            ],
           ] as const).map(([label, value, set, hint]) => (
             <label key={label} className="flex items-center gap-1.5 text-xs text-zinc-300" title={hint}>
               <input
@@ -861,7 +865,9 @@ export default function AdminProductComments({
                       ? { emoji: e.target.checked }
                       : label === 'Split the brand'
                         ? { splitBrand: e.target.checked }
-                        : { inSentence: e.target.checked }
+                        : label === 'Quote the brand'
+                          ? { quoteBrand: e.target.checked }
+                          : { inSentence: e.target.checked }
                   )
                 }}
                 className="accent-emerald-500"

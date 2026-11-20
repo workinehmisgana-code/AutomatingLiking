@@ -488,6 +488,12 @@ DEFAULTS = {
         # to another, and on its next turn it carries on in ITS copy from where
         # it stopped. Off: one shared list, each link worked by ONE account.
         "relay_own_copy": True,
+        # THE WARM-UP: before the turns above, every account first likes this
+        # many comments (a turn that stops at that many likes), the accounts
+        # going "at_once" at a time. Only when every account has warmed up do
+        # the ordinary turns of links_per_account..links_per_account_max begin.
+        # 0 = no warm-up.
+        "warmup_likes": 5,
         # DROPPED LIKES: an account whose likes TikTok drops this many times IN
         # A ROW (pressed, not kept) is closed. 0 = never. In a relay its
         # unfinished links go to the account that has been resting longest,
@@ -566,6 +572,16 @@ DEFAULTS = {
         "share": True,
         "cdp": "http://127.0.0.1:9222",
         "recover": 5,
+        # RECORD EVERY ZEFOY SCREEN. Each change on the page (full HTML of every
+        # new screen) and the run's log go to
+        # 2_comment_automation/zefoy-recordings/<run>/ — the material for a liker
+        # that handles every screen Zefoy can show. See page_recorder.py.
+        "record": True,
+        # ZEFOY'S ADS. Off: the run calls you (toast, sound, window to the
+        # front) and waits for you to watch and close each ad. On: it does it
+        # itself — presses "View a short ad" on the offer, watches the reward
+        # video to the end, closes vignettes once their close button shows.
+        "ads_auto": False,
     },
 }
 
@@ -623,6 +639,65 @@ def save_settings(s: dict) -> None:
 OVER = ("done", "failed", "stopped")
 
 
+class LikeReport:
+    """Likes per account, PER HOUR since an account-liker run started.
+
+    Fed by the "[like-tally] done total liked failed" lines like.py prints as
+    each video starts (Job.write): the growth since the last tally is booked to
+    the account, in the hour it happened. Each hour stands alone — hour 3 holds
+    only what was liked in hour 3. Notes record pauses (an account whose likes
+    TikTok stopped keeping) in the hour they happened.
+    """
+
+    def __init__(self) -> None:
+        self.started = time.time()
+        self.lock = threading.Lock()
+        self.hours: dict[int, dict[str, list[int]]] = {}   # hour -> account -> [liked, failed]
+        self.notes: dict[int, list[str]] = {}
+        self.resting: dict[str, float] = {}                # account -> paused until
+
+    def _hour(self) -> int:
+        return int((time.time() - self.started) // 3600)
+
+    def add(self, account: str, ok: int, failed: int) -> None:
+        if ok <= 0 and failed <= 0:
+            return
+        with self.lock:
+            row = self.hours.setdefault(self._hour(), {}).setdefault(account or "?", [0, 0])
+            row[0] += max(0, ok)
+            row[1] += max(0, failed)
+
+    def note(self, text: str) -> None:
+        with self.lock:
+            self.notes.setdefault(self._hour(), []).append(f"{time.strftime('%H:%M')} {text}")
+
+    def totals(self) -> tuple[int, int]:
+        with self.lock:
+            ok = sum(v[0] for h in self.hours.values() for v in h.values())
+            bad = sum(v[1] for h in self.hours.values() for v in h.values())
+        return ok, bad
+
+    def as_dict(self) -> dict:
+        now = time.time()
+        with self.lock:
+            out = []
+            for h in range(self._hour(), -1, -1):          # newest hour first
+                accs = self.hours.get(h, {})
+                rows = sorted(([a, v[0], v[1]] for a, v in accs.items()),
+                              key=lambda r: (-r[1], r[0]))
+                out.append({
+                    "h": h + 1,
+                    "from": self.started + h * 3600,
+                    "to": min(now, self.started + (h + 1) * 3600),
+                    "rows": rows,
+                    "ok": sum(r[1] for r in rows),
+                    "failed": sum(r[2] for r in rows),
+                    "notes": list(self.notes.get(h, [])),
+                })
+            resting = {a: t for a, t in self.resting.items() if t > now}
+        return {"started": self.started, "hours": out, "resting": resting}
+
+
 class Job:
     """One running program, its output, and how it ended."""
 
@@ -650,12 +725,32 @@ class Job:
         self.profile: Slot | None = None
         self.pin_profile = ""
         self.env_extra: dict[str, str] = {}
+        # ACCOUNT LIKER: the batch's progress ({done, total, ok, failed}) from
+        # like.py's [like-tally] lines, and the run's hourly report it feeds.
+        self.progress: dict | None = None
+        self.report: LikeReport | None = None
+        self.report_owner = False        # the one job whose row shows the report
+        self.account = ""
+        self._tally = (0, 0)
 
     def finished(self) -> bool:
         return self.status in OVER
 
     # The UI asks "what is new since line N", so every line gets a number.
     def write(self, text: str) -> None:
+        if text.startswith("[like-tally] "):
+            # Machine line, not log: progress bar + hourly report.
+            p = text.split()
+            try:
+                d, t, o, f = (int(x) for x in p[1:5])
+            except (ValueError, IndexError):
+                return
+            self.progress = {"done": d, "total": t, "ok": o, "failed": f}
+            po, pf = self._tally
+            if self.report is not None and o >= po and f >= pf:
+                self.report.add(self.account or self._cmd_arg("--profile"), o - po, f - pf)
+            self._tally = (o, f)
+            return
         with self._lines_lock:
             self.lines.append(text)
             self.seq += 1
@@ -983,6 +1078,13 @@ class LikerRelay(Job):
         self.slots = min(len(names), at_once if at_once > 0 else len(names))
         self._stop = False
         self.children: list[Job] = []
+        self.report = LikeReport()
+        self.report_owner = True
+        self._worked = 0                 # links finished by turns that have ended
+        try:
+            self.warm = max(0, int(s.get("warmup_likes", 0) or 0))
+        except (TypeError, ValueError):
+            self.warm = 0
 
     def stop(self) -> bool:
         if self.finished():
@@ -1046,10 +1148,21 @@ class LikerRelay(Job):
         def pending() -> bool:
             return any(queues[n] for n in self.names if n not in dropped)
 
+        total_links = len(links) * (len(self.names) if own else 1)
+
+        def update_progress() -> None:
+            live = sum(int((j.progress or {}).get("done", 0)) for j, _ in running.values())
+            ok_n, bad_n = self.report.totals()
+            self.progress = {"done": min(total_links, self._worked + live),
+                             "total": total_links, "ok": ok_n, "failed": bad_n}
+
         self.write(f"[*] {len(links)} link(s), {turn_label(self.per, self.per_max)} a turn, "
                    f"{self.slots} account(s) at once, accounts picked at random"
                    + (f"; EACH of the {len(self.names)} account(s) works its own copy of all "
                       f"{len(links)} link(s)" if own else "; each link worked by one account"))
+        if self.warm > 0:
+            self.write(f"[*] warm-up first: every account likes {self.warm} comment(s), "
+                       f"{self.slots} at a time, before the ordinary turns begin")
 
         # ── 2. turns ─────────────────────────────────────────────────────
         unused: list[str] = []          # accounts without a turn this round
@@ -1074,11 +1187,33 @@ class LikerRelay(Job):
             return [n for n in self.names
                     if n not in running and n not in dropped and not resting(n) and queues[n]]
 
+        warmed: set[str] = set()        # accounts that have done their warm-up
+        warm_jobs: set[str] = set()     # ids of the warm-up turns
+
+        def cold() -> list[str]:
+            """Accounts still owed a warm-up that could do it (not dropped, not
+            resting, links left) — while there are any, no ordinary turn starts."""
+            if self.warm <= 0:
+                return []
+            return [n for n in self.names if n not in warmed and n not in dropped
+                    and not resting(n) and queues[n]]
+
         def pick(replacement: bool = False) -> str | None:
             nonlocal unused
             idle = idle_now()
             if not idle:
                 return None
+            waiting_warm = cold()
+            if waiting_warm:
+                # WARM-UP FIRST: only an account still owed one may start, and
+                # when those are all busy, nobody else starts meanwhile.
+                ready = [n for n in waiting_warm if n in idle]
+                if not ready:
+                    return None
+                name = random.choice(ready)
+                if name in unused:
+                    unused.remove(name)
+                return name
             if replacement:
                 # THE ONE THAT HAS NOT WORKED FOR LONGEST (never = longest).
                 led = relay_ledger()
@@ -1104,6 +1239,30 @@ class LikerRelay(Job):
                     continue
                 del running[name]
                 relay_ledger_set(name, last=time.time())
+                if job.id in warm_jobs and job.summary is not None and job.status != "stopped" \
+                        and job.exit_code != self.DROPPED_EXIT:
+                    # A WARM-UP that got its likes (or ran out of links): the
+                    # links it never reached — and the one it was on — go back to
+                    # the front of its queue for its ordinary turns.
+                    seen = set(job.reached)
+                    on = job.reached[-1] if job.reached else None
+                    back = [u for u in mine if u not in seen or u == on]
+                    for u in reversed(back):
+                        queues[name].appendleft(u)
+                    self._worked += len(mine) - len(back)
+                    warmed.add(name)
+                    left = len(cold())
+                    self.write(f"[*] {name} warmed up ({job.summary[0]} liked, {job.summary[1]} failed)"
+                               + (f"; {left} account(s) still to warm up" if left else
+                                  f"; every account has warmed up — ordinary turns of "
+                                  f"{turn_label(self.per, self.per_max)} links from here"))
+                    continue
+                # Links this turn got through: all of them when it worked its
+                # batch, else the videos it finished before it stopped.
+                if job.status == "done" or job.summary is not None:
+                    self._worked += len(mine)
+                else:
+                    self._worked += max(0, len(job.reached) - 1)
                 if job.status == "done":
                     continue
                 # WORKED ITS WHOLE BATCH, SOME LIKES DID NOT LAND. like.py exits 1
@@ -1130,6 +1289,9 @@ class LikerRelay(Job):
                     # TikTok is dropping its likes: rest it, and put the account
                     # that has been resting longest in its place.
                     relay_ledger_set(name, rest_until=time.time() + rest_s)
+                    self.report.resting[name] = time.time() + rest_s
+                    self.report.note(f"{name}: TikTok stopped keeping its likes — paused, "
+                                     f"tries again at {time.strftime('%H:%M', time.localtime(time.time() + rest_s))}")
                     replace_pending += 1
                     self.write(f"[!] {name}: TikTok kept dropping its likes — closed, "
                                f"resting {rest_s // 60} min; "
@@ -1138,6 +1300,7 @@ class LikerRelay(Job):
                                   f"{len(back)} of its {len(mine)} link(s) go to the account that has rested longest"))
                     continue
                 if job.status == "stopped":
+                    self.report.note(f"{name}: stopped by hand")
                     dropped.add(name)
                     self.write(f"[!] {name} was stopped and sits out the rest of this run; "
                                + (f"{len(queues[name])} link(s) of its copy are not worked" if own else
@@ -1169,18 +1332,31 @@ class LikerRelay(Job):
                     replace_pending -= 1
                     self.write(f"[*] {name} replaces the closed account "
                                "(it has not worked for the longest)")
-                size = random.randint(self.per, self.per_max)
+                warming = self.warm > 0 and name not in warmed
+                # A warm-up takes the largest turn's worth of links, so it can
+                # find its likes, and stops at that many likes (--limit).
+                size = self.per_max if warming else random.randint(self.per, self.per_max)
                 q = queues[name]
                 mine = [q.popleft() for _ in range(min(size, len(q)))]
                 turn += 1
-                if self.per_max > self.per:
+                if warming:
+                    self.write(f"[*] turn {turn}: {name} WARMS UP — likes {self.warm} comment(s), "
+                               "then hands over")
+                elif self.per_max > self.per:
                     self.write(f"[*] turn {turn}: {name} gets {len(mine)} link(s) "
                                f"(drawn from {self.per}–{self.per_max})")
                 f = tmp / f"{self.id}-turn{turn}-{name}.txt"
                 f.write_text("\n".join(mine) + "\n", encoding="utf-8")
-                title, tcmd, tcwd = build_liker_for(self.s, name, self.names,
-                                                    relay_links=f, relay_products=products)
-                job = RUNNER.launch(RelayTurn("liker", f"{title} · turn {turn}", tcmd, tcwd))
+                title, tcmd, tcwd = build_liker_for(
+                    dict(self.s, limit=self.warm) if warming else self.s, name, self.names,
+                    relay_links=f, relay_products=products)
+                job = RelayTurn("liker", f"{title} · turn {turn}"
+                                + (f" · warm-up ({self.warm} likes)" if warming else ""), tcmd, tcwd)
+                if warming:
+                    warm_jobs.add(job.id)
+                job.report = self.report
+                job.account = name
+                job = RUNNER.launch(job)
                 self.children.append(job)
                 running[name] = (job, mine)
                 done_n = len(links) - len(queues[name])
@@ -1202,7 +1378,9 @@ class LikerRelay(Job):
                     waiting_said = True
             else:
                 waiting_said = False
+            update_progress()
             time.sleep(1)
+        update_progress()
         if not self._stop:
             if own:
                 full = [n for n in self.names if n not in dropped]
@@ -1288,6 +1466,8 @@ class Runner:
                 "started": j.started, "ended": j.ended,
                 "cmd": " ".join(j.cmd),
                 "can_type": bool(j.proc and j.proc.poll() is None and j.proc.stdin),
+                "progress": j.progress,
+                "report": j.report.as_dict() if (j.report is not None and j.report_owner) else None,
             })
         return out
 
@@ -1597,6 +1777,9 @@ def _build_hearts_one(s: dict) -> tuple[str, list[str], Path]:
         cmd += ["--share"]
     if str(s.get("cdp", "")).strip():
         cmd += ["--cdp", str(s["cdp"]).strip(), "--recover", str(int(s.get("recover", 5)))]
+    if s.get("record", True):
+        cmd += ["--record"]
+    cmd += ["--ad-mode", "auto" if s.get("ads_auto") else "manual"]
     where = "on the phone" if str(s.get("cdp", "")).strip() else "on this PC"
     return f"Hearts · {s.get('service')} · {where}", cmd, HEARTS_DIR
 
@@ -1684,6 +1867,9 @@ def build_liker_for(s: dict, profile: str, all_profiles: list[str],
     cmd += ["--mode", str(s.get("mode", "dom"))]
     if int(s.get("drop_limit", 0) or 0) > 0:
         cmd += ["--drop-limit", str(int(s["drop_limit"]))]
+    if "--progress-marks" not in cmd:
+        # The [like-tally] lines behind the Jobs progress bar and hourly report.
+        cmd += ["--progress-marks"]
     cmd += ["--pages", str(int(s.get("pages", 3)))]
     if str(s.get("mode", "dom")) == "dom":
         cmd += ["--scrolls", str(int(s.get("scrolls", 6)))]
@@ -2318,7 +2504,15 @@ class Handler(BaseHTTPRequestHandler):
                     relay = RUNNER.launch(LikerRelay(dict(s["liker"]), names, per, at_once, per_max))
                     self._json({"ok": True, "job": relay.id, "jobs": [relay.id]})
                     return
-                started = [j.id for j in RUNNER.start_limited(tool, built, at_once)]
+                jobs_ = RUNNER.start_limited(tool, built, at_once)
+                # ONE hourly report for the whole start, shown on its first row.
+                rep_ = LikeReport()
+                for j in jobs_:
+                    j.account = j._cmd_arg("--profile")
+                    j.report = rep_
+                if jobs_:
+                    jobs_[0].report_owner = True
+                started = [j.id for j in jobs_]
                 self._json({"ok": True, "job": started[0], "jobs": started})
                 return
 

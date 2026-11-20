@@ -187,7 +187,17 @@ def sel(slot: str, default: str) -> str:
     return _CUSTOM_SEL.get(slot, default)
 # ─────────────────────────────────────────────────────────────────────────────
 
-BROWSER_ARGS = ["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+# --disable-quic: in recording 20261120-004931 the browser's QUIC connection to
+# Zefoy died at 04:27 and every request after it ended in
+# ERR_QUIC_PROTOCOL_ERROR.QUIC_NETWORK_IDLE_TIMEOUT for five hours. Plain
+# HTTPS over TCP fails loudly and reconnects; it costs nothing here.
+BROWSER_ARGS = ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-quic"]
+
+# Zefoy down: this many links in a row with no answer is an outage, not bad
+# links; then wait these many seconds before each reload-and-login (the first
+# right away), and give up the window after running out of them.
+ZEFOY_DOWN_STREAK = int(os.getenv("ZEFOY_DOWN_STREAK", "3") or 3)
+ZEFOY_DOWN_WAITS = (0, 120, 300, 600, 900, 1800)
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1228,6 +1238,7 @@ def new_browser_page(playwright, proxy_url: str = ""):
                 "Chrome on the phone and try again.")
         context = ctxs[0]
         page = context.pages[0] if context.pages else context.new_page()
+        _record_pages(context, page)
         return browser, context, page
     launch_kwargs = {"headless": False, "args": BROWSER_ARGS}
     if proxy_url:
@@ -1238,7 +1249,22 @@ def new_browser_page(playwright, proxy_url: str = ""):
         user_agent=USER_AGENT,
         locale="en-US",
     )
-    return browser, context, context.new_page()
+    page = context.new_page()
+    _record_pages(context, page)
+    return browser, context, page
+
+
+def _record_pages(context, page) -> None:
+    """--record: every change on every page of this browser goes to the
+    recording (page_recorder.py). Nothing when recording is off, and a
+    recorder that fails is reported, never allowed to stop the run."""
+    try:
+        import page_recorder
+        rec = page_recorder.current()
+        if rec is not None:
+            rec.attach(context, page, window=_pfx())
+    except Exception as e:  # noqa: BLE001
+        print(f"[!] Recording could not watch this window: {e}")
 
 
 # ── Zefoy ─────────────────────────────────────────────────────────────────────
@@ -1657,6 +1683,13 @@ def browser_gone(page, err: Exception | None = None) -> bool:
 _AD_CLOSE_SELECTORS = (
     "#dismiss-button",
     "[aria-label='Close ad']",
+    "[aria-label='Close video']",
+    "#close-button",
+    "[class*='close-button']",
+    "[class*='close_button']",
+    "[class*='closeButton']",
+    "button:has-text('Skip')",
+    "[role='button']:has-text('Skip')",
     "[aria-label='Close']",
     "[aria-label*='close' i]",
     "button:has-text('Close')",
@@ -1672,6 +1705,11 @@ _AD_RESUME_SELECTORS = (
     "[role='button']:has-text('Resume')",
     "div:text-is('Resume video')",
 )
+# THE QUESTION ITSELF, which has to be on screen before Resume means anything.
+# The rewarded ad keeps its "Resume video" button in the page the whole time;
+# matched on its own, it was "pressed" every 3 s for 2½ minutes (recording
+# 20261120-004931) and the close button was never reached.
+_AD_FORFEIT_RE = re.compile(r"lose (your|the) reward|close (the )?video\?|reward will be lost", re.I)
 # The "watch an ad for access" offer (Google Funding Choices offerwall).
 _AD_OFFER_SELECTORS = (
     ".fc-rewarded-ad-button",
@@ -1682,6 +1720,9 @@ _AD_OFFER_SELECTORS = (
 
 _AD_DETECT_JS = """() => {
   if ((location.hash || '').includes('google_vignette')) return 'vignette';
+  // The rewarded video started from the offer ("View a short ad"): recorded
+  // as zefoy.com/#goog_fullscreen_ad for the 30-odd seconds it plays.
+  if ((location.hash || '').includes('goog_fullscreen_ad')) return 'rewarded';
   const vw = innerWidth, vh = innerHeight;
   const shown = (el) => {
     const cs = getComputedStyle(el);
@@ -1757,7 +1798,7 @@ _AD_HIDE_JS = """() => {
     const r = f.getBoundingClientRect();
     if (r.width * r.height >= 0.5 * vw * vh) { f.style.setProperty('display', 'none', 'important'); n++; }
   }
-  if ((location.hash || '').includes('google_vignette'))
+  if (/google_vignette|goog_fullscreen_ad/.test(location.hash || ''))
     history.replaceState(null, '', location.pathname + location.search);
   document.body.style.overflow = '';
   return n;
@@ -1789,9 +1830,24 @@ def zefoy_ad_showing(page) -> str:
         return ""
 
 
-def _ad_click_first(page, selectors) -> bool:
-    """Click the first visible match in any frame (the ad's own included)."""
+def _ad_click_first(page, selectors, covering_only: bool = False) -> bool:
+    """Click the first visible match in any frame (the ad's own included).
+
+    covering_only: only inside ad frames that cover the screen. Zefoy's page
+    also carries ordinary banner ads (a 1200x280 one under the form, in the
+    recordings) whose frames have their own "Close ad" / AdChoices buttons;
+    pressing those is not closing the ad in the way, and Zefoy's own hidden
+    modals have Close buttons in the main page too.
+    """
     for frame in page.frames:
+        if covering_only:
+            if frame is page.main_frame or frame.is_detached():
+                continue
+            try:
+                if not _frame_covers_screen(page, frame):
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
         for css in selectors:
             try:
                 loc = frame.locator(css).first
@@ -1811,8 +1867,34 @@ def _ad_click_first(page, selectors) -> bool:
     return False
 
 
-def _ad_video_playing(page) -> bool:
+def _ad_forfeit_asked(page) -> bool:
+    """Is a screen-covering ad frame showing "close video? you will lose your
+    reward" right now (visible text, not just markup)?"""
     for frame in page.frames:
+        if frame is page.main_frame or frame.is_detached():
+            continue
+        try:
+            if not _frame_covers_screen(page, frame):
+                continue
+            if _AD_FORFEIT_RE.search(frame.evaluate("() => document.body ? document.body.innerText : ''") or ""):
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def _ad_video_playing(page) -> bool:
+    """An ad video still to finish in a SCREEN-COVERING frame (and started if
+    paused). A banner's looping video under the form is not the ad in the
+    way, and waiting for it to end waited out the whole timeout."""
+    for frame in page.frames:
+        if frame is page.main_frame or frame.is_detached():
+            continue
+        try:
+            if not _frame_covers_screen(page, frame):
+                continue
+        except Exception:  # noqa: BLE001
+            continue
         try:
             if frame.evaluate(_AD_VIDEO_JS):
                 return True
@@ -2058,43 +2140,112 @@ def zefoy_clear_ad(page, timeout_s: float = 180, manual: bool = True) -> bool:
         kind = zefoy_ad_showing(page)
         if not kind:
             return True
+    return zefoy_auto_ad(page, kind, timeout_s)
+
+
+# THE ADS ZEFOY SHOWS, as recorded (zefoy-recordings/, page_recorder.py):
+#
+#   vignette  URL gains #google_vignette; a full-screen ad frame
+#             (ins[data-vignette-loaded] > iframe#aswift_N). No reward. Its
+#             close button ("Close ad" / #dismiss-button) is INSIDE the ad
+#             frame and appears after a few seconds. Lasted ~35 s by hand.
+#   offer     Google's offerwall in the page itself: "Unlock more content —
+#             Take action to continue accessing the content on this site —
+#             View a short ad — Site-wide access for 24 hours"
+#             (.fc-monetization-dialog, button.fc-rewarded-ad-button). The way
+#             on is the reward, so "View a short ad" is pressed.
+#   rewarded  what that button starts: URL gains #goog_fullscreen_ad and a
+#             full-screen ad frame plays a video (~32 s recorded). Closing it
+#             early forfeits the reward ("close video? you will lose your
+#             reward") — so it is watched to the end, "Resume" pressed if
+#             that question shows, and only then closed. Zefoy then says
+#             "Thanks for your support!" for a few seconds, and the offer
+#             should not return for 24 h.
+#   overlay   any other screen-covering Google ad frame: treated like a
+#             vignette (wait for a video to end, then its close button).
+#
+# "Done" is the page staying clear for a few seconds, never one clear read:
+# the offer box closes a second or two BEFORE its video appears, and a single
+# read in that gap was taken for the end of the ad.
+AD_AUTO_LOG = {"vignette": "full-screen ad, no reward: closing it once its close button shows",
+               "offer": "'watch a short ad' offer: pressing View a short ad",
+               "rewarded": "reward video: watching it to the end, then closing it",
+               "overlay": "full-screen ad: closing it once it lets us",
+               "video": "ad video: watching it to the end"}
+
+
+def zefoy_auto_ad(page, kind: str, timeout_s: float = 180) -> bool:
+    """Watch and close a Zefoy ad without help. True when Zefoy is usable."""
     tag = _pfx()
-    print(f"{tag} [AD] Zefoy is showing an ad ({kind}) — watching it to the end...")
+    started = time.time()
+    print(f"{tag} [AD] {kind}: {AD_AUTO_LOG.get(kind, 'handling it automatically')}")
     if kind == "offer":
-        # Start the ad that the reward is for.
         if _ad_click_first(page, _AD_OFFER_SELECTORS):
-            page.wait_for_timeout(2000)
-    deadline = time.time() + timeout_s
-    quiet_since = None
+            # Give the reward video its moment to arrive (the offer box goes
+            # first, then #goog_fullscreen_ad).
+            for _ in range(24):
+                page.wait_for_timeout(500)
+                k = zefoy_ad_showing(page)
+                if k and k != "offer":
+                    kind = k
+                    print(f"{tag} [AD] the reward video started — watching it to the end")
+                    break
+                if _ad_video_playing(page):
+                    kind = "rewarded"
+                    break
+        else:
+            print(f"{tag} [AD] no 'View a short ad' button to press")
+    deadline = started + timeout_s
+    quiet_since = None      # no video, nothing pressed yet: waiting for a close button
+    clear_since = None      # nothing covering Zefoy
+    close_presses = 0
     while time.time() < deadline:
-        if not zefoy_ad_showing(page):
-            print(f"{tag} [AD] Ad closed — reward collected, carrying on.")
-            page_wait(1, 2)
-            return True
-        # Closed too early somehow: go back to the video, or the reward is lost.
-        if _ad_click_first(page, _AD_RESUME_SELECTORS):
+        showing = zefoy_ad_showing(page)
+        video = _ad_video_playing(page)
+        if not showing and not video:
+            clear_since = clear_since or time.time()
+            need = AD_QUIET_OFFER_S if kind in ("offer", "rewarded", "video") else AD_QUIET_S
+            if time.time() - clear_since >= need:
+                print(f"{tag} [AD] {kind} ad done after {int(time.time() - started)}s — carrying on.")
+                page_wait(1, 2)
+                return True
             page.wait_for_timeout(1000)
             continue
-        if _ad_video_playing(page):
+        clear_since = None
+        if showing == "offer":
+            # The offer back again (or still): press it again.
+            _ad_click_first(page, _AD_OFFER_SELECTORS)
+            page.wait_for_timeout(2000)
+            continue
+        # "Close video? you will lose your reward" — go back to it. Only when
+        # that question is really showing and the video is not over.
+        if video and _ad_forfeit_asked(page) and \
+                _ad_click_first(page, _AD_RESUME_SELECTORS, covering_only=True):
+            print(f"{tag} [AD] the ad asked to give up the reward — resuming the video")
+            page.wait_for_timeout(1000)
+            continue
+        if video:
             quiet_since = None
             page.wait_for_timeout(1000)
             continue
-        # No video playing. A non-video ad (or one that just ended) shows its
-        # close button after a countdown: give the button a moment to appear
-        # rather than clicking the first thing that looks like one mid-video.
+        # No video left. Its close button appears after a short countdown, so
+        # it gets a moment rather than a press on whatever looks like one.
         if quiet_since is None:
             quiet_since = time.time()
             page.wait_for_timeout(1500)
             continue
-        if _ad_click_first(page, _AD_CLOSE_SELECTORS):
+        if close_presses < 8 and _ad_click_first(page, _AD_CLOSE_SELECTORS, covering_only=True):
+            close_presses += 1
+            if close_presses == 1:
+                print(f"{tag} [AD] nothing left playing — pressing the ad's close button")
             page.wait_for_timeout(1500)
             continue
-        # Nothing playing and nothing to press for half a minute: it is not
-        # going to close itself.
-        if time.time() - quiet_since > 30:
+        # Eight presses that changed nothing are pressing the wrong thing.
+        if close_presses >= 8 or time.time() - quiet_since > 30:
             break
         page.wait_for_timeout(1000)
-    print(f"{tag} [AD] The ad would not close — taking it off the page.")
+    print(f"{tag} [AD] The {kind} ad would not close after {int(time.time() - started)}s "
+          f"— taking it off the page.")
     return zefoy_hide_ad(page)
 
 
@@ -2120,11 +2271,20 @@ def zefoy_click(page, locator, timeout_ms: int = 30000) -> None:
     # cheap when there is none.
     zefoy_clear_ad(page)
     try:
-        locator.click(timeout=timeout_ms)
+        # SHORT FIRST TRY. In the first recording a vignette ad opened the
+        # moment Search was pressed, and this click retried against it for the
+        # full 30 s before the ad was even noticed. A button that is there
+        # clicks in well under a second; 8 s is plenty before looking for an ad.
+        locator.click(timeout=min(timeout_ms, 8000))
         return
     except Exception as e:  # noqa: BLE001
         if "intercepts pointer events" not in str(e) and not zefoy_ad_showing(page):
-            raise
+            if "Timeout" not in str(e) or timeout_ms <= 8000:
+                raise
+            # Timed out with nothing recognised on top: the rest of the
+            # original wait, as before.
+            locator.click(timeout=timeout_ms - 8000)
+            return
     if ZEFOY_AD_MODE != "auto":
         # YOUR AD, NOT OURS. The old path here hid whatever covered the button
         # — which, with you halfway through a reward video, threw the video
@@ -2445,6 +2605,20 @@ def watch_hearts(page, text: str, baseline: int, seconds: float,
             # looking for a few reads; a row that never comes back ends the watch
             # with what we last saw rather than with a zero.
             missing += 1
+            # ZEFOY CLOSES THE LIST WHEN IT CONFIRMS. Every submit in the first
+            # recording went: "Comment hearts successfully sent.", the comment
+            # list removed, then its cooldown — so the row is not coming back
+            # and the remaining reads were 12-15 s of looking at nothing. The
+            # next scan reads the real count.
+            try:
+                confirmed = "successfully sent" in page.inner_text("body", timeout=2000).lower()
+            except Exception:  # noqa: BLE001
+                confirmed = False
+            if confirmed:
+                if verbose:
+                    print(f"  [~] Watch: Zefoy confirmed the batch and closed its comment "
+                          f"list; the next scan reads the count (last seen {last:,})")
+                break
             if missing >= 3:
                 if verbose:
                     print(f"  [~] Watch: the comment row went off screen; "
@@ -2548,8 +2722,13 @@ def _zefoy_goto_page(page, n: int, cur: int = 0) -> bool:
 def zefoy_process_url(page, video_url: str, video_like_count: int, keywords: list[str],
                      to_top: bool = False, margin: int = TOP_MARGIN,
                      watch_s: float = HEART_WATCH_SECONDS,
-                     floor: float = HEART_FLOOR) -> dict:
+                     floor: float = HEART_FLOOR,
+                     stale_guard: tuple[str, int] | None = None) -> dict:
     """Run the full Comments Hearts flow for one video URL.
+
+    `stale_guard` = (comment text, the count the previous round scanned) after
+    a batch Zefoy confirmed: if this scan still shows no more than that, no
+    batch is sent (see step 6b).
 
     TWO WAYS TO DECIDE HOW MANY HEARTS TO SEND.
 
@@ -2664,14 +2843,55 @@ def zefoy_process_url(page, video_url: str, video_like_count: int, keywords: lis
 
         # ── 3. Click the dark comment-count button (e.g. "8,420") ─────────────
         count_btn = page.locator(count_btn_sel).first
+        # ZEFOY CAN ANSWER "No an comment found." instead of the count button
+        # (its wording). Seen in the first recording a second after Search; the
+        # run then waited out the full 15 s and logged "Count button did not
+        # appear", which named nothing. Watched for alongside the button now.
+        no_comments = False
+        deadline = time.time() + 15
+        while True:
+            try:
+                if count_btn.is_visible():
+                    break
+                body = page.inner_text("body", timeout=3000).lower()
+            except PlaywrightTimeoutError:
+                body = ""
+            if re.search(r"no an? comments? found", body):
+                no_comments = True
+                break
+            if time.time() >= deadline:
+                break
+            time.sleep(0.5)
+        if no_comments:
+            # Not marked no_comment: that means "we read the comments and
+            # none are ours". Zefoy reading none at all may be its own failure, so
+            # the video stays pending for a later pass.
+            return fail("Zefoy says it found no comments on this video (none yet, "
+                        "comments off, or Zefoy could not read them)")
         try:
-            count_btn.wait_for(state="visible", timeout=15000)
+            count_btn.wait_for(state="visible", timeout=1000)
         except PlaywrightTimeoutError:
             if zefoy_session_expired(page):
                 return fail("Session expired – will recover on retry")
             # NOT no_comment: Zefoy did not answer, so nothing is known about
             # this video's comments. It stays pending for the next pass.
-            return fail("Count button did not appear after Search")
+            #
+            # AND IT IS NOT THIS VIDEO'S FAULT. Recording 20261120-004931: from
+            # 04:27 every one of Zefoy's requests timed out (QUIC idle timeout,
+            # connection reset), its page said "An error occurred. Please try
+            # again.", and the run went on failing one link every 22 s for five
+            # hours — 830 links. `no_answer` lets the worker see a streak of
+            # these as Zefoy (or the connection) being down, not as bad links.
+            try:
+                body = page.inner_text("body", timeout=2000).lower()
+            except Exception:  # noqa: BLE001
+                body = ""
+            if "an error occurred" in body:
+                out = fail("Zefoy answered 'An error occurred' — its search failed")
+            else:
+                out = fail("Count button did not appear after Search")
+            out["no_answer"] = True
+            return out
         zefoy_click(page, count_btn)
         page_wait(2, 3)
 
@@ -3097,6 +3317,23 @@ def zefoy_process_url(page, video_url: str, video_like_count: int, keywords: lis
                     comment_text, comment_hearts, 0, keyword_used=keyword_used,
                 )
 
+        # ── 6b. Don't send blind into a count that isn't moving ───────────────
+        #
+        # SEEN IN A RECORDING: five rounds on one video, each answered "Comment
+        # hearts successfully sent.", and every following scan still read 928 —
+        # 500 hearts sent against a number that never moved. Whether Zefoy's
+        # list is stale or the hearts are not arriving, the next batch is being
+        # aimed by a reading we already know is wrong, and with a stale count it
+        # could even pass the ceiling unseen. So one confirmed batch that the
+        # next scan cannot see stops the rounds; the video stays pending and a
+        # later pass reads it fresh.
+        if stale_guard and stale_guard[0] == comment_text and comment_hearts <= stale_guard[1]:
+            return fail(
+                f"Zefoy confirmed the last batch but still shows {comment_hearts:,} hearts "
+                f"on this comment — not sending more until the count moves",
+                comment_text, comment_hearts, 0, keyword_used=keyword_used,
+                deficit=max(0, rival["hearts"] + margin - comment_hearts) if to_top else 0)
+
         # ── 7. Set quantity dropdown and click heart button ───────────────────
         try:
             qty_sel = target_row.locator("select[name='select_lmt']").first
@@ -3221,6 +3458,7 @@ def zefoy_process_url(page, video_url: str, video_like_count: int, keywords: lis
                 f" – at {after:,}, about {left:,} short of the lead" if to_top else "")
         if "successfully sent" in result_text or "comment hearts" in result_text:
             return {"ok": True, "note": f"Sent {hearts_sent} hearts{tail}",
+                    "confirmed": True, "scanned_hearts": comment_hearts,
                     # The count AFTER the batch, because that is the fact the
                     # next decision rests on.
                     "comment_text": comment_text, "comment_hearts": after,
@@ -3374,7 +3612,52 @@ def run_zefoy(urls: list[dict], delay: float, keywords: list[str],
                         signal_next()  # captcha solved → open the next window now (don't wait for a heart)
 
                         first_ok = False
+                        # ZEFOY STOPPED ANSWERING (see `no_answer`): the links it
+                        # failed meanwhile, and how many in a row.
+                        no_answer = 0
+                        held: list = []
+                        outages = 0
                         while True:
+                            if no_answer >= ZEFOY_DOWN_STREAK:
+                                # Three links in a row with no answer is Zefoy or the
+                                # connection, not the links. Start a FRESH page (the
+                                # dead connection lives in the old one — recorded,
+                                # 5 h without a single reload), log in again, and if
+                                # it is still down wait longer each time. The links
+                                # it could not do go back in the queue.
+                                outages += 1
+                                wait = ZEFOY_DOWN_WAITS[min(outages, len(ZEFOY_DOWN_WAITS)) - 1]
+                                print(f"\n{prefix} [!] Zefoy has not answered {no_answer} links in a row "
+                                      f"— its site or the connection is down. Outage check {outages}: "
+                                      + (f"waiting {wait // 60} min, then " if wait else "")
+                                      + "reloading and logging in again; "
+                                      f"{len(held)} link(s) put back in the queue.")
+                                for e in held:
+                                    url_queue.put(e)
+                                held.clear()
+                                no_answer = 0
+                                if outages > len(ZEFOY_DOWN_WAITS) + 2:
+                                    print(f"{prefix} [!] Zefoy has stayed down through {outages - 1} "
+                                          f"checks — stopping this window. The links not done stay "
+                                          f"pending for the next run.")
+                                    break
+                                if wait:
+                                    time.sleep(wait)
+                                try:
+                                    old = page
+                                    page = context.new_page()
+                                    try:
+                                        old.close()
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                    zefoy_login(page)
+                                    print(f"{prefix} [+] Zefoy is back — carrying on.")
+                                except Exception as e:  # noqa: BLE001
+                                    if isinstance(e, BrowserGone):
+                                        raise  # the worker's reconnect handles a dead browser
+                                    print(f"{prefix} [!] Zefoy still unreachable ({str(e)[:120]})")
+                                    no_answer = ZEFOY_DOWN_STREAK  # straight to the next, longer wait
+                                    continue
                             try:
                                 entry = url_queue.get_nowait()
                             except Empty:
@@ -3420,18 +3703,18 @@ def run_zefoy(urls: list[dict], delay: float, keywords: list[str],
                             if zefoy_session_expired(page):
                                 zefoy_recover_session(page)
 
-                            def once():
+                            def once(guard=None):
                                 """One visit: scan, one heart batch, then watch it land."""
                                 out = zefoy_process_url(page, url, like_count, keywords,
                                                         to_top=to_top, margin=margin,
                                                         watch_s=watch_s,
-                                                        floor=floor)
+                                                        floor=floor, stale_guard=guard)
                                 if not out["ok"] and zefoy_session_expired(page):
                                     zefoy_recover_session(page)
                                     out = zefoy_process_url(page, url, like_count, keywords,
                                                             to_top=to_top, margin=margin,
                                                             watch_s=watch_s,
-                                                            floor=floor)
+                                                            floor=floor, stale_guard=guard)
                                 elif not out["ok"] and out.get("retryable"):
                                     # ONE SECOND LOOK, not a loop: the panel was
                                     # swapped under the scan, and re-reading it is
@@ -3441,7 +3724,7 @@ def run_zefoy(urls: list[dict], delay: float, keywords: list[str],
                                     out = zefoy_process_url(page, url, like_count, keywords,
                                                             to_top=to_top, margin=margin,
                                                             watch_s=watch_s,
-                                                            floor=floor)
+                                                            floor=floor, stale_guard=guard)
                                 return out
 
                             r = once()
@@ -3465,7 +3748,11 @@ def run_zefoy(urls: list[dict], delay: float, keywords: list[str],
                                           f"({r.get('deficit', 0):,} short of the lead)…")
                                     if zefoy_session_expired(page):
                                         zefoy_recover_session(page)
-                                    nxt = once()
+                                    # A batch Zefoy confirmed must show up in this
+                                    # scan, or no more are sent (step 6b).
+                                    guard = ((r["comment_text"], r["scanned_hearts"])
+                                             if r.get("confirmed") else None)
+                                    nxt = once(guard)
                                     sent_total += nxt.get("hearts_sent", 0) or 0
                                     # Keep the LAST reading: it is the freshest picture of
                                     # where the comment stands, and it is what decides
@@ -3505,6 +3792,16 @@ def run_zefoy(urls: list[dict], delay: float, keywords: list[str],
                             log.write(row)
                             if r.get("no_comment"):
                                 no_comment_log.write({**row, "all_comments": r.get("all_comments", "")})
+                            # A streak of no-answers is an outage (handled at the
+                            # top of the loop); one that ends was just a bad link.
+                            if r.get("no_answer"):
+                                no_answer += 1
+                                held.append(entry)
+                            else:
+                                no_answer = 0
+                                held.clear()
+                                if r["ok"]:
+                                    outages = 0
 
                             with state_lock:
                                 # UNFINISHED VIDEOS STAY PENDING under --to-top. Marking
@@ -4254,7 +4551,25 @@ def main():
     parser.add_argument("--fresh", action="store_true",
                         help="Forget the last run and start at link #1. Deletes the "
                              "state file for this source, nothing else")
+    parser.add_argument("--record", action="store_true",
+                        default=_DOTENV.get("RECORD", os.getenv("RECORD", "")).strip().lower()
+                        in ("1", "true", "yes", "on"),
+                        help="Save every change on the Zefoy page (full HTML of each new "
+                             "screen) and this log into zefoy-recordings/<run>/, to learn "
+                             "every screen Zefoy can show. RECORD=true in .env")
+    parser.add_argument("--ad-mode", choices=("auto", "manual"), default=ZEFOY_AD_MODE
+                        if ZEFOY_AD_MODE in ("auto", "manual") else "manual",
+                        help="Zefoy's ads: auto = the script watches and closes them itself "
+                             "(presses 'View a short ad', watches the reward video to the end, "
+                             "closes vignettes); manual = it calls you and waits. "
+                             "ZEFOY_AD_MODE in .env")
     args = parser.parse_args()
+    # Read by zefoy_clear_ad / zefoy_click at every checkpoint.
+    globals()["ZEFOY_AD_MODE"] = args.ad_mode
+
+    if args.record:
+        import page_recorder
+        page_recorder.start(sys.argv)
 
     if args.resume and args.fresh:
         parser.error(
@@ -4336,6 +4651,9 @@ def main():
             print("[*]              one browser only; --workers is ignored when attached")
             args.workers = 1
     print(f"[*] Service    : {args.service}")
+    print(f"[*] Ads        : " + ("automatic — watched and closed by the script"
+                                  if args.ad_mode == "auto" else
+                                  "manual — you are called to watch and close them"))
     print(f"[*] URLs       : {len(all_urls)} loaded")
     print(f"[*] Delay      : {args.delay}s base")
     print(f"[*] Windows    : {args.workers} per service")
