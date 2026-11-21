@@ -2690,6 +2690,8 @@ def _watch_search(search_job: Job, settings: dict, platform: str = "") -> None:
     sent_q = 0          # keywords covered by an upload already started
     sent_rows = 0       # rows in the last snapshot uploaded
     current: Job | None = None
+    current_rows = 0    # rows in the upload `current` is sending
+    ok_rows = 0         # rows in the biggest per-keyword upload that SUCCEEDED
     while True:
         lines, seen = search_job.tail(seen)
         for ln in lines:
@@ -2702,6 +2704,15 @@ def _watch_search(search_job: Job, settings: dict, platform: str = "") -> None:
             elif QUERY_DONE_RE.match(ln.strip()):
                 done_q += 1
         over = search_job.finished()
+        if current is not None and current.finished() and current_rows:
+            # Counted only once it has WORKED. A failed one is made up for by
+            # the next keyword's upload, which sends everything found so far.
+            if current.status == "done":
+                ok_rows = max(ok_rows, current_rows)
+            else:
+                search_job.write(f"[!] the upload after a keyword failed ({current.status}); "
+                                 "the next one sends everything found so far again")
+            current_rows = 0
         if (each and not over and path is not None and done_q > sent_q
                 and (current is None or current.finished())):
             snap, rows = _snapshot_csv(path, sent_rows)
@@ -2714,6 +2725,7 @@ def _watch_search(search_job: Job, settings: dict, platform: str = "") -> None:
                 search_job.write(f"[*] keyword {done_q} done — uploading the {rows:,} link(s) "
                                  "found so far (append)")
                 current = RUNNER.start("upload", f"{title} · after keyword {done_q}", cmd, cwd)
+                current_rows = rows
                 sent_rows = rows
         if over:
             break
@@ -2721,7 +2733,11 @@ def _watch_search(search_job: Job, settings: dict, platform: str = "") -> None:
     # The final upload goes AFTER any per-keyword one still running, never beside it.
     while current is not None and not current.finished():
         time.sleep(1)
-    _chain_upload(search_job, settings, platform, appended=sent_rows)
+    if current is not None and current_rows and current.status == "done":
+        ok_rows = max(ok_rows, current_rows)
+    # What actually reached the pool, not what was sent: "they are in the pool"
+    # was said even when those uploads had failed.
+    _chain_upload(search_job, settings, platform, appended=ok_rows)
 
 
 def _chain_upload(search_job: Job, settings: dict, platform: str = "",
@@ -2757,7 +2773,10 @@ def _chain_upload(search_job: Job, settings: dict, platform: str = "",
             search_job.write(
                 f"[*] {appended:,} link(s) found before it stopped were already uploaded "
                 "keyword by keyword (append mode), so they are in the pool.")
-            return
+            if rows <= appended:
+                return
+            search_job.write(f"[*] {rows - appended:,} more were written after the last "
+                             "upload that worked:")
         if rows > 0:
             search_job.write(
                 f"[*] {rows:,} link(s) were written before it stopped: {csv}")

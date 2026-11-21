@@ -1,17 +1,14 @@
 {
   "search": {
     "platforms": [
-      "tiktok",
-      "youtube",
-      "instagram",
-      "reddit"
+      "tiktok"
     ],
-    "genre": "humanizer",
+    "genre": "study-helper",
     "queries_by_genre": {
       "humanizer": "humanizer\nAI text humanizer\nbypass AI detector\nai paraphraser\nnaturalwrite humanizer\ngrubbyai humanizer\nwalterwritesai humanizer\nwritehuman humanizer\nLegitWriter humanizer\npaperbleach humanizer\nmaskai humanizer\nundetectableai humanizer\nverva humanizer\naihumanizer\nturnitin detector\ngptzero detector\noriginalityai detector\npangram detector",
       "website": "ai website builder\nbuild a website with ai\nno code website\nbase44 website builder\nemergent website builder\nlovable website builder\nwix website builder\nwebador website builder\nshopify website builder\nSquarespace website builder\nHostinger AI website builder\nCatDoes website builder\nManus AI website builder\nFramer AI website builder\nReplit Agent website builder\nv0 AI website builder",
       "slides": "ai presentation maker\nai powerpoint generator\nai slides generator\nai deck generator\nmake slides fast\ngamma ai presentation\nkimi ai presentation\nManus AI presentation\nCanva AI presentation",
-      "link-in-bio": "how to put link in bio\nbest tool to put a link in bio\nTikTok bio link tool\nInstagram bio link tool\nlink in bio tools\nLinktree bio link\nLiinks bio link\nBeacon bio link\ncreator tools\ncontent creator tips\nInstagram growth\nTikTok growth\npersonal branding\ninfluencer tips\ncreator website\nsocial media marketing\nlink page",
+      "link-in-bio": "how to put link in bio\nbest tool to put a link in bio\nTikTok bio link tool\nInstagram bio link tool\nhow to link in bio tools\nhow to Linktree bio link\nhow to Liinks bio link\nhow to Beacon bio link\npersonal branding tool",
       "study-helper": "study tips\nhow to study for exams\nstudy with me\nexam revision tips\nhow to pass exams\nstudy hacks for students\nfinals week study\nhow to study effectively\nstudent study routine\nlast minute exam study"
     },
     "min": 200,
@@ -20,6 +17,7 @@
     "output": "",
     "upload_after": true,
     "upload_each_keyword": true,
+    "save_bandwidth": true,
     "upload_mode": "replace",
     "browser_profiles": "browser_profile",
     "use_liker_profiles": true
@@ -42,7 +40,7 @@
     "max_links": 7000,
     "target": "products",
     "users": "cocodly, co codly,purifytext, purify text,\u03c1\u03c5r\u0456f\u0443t\u0435xt,\u03c1\u03c5r\u0456f\u0443 t\u0435xt, \u03c1\u03c5r\u0456f\u0443t\u0435xt, acoustictext, acoustic text, prohumanly,  pro humanly, cohumanly, humlexic",
-    "profiles": "c,g,h,a,e,b,f,d,j,i,o,n,q,l,r,s,t,u,default",
+    "profiles": "c,g,h,e,b,f,d,j,i,o,n,q,l,r,s,t,u,a",
     "at_once": 8,
     "links_per_account": 300,
     "links_per_account_max": 400,
@@ -66,7 +64,7 @@
     "service": "zefoy",
     "source": "dashboard",
     "csv": "",
-    "cluster_by": "date",
+    "cluster_by": "rank",
     "clusters": "all",
     "platform": "tiktok",
     "category": "",

@@ -5,11 +5,13 @@ import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import {
   isCommentVoice,
+  normaliseMix,
   productForms,
   productWords,
   TOP_LIST_BOUNDS,
   type CommentStyle,
   type CommentVoice,
+  type MixFeature,
   type LinkCategory,
   type Product,
   type TopListRank,
@@ -157,6 +159,8 @@ export default function AdminProductComments({
   const [voice, setVoice] = useState<CommentVoice>(style.voice)
   // The name as part of the sentence (a concept) rather than a brand.
   const [inSentence, setInSentence] = useState(style.inSentence === true)
+  // Switches written BOTH ways, about half the comments each.
+  const [mix, setMix] = useState<MixFeature[]>(normaliseMix(style.mix))
   // What the server currently holds, so an edited-but-unsaved box is visible.
   const [savedBand, setSavedBand] = useState({ min: wordMin, max: wordMax })
 
@@ -335,6 +339,7 @@ export default function AdminProductComments({
     splitBrand?: boolean
     quoteBrand?: boolean
     inSentence?: boolean
+    mix?: MixFeature[]
   }) {
     setSavingStyle(true)
     setMsg('')
@@ -354,6 +359,7 @@ export default function AdminProductComments({
           quoteBrand: patch.quoteBrand ?? quoteBrand,
           voice: patch.voice ?? voice,
           inSentence: patch.inSentence ?? inSentence,
+          mix: patch.mix ?? mix,
         }),
       })
       const d = await res.json().catch(() => ({}))
@@ -368,6 +374,7 @@ export default function AdminProductComments({
       if (typeof d.splitBrand === 'boolean') setSplitBrand(d.splitBrand)
       if (typeof d.quoteBrand === 'boolean') setQuoteBrand(d.quoteBrand)
       if (typeof d.inSentence === 'boolean') setInSentence(d.inSentence)
+      if (Array.isArray(d.mix)) setMix(normaliseMix(d.mix))
       setMsg('Saved. It applies to the next regeneration.')
     } catch {
       setErr('Network error.')
@@ -397,7 +404,7 @@ export default function AdminProductComments({
       product as Product,
       category as LinkCategory,
       { min: Number(min) || wordMin, max: Number(max) || wordMax },
-      { emoji, splitBrand, quoteBrand, voice, inSentence }
+      { emoji, splitBrand, quoteBrand, voice, inSentence, mix }
     )
 
   // Which audience prompts are expanded. Collapsed by default: three of them
@@ -461,23 +468,32 @@ export default function AdminProductComments({
 
   // What a mention will look like under the current switches, so the effect is
   // visible before spending a regeneration to find out.
-  const words = splitBrand ? splitPreview(product) : product
-  // Quoted when "Quote the brand" is on — the same form productMention() sends.
-  const brand = quoteBrand ? `"${words}"` : words
-  // Show the VOICE as well as the mention: the two switches together are what
-  // a comment will actually read like, and the mention alone hid the bigger of
-  // the two changes.
+  // With anything MIXED, two examples: every mixed switch on, then every mixed
+  // switch off — the two ends of what the batch will hold.
+  const example = (s: { emoji: boolean; splitBrand: boolean; quoteBrand: boolean; inSentence: boolean }) => {
+    const words = s.splitBrand ? splitPreview(product) : product
+    // Quoted when "Quote the brand" is on — the same form productMention() sends.
+    const brand = s.quoteBrand ? `"${words}"` : words
+    // Show the VOICE as well as the mention: the switches together are what a
+    // comment will actually read like.
+    return (
+      (s.inSentence
+        ? `the trick is running it through a ${brand} after chatgpt`
+        : voice === 'question'
+          ? `why does nothing else come back 0% like ${brand} does?`
+          : voice === 'curious'
+            ? `what made you switch to ${brand}? the flow reads really clean`
+            : voice === 'recommendation'
+              ? `i switched to ${brand} and mine passes now`
+              : `${brand} rewrites ai text so detectors read it as human`) + (s.emoji ? ' 🙌' : '')
+    )
+  }
+  const set = { emoji, splitBrand, quoteBrand, inSentence }
   const preview =
-    (inSentence
-      ? `the trick is running it through a ${brand} after chatgpt`
-      : voice === 'question'
-      ? `why does nothing else come back 0% like ${brand} does?`
-      : voice === 'curious'
-        ? `what made you switch to ${brand}? the flow reads really clean`
-        : voice === 'recommendation'
-          ? `i switched to ${brand} and mine passes now`
-          : `${brand} rewrites ai text so detectors read it as human`) +
-    (emoji ? ' 🙌' : '')
+    mix.length === 0
+      ? example(set)
+      : `${example({ ...set, ...Object.fromEntries(mix.map((f) => [f, true])) })}  ·  ` +
+        `${example({ ...set, ...Object.fromEntries(mix.map((f) => [f, false])) })}`
 
   // Length spread of what is currently stored, across all three audiences —
   // there is nothing else stored, so this is the whole picture for the product.
@@ -827,14 +843,16 @@ export default function AdminProductComments({
             rule the generator can actually enforce after the model replies. */}
         <div className="flex flex-wrap items-center gap-4 mt-3 pt-3 border-t border-zinc-800">
           {([
-            ['Emoji', emoji, setEmoji, 'End each comment with one upbeat emoji.'],
+            ['emoji', 'Emoji', emoji, setEmoji, 'End each comment with one upbeat emoji.'],
             [
+              'splitBrand',
               'Split the brand',
               splitBrand,
               setSplitBrand,
               `Write compound names as two words: ${product} becomes ${splitPreview(product)}.`,
             ],
             [
+              'inSentence',
               'Name inside the sentence',
               inSentence,
               setInSentence,
@@ -844,37 +862,61 @@ export default function AdminProductComments({
                 'with "Split the brand" on.',
             ],
             [
+              'quoteBrand',
               'Quote the brand',
               quoteBrand,
               setQuoteBrand,
               `Put the name in quotation marks: i use "${splitBrand ? splitPreview(product) : product}" now. ` +
                 'Applies to the next regeneration.',
             ],
-          ] as const).map(([label, value, set, hint]) => (
-            <label key={label} className="flex items-center gap-1.5 text-xs text-zinc-300" title={hint}>
-              <input
-                type="checkbox"
-                checked={value}
-                disabled={savingStyle}
-                onChange={(e) => {
-                  set(e.target.checked)
-                  // Same bug as the voice: a checkbox that only moved local state
-                  // looked saved and was not.
-                  void commitStyle(
-                    label === 'Emoji'
-                      ? { emoji: e.target.checked }
-                      : label === 'Split the brand'
-                        ? { splitBrand: e.target.checked }
-                        : label === 'Quote the brand'
-                          ? { quoteBrand: e.target.checked }
-                          : { inSentence: e.target.checked }
-                  )
-                }}
-                className="accent-emerald-500"
-              />
-              {label}
-            </label>
-          ))}
+          ] as const).map(([key, label, value, set, hint]) => {
+            const mixed = mix.includes(key)
+            return (
+              <span
+                key={key}
+                className={`inline-flex items-center gap-2 rounded-lg border px-2 py-1 ${
+                  mixed ? 'border-violet-500/50 bg-violet-500/10' : 'border-zinc-800'
+                }`}
+              >
+                <label className="flex items-center gap-1.5 text-xs text-zinc-300" title={hint}>
+                  <input
+                    type="checkbox"
+                    // Mixed is neither on nor off; the box shows that instead of
+                    // a value that no longer decides anything.
+                    checked={mixed ? false : value}
+                    ref={(el) => { if (el) el.indeterminate = mixed }}
+                    disabled={savingStyle || mixed}
+                    onChange={(e) => {
+                      set(e.target.checked)
+                      // Same bug as the voice: a checkbox that only moved local state
+                      // looked saved and was not.
+                      void commitStyle({ [key]: e.target.checked })
+                    }}
+                    className="accent-emerald-500"
+                  />
+                  {label}
+                  {mixed && <span className="text-violet-300">· both</span>}
+                </label>
+                <label
+                  className="flex items-center gap-1 text-[11px] text-violet-300/90 border-l border-zinc-700 pl-2"
+                  title={`Mix: about half the comments ${label.toLowerCase()} and half without, in the same set — decided comment by comment. Applies to the next regeneration.`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={mixed}
+                    disabled={savingStyle}
+                    onChange={(e) => {
+                      const next = e.target.checked ? [...mix, key] : mix.filter((f) => f !== key)
+                      setMix(next)
+                      void commitStyle({ mix: next })
+                    }}
+                    className="accent-violet-500"
+                  />
+                  mix
+                </label>
+              </span>
+            )
+          })}
           {/* The voice is a choice of three, not a switch: they are three
               different things for a comment to BE, and only one applies. */}
           <label className="flex items-center gap-1.5 text-xs text-zinc-300">

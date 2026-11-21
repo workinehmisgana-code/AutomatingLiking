@@ -9,6 +9,8 @@ import {
   productWords,
   productMatchWords,
   productMention,
+  resolveMix,
+  isMixed,
   type CommentStyle,
   DEFAULT_COMMENT_STYLE,
   type LinkCategory,
@@ -295,6 +297,15 @@ export function sanitize(
 ): string[] {
   const style = opts.style ?? DEFAULT_COMMENT_STYLE
   if (!Array.isArray(lines)) return []
+  // MIXED SWITCHES (CommentStyle.mix): decided comment by comment, and
+  // BALANCED — whichever way a feature has gone less often in this batch goes
+  // next (ties by coin) — so a batch of 30 is about 15 and 15, not whatever a
+  // run of coin tosses gave. Counted only for comments that are kept.
+  const mixCount = new Map<string, { on: number; off: number }>()
+  const pickBalanced = (f: string): boolean => {
+    const c = mixCount.get(f) ?? { on: 0, off: 0 }
+    return c.on === c.off ? Math.random() < 0.5 : c.on < c.off
+  }
   const seen = new Set<string>()
   const out: string[] = []
   // How many kept comments already end on each emoji, so no one face takes over.
@@ -310,11 +321,13 @@ export function sanitize(
     if (typeof raw !== 'string') continue
     let s = raw.trim().replace(/^["'\s]+|["'\s]+$/g, '')
     if (!s) continue
+    // This comment's own style, with every mixed switch decided for it.
+    const per = resolveMix(style, pickBalanced)
     // MUST mention the product; the name is normalised here rather than trusted
     // to the model, so nothing goes out announcing a brand however the model
     // chose to write it â€” split, lowercase, unquoted, un-hashed, with whatever
     // inflection the sentence needs left alone.
-    const named = canonicaliseMention(s, product, style)
+    const named = canonicaliseMention(s, product, per)
     if (named === null) continue
     s = named
     const n = wordCount(s)
@@ -363,7 +376,7 @@ export function sanitize(
     // it got carried away. Doing it here rather than rejecting keeps a good
     // comment that simply missed one instruction.
     const n_emoji = countEmoji(s)
-    if (!style.emoji) {
+    if (!per.emoji) {
       // Emoji switched off: strip whatever the model produced anyway, rather
       // than rejecting the line over a rule it was never told about.
       if (n_emoji > 0) s = stripEmoji(s)
@@ -375,7 +388,7 @@ export function sanitize(
     // Spread them across the batch. Told to vary the emoji, the model still
     // lands on one face for most of a run, and a pool where every comment ends
     // the same way is exactly the pattern that reads as automated.
-    const face = style.emoji ? (s.match(EMOJI) || []).find((c) => !isModifier(c)) : undefined
+    const face = per.emoji ? (s.match(EMOJI) || []).find((c) => !isModifier(c)) : undefined
     if (face) {
       const cap = Math.max(2, Math.ceil(lineCount / VIBES.length))
       if ((used.get(face) ?? 0) >= cap) {
@@ -390,6 +403,12 @@ export function sanitize(
     if (seen.has(key)) continue
     seen.add(key)
     out.push(s)
+    for (const f of style.mix ?? []) {
+      const c = mixCount.get(f) ?? { on: 0, off: 0 }
+      if (per[f]) c.on++
+      else c.off++
+      mixCount.set(f, c)
+    }
   }
   return out
 }
@@ -560,6 +579,30 @@ export async function callGroqForAudience(
   band: WordBand,
   style: CommentStyle
 ): Promise<string[]> {
+  // "NAME INSIDE THE SENTENCE" MIXED is an instruction to the model, not a
+  // finishing touch, so it cannot be decided comment by comment afterwards:
+  // the batch is written in two halves, one told to use it and one not.
+  if (isMixed(style, 'inSentence') && base.length >= 2) {
+    const rest = (style.mix ?? []).filter((f) => f !== 'inSentence')
+    const half = Math.ceil(base.length / 2)
+    const parts = await Promise.allSettled([
+      callGroqForAudience(product, category, base.slice(0, half), band, { ...style, inSentence: true, mix: rest }),
+      callGroqForAudience(product, category, base.slice(half), band, { ...style, inSentence: false, mix: rest }),
+    ])
+    const got = parts.flatMap((p) => (p.status === 'fulfilled' ? p.value : []))
+    if (got.length === 0) {
+      const err = parts.find((p) => p.status === 'rejected') as PromiseRejectedResult | undefined
+      throw err?.reason ?? new Error('No valid rewrites returned')
+    }
+    // Interleaved, so a set read top to bottom is not one style then the other.
+    const [a, b] = parts.map((p) => (p.status === 'fulfilled' ? p.value : []))
+    const out: string[] = []
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+      if (a[i]) out.push(a[i])
+      if (b[i]) out.push(b[i])
+    }
+    return out
+  }
   // The form the model is asked for. canonicaliseMention() normalises whatever
   // comes back anyway â€” including stripping quotes the model adds by itself,
   // which inside a JSON string is also an escaping hazard, and

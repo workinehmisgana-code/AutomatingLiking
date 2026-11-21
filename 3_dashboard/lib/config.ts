@@ -944,6 +944,45 @@ export interface CommentStyle {
    * style stored before it existed still parses (absent = off).
    */
   inSentence?: boolean
+  /**
+   * MIXED FEATURES: the switches listed here are neither on nor off but BOTH,
+   * about half the comments each — some "purify text", some "purifytext";
+   * some quoted, some not. A comment section where every line writes the name
+   * the same way is a pattern; a mix is what different people look like.
+   * Absent or empty = nothing mixed (each switch is simply on or off).
+   */
+  mix?: MixFeature[]
+}
+
+/** The switches that can be mixed (the voice has its own mix: the set's voices). */
+export type MixFeature = 'emoji' | 'splitBrand' | 'quoteBrand' | 'inSentence'
+export const MIX_FEATURES: readonly MixFeature[] = ['emoji', 'splitBrand', 'quoteBrand', 'inSentence'] as const
+
+/** A clean mix list from anything stored or sent: known names, each once. */
+export function normaliseMix(v: unknown): MixFeature[] {
+  const list = Array.isArray(v) ? v : typeof v === 'string' ? v.split(',') : []
+  return MIX_FEATURES.filter((f) => list.map((x) => String(x).trim()).includes(f))
+}
+
+export function isMixed(style: CommentStyle, f: MixFeature): boolean {
+  return (style.mix ?? []).includes(f)
+}
+
+/**
+ * One comment's actual style under a mix: every mixed switch decided for this
+ * comment, the rest as set. `pick` chooses on/off for a feature (default: a
+ * coin toss); the batch writer passes a balancing one so a batch comes out
+ * close to half and half rather than whatever the coin did.
+ */
+export function resolveMix(
+  style: CommentStyle,
+  pick: (f: MixFeature) => boolean = () => Math.random() < 0.5
+): CommentStyle {
+  const mix = style.mix ?? []
+  if (mix.length === 0) return style
+  const out: CommentStyle = { ...style, mix: [] }
+  for (const f of mix) out[f] = pick(f)
+  return out
 }
 
 export type CommentVoice = 'question' | 'recommendation' | 'informational' | 'curious'
@@ -963,6 +1002,7 @@ export const DEFAULT_COMMENT_STYLE: CommentStyle = {
   quoteBrand: false,
   voice: 'question',
   inSentence: false,
+  mix: [],
 }
 
 /**

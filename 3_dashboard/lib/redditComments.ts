@@ -19,7 +19,7 @@ import { pool, getProductCommentSettings } from './db'
 import { llmChat } from './llm'
 import { canonicaliseMention } from './commentGen'
 import { redditCommentSystem, redditCommentUser, REDDIT_COMMENTS_PER_POST } from './prompts'
-import { COMMENT_WORD_MIN, COMMENT_WORD_MAX, type CommentStyle, type Product } from './config'
+import { COMMENT_WORD_MIN, COMMENT_WORD_MAX, resolveMix, type CommentStyle, type Product } from './config'
 
 export { REDDIT_COMMENTS_PER_POST }
 
@@ -115,7 +115,8 @@ export function cleanRedditComments(product: Product, lines: unknown, style: Com
     let s = raw.trim().replace(/^["'\s]+|["'\s]+$/g, '')
     if (!s) continue
     // Names the product, written the admin's way (split or joined, unquoted).
-    const named = canonicaliseMention(s, product, style)
+    // Mixed switches (split / quoted) decided per comment, like the main sets.
+    const named = canonicaliseMention(s, product, resolveMix(style))
     if (named === null) continue
     s = named
     // "a acoustictext" → "an acoustictext" (the name-inside-the-sentence style).

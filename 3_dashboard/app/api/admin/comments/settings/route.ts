@@ -8,6 +8,7 @@ import {
   COMMENT_WORD_MAX,
   DEFAULT_COMMENT_STYLE,
   isCommentVoice,
+  normaliseMix,
   isTopListRank,
   clampTopList,
   DEFAULT_TOP_LIST,
@@ -101,6 +102,8 @@ export async function POST(req: NextRequest) {
     quoteBrand: flag(body?.quoteBrand, current.style.quoteBrand),
     voice: isCommentVoice(body?.voice) ? body.voice : current.style.voice,
     inSentence: flag(body?.inSentence, current.style.inSentence === true),
+    // Which switches are written both ways. Absent = leave the stored mix alone.
+    mix: body?.mix !== undefined ? normaliseMix(body.mix) : (current.style.mix ?? []),
   }
   // Same rule for the top list: only the keys that were sent are changed, so a
   // save from the length form cannot switch the serving source off.

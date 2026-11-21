@@ -6,7 +6,9 @@ import {
   pickFairProductForUrl,
   getProductCommentSettings,
   getTopCommentsForProduct,
+  getLinkCommentTexts,
 } from './db'
+import { pickForLink } from './commentStyleSig'
 import { COMMENT_WORD_MIN, COMMENT_WORD_MAX, DEFAULT_TOP_LIST } from './config'
 import { getFreshCategoryComments } from './commentGen'
 import {
@@ -84,7 +86,7 @@ export async function serveCommentForUrl(
     const comment = await pickRedditComment(url, product as Product).catch(() => null)
     if (comment) return { product, comment, category }
   }
-  return serveFromBank(order, category)
+  return serveFromBank(order, category, url)
 }
 
 /**
@@ -143,8 +145,17 @@ export async function productOrderForUrl(
  *  THIS audience only; getFreshCategoryComments regenerates a stale set on the way. */
 async function serveFromBank(
   order: string[],
-  category: LinkCategory
+  category: LinkCategory,
+  url = ''
 ): Promise<{ product: string | null; comment: string | null; category: LinkCategory }> {
+  // A DIFFERENT STYLE ON EACH LINK. What of this product is already under the
+  // video — verified by the comment scan, or handed out and not yet verified —
+  // so a style already there is not served again until the product's other
+  // styles have been used on it too (lib/commentStyleSig pickForLink). A read
+  // that fails just means no preference: serving goes on as before.
+  const onLink = async (product: string) =>
+    url ? await getLinkCommentTexts(url, product).catch(() => ({ found: [], served: [] }))
+        : { found: [] as string[], served: [] as string[] }
   for (const product of order) {
     // The measured list first, when this product is set to use one.
     const { top } = await getProductCommentSettings(product, {
@@ -158,13 +169,10 @@ async function serveFromBank(
       if (best.length > 0) {
         // DRAWN BY RATIO, not evenly: each comment's chance is the share the
         // list shows beside it (topServeChances), so what lands more often is
-        // served more often.
-        let r = Math.random() * best.reduce((n, b) => n + b.chance, 0)
-        let pick = best[best.length - 1]
-        for (const b of best) {
-          r -= b.chance
-          if (r < 0) { pick = b; break }
-        }
+        // served more often — among the styles this link does not have yet.
+        const { found, served } = await onLink(product)
+        const chosen = pickForLink(best.map((b) => ({ ...b, weight: b.chance })), product, found, served)
+        const pick = chosen?.pick ?? best[0]
         let comment = pick.text.trim()
         // Written under one of the admin's spellings of the name, when set.
         if (top.aliases.length > 0) {
@@ -181,7 +189,9 @@ async function serveFromBank(
     }))
     const clean = comments.map((c: string) => String(c || '').trim()).filter(Boolean)
     if (clean.length === 0) continue
-    return { product, comment: clean[Math.floor(Math.random() * clean.length)], category }
+    const { found, served } = await onLink(product)
+    const chosen = pickForLink(clean.map((text) => ({ text })), product, found, served)
+    return { product, comment: chosen?.pick.text ?? clean[Math.floor(Math.random() * clean.length)], category }
   }
   // Nothing written for this audience by anyone. Don't attribute the click to a
   // product, or one would take a "turn" without a comment being served.

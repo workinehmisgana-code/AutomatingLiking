@@ -56,6 +56,7 @@ import {
   COMMENT_WORD_MAX,
   type CommentStyle,
   isCommentVoice,
+  normaliseMix,
   DEFAULT_COMMENT_STYLE,
   OUR_RATIO_RETIRE_DEFAULT,
   genreOfProduct,
@@ -5583,6 +5584,30 @@ async function getProductCommentCountsByUrlUncached(): Promise<Record<string, Re
  * that a later scan then finds — which inflates the leader, and the leader is
  * what we are trying to identify, so it pushes the right way.
  */
+/**
+ * One product's comments ON ONE LINK, for spreading styles there
+ * (lib/commentStyleSig pickForLink): `found` are the ones the comment scan
+ * verified on the video, `served` the ones handed out for it. One round trip.
+ */
+export async function getLinkCommentTexts(
+  url: string,
+  product: string
+): Promise<{ found: string[]; served: string[] }> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ src: string; text: string }>(
+    `SELECT 'found' AS src, text FROM link_product_comment
+      WHERE url = $1 AND product = $2 AND text IS NOT NULL AND btrim(text) <> ''
+     UNION ALL
+     SELECT 'served' AS src, served_comment AS text FROM clicked_link
+      WHERE url = $1 AND product = $2 AND served_comment IS NOT NULL AND btrim(served_comment) <> ''`,
+    [url, product]
+  )
+  return {
+    found: rows.filter((r) => r.src === 'found').map((r) => r.text),
+    served: rows.filter((r) => r.src === 'served').map((r) => r.text),
+  }
+}
+
 export async function getProductCountsForUrl(url: string): Promise<Record<string, number>> {
   await ensureClickedTable()
   const { rows } = await pool.query<{ product: string; n: number }>(
@@ -6536,6 +6561,9 @@ export function ensureAdminTables(): Promise<void> {
         ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS quote_brand BOOLEAN NOT NULL DEFAULT true;
         -- The name written as part of the sentence, not as a brand (off = as before).
         ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS in_sentence BOOLEAN NOT NULL DEFAULT false;
+        -- Style switches written BOTH ways, about half the comments each
+        -- (CommentStyle.mix): e.g. {splitBrand,quoteBrand}.
+        ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS style_mix TEXT[] NOT NULL DEFAULT '{}';
         -- Question style vs plain statements. Defaults TRUE because that is what
         -- the generator was switched to; a row written before this column existed
         -- picks it up as well, which is intended - the two styles are a choice to
@@ -6845,13 +6873,14 @@ export async function getProductCommentSettings(
     quote_brand: boolean
     voice: string
     in_sentence: boolean | null
+    style_mix: string[] | null
     top_enabled: boolean
     top_count: number
     top_rank: string
     top_days: number
     top_aliases: string[] | null
   }>(
-    `SELECT word_min, word_max, emoji, split_brand, quote_brand, voice, in_sentence,
+    `SELECT word_min, word_max, emoji, split_brand, quote_brand, voice, in_sentence, style_mix,
             top_enabled, top_count, top_rank, top_days, top_aliases
        FROM product_comment_setting WHERE product = $1`,
     [product]
@@ -6875,6 +6904,7 @@ export async function getProductCommentSettings(
       quoteBrand: r.quote_brand,
       voice: isCommentVoice(r.voice) ? r.voice : DEFAULT_COMMENT_STYLE.voice,
       inSentence: r.in_sentence === true,
+      mix: normaliseMix(r.style_mix),
     },
   }
 }
@@ -6907,17 +6937,18 @@ export async function setProductCommentStyle(product: string, style: CommentStyl
   // The row may not exist yet — a product whose band was never touched still
   // needs somewhere to put the style, so this inserts the defaults alongside it.
   await pool.query(
-    `INSERT INTO product_comment_setting (product, word_min, word_max, emoji, split_brand, quote_brand, voice, in_sentence, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+    `INSERT INTO product_comment_setting (product, word_min, word_max, emoji, split_brand, quote_brand, voice, in_sentence, style_mix, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
      ON CONFLICT (product) DO UPDATE SET
        emoji = EXCLUDED.emoji,
        split_brand = EXCLUDED.split_brand,
        quote_brand = EXCLUDED.quote_brand,
        voice = EXCLUDED.voice,
        in_sentence = EXCLUDED.in_sentence,
+       style_mix = EXCLUDED.style_mix,
        updated_at = now()`,
     [product, COMMENT_WORD_MIN, COMMENT_WORD_MAX, style.emoji, style.splitBrand, style.quoteBrand,
-     style.voice, style.inSentence === true]
+     style.voice, style.inSentence === true, normaliseMix(style.mix)]
   )
 }
 

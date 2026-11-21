@@ -56,6 +56,7 @@ import csv
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -269,13 +270,36 @@ def upload(videos: list[dict], mode: str = "replace", genre: str = DEFAULT_GENRE
 
     url = f"{DASHBOARD_URL}/api/upload?mode={mode}&genre={genre}"
     print(f"[*] Uploading {len(videos)} videos to {url} ({mode}, genre {genre}) ...")
-    r = requests.post(
-        url,
-        json=videos,
-        headers={"x-upload-secret": UPLOAD_SECRET, "Content-Type": "application/json"},
-        # The server now judges each new link's title before adding it.
-        timeout=120,
-    )
+    # TRIED AGAIN ON A SERVER OR NETWORK FAILURE. A 500 from Vercel (a crashed
+    # or overloaded function), a 502-504, a 429 or a dropped connection is not
+    # an answer about these links, and sending the same batch again is safe:
+    # the pool matches links by URL, so nothing is added twice. A 4xx (bad
+    # secret, bad request) is an answer, and is not retried.
+    waits = [0] + UPLOAD_RETRY_WAITS
+    r = None
+    for attempt, wait in enumerate(waits, 1):
+        if wait:
+            print(f"[*] Trying again in {wait}s (attempt {attempt} of {len(waits)}) ...")
+            time.sleep(wait)
+        try:
+            r = requests.post(
+                url,
+                json=videos,
+                headers={"x-upload-secret": UPLOAD_SECRET, "Content-Type": "application/json"},
+                # The server now judges each new link's title before adding it.
+                timeout=120,
+            )
+        except requests.RequestException as e:
+            print(f"[!] Upload attempt {attempt} could not reach the dashboard: {e}")
+            r = None
+            continue
+        if r.ok or not (r.status_code >= 500 or r.status_code == 429):
+            break
+        print(f"[!] Upload attempt {attempt} failed: {_explain_failure(r)}")
+    if r is None:
+        print("[!] Upload failed: the dashboard could not be reached. Nothing was changed there; "
+              "the scraped file is still on disk — run this same command again to retry.")
+        sys.exit(1)
     if r.ok:
         data = r.json()
         if data.get("checked") or data.get("stagedUnrelated"):
@@ -306,8 +330,31 @@ def upload(videos: list[dict], mode: str = "replace", genre: str = DEFAULT_GENRE
                   f" · posted-date clusters re-scored: {data.get('scored', 0)} link(s)")
             _report_protected(data)
     else:
-        print(f"[!] Upload failed: {r.status_code} {r.text}")
+        print(f"[!] Upload failed: {_explain_failure(r)}")
+        print("    The scraped file is still on disk — run this same command again to retry "
+              "(safe: links are matched by URL, nothing is added twice).")
         sys.exit(1)
+
+
+# Seconds to wait before the 2nd and 3rd tries of a failed upload.
+UPLOAD_RETRY_WAITS = [30, 90]
+
+
+def _explain_failure(r) -> str:
+    """The failure in one line. Vercel answers a crashed function with a whole
+    HTML error page; printing it buried the one useful fact (the status) in two
+    screens of markup. Its request id is what finds the crash in Vercel's logs."""
+    body = r.text or ""
+    rid = r.headers.get("x-vercel-id", "")
+    if body.lstrip().lower().startswith("<!doctype") or "<html" in body[:200].lower():
+        what = ("the server crashed (HTML error page) — usually out of memory or out of time "
+                "on Vercel")
+    else:
+        try:
+            what = str(r.json().get("error") or body)[:300]
+        except ValueError:
+            what = body[:300]
+    return f"HTTP {r.status_code}: {what}" + (f" [Vercel request id {rid}]" if rid else "")
 
 
 def main():
