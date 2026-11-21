@@ -55,6 +55,96 @@ BROWSER_PROFILE_DIR  = os.getenv("BROWSER_PROFILE_DIR", "./browser_profile")
 # read back - one Chrome run would sign the account liker out of that account.
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome") or None
 
+
+# ── LOW-BANDWIDTH MODE ────────────────────────────────────────────────────────
+#
+# A search run needs the page's HTML, scripts and stylesheets (the grid is built
+# by script, and the scroll that loads more results needs real layout) — and
+# NOTHING it shows: every card's URL, caption (an <img>'s alt text), views and
+# date are in the markup, whether or not its picture or video ever arrives.
+# So pictures, videos, fonts and the ad/analytics trackers are refused.
+#
+# BY WHAT A REQUEST IS, NOT ITS FILE NAME. The old blocking matched URL endings
+# (`**/*.jpg`, `**/*.mp4`), and almost nothing here ends that way: TikTok's
+# images and videos come off CDN URLs with query strings and no extension,
+# YouTube's previews stream from googlevideo.com, and Instagram and Reddit
+# kept every image on purpose. Playwright says what each request is
+# (image/media/font/...), and that is what is matched now.
+#
+# CAPTCHAS STILL LOAD: anything whose address says captcha/verify/challenge
+# passes, so TikTok's slider puzzle or Google's reCAPTCHA can be solved if one
+# appears mid-run. Turn the whole thing off with --full-load (the Control
+# Center's "Save bandwidth" box) if a platform ever misbehaves without images.
+SAVE_BANDWIDTH = os.getenv("SAVE_BANDWIDTH", "1").strip().lower() not in ("0", "false", "no", "off")
+_BW_KEEP = re.compile(r"captcha|verif|recaptcha|hcaptcha|arkose|funcaptcha|challenge|secsdk", re.I)
+_BW_BLOCK_TYPES = {"image", "media", "font"}
+# Ad and analytics hosts (third parties only — the sites' own telemetry stays,
+# since refusing a platform's own scripts can look like a bot), and YouTube's
+# video stream host, which a search page only uses for hover previews.
+_BW_BLOCK_HOST = re.compile(
+    r"(^|\.)(googlevideo\.com|doubleclick\.net|google-analytics\.com|googletagmanager\.com|"
+    r"googlesyndication\.com|googleadservices\.com|adservice\.google\.com|"
+    r"amazon-adsystem\.com|adsrvr\.org|criteo\.com|scorecardresearch\.com|"
+    r"quantserve\.com|hotjar\.com|branch\.io|bat\.bing\.com|ads-twitter\.com)$", re.I)
+# Video/picture data fetched by script (fetch/xhr), which carries no
+# "media"/"image" label: TikTok streams its videos this way.
+_BW_MEDIA_URL = re.compile(
+    r"\.(mp4|webm|m4s|m4a|m3u8|mp3|aac|jpe?g|png|gif|webp|avif|heic)(\?|$)|"
+    r"mime_type=video|/video/tos/|videoplayback|[?&]mime=video|bytevc1", re.I)
+_BW_STATS: dict[str, int] = {}
+
+
+def _bw_route(route) -> None:
+    req = route.request
+    url = req.url
+    if _BW_KEEP.search(url):
+        route.continue_()
+        return
+    kind = req.resource_type
+    host = urlsplit(url).hostname or ""
+    if kind in _BW_BLOCK_TYPES:
+        why = kind
+    elif _BW_BLOCK_HOST.search(host):
+        why = "ads/trackers" if "googlevideo" not in host else "media"
+    elif kind in ("fetch", "xhr", "other") and _BW_MEDIA_URL.search(url):
+        why = "media"
+    else:
+        route.continue_()
+        return
+    _BW_STATS[why] = _BW_STATS.get(why, 0) + 1
+    try:
+        route.abort()
+    except Exception:  # noqa: BLE001 - the page went away meanwhile
+        pass
+
+
+def launch_extras() -> dict:
+    """Extra launch settings for low-bandwidth mode.
+
+    Service workers are blocked because a request a worker makes never passes
+    through Playwright's routing, so a site's worker could still fetch every
+    picture; and videos never autoplay, so nothing starts streaming at all."""
+    return {"service_workers": "block"} if SAVE_BANDWIDTH else {}
+
+
+def launch_args(base: list[str]) -> list[str]:
+    return base + (["--autoplay-policy=user-gesture-required"] if SAVE_BANDWIDTH else [])
+
+
+def install_bandwidth_saver(context, platform: str) -> None:
+    """Refuse everything the search does not need, on every tab of this browser."""
+    if not SAVE_BANDWIDTH:
+        print(f"[*] Bandwidth   : full page loads ({platform}) — --full-load")
+        return
+    context.route("**/*", _bw_route)
+    print("[*] Bandwidth   : saving — no pictures, videos, fonts or ad trackers are downloaded")
+
+
+def bandwidth_report() -> None:
+    if SAVE_BANDWIDTH and _BW_STATS:
+        parts = ", ".join(f"{n:,} {k}" for k, n in sorted(_BW_STATS.items(), key=lambda kv: -kv[1]))
+        print(f"[*] Bandwidth   : not downloaded — {parts} request(s)")
+
 # WHAT TO DO WHEN THE PROFILE IS NOT LOGGED IN to the site being searched (set
 # by the Control Center, which lends each run a profile):
 #   "exit" - say so ([signed-out]) and exit with SIGNED_OUT_EXIT, so the Control
@@ -484,11 +574,12 @@ def scrape_youtube_search(queries: list[str], min_videos: int, max_videos: int,
             user_data_dir=str(Path(BROWSER_PROFILE_DIR).resolve()),
             headless=False,
             channel=BROWSER_CHANNEL,
-            args=[
+            args=launch_args([
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
-            ],
+            ]),
+            **launch_extras(),
             viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -509,10 +600,7 @@ def scrape_youtube_search(queries: list[str], min_videos: int, max_videos: int,
 
         require_session(context, page, "youtube")
 
-        page.route(
-            "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,mp4,webm}",
-            lambda route: route.abort(),
-        )
+        install_bandwidth_saver(context, "youtube")
 
         for q_idx, query in enumerate(queries, 1):
             if q_idx > 1:
@@ -731,11 +819,12 @@ def scrape_tiktok_search(queries: list[str], min_videos: int, max_videos: int, o
             user_data_dir=str(Path(BROWSER_PROFILE_DIR).resolve()),
             headless=False,
             channel=BROWSER_CHANNEL,
-            args=[
+            args=launch_args([
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
-            ],
+            ]),
+            **launch_extras(),
             viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -781,11 +870,8 @@ def scrape_tiktok_search(queries: list[str], min_videos: int, max_videos: int, o
             input()
             print("[+] Login confirmed – starting search...")
 
-        # Block images/fonts/videos to speed up page loading (applied after login)
-        page.route(
-            "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,mp4,webm}",
-            lambda route: route.abort(),
-        )
+        # Pictures, videos, fonts and ad trackers refused (applied after login).
+        install_bandwidth_saver(context, "tiktok")
 
         # ── Iterate over each query ───────────────────────────────────────────
         for q_idx, query in enumerate(queries, 1):
@@ -1190,11 +1276,12 @@ def scrape_instagram_search(queries: list[str], min_videos: int, max_videos: int
             user_data_dir=str(Path(BROWSER_PROFILE_DIR).resolve()),
             headless=False,
             channel=BROWSER_CHANNEL,
-            args=[
+            args=launch_args([
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
-            ],
+            ]),
+            **launch_extras(),
             viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             locale="en-US",
         )
@@ -1240,11 +1327,9 @@ def scrape_instagram_search(queries: list[str], min_videos: int, max_videos: int
             input()
             print("[+] Login confirmed – starting search...")
 
-        # Block fonts/media for speed, but keep images so the post grid renders.
-        page.route(
-            "**/*.{woff,woff2,ttf,mp4,webm}",
-            lambda route: route.abort(),
-        )
+        # The grid's tiles, links and alt text are in the markup either way;
+        # only the pictures themselves are refused.
+        install_bandwidth_saver(context, "instagram")
 
         for q_idx, query in enumerate(queries, 1):
             if q_idx > 1:
@@ -1582,11 +1667,12 @@ def scrape_reddit_search(queries: list[str], min_videos: int, max_videos: int, o
             user_data_dir=str(Path(BROWSER_PROFILE_DIR).resolve()),
             headless=False,
             channel=BROWSER_CHANNEL,
-            args=[
+            args=launch_args([
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
-            ],
+            ]),
+            **launch_extras(),
             viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             locale="en-US",
         )
@@ -1606,11 +1692,7 @@ def scrape_reddit_search(queries: list[str], min_videos: int, max_videos: int, o
 
         require_session(context, page, "reddit")
 
-        # Block fonts/media for speed; keep images so cards render normally.
-        page.route(
-            "**/*.{woff,woff2,ttf,mp4,webm}",
-            lambda route: route.abort(),
-        )
+        install_bandwidth_saver(context, "reddit")
 
         for q_idx, query in enumerate(queries, 1):
             if q_idx > 1:
@@ -1847,9 +1929,16 @@ def main():
         help="Start searching at once instead of waiting for a login + Enter "
              "(Instagram still waits, by itself, if it is signed out)",
     )
+    parser.add_argument(
+        "--full-load", action="store_true",
+        help="Load pictures, videos and fonts as a normal browser would "
+             "(default: they are refused to save bandwidth). SAVE_BANDWIDTH=0 in .env",
+    )
     args = parser.parse_args()
-    global NO_LOGIN_WAIT
+    global NO_LOGIN_WAIT, SAVE_BANDWIDTH
     NO_LOGIN_WAIT = args.no_login_wait
+    if args.full_load:
+        SAVE_BANDWIDTH = False
 
     queries = args.query if isinstance(args.query, list) else [args.query]
     queries = [q.strip() for q in queries if q.strip()]
@@ -1874,14 +1963,17 @@ def main():
     if args.platform == "youtube":
         print(f"[*] Content     : {args.content}")
 
-    if args.platform == "youtube":
-        scrape_youtube_search(queries, args.min, args.max, args.output, args.content)
-    elif args.platform == "instagram":
-        scrape_instagram_search(queries, args.min, args.max, args.output)
-    elif args.platform == "reddit":
-        scrape_reddit_search(queries, args.min, args.max, args.output, args.exact_mention)
-    else:
-        scrape_tiktok_search(queries, args.min, args.max, args.output)
+    try:
+        if args.platform == "youtube":
+            scrape_youtube_search(queries, args.min, args.max, args.output, args.content)
+        elif args.platform == "instagram":
+            scrape_instagram_search(queries, args.min, args.max, args.output)
+        elif args.platform == "reddit":
+            scrape_reddit_search(queries, args.min, args.max, args.output, args.exact_mention)
+        else:
+            scrape_tiktok_search(queries, args.min, args.max, args.output)
+    finally:
+        bandwidth_report()
 
 
 if __name__ == "__main__":

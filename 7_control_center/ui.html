@@ -286,6 +286,11 @@
           <label class="f"><span>Maximum per phrase</span>
             <input type="number" id="s_max" min="0" step="10"></label>
         </div>
+        <div class="checks" style="margin-top:12px">
+          <label class="c" title="ON: pictures, thumbnails, videos, fonts and ad/analytics trackers are not downloaded — the search only reads each page's text and links, which is all it needs. Captchas still load. Untick to load pages in full if a platform ever misbehaves.">
+            <input type="checkbox" id="s_save_bandwidth">
+            Save bandwidth <small>— no pictures, videos or thumbnails are downloaded</small></label>
+        </div>
         <label class="f" style="margin-top:14px"><span>Product genre</span>
           <select id="s_genre"
             title="Each genre keeps its own search phrases and its own link pool. A humanizer phrase finds nothing a website builder wants to be under, so one genre is searched at a time and its links upload into that genre's pool.">
@@ -788,7 +793,7 @@ async function api(path, body) {
 const FIELDS = {
   // `platforms` is handled on its own below: it is a set of checkboxes, not one
   // input, so it does not fit the read/fill-by-id table.
-  search: { content:'s_content', min:'s_min', max:'s_max',
+  search: { content:'s_content', min:'s_min', max:'s_max', save_bandwidth:'s_save_bandwidth',
             queries:'s_queries', output:'s_output',
             upload_after:'s_upload_after', upload_each_keyword:'s_upload_each_keyword',
             upload_mode:'s_upload_mode',

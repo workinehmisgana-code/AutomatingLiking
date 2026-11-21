@@ -407,6 +407,10 @@ DEFAULTS = {
         # remove the links of the keywords not searched yet. The full upload in
         # upload_mode still runs at the end.
         "upload_each_keyword": True,
+        # LOW BANDWIDTH: the search reads only the page's markup, so pictures,
+        # videos, fonts and ad trackers are refused (scraper.py). Untick to load
+        # pages in full if a platform ever misbehaves without them.
+        "save_bandwidth": True,
         "upload_mode": "replace",
         # THE SCRAPER'S CHROME PROFILES, comma-separated directory names inside
         # 1_tiktok_search_scraper. Each search or harvest job takes a free one,
@@ -1588,6 +1592,10 @@ def build_search_for(s: dict, platform: str, content: str = "",
     # Instagram. The Chrome profile keeps the logins; Instagram waits by itself
     # only if it finds itself signed out.
     cmd += ["--no-login-wait"]
+    # SAVE BANDWIDTH (on unless unticked): no pictures, videos, fonts or ad
+    # trackers are downloaded — the search reads only the page's markup.
+    if s.get("save_bandwidth") is False:
+        cmd += ["--full-load"]
     # REDDIT: the first REDDIT_KEYWORDS phrases only, then the genre's product
     # names. A product-name search keeps only posts that mention the name
     # exactly (scraper.py --exact-mention); one that finds none moves on.
