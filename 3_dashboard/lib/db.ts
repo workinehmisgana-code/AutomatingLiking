@@ -6564,6 +6564,8 @@ export function ensureAdminTables(): Promise<void> {
         -- Style switches written BOTH ways, about half the comments each
         -- (CommentStyle.mix): e.g. {splitBrand,quoteBrand}.
         ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS style_mix TEXT[] NOT NULL DEFAULT '{}';
+        -- First comment on a link quoted + split, later ones plain (CommentStyle.linkAware).
+        ALTER TABLE product_comment_setting ADD COLUMN IF NOT EXISTS link_aware BOOLEAN NOT NULL DEFAULT true;
         -- Question style vs plain statements. Defaults TRUE because that is what
         -- the generator was switched to; a row written before this column existed
         -- picks it up as well, which is intended - the two styles are a choice to
@@ -6874,13 +6876,14 @@ export async function getProductCommentSettings(
     voice: string
     in_sentence: boolean | null
     style_mix: string[] | null
+    link_aware: boolean | null
     top_enabled: boolean
     top_count: number
     top_rank: string
     top_days: number
     top_aliases: string[] | null
   }>(
-    `SELECT word_min, word_max, emoji, split_brand, quote_brand, voice, in_sentence, style_mix,
+    `SELECT word_min, word_max, emoji, split_brand, quote_brand, voice, in_sentence, style_mix, link_aware,
             top_enabled, top_count, top_rank, top_days, top_aliases
        FROM product_comment_setting WHERE product = $1`,
     [product]
@@ -6905,6 +6908,7 @@ export async function getProductCommentSettings(
       voice: isCommentVoice(r.voice) ? r.voice : DEFAULT_COMMENT_STYLE.voice,
       inSentence: r.in_sentence === true,
       mix: normaliseMix(r.style_mix),
+      linkAware: r.link_aware !== false,
     },
   }
 }
@@ -6937,8 +6941,8 @@ export async function setProductCommentStyle(product: string, style: CommentStyl
   // The row may not exist yet — a product whose band was never touched still
   // needs somewhere to put the style, so this inserts the defaults alongside it.
   await pool.query(
-    `INSERT INTO product_comment_setting (product, word_min, word_max, emoji, split_brand, quote_brand, voice, in_sentence, style_mix, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+    `INSERT INTO product_comment_setting (product, word_min, word_max, emoji, split_brand, quote_brand, voice, in_sentence, style_mix, link_aware, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
      ON CONFLICT (product) DO UPDATE SET
        emoji = EXCLUDED.emoji,
        split_brand = EXCLUDED.split_brand,
@@ -6946,9 +6950,10 @@ export async function setProductCommentStyle(product: string, style: CommentStyl
        voice = EXCLUDED.voice,
        in_sentence = EXCLUDED.in_sentence,
        style_mix = EXCLUDED.style_mix,
+       link_aware = EXCLUDED.link_aware,
        updated_at = now()`,
     [product, COMMENT_WORD_MIN, COMMENT_WORD_MAX, style.emoji, style.splitBrand, style.quoteBrand,
-     style.voice, style.inSentence === true, normaliseMix(style.mix)]
+     style.voice, style.inSentence === true, normaliseMix(style.mix), style.linkAware !== false]
   )
 }
 

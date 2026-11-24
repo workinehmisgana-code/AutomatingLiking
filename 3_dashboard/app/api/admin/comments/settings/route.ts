@@ -104,6 +104,7 @@ export async function POST(req: NextRequest) {
     inSentence: flag(body?.inSentence, current.style.inSentence === true),
     // Which switches are written both ways. Absent = leave the stored mix alone.
     mix: body?.mix !== undefined ? normaliseMix(body.mix) : (current.style.mix ?? []),
+    linkAware: flag(body?.linkAware, current.style.linkAware !== false),
   }
   // Same rule for the top list: only the keys that were sent are changed, so a
   // save from the length form cannot switch the serving source off.

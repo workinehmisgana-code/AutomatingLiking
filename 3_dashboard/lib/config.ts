@@ -952,6 +952,14 @@ export interface CommentStyle {
    * Absent or empty = nothing mixed (each switch is simply on or off).
    */
   mix?: MixFeature[]
+  /**
+   * THE NAME'S FORM DECIDED BY THE LINK, at the moment a comment is served:
+   * the FIRST comment of ours on a video writes it quoted and split
+   * ("purify text"), every later one joined and unquoted (purifytext). While
+   * on, it overrides "Quote the brand" and "Split the brand" (and their mix).
+   * Absent = on: stored rows from before it existed get it.
+   */
+  linkAware?: boolean
 }
 
 /** The switches that can be mixed (the voice has its own mix: the set's voices). */
@@ -1003,6 +1011,7 @@ export const DEFAULT_COMMENT_STYLE: CommentStyle = {
   voice: 'question',
   inSentence: false,
   mix: [],
+  linkAware: true,
 }
 
 /**

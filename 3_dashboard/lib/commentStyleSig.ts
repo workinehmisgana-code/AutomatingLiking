@@ -52,11 +52,12 @@ export function readStyle(text: string, product: string): StyleSig | null {
   }
 }
 
-/** A short key for a style, e.g. "quoted+split+emoji" or "plain". */
-export function styleKey(text: string, product: string): string {
+/** A short key for a style, e.g. "quoted+split+emoji" or "plain". `ignore`
+ *  leaves features out (the ones something else decides, like the name's form). */
+export function styleKey(text: string, product: string, ignore: readonly (keyof StyleSig)[] = []): string {
   const s = readStyle(text, product)
   if (!s) return 'unnamed'
-  const parts = (['quoted', 'split', 'emoji', 'question'] as const).filter((k) => s[k])
+  const parts = (['quoted', 'split', 'emoji', 'question'] as const).filter((k) => s[k] && !ignore.includes(k))
   return parts.length ? parts.join('+') : 'plain'
 }
 
@@ -77,20 +78,21 @@ export function pickForLink<T extends { text: string; weight?: number }>(
   candidates: T[],
   product: string,
   found: string[],
-  served: string[]
+  served: string[],
+  ignore: readonly (keyof StyleSig)[] = []
 ): { pick: T; style: string; fresh: boolean } | null {
   if (candidates.length === 0) return null
   const count = (texts: string[]) => {
     const m = new Map<string, number>()
     for (const t of texts) {
-      const k = styleKey(t, product)
+      const k = styleKey(t, product, ignore)
       if (k !== 'unnamed') m.set(k, (m.get(k) ?? 0) + 1)
     }
     return m
   }
   const onLink = count(found)
   const handed = count(served)
-  const keyed = candidates.map((c) => ({ c, k: styleKey(c.text, product) }))
+  const keyed = candidates.map((c) => ({ c, k: styleKey(c.text, product, ignore) }))
   let best: [number, number] | null = null
   for (const { k } of keyed) {
     const score: [number, number] = [onLink.get(k) ?? 0, handed.get(k) ?? 0]

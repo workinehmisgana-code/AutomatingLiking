@@ -161,6 +161,9 @@ export default function AdminProductComments({
   const [inSentence, setInSentence] = useState(style.inSentence === true)
   // Switches written BOTH ways, about half the comments each.
   const [mix, setMix] = useState<MixFeature[]>(normaliseMix(style.mix))
+  // The link decides the name's form when served: first comment of ours on a
+  // video "quoted and split", later ones joined and plain.
+  const [linkAware, setLinkAware] = useState(style.linkAware !== false)
   // What the server currently holds, so an edited-but-unsaved box is visible.
   const [savedBand, setSavedBand] = useState({ min: wordMin, max: wordMax })
 
@@ -340,6 +343,7 @@ export default function AdminProductComments({
     quoteBrand?: boolean
     inSentence?: boolean
     mix?: MixFeature[]
+    linkAware?: boolean
   }) {
     setSavingStyle(true)
     setMsg('')
@@ -360,6 +364,7 @@ export default function AdminProductComments({
           voice: patch.voice ?? voice,
           inSentence: patch.inSentence ?? inSentence,
           mix: patch.mix ?? mix,
+          linkAware: patch.linkAware ?? linkAware,
         }),
       })
       const d = await res.json().catch(() => ({}))
@@ -375,6 +380,7 @@ export default function AdminProductComments({
       if (typeof d.quoteBrand === 'boolean') setQuoteBrand(d.quoteBrand)
       if (typeof d.inSentence === 'boolean') setInSentence(d.inSentence)
       if (Array.isArray(d.mix)) setMix(normaliseMix(d.mix))
+      if (typeof d.linkAware === 'boolean') setLinkAware(d.linkAware)
       setMsg('Saved. It applies to the next regeneration.')
     } catch {
       setErr('Network error.')
@@ -871,6 +877,19 @@ export default function AdminProductComments({
             ],
           ] as const).map(([key, label, value, set, hint]) => {
             const mixed = mix.includes(key)
+            // The link decides these two when served (see the switch below).
+            const byLink = linkAware && (key === 'splitBrand' || key === 'quoteBrand')
+            if (byLink) {
+              return (
+                <span
+                  key={key}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/40 bg-sky-500/10 px-2 py-1 text-xs text-sky-200"
+                  title="Decided per link when served: the first comment of ours on a video is quoted and split, later ones joined and plain. Turn off 'First comment on a link' to set it here."
+                >
+                  {label} <span className="text-sky-300/80">· set by the link</span>
+                </span>
+              )
+            }
             return (
               <span
                 key={key}
@@ -917,6 +936,30 @@ export default function AdminProductComments({
               </span>
             )
           })}
+          <label
+            className={`inline-flex items-center gap-1.5 rounded-lg border px-2 py-1 text-xs ${
+              linkAware ? 'border-sky-500/50 bg-sky-500/10 text-sky-100' : 'border-zinc-800 text-zinc-300'
+            }`}
+            title={
+              `ON: when a comment is served, the link decides how the name is written. The FIRST comment of ` +
+              `ours on a video writes it "${splitPreview(product)}" (quoted and split); once any comment of ` +
+              `ours is on that video — found by the comment scan or already handed out — the rest write it ` +
+              `${product} (joined, no quotes). Applies straight away, to every comment served, without ` +
+              `regenerating. OFF: "Split the brand" and "Quote the brand" apply as set.`
+            }
+          >
+            <input
+              type="checkbox"
+              checked={linkAware}
+              disabled={savingStyle}
+              onChange={(e) => {
+                setLinkAware(e.target.checked)
+                void commitStyle({ linkAware: e.target.checked })
+              }}
+              className="accent-sky-500"
+            />
+            First comment on a link: &quot;{splitPreview(product)}&quot;, then {product}
+          </label>
           {/* The voice is a choice of three, not a switch: they are three
               different things for a comment to BE, and only one applies. */}
           <label className="flex items-center gap-1.5 text-xs text-zinc-300">

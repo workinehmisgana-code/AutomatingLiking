@@ -41,7 +41,7 @@
     "target": "products",
     "users": "cocodly, co codly,purifytext, purify text,\u03c1\u03c5r\u0456f\u0443t\u0435xt,\u03c1\u03c5r\u0456f\u0443 t\u0435xt, \u03c1\u03c5r\u0456f\u0443t\u0435xt, acoustictext, acoustic text, prohumanly,  pro humanly, cohumanly, humlexic",
     "profiles": "c,g,h,e,b,f,d,j,i,o,n,q,l,r,s,t,u,a",
-    "at_once": 8,
+    "at_once": 5,
     "links_per_account": 300,
     "links_per_account_max": 400,
     "relay_own_copy": true,

@@ -7,9 +7,11 @@ import {
   getProductCommentSettings,
   getTopCommentsForProduct,
   getLinkCommentTexts,
+  getProductCountsForUrl,
 } from './db'
+import { canonicaliseMention } from './commentGen'
 import { pickForLink } from './commentStyleSig'
-import { COMMENT_WORD_MIN, COMMENT_WORD_MAX, DEFAULT_TOP_LIST } from './config'
+import { COMMENT_WORD_MIN, COMMENT_WORD_MAX, DEFAULT_TOP_LIST, DEFAULT_COMMENT_STYLE } from './config'
 import { getFreshCategoryComments } from './commentGen'
 import {
   DEFAULT_GENRE,
@@ -81,12 +83,54 @@ export async function serveCommentForUrl(
   // that does not answer the post is spotted. Only the winning product is
   // tried — a failure here means the model is unreachable, and asking again for
   // the next product would only double the wait before the bank below.
+  let out: { product: string | null; comment: string | null; category: LinkCategory } | null = null
   if (platformFromUrl(url) === 'reddit') {
     const product = order[0]
     const comment = await pickRedditComment(url, product as Product).catch(() => null)
-    if (comment) return { product, comment, category }
+    if (comment) out = { product, comment, category }
   }
-  return serveFromBank(order, category, url)
+  out = out ?? (await serveFromBank(order, category, url))
+  if (out.product && out.comment) {
+    out = { ...out, comment: await nameForLink(out.comment, out.product, url) }
+  }
+  return out
+}
+
+/**
+ * THE NAME'S FORM, DECIDED BY THE LINK (CommentStyle.linkAware, on unless the
+ * product turns it off on the Comments page).
+ *
+ * The first comment of ours on a video writes the name quoted and split —
+ * "purify text" — and every later one joined and plain: purifytext. "Ours"
+ * is ANY of our products, verified on the video by the comment scan or
+ * already handed out for it (getProductCountsForUrl): counting only verified
+ * ones would let every worker who opens a fresh link before the next scan
+ * post the quoted first comment.
+ *
+ * Applied to whatever comment was chosen, so it holds whatever the stored set
+ * looks like. A comment where the name cannot be found as written (an admin
+ * alias in lookalike letters) is left exactly as it is.
+ */
+async function nameForLink(comment: string, product: string, url: string): Promise<string> {
+  const { style } = await getProductCommentSettings(product, { min: COMMENT_WORD_MIN, max: COMMENT_WORD_MAX })
+    .catch(() => ({ style: DEFAULT_COMMENT_STYLE }))
+  if (style.linkAware === false) return comment
+  const counts = await getProductCountsForUrl(url).catch(() => null)
+  if (counts === null) return comment // unknown: leave the comment as written
+  return formNameForLink(comment, product, Object.values(counts).every((n) => !n))
+}
+
+/** The comment with its name written for the first comment on a link
+ *  ("purify text") or a later one (purifytext). Unchanged if the name
+ *  cannot be found as written. */
+export function formNameForLink(comment: string, product: string, first: boolean): string {
+  const formed = canonicaliseMention(comment, product as Product, {
+    ...DEFAULT_COMMENT_STYLE,
+    quoteBrand: first,
+    splitBrand: first,
+    mix: [],
+  })
+  return formed ?? comment
 }
 
 /**
@@ -158,10 +202,13 @@ async function serveFromBank(
         : { found: [] as string[], served: [] as string[] }
   for (const product of order) {
     // The measured list first, when this product is set to use one.
-    const { top } = await getProductCommentSettings(product, {
+    const { top, style } = await getProductCommentSettings(product, {
       min: COMMENT_WORD_MIN,
       max: COMMENT_WORD_MAX,
-    }).catch(() => ({ top: DEFAULT_TOP_LIST }))
+    }).catch(() => ({ top: DEFAULT_TOP_LIST, style: DEFAULT_COMMENT_STYLE }))
+    // With the link deciding the name's form (nameForLink), quoting and
+    // splitting are not styles to rotate: only the rest are.
+    const ignore = style.linkAware !== false ? (['quoted', 'split'] as const) : []
     if (top.enabled) {
       const best = (await getTopCommentsForProduct(product, top).catch(() => [])).filter((b) =>
         b.text.trim()
@@ -171,7 +218,7 @@ async function serveFromBank(
         // list shows beside it (topServeChances), so what lands more often is
         // served more often — among the styles this link does not have yet.
         const { found, served } = await onLink(product)
-        const chosen = pickForLink(best.map((b) => ({ ...b, weight: b.chance })), product, found, served)
+        const chosen = pickForLink(best.map((b) => ({ ...b, weight: b.chance })), product, found, served, ignore)
         const pick = chosen?.pick ?? best[0]
         let comment = pick.text.trim()
         // Written under one of the admin's spellings of the name, when set.
@@ -190,7 +237,7 @@ async function serveFromBank(
     const clean = comments.map((c: string) => String(c || '').trim()).filter(Boolean)
     if (clean.length === 0) continue
     const { found, served } = await onLink(product)
-    const chosen = pickForLink(clean.map((text) => ({ text })), product, found, served)
+    const chosen = pickForLink(clean.map((text) => ({ text })), product, found, served, ignore)
     return { product, comment: chosen?.pick.text ?? clean[Math.floor(Math.random() * clean.length)], category }
   }
   // Nothing written for this audience by anyone. Don't attribute the click to a
