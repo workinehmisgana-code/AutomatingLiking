@@ -55,6 +55,9 @@ import {
 } from '@/lib/db'
 import { retiredUrlSet } from '@/lib/videos'
 import { buildUserFeed, FEED_PER_PLATFORM } from '@/lib/userFeed'
+import { commentCoverage } from '@/lib/serveComment'
+import { pendingRemovals } from '@/lib/commentRemoval'
+import { genreOfRow } from '@/lib/config'
 import { BROKEN_AFTER_MISSES } from '@/lib/linkStats'
 import { DEFAULT_DATE_SHARE } from '@/lib/clusterMix'
 import {
@@ -307,8 +310,13 @@ export default async function Home() {
   const recentGenres = await getRecentClickGenres(session.user.id).catch(
     () => ({}) as Record<string, string[]>
   )
+  // NO COMMENT, NO LINK: genres with nothing to serve on a platform are left
+  // out of the feed (commentCoverage), as in the app's links route.
+  const canServe = await commentCoverage()
   const { served, remaining } = buildUserFeed(
-    videos,
+    videos.filter((v) =>
+      canServe(genreOfRow(v as { genre?: unknown }), String((v as { url?: unknown }).url ?? ''))
+    ),
     new Set([...alreadyOpened, ...retiredUrls]),
     FEED_PER_PLATFORM,
     genreMix,
@@ -328,10 +336,25 @@ export default async function Home() {
     category: feedCategories[String(v.url)] ?? null,
   }))
 
+  // COMMENT REMOVAL MODE (lib/commentRemoval): the dashboard stays open, but no
+  // links until the listed comments are deleted — that is done in the app.
+  const toRemove = (await pendingRemovals(session.user.id).catch(() => [])).length
+
   return (
+    <>
+    {toRemove > 0 && (
+      <div className="mx-4 sm:mx-auto max-w-3xl mt-4 rounded-xl border border-red-500 bg-red-950/80 p-4 text-sm text-red-100">
+        <div className="text-base font-semibold text-red-300">🧹 Remove your comments first</div>
+        <p className="mt-1">
+          The admin asked you to delete your comment on {toRemove} link{toRemove === 1 ? '' : 's'}. Open the
+          app — it shows each link and checks that your comment is gone. Links to work on come back here and
+          in the app once all of them are removed.
+        </p>
+      </div>
+    )}
     <Dashboard
-      videos={withCategory}
-      remainingByPlatform={remaining}
+      videos={toRemove > 0 ? [] : withCategory}
+      remainingByPlatform={toRemove > 0 ? {} : remaining}
       clickedUrls={alreadyOpened}
       retiredUrls={retiredUrls}
       dateShare={dateShare}
@@ -357,5 +380,6 @@ export default async function Home() {
       genreMix={genreMix}
       recentGenres={recentGenres}
     />
+    </>
   )
 }

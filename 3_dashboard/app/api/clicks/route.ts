@@ -7,6 +7,7 @@ import { auth } from '@/lib/auth'
 import { profileGate } from '@/lib/profileGate'
 import { isProduct, platformFromUrl, CLICK_PLATFORMS, VERIFY_VIDEO_URL, VERIFY_GATE_ENABLED } from '@/lib/config'
 import { serveCommentReliably } from '@/lib/serveComment'
+import { inRemovalMode } from '@/lib/commentRemoval'
 import {
   getClickedUrls,
   recordClick,
@@ -75,6 +76,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
   }
   if (!url) return NextResponse.json({ error: 'Missing url' }, { status: 400 })
+  // Comment removal mode: no work is recorded until their listed comments are gone.
+  if (await inRemovalMode(userId)) {
+    return NextResponse.json(
+      { error: 'Remove your listed comments in the app first', removalMode: true },
+      { status: 409 }
+    )
+  }
   if (!platform || !(CLICK_PLATFORMS as readonly string[]).includes(platform)) {
     platform = platformFromUrl(url)
   }

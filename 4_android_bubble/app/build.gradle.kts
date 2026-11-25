@@ -11,8 +11,8 @@ android {
         applicationId = "com.repostearn.bubble"
         minSdk = 26
         targetSdk = 33
-        versionCode = 14
-        versionName = "4.3"
+        versionCode = 16
+        versionName = "4.5"
     }
 
     buildFeatures {

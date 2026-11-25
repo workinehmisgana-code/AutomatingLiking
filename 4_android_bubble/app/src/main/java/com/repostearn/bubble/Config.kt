@@ -22,6 +22,8 @@ object Config {
     val CLICK_URL: String get() = "$DASHBOARD/api/app/click"
     val COMMENTS_URL: String get() = "$DASHBOARD/api/app/comments"
     val UNRELATED_URL: String get() = "$DASHBOARD/api/app/unrelated"
+    /** Comment removal mode: "I removed it" — the server reads the video and crosses it off. */
+    val REMOVAL_CHECK_URL: String get() = "$DASHBOARD/api/app/removals/check"
     // The tester's counts are of the humanizer links it is served (see linksUrl).
     val STATUS_URL: String get() =
         "$DASHBOARD/api/app/status" + if (BuildConfig.TESTER) "?genre=humanizer" else ""

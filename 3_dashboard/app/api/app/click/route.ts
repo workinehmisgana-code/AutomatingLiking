@@ -14,6 +14,7 @@ import {
 } from '@/lib/db'
 import { isProduct, platformFromUrl, CLICK_PLATFORMS, VERIFY_VIDEO_URL, VERIFY_GATE_ENABLED } from '@/lib/config'
 import { serveCommentReliably } from '@/lib/serveComment'
+import { inRemovalMode } from '@/lib/commentRemoval'
 
 export const dynamic = 'force-dynamic'
 
@@ -62,6 +63,14 @@ export async function POST(req: NextRequest) {
   const rawProduct = String(b?.product ?? '').trim()
   const clientProduct = isProduct(rawProduct) ? rawProduct : null
   if (!url.startsWith('http')) return NextResponse.json({ error: 'Bad url' }, { status: 400 })
+  // In comment removal mode no work is recorded: a list fetched before the admin
+  // added their links must not keep earning (lib/commentRemoval).
+  if (await inRemovalMode(userId)) {
+    return NextResponse.json(
+      { error: 'Remove your listed comments first', removalMode: true },
+      { status: 409 }
+    )
+  }
 
   try {
     // Quota enforcement is skipped when THIS platform's own Hourly switch is off

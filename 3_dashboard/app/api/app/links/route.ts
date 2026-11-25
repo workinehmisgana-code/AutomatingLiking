@@ -45,6 +45,8 @@ import {
   FALLBACK_COMMENT_CATEGORY,
 } from '@/lib/config'
 import { ensureGenreRegistry } from '@/lib/genreStore'
+import { commentCoverage } from '@/lib/serveComment'
+import { pendingRemovals } from '@/lib/commentRemoval'
 
 export const dynamic = 'force-dynamic'
 
@@ -133,6 +135,21 @@ export async function GET(req: NextRequest) {
       latestVersion: apk.version,
       update: apk.version && apk.url ? { versionName: apk.version, url: `${apk.url}?download=1` } : null,
       message: `Please update the app to v${apk.version ?? 'the latest version'} to keep getting links.`,
+    })
+  }
+
+  // COMMENT REMOVAL MODE (lib/commentRemoval): while the admin has listed links
+  // this worker must delete their comment from, they get those instead of work.
+  // After the version gate, so an old build is sent to update first — it would
+  // not know what to do with the list.
+  const removals = await pendingRemovals(userId).catch(() => [])
+  if (removals.length > 0) {
+    return NextResponse.json({
+      removalMode: true,
+      removals,
+      message: `Remove your comment from ${removals.length} link(s) before you get new links.`,
+      count: 0,
+      links: [],
     })
   }
 
@@ -230,10 +247,15 @@ export async function GET(req: NextRequest) {
     () => ({}) as Record<string, string[]>
   )
 
+  // NO COMMENT, NO LINK: a genre whose products have nothing to serve on this
+  // platform is left out entirely (commentCoverage), rather than handed to a
+  // worker who would then be given nothing to paste.
+  const canServe = await commentCoverage()
   const available = videos.filter(
     (v) =>
       v.url && v.url.startsWith('http') && !hidden.has(v.url) &&
-      (!onlyGenre || !isGenre(onlyGenre) || genreOfRow(v) === onlyGenre)
+      (!onlyGenre || !isGenre(onlyGenre) || genreOfRow(v) === onlyGenre) &&
+      canServe(genreOfRow(v), v.url)
   )
 
   // Ordering WITHIN each clustering is the score and nothing else — search rank

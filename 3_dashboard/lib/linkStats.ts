@@ -753,6 +753,12 @@ export interface CommentRead {
   complete: boolean
   /** The share link could not be resolved to a video at all. */
   unresolved: boolean
+  /**
+   * TikTok said there were no more top-level pages (as opposed to the read
+   * stopping on a page limit, an error or a throttled empty reply). Every
+   * top-level comment was read — replies are not in the list either way.
+   */
+  exhausted?: boolean
 }
 
 /**
@@ -853,5 +859,6 @@ export async function fetchComments(
     // "we cannot see replies" into "they did not comment".
     complete: exhausted && (total === null || out.length >= total),
     unresolved: false,
+    exhausted,
   }
 }

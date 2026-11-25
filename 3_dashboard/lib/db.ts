@@ -7457,6 +7457,16 @@ export function ensureCommentsTable(): Promise<void> {
   return ensuredComments
 }
 
+/** Products with at least one comment written in their bank, any audience. */
+export async function productsWithComments(): Promise<Set<string>> {
+  await ensureCommentsTable()
+  const { rows } = await pool.query<{ product: string }>(
+    `SELECT DISTINCT product FROM category_comments
+      WHERE jsonb_typeof(comments) = 'array' AND jsonb_array_length(comments) > 0`
+  )
+  return new Set(rows.map((r) => r.product))
+}
+
 export async function getCategoryComments(
   product: string,
   category: string

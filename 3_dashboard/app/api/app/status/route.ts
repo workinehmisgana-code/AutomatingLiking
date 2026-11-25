@@ -25,6 +25,7 @@ import {
   genreWeights,
   withoutGenres, HOURLY_LINK_LIMIT, HOURLY_WINDOW_MS, RETIRE_AFTER_USERS, SHOW_CLICKED_TODAY } from '@/lib/config'
 import { ensureGenreRegistry } from '@/lib/genreStore'
+import { commentCoverage } from '@/lib/serveComment'
 
 export const dynamic = 'force-dynamic'
 
@@ -101,10 +102,13 @@ export async function GET(req: NextRequest) {
             await getUserPausedGenres(userId).catch(() => [])
           )
         )
+  // And links with no comment to give are not served (commentCoverage), so not counted.
+  const canServe = await commentCoverage()
   const avail: Record<string, number> = {}
   for (const v of videos) {
     if (!v.url || !v.url.startsWith('http') || hidden.has(v.url)) continue
     if ((genreMix[genreOfRow(v)] ?? 0) <= 0) continue
+    if (!canServe(genreOfRow(v), v.url)) continue
     const p = String(v.platform ?? '')
     avail[p] = (avail[p] ?? 0) + 1
   }

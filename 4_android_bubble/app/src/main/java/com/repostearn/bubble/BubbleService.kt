@@ -68,6 +68,20 @@ class BubbleService : Service() {
     private var updateInfo: Pair<String, String>? = null // versionName, url
     private val ui = Handler(Looper.getMainLooper())
     private val platformStats = mutableListOf<PlatformStat>()
+
+    // ── Comment removal mode ────────────────────────────────────────────────
+    // The admin listed links this worker must delete their comment from. While
+    // any are left the server serves no links (it sends `removalMode` and the
+    // list instead), the bubble turns red, Next opens the next listed link, and
+    // the left button becomes "✓ Removed", which asks the server to read the
+    // video and cross it off. When the server says none are left, the bubble
+    // reloads normal links and goes back to its usual look.
+    private data class Removal(val id: Long, val url: String, val matchText: String?)
+    @Volatile private var removalMode = false
+    private val removals = mutableListOf<Removal>()
+    private var removalIndex = 0
+    /** The listed link the worker last opened — what "✓ Removed" checks. */
+    private var removalOpen: Removal? = null
     private var statusTicker: Runnable? = null
     private var messageBanner: View? = null
 
@@ -121,8 +135,11 @@ class BubbleService : Service() {
             }
         }
     }
-    private fun idleText(): String =
-        if (LinkStore.size(this) > 0) nextHint else "No links — reopen to reload"
+    private fun idleText(): String = when {
+        removalMode -> "🧹 REMOVAL MODE — delete your comment on ${removals.size} link(s)"
+        LinkStore.size(this) > 0 -> nextHint
+        else -> "No links — reopen to reload"
+    }
 
     @Suppress("DEPRECATION")
     private fun overlayType(): Int =
@@ -207,6 +224,7 @@ class BubbleService : Service() {
         counterView?.setOnClickListener { togglePanel(PanelKind.DETAILS) }
         finish.setOnClickListener { animateTap(it); openUrl(Config.FINISH_URL) }
         closeTop.setOnClickListener { stopSelf() }
+        applyMode()
 
         // Drag from ANYWHERE on the bubble (buttons still tap; a move becomes a drag).
         (v as? DraggableLayout)?.dragListener = object : DraggableLayout.DragListener {
@@ -277,6 +295,10 @@ class BubbleService : Service() {
     }
 
     private fun refreshCounter() {
+        if (removalMode) {
+            counterView?.text = "🧹 ${removals.size} left"
+            return
+        }
         val n = LinkStore.size(this)
         // Progress = how many links opened so far (index), so it starts at 0 on
         // open and climbs to n as the user taps Next.
@@ -316,7 +338,123 @@ class BubbleService : Service() {
         // a second tap while the first click is still being recorded must not
         // open a second link.
         if (busy) return
+        // Removal mode: the big button is the next step — open the link, then
+        // (once it is open) "✓ Removed" to have it checked.
+        if (removalMode) { if (removalOpen != null) checkRemoval() else openRemovalLink(); return }
         openNextLink()
+    }
+
+    /** Paint the bubble for the mode it is in: red for removal, the usual look otherwise. */
+    private fun applyMode() {
+        val v = view ?: return
+        if (removalMode) {
+            v.setBackgroundResource(R.drawable.bubble_removal_bg)
+            if (removalOpen == null) {
+                // Step 1: open the link. Nothing else to tap yet.
+                nextButton?.text = "Open 🗑"
+                nextButton?.setBackgroundResource(R.drawable.btn_removal_bg)
+                unrelatedButton?.visibility = View.GONE
+            } else {
+                // Step 2: the big button is now the green "✓ Removed"; the small
+                // one reopens the video if they left it.
+                nextButton?.text = "✓ Removed"
+                nextButton?.setBackgroundResource(R.drawable.btn_removed_bg)
+                unrelatedButton?.text = "🗑 Open again"
+                unrelatedButton?.setBackgroundResource(R.drawable.btn_removal_bg)
+                unrelatedButton?.visibility = View.VISIBLE
+            }
+            platformButton?.visibility = View.GONE
+            urlView?.setTextColor(0xFFFCA5A5.toInt())
+        } else {
+            v.setBackgroundResource(R.drawable.bubble_bg)
+            nextButton?.text = "Next ▶"
+            nextButton?.setBackgroundResource(R.drawable.btn_next_bg)
+            unrelatedButton?.text = "🚫 Unrelated"
+            unrelatedButton?.setBackgroundResource(R.drawable.btn_unrelated_bg)
+            unrelatedButton?.visibility = View.VISIBLE
+            platformButton?.visibility = View.VISIBLE
+            urlView?.setTextColor(0xFF93C5A5.toInt())
+        }
+        refreshCounter()
+    }
+
+    /** What to tell the worker about one listed link. */
+    private fun removalHowTo(r: Removal): String {
+        val which = r.matchText?.takeIf { it.isNotBlank() }?.let { "your comment \"$it\"" } ?: "your comment"
+        return "🗑 Find $which, press and hold it, tap Delete — then come back and tap the green ✓ Removed button"
+    }
+
+    /** Open the next listed link (the same one again until it is crossed off). */
+    private fun openRemovalLink() {
+        if (removals.isEmpty()) { refreshData(); return }
+        if (removalIndex >= removals.size) removalIndex = 0
+        val r = removals[removalIndex]
+        removalOpen = r
+        applyMode() // the big button becomes "✓ Removed"
+        urlView?.text = r.url
+        // Nothing to paste in this mode, and nothing from before must be pasted.
+        clearClipboard()
+        showCheckResult(removalHowTo(r))
+        openUrl(r.url)
+    }
+
+    /** "✓ Removed": the server reads the video and crosses the link off if their comment is gone. */
+    private fun checkRemoval() {
+        if (busy) return
+        val r = removalOpen ?: removals.getOrNull(removalIndex)
+        if (r == null) { refreshData(); return }
+        if (removalOpen == null) {
+            showCheckResult("Open the link first (Open 🗑), delete your comment, then tap ✓ Removed")
+            return
+        }
+        val token = AuthStore.token(this) ?: run { promptSignIn(); return }
+        lock()
+        showCheckResult("⏳ Checking that your comment is gone… (up to a minute)")
+        thread {
+            val (code, body) = Net.postJsonBody(
+                Config.REMOVAL_CHECK_URL, token, JSONObject().apply { put("id", r.id) }, this
+            )
+            val d = try { JSONObject(body) } catch (e: Exception) { JSONObject() }
+            ui.post {
+                unlock()
+                when {
+                    code == 401 -> promptSignIn()
+                    code == -1 -> showCheckResult("⚠️ No connection — try ✓ Removed again")
+                    code == 404 -> { removals.remove(r); removalOpen = null; afterRemovalProgress(d.optInt("remaining", removals.size)) }
+                    code !in 200..299 -> showCheckResult("⚠️ " + d.optString("error", "Could not check (HTTP $code)"))
+                    d.optBoolean("done") -> {
+                        removals.remove(r)
+                        removalOpen = null
+                        afterRemovalProgress(d.optInt("remaining", removals.size))
+                    }
+                    // Nothing found, but the read could not prove it is gone.
+                    d.isNull("stillText") && d.optString("message").isNotBlank() ->
+                        showCheckResult("⏳ " + d.optString("message"))
+                    else -> {
+                        val still = if (d.isNull("stillText")) "" else d.optString("stillText")
+                        showCheckResult("❌ Still there" + (if (still.isNotBlank()) ": \"${still.take(80)}\"" else "") +
+                            " — delete it, then tap ✓ Removed again")
+                    }
+                }
+            }
+        }
+    }
+
+    /** After a link is crossed off: the next one, or back to normal when none are left. */
+    private fun afterRemovalProgress(remaining: Int) {
+        if (remaining <= 0 || removals.isEmpty()) {
+            removalMode = false
+            removals.clear()
+            removalOpen = null
+            showCheckResult("✅ All your comments are removed — back to normal links")
+            applyMode()
+            refreshData()
+            return
+        }
+        if (removalIndex >= removals.size) removalIndex = 0
+        applyMode() // back to "Open 🗑" for the next one
+        urlView?.text = idleText()
+        showCheckResult("✅ Removed. ${removals.size} left — tap Open 🗑 for the next one")
     }
 
     /**
@@ -409,6 +547,9 @@ class BubbleService : Service() {
             ui.post {
                 when (code) {
                     401 -> { promptSignIn(); unlock() }
+                    // The admin put this worker into removal mode after the list
+                    // was fetched: nothing is recorded; load the removal list.
+                    409 -> { unlock(); clearClipboard(); refreshData() }
                     429 -> {
                         if (SettingsStore.platform(this).isBlank()) {
                             // "All platforms" mode → this platform's quota is done,
@@ -507,6 +648,8 @@ class BubbleService : Service() {
         // Blocked only while an operation is in flight, so a double tap cannot
         // flag the same link twice or race the advance.
         if (busy) return
+        // In removal mode this small button is "🗑 Open again".
+        if (removalMode) { openRemovalLink(); return }
         val token = AuthStore.token(this) ?: run { promptSignIn(); return }
         val current = LinkStore.current(this)
         if (current == null) {
@@ -1066,7 +1209,31 @@ class BubbleService : Service() {
             if (lc == 200) {
                 try {
                     val o = JSONObject(lb)
-                    if (o.optBoolean("updateRequired", false)) {
+                    // Comment removal mode: a list of links to clean instead of links to work.
+                    val gotRemovals = mutableListOf<Removal>()
+                    if (o.optBoolean("removalMode", false)) {
+                        val arr = o.optJSONArray("removals")
+                        if (arr != null) for (i in 0 until arr.length()) {
+                            val r = arr.optJSONObject(i) ?: continue
+                            val url = r.optString("url")
+                            if (url.isBlank()) continue
+                            val match = if (r.isNull("matchText")) null else r.optString("matchText").ifBlank { null }
+                            gotRemovals.add(Removal(r.optLong("id"), url, match))
+                        }
+                    }
+                    ui.post {
+                        val was = removalMode
+                        removalMode = gotRemovals.isNotEmpty()
+                        removals.clear(); removals.addAll(gotRemovals)
+                        if (removalIndex >= removals.size) removalIndex = 0
+                        // Keep the open one only if it is still on the list.
+                        if (removalOpen != null && removals.none { it.id == removalOpen!!.id }) removalOpen = null
+                        if (!removalMode) removalOpen = null
+                        if (was != removalMode) applyMode()
+                    }
+                    if (gotRemovals.isNotEmpty()) {
+                        LinkStore.setFromJson(this, "[]") // no work links while cleaning up
+                    } else if (o.optBoolean("updateRequired", false)) {
                         needsUpdate = true
                         val upd = o.optJSONObject("update")
                         val vn = upd?.optString("versionName").orEmpty()
@@ -1130,6 +1297,13 @@ class BubbleService : Service() {
                     updateInfo?.let { (vn, url) -> showUpdateBanner(vn, url) }
                     urlView?.text = "Update required — tap Download to update"
                     Toast.makeText(this, "Please update the app to keep getting links.", Toast.LENGTH_LONG).show()
+                } else if (removalMode) {
+                    applyMode()
+                    urlView?.text = idleText()
+                    if (removalOpen == null) {
+                        showCheckResult("🧹 The admin asked you to delete your comment on ${removals.size} link(s). " +
+                            "Tap Open 🗑, delete it, then tap the green ✓ Removed button. Normal links come back when all are done.")
+                    }
                 } else {
                     urlView?.text = idleText()
                     Toast.makeText(this, "Loaded ${LinkStore.size(this)} links", Toast.LENGTH_SHORT).show()

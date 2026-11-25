@@ -93,6 +93,14 @@ export default function GenreSwitch({
         >
           🧪 Tester comments
         </a>
+        {/* Workers who must delete their comment on listed links (removal mode). */}
+        <a
+          href="/admin/removals"
+          title="Put workers into comment removal mode for specific links"
+          className="text-sm rounded-lg px-2.5 py-1 border border-red-900/60 bg-zinc-900 text-red-300 hover:text-red-200 hover:border-red-700"
+        >
+          🧹 Comment removal
+        </a>
         {/* Says what is being looked at, in words, so a screenshot of any admin
             page carries its own genre. */}
         <span className="text-[11px] text-zinc-600 ml-auto">

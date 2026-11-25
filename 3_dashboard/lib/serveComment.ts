@@ -13,7 +13,11 @@ import { canonicaliseMention } from './commentGen'
 import { pickForLink } from './commentStyleSig'
 import { COMMENT_WORD_MIN, COMMENT_WORD_MAX, DEFAULT_TOP_LIST, DEFAULT_COMMENT_STYLE } from './config'
 import { getFreshCategoryComments } from './commentGen'
+import { cached } from './poolCache'
+import { productsWithComments } from './db'
 import {
+  CLICK_PLATFORMS as PLATFORMS,
+  GENRES,
   DEFAULT_GENRE,
   fallbackCategory,
   isLinkCategory,
@@ -97,27 +101,99 @@ export async function serveCommentForUrl(
 }
 
 /**
+ * WHICH LINKS HAVE A COMMENT TO GIVE, by genre and platform.
+ *
+ * A link is only worth handing a worker if a comment comes with it. When a
+ * genre's links were in the feed before its product had a single comment
+ * written (AI models hub, 2026-11-24 16:00 → 11-25 07:30), 531 clicks were
+ * served nothing and the app pasted "null" under the videos.
+ *
+ * So the feeds ask this first: some product of the link's genre must be active
+ * on the link's platform AND have something to serve — a measured top list, or
+ * comments in its bank. Reddit needs only the active product, because a Reddit
+ * post gets comments written for it on the first click (lib/redditComments).
+ *
+ * Per genre and platform, not per link: a per-link answer would mean reading
+ * the category of 150k links on every load. The finer causes of an empty serve
+ * (one audience unwritten, the revive rule) are left to serveCommentReliably.
+ *
+ * Cached for a minute; anything that fails to read counts as "can serve", so a
+ * database hiccup never empties everybody's list.
+ */
+export function commentCoverage(): Promise<(genre: string, url: string) => boolean> {
+  return cached('commentCoverage', 60_000, async () => {
+    const active: Record<string, string[] | null> = {}
+    for (const p of PLATFORMS) {
+      active[p] = await activeProductsForPlatform(p).catch(() => null)
+    }
+    const banked = await productsWithComments().catch(() => null)
+    const ready = new Map<string, boolean>()
+    const hasSomething = async (product: string): Promise<boolean> => {
+      if (ready.has(product)) return ready.get(product)!
+      let ok = banked === null || banked.has(product)
+      if (!ok) {
+        const { top } = await getProductCommentSettings(product, {
+          min: COMMENT_WORD_MIN,
+          max: COMMENT_WORD_MAX,
+        }).catch(() => ({ top: DEFAULT_TOP_LIST }))
+        ok = top.enabled
+          ? (await getTopCommentsForProduct(product, top).catch(() => [{ text: 'x' }])).length > 0
+          : false
+      }
+      ready.set(product, ok)
+      return ok
+    }
+    // genre|platform -> can serve
+    const table = new Map<string, boolean>()
+    for (const p of PLATFORMS) {
+      const on = active[p]
+      for (const g of GENRES) {
+        if (on === null) {
+          table.set(`${g}|${p}`, true)
+          continue
+        }
+        const candidates = productsInGenre(g).filter((x) => on.includes(x))
+        let ok = false
+        for (const c of candidates) {
+          if (p === 'reddit' || (await hasSomething(c))) {
+            ok = true
+            break
+          }
+        }
+        table.set(`${g}|${p}`, ok)
+      }
+    }
+    return (genre: string, url: string) => table.get(`${genre}|${platformFromUrl(url)}`) ?? true
+  }).catch(() => () => true)
+}
+
+/**
  * serveCommentForUrl, asked again when it comes back empty.
  *
  * Every read inside it swallows its own error, and a failed read of the active
  * products or of the fair pick looks exactly like "no product may be served":
- * the click is recorded with nothing and the worker is handed no comment. On the
- * real data that happened to 246 + 298 clicks over 2026-11-24/25 on humanizer
- * links that serve fine when asked again — a database or blob hiccup, not a
- * rule. So an empty answer gets one more try before it is believed.
+ * the click is recorded with nothing and the worker is handed no comment. From
+ * the outside, a database or blob hiccup is indistinguishable from a rule. So
+ * an empty answer is asked again, RETRIES more times, before it is believed.
+ * (Links whose genre has nothing to serve at all are kept out of the feeds by
+ * commentCoverage, so these retries are not spent on a certain no.)
  */
+const RETRIES = 5
+
 export async function serveCommentReliably(
   url: string
 ): Promise<{ product: string | null; comment: string | null }> {
-  for (let attempt = 0; attempt < 2; attempt++) {
+  let last: { product: string | null; comment: string | null } | null = null
+  for (let attempt = 0; attempt <= RETRIES; attempt++) {
+    if (attempt > 0) await new Promise((res) => setTimeout(res, 250 * attempt))
     const r = await serveCommentForUrl(url).catch((e) => {
       console.warn('[serveComment] failed for', url, String(e))
       return null
     })
     if (r?.product && r.comment) return r
-    if (attempt === 0) await new Promise((res) => setTimeout(res, 400))
-    else if (r) return r
+    if (r) last = r
   }
+  if (last) return last
   console.warn('[serveComment] no comment for', url)
   return { product: null, comment: null }
 }
