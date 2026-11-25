@@ -13,7 +13,7 @@ import {
   isTestUser,
 } from '@/lib/db'
 import { isProduct, platformFromUrl, CLICK_PLATFORMS, VERIFY_VIDEO_URL, VERIFY_GATE_ENABLED } from '@/lib/config'
-import { serveCommentForUrl } from '@/lib/serveComment'
+import { serveCommentReliably } from '@/lib/serveComment'
 
 export const dynamic = 'force-dynamic'
 
@@ -94,7 +94,7 @@ export async function POST(req: NextRequest) {
         (await genreOfUrl(url).catch(() => DEFAULT_GENRE))
     const served: { product: string | null; comment: string | null } = clientProduct
       ? { product: sameGenre ? clientProduct : null, comment: null }
-      : await serveCommentForUrl(url).catch(() => ({ product: null, comment: null }))
+      : await serveCommentReliably(url)
 
     await recordClick(userId, url, searchQuery, platform, served.product, served.comment)
     // While "only links with none of ours" is on the permanent record is
@@ -108,7 +108,11 @@ export async function POST(req: NextRequest) {
       ok: true,
       // The app pastes this; absent when an older build already picked its own.
       product: served.product,
-      comment: served.comment,
+      // LEFT OUT, never sent as null, when there is no comment. The Android app
+      // reads it with org.json's optString, which turns a JSON null into the
+      // four-letter string "null" — and workers pasted exactly that under
+      // videos. A missing key reads as "", which the app already treats as none.
+      ...(served.comment ? { comment: served.comment } : {}),
       ...(enforced ? { hourlyCount: recent + 1, limit } : {}),
     })
   } catch (e) {

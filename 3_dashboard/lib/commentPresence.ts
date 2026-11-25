@@ -30,8 +30,21 @@ import {
   getRecentJudgedByProduct,
   setGenrePauses,
   recordTiktokAccount,
+  getUserProfile,
+  getPlatformAccounts,
+  recordPlatformAccount,
+  handlesOwnedByOthers,
+  getClickHints,
 } from './db'
 import { ensureGenreRegistry } from './genreStore'
+import {
+  platformOfUrl,
+  verifiablePlatforms,
+  youtubeIdentity,
+  fetchYoutubeComments,
+  fetchRedditComments,
+  matchesServed,
+} from './platformComments'
 
 
 /**
@@ -96,7 +109,11 @@ export interface PresenceResult {
  * counts when every comment was readable; otherwise the link is not judgeable
  * and is left out of the score rather than held against the user.
  */
-async function judge(username: string, url: string): Promise<JudgedLink> {
+async function judge(who: Who, url: string, hint?: ClickHint): Promise<JudgedLink> {
+  const platform = platformOfUrl(url)
+  if (platform === 'youtube' || platform === 'reddit') return judgeOther(who, platform, url, hint)
+  const username = who.tiktok
+  if (!username) return { url, found: false, judgeable: false }
   const read = await fetchComments(url, MAX_PAGES)
   const hit = read.unresolved ? undefined : read.comments.find((c) => c.username === username)
   const found = hit !== undefined
@@ -113,12 +130,121 @@ async function judge(username: string, url: string): Promise<JudgedLink> {
 }
 
 /**
+ * Who a check is looking for, on every platform it can read.
+ *
+ * TikTok by the @handle on the profile, as always. YouTube by the profile's
+ * channel when there is one, and on both YouTube and Reddit by the account a
+ * previous check saw them comment from — and failing that, by the very comment
+ * they were handed for the link (see judgeOther).
+ */
+export interface Who {
+  userId: string
+  tiktok: string | null
+  ytHandle: string | null
+  ytChannel: string | null
+  /** Accounts learned by earlier checks: { youtube?: handle, reddit?: name }. */
+  known: Record<string, string>
+}
+
+interface ClickHint {
+  servedComment: string | null
+  clickedAt: string
+}
+
+/** Everything needed to recognise this user's comments. */
+export async function whoIs(userId: string, tiktokUrl?: string | null): Promise<Who> {
+  const [profile, known] = await Promise.all([
+    getUserProfile(userId).catch(() => null),
+    getPlatformAccounts(userId).catch(() => ({} as Record<string, string>)),
+  ])
+  const yt = youtubeIdentity(profile?.youtube_url)
+  return {
+    userId,
+    tiktok: handleFromProfile(tiktokUrl ?? profile?.tiktok_url ?? ''),
+    ytHandle: yt.handle,
+    ytChannel: yt.channelId,
+    known,
+  }
+}
+
+/** Can anything at all be checked for this user? */
+function checkable(who: Who): boolean {
+  return !!who.tiktok || verifiablePlatforms().length > 1
+}
+
+/**
+ * Judge a YouTube video or a Reddit post.
+ *
+ * THEIR COMMENT IS one by an account known to be theirs, or one saying what
+ * they were handed for this link (clicked_link.served_comment), posted after
+ * they opened it, by an account that is not another worker's. Found that way,
+ * its author is remembered as their account on the platform.
+ *
+ * A MISS needs a complete read AND something to recognise them by. With no
+ * known account and no stored comment, absence proves nothing, and the link is
+ * left unjudged rather than counted against them.
+ */
+async function judgeOther(
+  who: Who,
+  platform: 'youtube' | 'reddit',
+  url: string,
+  hint?: ClickHint
+): Promise<JudgedLink> {
+  const read =
+    platform === 'youtube'
+      ? await fetchYoutubeComments(url, hint?.clickedAt)
+      : await fetchRedditComments(url)
+  if (read.unresolved) return { url, found: false, judgeable: false }
+
+  const mine = new Set(
+    [platform === 'youtube' ? who.ytHandle : null, who.known[platform]].filter(Boolean) as string[]
+  )
+  let hit = read.comments.find(
+    (c) => (c.author && mine.has(c.author)) || (!!who.ytChannel && c.authorId === who.ytChannel)
+  )
+
+  const served = hint?.servedComment ?? null
+  if (!hit && served) {
+    const floor = hint ? Date.parse(hint.clickedAt) - 10 * 60 * 1000 : NaN
+    const words = read.comments.filter(
+      (c) =>
+        matchesServed(c.text, served) &&
+        !(Number.isFinite(floor) && c.postedAt && Date.parse(c.postedAt) < floor)
+    )
+    if (words.length > 0 && who.userId) {
+      const others = await handlesOwnedByOthers(
+        who.userId,
+        platform,
+        words.map((c) => c.author)
+      ).catch(() => new Set<string>())
+      hit = words.find((c) => c.author && !others.has(c.author))
+      if (hit?.author && who.known[platform] !== hit.author) {
+        who.known[platform] = hit.author
+        await recordPlatformAccount(who.userId, platform, hit.author).catch(() => {})
+      }
+    }
+  }
+
+  const found = hit !== undefined
+  const recognisable = mine.size > 0 || !!who.ytChannel || !!served
+  return {
+    url,
+    found,
+    judgeable: found || (read.complete && recognisable),
+    text: hit?.text ?? null,
+    total: read.total ?? (read.complete ? read.comments.length : null),
+    uid: null,
+  }
+}
+
+/**
  * Store the account id from whichever judged link found the user's comment.
  *
  * Free — the id was already in the payload that judged the link. Failing to
  * record it must never fail the judging, so this swallows its own errors.
  */
-async function rememberAccount(userId: string, username: string, judged: JudgedLink[]) {
+async function rememberAccount(userId: string, username: string | null, judged: JudgedLink[]) {
+  if (!username) return
   const uid = judged.find((l) => l.found && l.uid)?.uid
   if (uid) await recordTiktokAccount(userId, username, uid).catch(() => {})
 }
@@ -131,10 +257,25 @@ async function rememberAccount(userId: string, username: string, judged: JudgedL
  * from the links it did not reach.
  */
 export async function judgeLinks(
-  username: string,
+  /** A bare TikTok @handle (TikTok links only), or a whole Who. */
+  user: string | Who,
   links: string[],
   deadline: number
 ): Promise<JudgedLink[]> {
+  const who: Who =
+    typeof user === 'string'
+      ? { userId: '', tiktok: user, ytHandle: null, ytChannel: null, known: {} }
+      : user
+  // When each YouTube / Reddit link was opened and what it was handed — how
+  // those comments are recognised. One query for the batch.
+  const others = links.filter((u) => {
+    const p = platformOfUrl(u)
+    return p === 'youtube' || p === 'reddit'
+  })
+  const hints =
+    who.userId && others.length
+      ? await getClickHints(who.userId, others).catch(() => new Map<string, ClickHint>())
+      : new Map<string, ClickHint>()
   const out: JudgedLink[] = []
   let next = 0
   const worker = async () => {
@@ -144,7 +285,7 @@ export async function judgeLinks(
       if (out.length > 0 && Date.now() >= deadline) return
       const i = next++
       if (i >= links.length) return
-      out.push(await judge(username, links[i]))
+      out.push(await judge(who, links[i], hints.get(links[i])))
     }
   }
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, links.length || 1) }, worker))
@@ -185,8 +326,8 @@ export async function scoreUserDay(
   deadline: number,
   freshSince?: string | null
 ): Promise<{ judged: number; remaining: number; total: number; opened: number } | null> {
-  const username = handleFromProfile(tiktokUrl)
-  if (!username) return null
+  const who = await whoIs(userId, tiktokUrl)
+  if (!checkable(who)) return null
   const opened = await getClickedOnDay(userId, day).catch(() => [] as string[])
   if (opened.length === 0) return null
   // Every link opened that day, not a sample of them — see the note above.
@@ -198,9 +339,9 @@ export async function scoreUserDay(
     return { judged: 0, remaining: 0, total: all.length, opened: opened.length }
   }
 
-  const judged = await judgeLinks(username, todo, deadline)
+  const judged = await judgeLinks(who, todo, deadline)
   await saveJudgedLinks(userId, day, judged, freshSince)
-  await rememberAccount(userId, username, judged)
+  await rememberAccount(userId, who.tiktok, judged)
   return {
     judged: judged.length,
     remaining: todo.length - judged.length,
@@ -276,8 +417,8 @@ export async function scoreUserRecent(
   days: string[]
   links: (JudgedLink & { day: string })[]
 } | null> {
-  const username = handleFromProfile(tiktokUrl)
-  if (!username) return null
+  const who = await whoIs(userId, tiktokUrl)
+  if (!checkable(who)) return null
   const recent = await getRecentClickedLinks(userId, limit, before).catch(
     () => [] as { url: string; day: string }[]
   )
@@ -295,7 +436,7 @@ export async function scoreUserRecent(
   const byUrl = new Map<string, string[]>()
   for (const r of todo) byUrl.set(r.url, [...(byUrl.get(r.url) ?? []), r.day])
   const judged = todo.length
-    ? await judgeLinks(username, Array.from(byUrl.keys()), deadline)
+    ? await judgeLinks(who, Array.from(byUrl.keys()), deadline)
     : []
 
   // Written per day, because the ledger is keyed by day — a verdict for a url
@@ -317,7 +458,7 @@ export async function scoreUserRecent(
       refreshDays
     )
   }
-  await rememberAccount(userId, username, judged)
+  await rememberAccount(userId, who.tiktok, judged)
 
   // The report is over the SAMPLE, in the order the user opened it: this pass's
   // verdicts plus the ones it made on an earlier request. Both carry the comment
@@ -545,8 +686,8 @@ export async function noCommentVerdict(
   before?: string | null
 ): Promise<BlockVerdict> {
   const empty: BlockVerdict = { judged: 0, found: 0, skipped: 0, block: false }
-  const username = handleFromProfile(tiktokUrl)
-  if (!username) return empty
+  const who = await whoIs(userId, tiktokUrl)
+  if (!checkable(who)) return empty
 
   // ONE SOURCE FOR THE THRESHOLDS. Read here rather than passed in by each
   // caller, so the cron, the manual sweep and the verify button cannot be running
@@ -603,9 +744,9 @@ export async function noCommentVerdict(
     const slice = pending.slice(i, Math.min(j, i + want))
     i += slice.length
 
-    const verdicts = await judgeLinks(username, slice.map((x) => x.url), deadline)
+    const verdicts = await judgeLinks(who, slice.map((x) => x.url), deadline)
     if (verdicts.length > 0) await saveJudgedLinks(userId, day, verdicts).catch(() => {})
-    await rememberAccount(userId, username, verdicts)
+    await rememberAccount(userId, who.tiktok, verdicts)
     for (const v of verdicts) {
       if (v.judgeable) {
         judged++

@@ -97,6 +97,32 @@ export async function serveCommentForUrl(
 }
 
 /**
+ * serveCommentForUrl, asked again when it comes back empty.
+ *
+ * Every read inside it swallows its own error, and a failed read of the active
+ * products or of the fair pick looks exactly like "no product may be served":
+ * the click is recorded with nothing and the worker is handed no comment. On the
+ * real data that happened to 246 + 298 clicks over 2026-11-24/25 on humanizer
+ * links that serve fine when asked again — a database or blob hiccup, not a
+ * rule. So an empty answer gets one more try before it is believed.
+ */
+export async function serveCommentReliably(
+  url: string
+): Promise<{ product: string | null; comment: string | null }> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const r = await serveCommentForUrl(url).catch((e) => {
+      console.warn('[serveComment] failed for', url, String(e))
+      return null
+    })
+    if (r?.product && r.comment) return r
+    if (attempt === 0) await new Promise((res) => setTimeout(res, 400))
+    else if (r) return r
+  }
+  console.warn('[serveComment] no comment for', url)
+  return { product: null, comment: null }
+}
+
+/**
  * THE NAME'S FORM, DECIDED BY THE LINK (CommentStyle.linkAware, on unless the
  * product turns it off on the Comments page).
  *

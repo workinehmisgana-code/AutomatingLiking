@@ -832,6 +832,10 @@ export default function AdminDashboard({
     } | null
     genreMinPct: number
     genreSample: number
+    /** Judged / found / unjudged per platform (tiktok, youtube, reddit). */
+    byPlatform: Record<string, { judged: number; found: number; skipped: number }>
+    /** Which platforms were left out, and why. */
+    notChecked: string
     /** Why it did not, when it did not. Empty while the check is unfinished. */
     blockNote: string
   }
@@ -1304,6 +1308,8 @@ export default function AdminDashboard({
         genres: d.genres && Array.isArray(d.genres.rates) ? d.genres : null,
         genreMinPct: Number(d.genreMinPct) || 10,
         genreSample: Number(d.genreSample) || 50,
+        byPlatform: d.byPlatform && typeof d.byPlatform === 'object' ? d.byPlatform : {},
+        notChecked: String(d.notChecked ?? ''),
       }
       const total = Number(d.total) || 0
       onProgress(total - (Number(d.remaining) || 0), total,
@@ -1332,13 +1338,10 @@ export default function AdminDashboard({
 
   async function verifyUser(u: AdminUserRow) {
     const who = u.profile?.name || u.name || u.email || 'user'
-    if (!u.profile?.tiktok_url) {
-      alert('This user has no TikTok profile link, so there is no @username to look for.')
-      return
-    }
     if (!confirm(
       `Check ${who}'s last 300 links?\n\n` +
-      'Reads the last 300 links they actually opened — across however many days those ' +
+      'Reads the last 300 TikTok, YouTube and Reddit links they actually opened (YouTube and ' +
+      'Reddit once their keys are set) — across however many days those ' +
       'span — and checks which carry a comment from their own account. Same reads and ' +
       'same judging as the bulk sweep; only the population differs, so one user\'s ' +
       'number means the same as another\'s. Every link is read again now, not taken ' +
@@ -3156,6 +3159,21 @@ export default function AdminDashboard({
                       ).toLocaleString()} still to read`}
                     {verifyReport.skipped > 0 && ` · ${verifyReport.skipped} could not be judged`}
                   </div>
+                  {Object.keys(verifyReport.byPlatform).length > 0 && (
+                    <div className="text-[11px] text-zinc-400 mt-1 flex flex-wrap gap-x-3 gap-y-0.5">
+                      {Object.entries(verifyReport.byPlatform).map(([p, v]) => (
+                        <span key={p}>
+                          {p === 'tiktok' ? 'TikTok' : p === 'youtube' ? 'YouTube' : p === 'reddit' ? 'Reddit' : p}:{' '}
+                          <span className="text-zinc-200">{v.found} of {v.judged}</span>
+                          {v.judged > 0 && ` (${Math.round((100 * v.found) / v.judged)}%)`}
+                          {v.skipped > 0 && <span className="text-zinc-600"> · {v.skipped} not judged</span>}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {verifyReport.notChecked && (
+                    <div className="text-[11px] text-amber-500/80 mt-1">{verifyReport.notChecked}</div>
+                  )}
                 </div>
               </div>
             </div>
@@ -5147,16 +5165,51 @@ function PayDaysTable({ days }: { days: PayDay[] }) {
   const top = Math.max(...days.map((d) => d.total), 1)
   const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Addis_Ababa' })
   const open = days.find((d) => d.day === openDay) ?? null
+  // WHAT IT WAS FOR, BY GENRE. Apportioned the way each worker's pay card
+  // divides it (see apportionPayByGenre); 'other' is pay for work with no
+  // genre (videos, reposts), 'unsplit' a payment with nothing to divide it by.
+  const genreLabel = (g: string) =>
+    g === 'other' ? 'other (videos, reposts)' : g === 'unsplit' ? 'not split' : (GENRE_LABELS[g] ?? g)
+  const genreOrder = (m: Record<string, number>) =>
+    Object.entries(m ?? {}).sort((a, b) =>
+      (a[0] === 'other' || a[0] === 'unsplit' ? 1 : 0) - (b[0] === 'other' || b[0] === 'unsplit' ? 1 : 0) || b[1] - a[1])
+  const allGenres: Record<string, number> = {}
+  for (const d of days) for (const [g, v] of Object.entries(d.byGenre ?? {})) allGenres[g] = (allGenres[g] ?? 0) + v
+  const anyEstimated = days.some((d) => d.estimated)
+  const GenreLine = ({ m, approx }: { m: Record<string, number>; approx?: boolean }) => (
+    <span className="flex flex-wrap gap-x-3 gap-y-0.5">
+      {genreOrder(m).map(([g, v]) => (
+        <span key={g} className="whitespace-nowrap">
+          <span className="text-zinc-500">{genreLabel(g)}</span>{' '}
+          <span className="tabular-nums text-zinc-300">{approx ? '≈' : ''}{fmtBirr(Math.round(v * 100) / 100)}</span>
+        </span>
+      ))}
+    </span>
+  )
   return (
     <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3 mb-4">
-      <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2">
+      <div className="flex flex-wrap items-baseline justify-between gap-2 mb-1">
         <div className="text-sm font-semibold text-white">💸 Paid out — last {days.length} payment days</div>
         <div className="text-[11px] text-zinc-500">{fmtBirr(sum)} birr in all</div>
       </div>
+      {Object.keys(allGenres).length > 0 && (
+        <div
+          className="text-[11px] mb-2"
+          title={
+            'By genre, apportioned the way each pay card splits it: comment pay by the worker’s links per genre, ' +
+            'referral commission by their members’ links. ' +
+            (anyEstimated
+              ? '≈ marks days with payments made before the split was recorded at payment time — those are rebuilt from the snapshot saved just before paying, so they are approximate.'
+              : '')
+          }
+        >
+          <GenreLine m={allGenres} approx={anyEstimated} />
+        </div>
+      )}
       <div className="space-y-1">
         {days.map((d) => (
+          <div key={d.day}>
           <button
-            key={d.day}
             type="button"
             onClick={() => setOpenDay(openDay === d.day ? null : d.day)}
             className="w-full flex items-center gap-3 text-xs text-left hover:bg-zinc-800/40 rounded px-1 py-0.5"
@@ -5177,6 +5230,12 @@ function PayDaysTable({ days }: { days: PayDay[] }) {
             <span className="w-28 shrink-0 text-right tabular-nums text-zinc-100 font-medium">{fmtBirr(d.total)} birr</span>
             <span className="w-20 shrink-0 text-right text-[11px] text-zinc-500">{d.workers} worker(s)</span>
           </button>
+          {Object.keys(d.byGenre ?? {}).length > 0 && (
+            <div className="pl-1 sm:pl-[7.75rem] pb-1 text-[11px]">
+              <GenreLine m={d.byGenre} approx={d.estimated} />
+            </div>
+          )}
+          </div>
         ))}
       </div>
       {open && (

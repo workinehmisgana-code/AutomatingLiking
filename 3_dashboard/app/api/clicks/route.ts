@@ -6,7 +6,7 @@ import { headers } from 'next/headers'
 import { auth } from '@/lib/auth'
 import { profileGate } from '@/lib/profileGate'
 import { isProduct, platformFromUrl, CLICK_PLATFORMS, VERIFY_VIDEO_URL, VERIFY_GATE_ENABLED } from '@/lib/config'
-import { serveCommentForUrl } from '@/lib/serveComment'
+import { serveCommentReliably } from '@/lib/serveComment'
 import {
   getClickedUrls,
   recordClick,
@@ -109,7 +109,7 @@ export async function POST(req: NextRequest) {
         (await genreOfUrl(url).catch(() => DEFAULT_GENRE))
     const served: { product: string | null; comment: string | null } = servedProduct
       ? { product: sameGenre ? servedProduct : null, comment: null }
-      : await serveCommentForUrl(url).catch(() => ({ product: null, comment: null }))
+      : await serveCommentReliably(url)
 
     await recordClick(userId, url, searchQuery, platform, served.product, served.comment)
     // While "only links with none of ours" is on the permanent record is

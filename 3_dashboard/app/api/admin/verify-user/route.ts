@@ -22,6 +22,7 @@ import {
   handleFromProfile,
   tally,
 } from '@/lib/commentPresence'
+import { platformOfUrl, verifiablePlatforms, type CheckPlatform } from '@/lib/platformComments'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
@@ -76,6 +77,30 @@ export const maxDuration = 60
 
 const BUDGET_MS = 45_000
 
+const platformName = (p: string) =>
+  p === 'tiktok' ? 'TikTok' : p === 'youtube' ? 'YouTube' : p === 'reddit' ? 'Reddit' : p
+
+/** Which readable platforms are switched off, and what turns each one on. */
+function notCheckedNote(on: CheckPlatform[]): string {
+  const off: string[] = []
+  if (!on.includes('youtube')) off.push('YouTube (set YOUTUBE_API_KEY)')
+  if (!on.includes('reddit')) off.push('Reddit (set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET)')
+  return off.length ? `Not checked: ${off.join(', ')}. Instagram cannot be checked.` : 'Instagram cannot be checked.'
+}
+
+/** Judged / found / unjudged per platform. */
+function byPlatform(links: { url: string; found: boolean; judgeable: boolean }[]) {
+  const out: Record<string, { judged: number; found: number; skipped: number }> = {}
+  for (const l of links) {
+    const p = platformOfUrl(l.url) ?? 'other'
+    const e = (out[p] ??= { judged: 0, found: 0, skipped: 0 })
+    if (l.judgeable) e.judged++
+    else e.skipped++
+    if (l.found) e.found++
+  }
+  return out
+}
+
 /** Whether a machine may block this person at all. */
 async function canBlock(userId: string): Promise<boolean> {
   const st = await autoBlockStatus(userId).catch(() => ({ blocked: true, exempt: true }))
@@ -105,7 +130,10 @@ export async function POST(req: NextRequest) {
 
   const profile = await getUserProfile(userId).catch(() => null)
   const username = handleFromProfile(profile?.tiktok_url ?? '')
-  if (!username) {
+  // YouTube / Reddit comments are recognised by the comment the user was handed,
+  // so a missing TikTok link only stops the check when nothing else is readable.
+  const platforms = verifiablePlatforms()
+  if (!username && platforms.length === 1) {
     return NextResponse.json(
       { error: "This user has no usable TikTok profile link — there's no @username to look for. Edit their links first." },
       { status: 400 }
@@ -121,7 +149,7 @@ export async function POST(req: NextRequest) {
     // a property.
     const r = await scoreUserRecent(
       userId,
-      profile!.tiktok_url!,
+      profile?.tiktok_url ?? '',
       RECENT_SAMPLE,
       Date.now() + BUDGET_MS,
       since,
@@ -132,8 +160,9 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         {
           error:
-            'No TikTok links to check: they have not opened one since their TikTok account was last ' +
-            'changed (only links opened with the current account are checked), or never have.',
+            `No ${platforms.map(platformName).join(' / ')} links to check: they have not opened one ` +
+            '(TikTok links count only since their TikTok account was last changed).' +
+            (platforms.length < 3 ? ` ${notCheckedNote(platforms)}` : ''),
         },
         { status: 400 }
       )
@@ -191,7 +220,7 @@ export async function POST(req: NextRequest) {
         // constant here is how this route used to ignore the admin's own setting.
         const v = await noCommentVerdict(
           userId,
-          profile!.tiktok_url!,
+          profile?.tiktok_url ?? '',
           Date.now() + BUDGET_MS,
           undefined,
           since
@@ -297,6 +326,11 @@ export async function POST(req: NextRequest) {
       remaining: r.remaining,
       done: r.remaining === 0,
       links: r.links,
+      // Per platform, so a 0% on three TikTok links is not mistaken for the
+      // verdict on a worker whose work is YouTube.
+      byPlatform: byPlatform(r.links),
+      // Platforms whose links were left out because their key is not set.
+      notChecked: notCheckedNote(platforms),
       // The distinct comments found, most-used first. The frequency is the
       // interesting part: one comment on forty links is somebody pasting the same
       // line all day, which reads as automation to anyone looking at the video.

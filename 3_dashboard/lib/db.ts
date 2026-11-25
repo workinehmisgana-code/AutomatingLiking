@@ -67,6 +67,7 @@ import {
   balanceGenreWeights,
 } from './config'
 import { isGenericTitle } from './titleFilter'
+import { verifiableUrlSql } from './platformComments'
 import { normalizeReferralCode, referralCodeFrom, candidateCode } from './referrals'
 import { clampShare } from './clusterMix'
 import { getPoolGenreIndex, loadVideosJson } from './videos'
@@ -292,6 +293,18 @@ export function ensureClickedTable(): Promise<void> {
           uid        TEXT NOT NULL,
           seen_at    TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+        -- The YouTube / Reddit account a worker actually comments from, learned
+        -- when a check finds the exact comment they were handed (served_comment)
+        -- on a post. Nobody registers a Reddit name, and the YouTube profile link
+        -- is often blank or a different channel — see lib/platformComments.
+        CREATE TABLE IF NOT EXISTS platform_account (
+          user_id    TEXT NOT NULL,
+          platform   TEXT NOT NULL,
+          handle     TEXT NOT NULL,
+          seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (user_id, platform)
+        );
+        CREATE INDEX IF NOT EXISTS platform_account_handle_idx ON platform_account (platform, handle);
         -- One turn of the automatic cycle: harvest -> extract -> categorise
         -- -> recluster. app_kv only ever holds the LATEST tick, which answers
         -- "what is it doing now" and nothing about what it has done — so every
@@ -3029,12 +3042,15 @@ const NOT_BLOCKED = `
         OR (b.user_id IS NOT NULL AND b.user_id = c.user_id)
   )`
 
-/** TikTok links a user opened on one day (UTC), newest first. */
+/**
+ * Links a user opened on one day (UTC) whose comments can be read — TikTok, plus
+ * YouTube and Reddit when their keys are set (lib/platformComments) — newest first.
+ */
 export async function getClickedOnDay(userId: string, day: string): Promise<string[]> {
   await ensureClickedTable()
   const { rows } = await pool.query<{ url: string }>(
     `SELECT url FROM clicked_link
-      WHERE user_id = $1 AND clicked_at::date = $2::date AND url ILIKE '%tiktok.com%'
+      WHERE user_id = $1 AND clicked_at::date = $2::date AND ${verifiableUrlSql('url')}
       -- url breaks ties so the order is identical on every call. The day cap
       -- picks links by position, and a wobbling order would pick a different
       -- hundred each pass and defeat the resume ledger.
@@ -3055,7 +3071,7 @@ export async function getClickersOnDay(
        JOIN user_profile p ON p.user_id = c.user_id
        JOIN "user" au ON au.id = c.user_id
       WHERE c.clicked_at::date = $1::date
-        AND c.url ILIKE '%tiktok.com%'
+        AND ${verifiableUrlSql('c.url')}
         AND p.tiktok_url IS NOT NULL AND p.tiktok_url <> ''
         AND ${NOT_BLOCKED}
       GROUP BY c.user_id, p.tiktok_url
@@ -3084,7 +3100,7 @@ export async function getRecentClickers(
        JOIN user_profile p ON p.user_id = c.user_id
        JOIN "user" au ON au.id = c.user_id
       WHERE c.clicked_at >= now() - ($1::int || ' days')::interval
-        AND c.url ILIKE '%tiktok.com%'
+        AND ${verifiableUrlSql('c.url')}
         AND p.tiktok_url IS NOT NULL AND p.tiktok_url <> ''
         AND ${NOT_BLOCKED}
       GROUP BY c.user_id, p.tiktok_url
@@ -3837,6 +3853,79 @@ export async function recordTiktokAccount(
   )
 }
 
+/** The YouTube / Reddit accounts a check has seen this user comment from. */
+export async function getPlatformAccounts(userId: string): Promise<Record<string, string>> {
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ platform: string; handle: string }>(
+    'SELECT platform, handle FROM platform_account WHERE user_id = $1',
+    [userId]
+  )
+  return Object.fromEntries(rows.map((r) => [r.platform, r.handle]))
+}
+
+export async function recordPlatformAccount(
+  userId: string,
+  platform: string,
+  handle: string
+): Promise<void> {
+  const h = String(handle ?? '').trim().toLowerCase()
+  if (!userId || !platform || !h || h === '[deleted]') return
+  await ensureClickedTable()
+  await pool.query(
+    `INSERT INTO platform_account (user_id, platform, handle) VALUES ($1, $2, $3)
+     ON CONFLICT (user_id, platform) DO UPDATE SET handle = EXCLUDED.handle, seen_at = now()`,
+    [userId, platform, h]
+  )
+}
+
+/**
+ * Which of these handles belong to SOMEONE ELSE on this platform — learned by a
+ * check, or (YouTube) registered on their profile. A comment by one of them is
+ * not this user's, however closely its words match what this user was given:
+ * two workers can be handed the same comment for the same post.
+ */
+export async function handlesOwnedByOthers(
+  userId: string,
+  platform: string,
+  handles: string[]
+): Promise<Set<string>> {
+  const hs = Array.from(new Set(handles.map((h) => h.toLowerCase()).filter(Boolean)))
+  if (hs.length === 0) return new Set()
+  await Promise.all([ensureClickedTable(), ensureUserProfileTable()])
+  const { rows } = await pool.query<{ h: string }>(
+    `SELECT handle AS h FROM platform_account
+      WHERE platform = $2 AND user_id <> $1 AND handle = ANY($3::text[])
+     UNION
+     SELECT lower(substring(youtube_url from '@([A-Za-z0-9._-]+)')) AS h FROM user_profile
+      WHERE $2 = 'youtube' AND user_id <> $1
+        AND lower(substring(youtube_url from '@([A-Za-z0-9._-]+)')) = ANY($3::text[])`,
+    [userId, platform, hs]
+  )
+  return new Set(rows.map((r) => r.h))
+}
+
+/**
+ * When each of these links was opened and which comment it was handed. Used to
+ * recognise a YouTube / Reddit comment by its words and its timing.
+ */
+export async function getClickHints(
+  userId: string,
+  urls: string[]
+): Promise<Map<string, { servedComment: string | null; clickedAt: string }>> {
+  const out = new Map<string, { servedComment: string | null; clickedAt: string }>()
+  if (urls.length === 0) return out
+  await ensureClickedTable()
+  const { rows } = await pool.query<{ url: string; served_comment: string | null; clicked_at: Date }>(
+    `SELECT url, served_comment, clicked_at FROM clicked_link
+      WHERE user_id = $1 AND url = ANY($2::text[])`,
+    [userId, urls]
+  )
+  for (const r of rows) {
+    out.set(r.url, { servedComment: r.served_comment, clickedAt: r.clicked_at.toISOString() })
+  }
+  return out
+}
+
 export interface TiktokAccountRow {
   handle: string
   uid: string
@@ -4078,13 +4167,17 @@ export async function getRecentClickedLinks(
   // one, so judging those against the new @username finds nothing and blocks
   // them for links they did comment on. Every comment check — Verify, Verify
   // all, the nightly sweep and the block verdict — reads its window from here.
+  //
+  // YouTube and Reddit links join the window once their keys are set (see
+  // lib/platformComments). The account-change date is TikTok's alone: those two
+  // are recognised by the comment they were handed, not by a profile handle.
   const { rows } = await pool.query<{ url: string; day: Date }>(
     `SELECT url, clicked_at::date AS day
        FROM clicked_link
-      WHERE user_id = $1 AND url ILIKE '%tiktok.com%'
-        AND clicked_at >= COALESCE(
+      WHERE user_id = $1 AND ${verifiableUrlSql('url')}
+        AND (url NOT ILIKE '%tiktok.com%' OR clicked_at >= COALESCE(
               (SELECT tiktok_changed_at FROM user_profile WHERE user_id = $1),
-              '-infinity'::timestamptz)
+              '-infinity'::timestamptz))
         ${before ? 'AND clicked_at < $3::timestamptz' : ''}
       ORDER BY clicked_at DESC, url
       LIMIT $2`,
@@ -4125,7 +4218,7 @@ export async function getRecentJudgedRate(
        SELECT c.url, c.clicked_at::date AS day, c.clicked_at,
               row_number() OVER (ORDER BY c.clicked_at DESC) AS rn
          FROM clicked_link c
-        WHERE c.user_id = $1 AND c.url ILIKE '%tiktok.com%'
+        WHERE c.user_id = $1 AND ${verifiableUrlSql('c.url')}
      ),
      j AS (
        SELECT l.found, row_number() OVER (ORDER BY r.clicked_at DESC) AS jn
@@ -4161,7 +4254,7 @@ export async function getRecentJudgedByProduct(
        SELECT c.url, c.clicked_at::date AS day, c.product,
               row_number() OVER (ORDER BY c.clicked_at DESC) AS rn
          FROM clicked_link c
-        WHERE c.user_id = $1 AND c.url ILIKE '%tiktok.com%'
+        WHERE c.user_id = $1 AND ${verifiableUrlSql('c.url')}
      )
      SELECT r.product, count(*) AS judged, count(*) FILTER (WHERE l.found) AS found
        FROM r
@@ -9228,6 +9321,9 @@ function ensurePayLog(): Promise<void> {
           source   TEXT NOT NULL DEFAULT 'paid'
         );
         CREATE INDEX IF NOT EXISTS pay_log_paid_at ON pay_log (paid_at DESC);
+        -- What the payment was for, by genre (apportionPayByGenre), recorded
+        -- when it is made. Null on payments made before this existed.
+        ALTER TABLE pay_log ADD COLUMN IF NOT EXISTS by_genre JSONB;
       `)
       // The backfill, once: snapshots older than the first logged payment.
       await ensureSnapshotTable()
@@ -9260,36 +9356,126 @@ export interface PayDay {
   payments: number
   /** Who, and how much, biggest first. */
   people: { name: string; amount: number }[]
+  /**
+   * Birr paid that day BY GENRE (apportioned — see apportionPayByGenre).
+   * 'other' is pay that belongs to no genre (videos, reposts); 'unsplit' is a
+   * payment nothing was left to split it by.
+   */
+  byGenre: Record<string, number>
+  /** Some of the day's split was rebuilt from the pre-payment snapshot
+   *  (payments made before the split was recorded), so it is approximate. */
+  estimated: boolean
 }
+
+/**
+ * One payment's birr divided between genres, the way the pay card divides it:
+ * the comment pay in proportion to the worker's own links per genre over the
+ * same window, the referral commission in proportion to their members' links,
+ * and the rest (videos, reposts — work with no genre) as 'other'. A part with
+ * no links to divide it by stays 'unsplit' rather than being guessed.
+ */
+export function apportionPayByGenre(
+  parts: { comments: number; referrals: number; total: number },
+  w: { own?: Record<string, number>; referral?: Record<string, number> } | null | undefined
+): Record<string, number> {
+  const out: Record<string, number> = {}
+  const add = (k: string, v: number) => { if (v > 0) out[k] = (out[k] ?? 0) + v }
+  const split = (amount: number, weights: Record<string, number> = {}) => {
+    const t = Object.values(weights).reduce((a, b) => a + (Number(b) || 0), 0)
+    if (amount <= 0) return
+    if (t <= 0) return add('unsplit', amount)
+    for (const [g, n] of Object.entries(weights)) add(g === '(none)' ? 'unsplit' : g, (amount * (Number(n) || 0)) / t)
+  }
+  split(parts.comments, w?.own)
+  split(parts.referrals, w?.referral)
+  add('other', parts.total - Math.max(0, parts.comments) - Math.max(0, parts.referrals))
+  for (const k of Object.keys(out)) out[k] = Math.round(out[k] * 100) / 100
+  return out
+}
+
+/**
+ * The first click on a product outside the humanizer genre: cocodly, 2026-10-17
+ * 13:22 UTC (measured from clicked_link; tintfolio was clicked earlier but was a
+ * humanizer product then). A payment made before it can only have been for
+ * humanizer work — which matters because the snapshots of those payments
+ * predate the per-genre link counts and could otherwise not be split at all.
+ */
+const ONLY_HUMANIZER_BEFORE = Date.parse('2026-10-17T13:22:11Z')
 
 /** The last `n` days on which any payment was made, newest first. */
 export async function getRecentPayDays(n = 10): Promise<PayDay[]> {
   await ensurePayLog()
-  const { rows } = await pool.query<{ day: string; user_id: string; name: string | null; amount: string; k: number }>(
+  await ensureSnapshotTable()
+  // One row PER PAYMENT, with its recorded split — or, for payments made
+  // before the split was recorded, the snapshot saved just before it (Mark
+  // paid saves one a moment earlier; the backfilled rows ARE snapshots).
+  const { rows } = await pool.query<{
+    day: string; user_id: string; name: string | null; amount: string; paid_at: Date
+    by_genre: Record<string, number> | null
+    w_own: Record<string, number> | null; w_ref: Record<string, number> | null
+  }>(
     `WITH d AS (
        SELECT DISTINCT (paid_at AT TIME ZONE $2)::date AS day FROM pay_log ORDER BY 1 DESC LIMIT $1
      )
      SELECT (l.paid_at AT TIME ZONE $2)::date::text AS day, l.user_id,
-            max(COALESCE(NULLIF(u.name, ''), u.email)) AS name,
-            sum(l.amount)::text AS amount, count(*)::int AS k
+            COALESCE(NULLIF(u.name, ''), u.email) AS name,
+            l.amount::text AS amount, l.paid_at, l.by_genre,
+            s.snapshot->'payClicksByGenre' AS w_own,
+            s.snapshot->'referralClicksByGenre' AS w_ref
        FROM pay_log l
        JOIN d ON d.day = (l.paid_at AT TIME ZONE $2)::date
        LEFT JOIN "user" u ON u.id = l.user_id
-      GROUP BY 1, 2`,
+       LEFT JOIN LATERAL (
+         SELECT snapshot FROM user_snapshot
+          WHERE l.by_genre IS NULL AND user_id = l.user_id
+            AND created_at BETWEEN l.paid_at - interval '15 minutes' AND l.paid_at + interval '1 minute'
+          ORDER BY created_at DESC LIMIT 1
+       ) s ON true`,
     [n, PAY_DAY_TZ]
   )
-  const byDay = new Map<string, PayDay>()
+  const byDay = new Map<string, PayDay & { who: Map<string, { name: string; amount: number }> }>()
   for (const r of rows) {
-    const d = byDay.get(r.day) ?? { day: r.day, total: 0, workers: 0, payments: 0, people: [] }
+    const d = byDay.get(r.day) ?? {
+      day: r.day, total: 0, workers: 0, payments: 0, people: [],
+      byGenre: {} as Record<string, number>, estimated: false, who: new Map(),
+    }
     const amt = Math.round(Number(r.amount) * 100) / 100
     d.total += amt
-    d.workers += 1
-    d.payments += r.k
-    d.people.push({ name: r.name ?? r.user_id.slice(0, 8), amount: amt })
+    d.payments += 1
+    const p = d.who.get(r.user_id) ?? { name: r.name ?? r.user_id.slice(0, 8), amount: 0 }
+    p.amount += amt
+    d.who.set(r.user_id, p)
+    let split = r.by_genre
+    if (!split) {
+      if (new Date(r.paid_at).getTime() < ONLY_HUMANIZER_BEFORE && !Object.keys(r.w_own ?? {}).length) {
+        // Before any other genre was served there was nothing else it could
+        // have been for — exact, not an estimate.
+        split = { humanizer: amt }
+      } else {
+        // Rebuilt: no comment/referral breakdown was kept, so the whole amount
+        // is divided by the worker's own links (comment pay is nearly all of it).
+        split = apportionPayByGenre(
+          { comments: amt, referrals: 0, total: amt },
+          { own: { ...(r.w_own ?? {}) } }
+        )
+        d.estimated = true
+      }
+    }
+    for (const [g, v] of Object.entries(split)) d.byGenre[g] = (d.byGenre[g] ?? 0) + Number(v || 0)
     byDay.set(r.day, d)
   }
   return Array.from(byDay.values())
-    .map((d) => ({ ...d, total: Math.round(d.total * 100) / 100, people: d.people.sort((a, b) => b.amount - a.amount) }))
+    .map(({ who, ...d }) => ({
+      ...d,
+      total: Math.round(d.total * 100) / 100,
+      workers: who.size,
+      people: Array.from(who.values())
+        .map((p) => ({ ...p, amount: Math.round(p.amount * 100) / 100 }))
+        .sort((a, b) => b.amount - a.amount),
+      byGenre: Object.fromEntries(
+        Object.entries(d.byGenre).map(([g, v]) => [g, Math.round(v * 100) / 100]).filter(([, v]) => Number(v) > 0)
+      ),
+    }))
     .sort((a, b) => b.day.localeCompare(a.day))
 }
 
@@ -9297,6 +9483,15 @@ export async function markUserPaid(userId: string): Promise<{ amount: number; un
   await Promise.all([ensureAdminTables(), ensurePromoTables()])
   const pending = await getUserPendingPayments(userId) // amount BEFORE resetting
   const amount = pending.total
+  // WHAT IT IS FOR, BY GENRE — measured now, before the markers below move the
+  // window the weights are read over. Never allowed to fail the payment.
+  const byGenre = await getResetAt()
+    .then((resetAt) => getPayGenreWeights(resetAt))
+    .then((w) => apportionPayByGenre(
+      { comments: pending.comments.birr, referrals: pending.referrals.birr, total: amount },
+      w[userId]
+    ))
+    .catch(() => null)
 
   // Capture prior state so undo can restore it exactly.
   const mk = await pool.query<{ paid_at: Date }>(
@@ -9360,7 +9555,10 @@ export async function markUserPaid(userId: string): Promise<{ amount: number; un
   // The payment log. Never allowed to fail the payment itself.
   const logged = await ensurePayLog()
     .then(() =>
-      pool.query<{ id: string }>('INSERT INTO pay_log (user_id, amount) VALUES ($1, $2) RETURNING id', [userId, amount])
+      pool.query<{ id: string }>(
+        'INSERT INTO pay_log (user_id, amount, by_genre) VALUES ($1, $2, $3) RETURNING id',
+        [userId, amount, byGenre ? JSON.stringify(byGenre) : null]
+      )
     )
     .then((r) => Number(r.rows[0]?.id ?? 0))
     .catch(() => 0)

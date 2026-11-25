@@ -1,15 +1,17 @@
 {
   "search": {
     "platforms": [
-      "tiktok"
+      "tiktok",
+      "youtube"
     ],
-    "genre": "study-helper",
+    "genre": "ai-hub",
     "queries_by_genre": {
       "humanizer": "humanizer\nAI text humanizer\nbypass AI detector\nai paraphraser\nnaturalwrite humanizer\ngrubbyai humanizer\nwalterwritesai humanizer\nwritehuman humanizer\nLegitWriter humanizer\npaperbleach humanizer\nmaskai humanizer\nundetectableai humanizer\nverva humanizer\naihumanizer\nturnitin detector\ngptzero detector\noriginalityai detector\npangram detector",
       "website": "ai website builder\nbuild a website with ai\nno code website\nbase44 website builder\nemergent website builder\nlovable website builder\nwix website builder\nwebador website builder\nshopify website builder\nSquarespace website builder\nHostinger AI website builder\nCatDoes website builder\nManus AI website builder\nFramer AI website builder\nReplit Agent website builder\nv0 AI website builder",
       "slides": "ai presentation maker\nai powerpoint generator\nai slides generator\nai deck generator\nmake slides fast\ngamma ai presentation\nkimi ai presentation\nManus AI presentation\nCanva AI presentation",
       "link-in-bio": "how to put link in bio\nbest tool to put a link in bio\nTikTok bio link tool\nInstagram bio link tool\nhow to link in bio tools\nhow to Linktree bio link\nhow to Liinks bio link\nhow to Beacon bio link\npersonal branding tool",
-      "study-helper": "study tips\nhow to study for exams\nstudy with me\nexam revision tips\nhow to pass exams\nstudy hacks for students\nfinals week study\nhow to study effectively\nstudent study routine\nlast minute exam study"
+      "study-helper": "study tips\nhow to study for exams\nstudy with me\nexam revision tips\nhow to pass exams\nstudy hacks for students\nfinals week study\nhow to study effectively\nstudent study routine\nlast minute exam study",
+      "ai-hub": "Poe.com\nChatGPT\nClaude\nClaude AI\nGemini\nGoogle Gemini\nPerplexity AI\nDeepSeek\nGrok\nMistral AI\nOpenRouter\nHugging Face\nCharacter AI\nYou.com\nMonica AI\nMerlin AI\nAbacus AI\nYouChat\nPhind\nChatbox AI\nTypingMind\nLibreChat\nChatALL\nChatHub\nMagai\nChatSonic\nJasper AI\nChatGPT alternatives\nClaude alternatives\nPoe alternatives\nAI chatbot platforms\nmultiple AI models platform\nAI model aggregator\nAI model comparison\nall-in-one AI platform\nAI workspace\nAI assistant\nAI website builder\nAI app builder\nAI coding assistant\nAI Excel analyzer\nAI spreadsheet generator\nAI data analysis\nAI 3D model generator\ntext to 3D\nimage to 3D\nAI research assistant\nAI productivity tools"
     },
     "min": 200,
     "max": 400,

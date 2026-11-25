@@ -391,7 +391,11 @@ class BubbleService : Service() {
         thread {
             val (code, respBody) = postClick(token, item)
             val serverComment = try {
-                JSONObject(respBody).optString("comment").ifBlank { null }
+                // isNull first: optString turns a JSON null into the text "null",
+                // which workers then pasted under videos.
+                val o = JSONObject(respBody)
+                if (o.isNull("comment")) null
+                else o.optString("comment").trim().takeUnless { it.isBlank() || it.equals("null", true) }
             } catch (e: Exception) {
                 null
             }
