@@ -1,10 +1,16 @@
 {
   "search": {
     "platforms": [
-      "tiktok",
-      "youtube"
+      "tiktok"
     ],
     "genre": "ai-hub",
+    "run_genres": [
+      "humanizer",
+      "website",
+      "slides",
+      "link-in-bio",
+      "study-helper"
+    ],
     "queries_by_genre": {
       "humanizer": "humanizer\nAI text humanizer\nbypass AI detector\nai paraphraser\nnaturalwrite humanizer\ngrubbyai humanizer\nwalterwritesai humanizer\nwritehuman humanizer\nLegitWriter humanizer\npaperbleach humanizer\nmaskai humanizer\nundetectableai humanizer\nverva humanizer\naihumanizer\nturnitin detector\ngptzero detector\noriginalityai detector\npangram detector",
       "website": "ai website builder\nbuild a website with ai\nno code website\nbase44 website builder\nemergent website builder\nlovable website builder\nwix website builder\nwebador website builder\nshopify website builder\nSquarespace website builder\nHostinger AI website builder\nCatDoes website builder\nManus AI website builder\nFramer AI website builder\nReplit Agent website builder\nv0 AI website builder",
@@ -43,7 +49,7 @@
     "target": "products",
     "users": "cocodly, co codly,purifytext, purify text,\u03c1\u03c5r\u0456f\u0443t\u0435xt,\u03c1\u03c5r\u0456f\u0443 t\u0435xt, \u03c1\u03c5r\u0456f\u0443t\u0435xt, acoustictext, acoustic text, prohumanly,  pro humanly, cohumanly, humlexic",
     "profiles": "c,g,h,e,b,f,d,j,i,o,n,q,l,r,s,t,u,a",
-    "at_once": 5,
+    "at_once": 7,
     "links_per_account": 300,
     "links_per_account_max": 400,
     "relay_own_copy": true,

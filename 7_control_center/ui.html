@@ -231,6 +231,7 @@
       <div class="sec">Promote</div>
       <button data-page="hearts"><span class="ic">♥</span> Zefoy liker</button>
       <button data-page="liker"><span class="ic">◉</span> Account liker</button>
+      <button data-page="assist"><span class="ic">✎</span> Comment by hand</button>
       <div class="sec">Activity</div>
       <button data-page="jobs"><span class="ic">▤</span> Jobs <span class="count" id="jobCount">0</span></button>
     </nav>
@@ -299,6 +300,11 @@
             <option value="slides">Slides (pptera)</option>
           </select>
         </label>
+        <div class="f" style="margin-top:10px">
+          <span title="Tick two or more to search them at the same time. Each genre uses its own phrases (pick it in the box above to see or edit them), runs its own job per platform, and uploads into its own pool. Nothing ticked = only the genre selected above.">
+            Run these genres together <small style="opacity:.7">(optional — nothing ticked runs only the genre above)</small></span>
+          <div class="checks" id="s_run_genres" style="margin-top:6px"></div>
+        </div>
         <label class="f" style="margin-top:14px"><span>Search phrases for this genre</span>
           <textarea id="s_queries" spellcheck="false"></textarea></label>
         <label class="f" style="margin-top:14px"><span>Output CSV (optional — blank lets the scraper name it)</span>
@@ -753,6 +759,63 @@
       </div>
     </section>
 
+    <!-- ── comment by hand ────────────────────────────────────────────── -->
+    <section id="page-assist" class="hidden">
+      <div class="head">
+        <div>
+          <h2>Comment by hand</h2>
+          <p>Opens one of your accounts on a genre's TikTok links, one at a time, with a comment
+             from the dashboard <b>already copied</b> — you paste it and post it yourself. After
+             each one, answer in the job's box: <b>Enter</b> = posted, <b>s</b> = skip, <b>q</b> = stop.
+             Every comment you post is checked again later, and the job ends with a report of how
+             many are still there.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Account</h3>
+        <p class="sub">The account liker's saved TikTok logins (6_comment_liker), with the
+           TikTok username each one is signed in as.</p>
+        <label class="f"><span>Comment with</span>
+          <select id="a_profile"><option value="">— pick an account —</option></select></label>
+      </div>
+
+      <div class="card">
+        <h3>Links and comments</h3>
+        <div class="grid">
+          <label class="f"><span>Product genre</span>
+            <select id="a_genre"
+              title="Which genre's links to open. Only TikTok links that carry none of our comments yet are taken, best first.">
+              <option value="humanizer">Humanizer</option>
+              <option value="website">Website builder (cocodly)</option>
+              <option value="slides">Slides (pptera)</option>
+            </select></label>
+          <label class="f"><span>Links this session</span>
+            <input type="number" id="a_count" min="1" max="200" step="1"></label>
+          <label class="f"><span>Check each comment after (minutes)</span>
+            <input type="number" id="a_check_minutes" min="1" step="1"></label>
+        </div>
+        <div class="checks" style="margin-top:14px">
+          <label class="c" title="End the comment with an upbeat emoji.">
+            <input type="checkbox" id="a_emoji"> Emoji</label>
+          <label class="c" title="Write the name as two words: purifytext → purify text.">
+            <input type="checkbox" id="a_split"> Split the brand</label>
+          <label class="c" title="Write the name the way a common noun is used — “running it through a purify text” — rather than as a product being recommended.">
+            <input type="checkbox" id="a_in_sentence"> Name inside the sentence</label>
+          <label class="c" title="Put the name in double quotes: “purify text”.">
+            <input type="checkbox" id="a_quote"> Quote the brand</label>
+        </div>
+        <p class="note">The comment is written in the style ticked here, whatever the product's own
+           settings on the dashboard say. The check reads the video's comments the way a stranger
+           sees them (from the dashboard's server, not from your account) — "can't tell" means the
+           list could not be read fully, which is not the same as removed.</p>
+        <div class="cmd" id="a_cmd"></div>
+        <div class="row" style="margin-top:14px">
+          <button class="btn" onclick="start('assist')">Open the account</button>
+        </div>
+      </div>
+    </section>
+
     <!-- ── jobs ───────────────────────────────────────────────────────── -->
     <section id="page-jobs" class="hidden">
       <div class="head">
@@ -798,6 +861,8 @@ const FIELDS = {
             upload_after:'s_upload_after', upload_each_keyword:'s_upload_each_keyword',
             upload_mode:'s_upload_mode',
             browser_profiles:'s_browser_profiles', use_liker_profiles:'s_use_liker_profiles' },
+  assist: { profile:'a_profile', genre:'a_genre', count:'a_count', check_minutes:'a_check_minutes',
+            emoji:'a_emoji', split:'a_split', in_sentence:'a_in_sentence', quote:'a_quote' },
   harvest:{ limit:'h_limit', accounts:'h_accounts', genre:'h_genre',
             dry_run:'h_dry_run', upload:'h_upload' },
   liker:  { source:'k_source', links:'k_links', cluster_by:'k_cluster_by',
@@ -822,7 +887,7 @@ const FIELDS = {
             tag:'z_tag', cdp:'z_cdp', recover:'z_recover', share:'z_share', record:'z_record', ads_auto:'z_ads_auto',
             on_pc:'z_on_pc', on_phone:'z_on_phone' },
 };
-const CMD_BOX = { search:'s_cmd', harvest:'h_cmd', hearts:'z_cmd', liker:'k_cmd' };
+const CMD_BOX = { search:'s_cmd', harvest:'h_cmd', hearts:'z_cmd', liker:'k_cmd', assist:'a_cmd' };
 
 // THE PHRASES FOR EVERY GENRE, not just the one on screen.
 //
@@ -847,6 +912,31 @@ function showGenre(genre) {
   if (box) box.value = QBG[genre] ?? '';
 }
 
+// "Run these genres together": one tick box per genre, built from the genre
+// dropdown so an added genre shows up too. Nothing ticked = the dropdown's genre.
+const RUN_GENRE_BOXES = () => [...document.querySelectorAll('#s_run_genres input[data-genre]')];
+const runGenresPicked = () => RUN_GENRE_BOXES().filter(b => b.checked).map(b => b.dataset.genre);
+function buildRunGenreBoxes() {
+  const holder = $('s_run_genres');
+  const sel = GENRE_SEL();
+  if (!holder || !sel) return;
+  const keep = new Set(runGenresPicked());
+  holder.innerHTML = '';
+  for (const o of sel.options) {
+    if (!o.value) continue;
+    const lab = document.createElement('label');
+    lab.className = 'c';
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.dataset.genre = o.value;
+    box.checked = keep.has(o.value);
+    box.addEventListener('change', () => touched('search'));
+    lab.appendChild(box);
+    lab.appendChild(document.createTextNode(' ' + o.textContent));
+    holder.appendChild(lab);
+  }
+}
+
 const PLAT_BOXES = () => [...document.querySelectorAll('#s_platforms_menu input[data-plat]')];
 const platformsPicked = () => PLAT_BOXES().filter(b => b.checked).map(b => b.dataset.plat);
 
@@ -866,6 +956,7 @@ function readForm(tool) {
     stashQueries();
     out.genre = QBG_GENRE;
     out.queries_by_genre = { ...QBG };
+    out.run_genres = runGenresPicked();
   }
   return out;
 }
@@ -890,6 +981,9 @@ function fillForm(tool, values) {
     if (GENRE_SEL()) GENRE_SEL().value = QBG_GENRE;
     const box = $('s_queries');
     if (box) box.value = QBG[QBG_GENRE] ?? '';
+    buildRunGenreBoxes();
+    const runWant = new Set([].concat(values.run_genres || []));
+    for (const b of RUN_GENRE_BOXES()) b.checked = runWant.has(b.dataset.genre);
   }
 }
 
@@ -1107,6 +1201,20 @@ async function loadLogins() {
     const r = await fetch('/api/logins');
     logins = (await r.json()).logins || [];
   } catch (e) { return; }
+  // Comment by hand: one account, shown with its TikTok username.
+  const ap = $('a_profile');
+  if (ap) {
+    const want = (STATE && STATE.settings && STATE.settings.assist && STATE.settings.assist.profile) || ap.value;
+    ap.innerHTML = '<option value="">— pick an account —</option>';
+    const sorted = [...logins].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    for (const l of sorted) {
+      const o = document.createElement('option');
+      o.value = l.name;
+      o.textContent = `${l.name} — ${l.username ? '@' + l.username : 'username unknown'}` + (l.ready ? '' : ' (never signed in)');
+      ap.appendChild(o);
+    }
+    ap.value = want || '';
+  }
   if (!logins.length) {
     box.innerHTML = '<span class="sub">No saved logins yet \u2014 run login.py in 6_comment_liker first.</span>';
     return;
@@ -1595,7 +1703,7 @@ function renderHealth() {
  */
 function applyGenreOptions(genres) {
   if (!genres.length) return;
-  for (const id of ['s_genre', 'h_genre', 'z_genre', 'k_genre']) {
+  for (const id of ['s_genre', 'h_genre', 'z_genre', 'k_genre', 'a_genre']) {
     const sel = $(id);
     if (!sel) continue;
     const keepAll = sel.querySelector('option[value=""]');
@@ -1610,6 +1718,7 @@ function applyGenreOptions(genres) {
     }
     sel.value = was;
   }
+  buildRunGenreBoxes();
 }
 
 let first = true;

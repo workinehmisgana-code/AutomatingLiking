@@ -64,6 +64,9 @@ SCRIPTS = {
     "harvest": SCRAPER_DIR / "harvest_instagram.py",
     "hearts": HEARTS_DIR / "automate.py",
     "liker": LIKER_DIR / "like.py",
+    # Comment by hand: opens one account on a genre's links with a comment
+    # ready to paste, and checks each posted one 10 minutes later.
+    "assist": LIKER_DIR / "comment_assist.py",
 }
 
 # WHICH TOOLS DRIVE A CHROME PROFILE, AND WHICH PROFILE EACH GETS.
@@ -391,6 +394,10 @@ DEFAULTS = {
         "platforms": ["tiktok"],
         # Which genre this search is for, and one phrase set per genre.
         "genre": "humanizer",
+        # RUN SEVERAL GENRES AT ONCE: the genres ticked here are each searched
+        # with their own phrases, side by side (one job per genre per platform),
+        # and each uploads into its own pool. Empty = just `genre` above.
+        "run_genres": [],
         "queries_by_genre": {
             "humanizer": "ai humanizer\nhumanize ai text\nturnitin bypass",
             "website": "ai website builder\nbuild a website with ai\nno code website",
@@ -419,6 +426,18 @@ DEFAULTS = {
         # And the account liker's saved logins too (6_comment_liker), when this
         # window's own are busy — shared safely with the liker, see the pool.
         "use_liker_profiles": True,
+    },
+    # COMMENT BY HAND (comment_assist.py): you post every comment yourself; the
+    # window opens the account on the genre's links and hands you each comment.
+    "assist": {
+        "profile": "",
+        "genre": "humanizer",
+        "count": 10,
+        "emoji": True,
+        "split": True,
+        "in_sentence": False,
+        "quote": False,
+        "check_minutes": 10,
     },
     "harvest": {
         "limit": 50,
@@ -862,7 +881,7 @@ class Job:
             self.write(f"[*] browser profile: {got.label}" + (
                 " — never opened before, so it is signed out of everything. "
                 "Use Search -> Sign in to a profile to log its accounts in." if fresh else ""))
-        elif self.tool == "liker" and self.cmd and "--list-only" not in self.cmd:
+        elif (self.tool == "liker" and self.cmd and "--list-only" not in self.cmd) or self.tool == "assist":
             # THE ACCOUNT LIKER TAKES ITS PROFILE FROM THE SAME POOL, so a search
             # never opens an account it is liking with, and it waits for a
             # search to finish rather than failing. like.py checks for browsers
@@ -1541,6 +1560,31 @@ def genre_of(s: dict) -> str:
     return g if g in GENRES else GENRES[0]
 
 
+def search_genres(s: dict) -> list[str]:
+    """The genres one Start searches: the ones ticked under "Run these genres
+    together", in the dashboard's order, or just the selected genre."""
+    picked = s.get("run_genres")
+    if isinstance(picked, str):
+        picked = [picked]
+    picked = {str(g).strip().lower() for g in (picked or [])}
+    chosen = [g for g in GENRES if g in picked]
+    return chosen or [genre_of(s)]
+
+
+def search_plan(s: dict) -> list[tuple[dict, str, str]]:
+    """Every run one Start makes: (settings for that genre, platform, tab).
+
+    Each genre is its own set of runs, with the genre fixed in its settings — so
+    its phrases, its output file name and its upload pool are that genre's.
+    """
+    plan = []
+    for g in search_genres(s):
+        sg = {**s, "genre": g}
+        for pl, ct in search_runs(sg):
+            plan.append((sg, pl, ct))
+    return plan
+
+
 def queries_for(s: dict) -> list[str]:
     """The search phrases for the chosen genre, one per line.
 
@@ -1922,7 +1966,32 @@ def build_liker(s: dict) -> tuple[str, list[str], Path]:
     return build_liker_for(s, names[0], names)
 
 
+def build_assist(s: dict) -> tuple[str, list[str], Path]:
+    """Comment by hand: one account, a genre's links, a comment ready to paste."""
+    profile = str(s.get("profile", "")).strip()
+    if not profile:
+        raise ValueError("Pick the account to comment with.")
+    try:
+        count = max(1, min(200, int(s.get("count", 10) or 10)))
+        minutes = max(1.0, float(s.get("check_minutes", 10) or 10))
+    except (TypeError, ValueError):
+        raise ValueError("Links and check minutes must be numbers.")
+    genre = str(s.get("genre", "")).strip().lower()
+    cmd = _py(SCRIPTS["assist"]) + ["--profile", profile, "--count", str(count),
+                                    "--check-minutes", f"{minutes:g}"]
+    if genre in GENRES:
+        cmd += ["--genre", genre]
+    flags = {"emoji": "--emoji", "split": "--split", "in_sentence": "--in-sentence", "quote": "--quote"}
+    for key, flag in flags.items():
+        cmd += [flag, "1" if s.get(key) else "0"]
+    who = account_usernames().get(profile, "")
+    which = GENRE_LABELS.get(genre, genre) if genre in GENRES else "all genres"
+    return (f"Comment by hand · {profile}{f' (@{who})' if who else ''} · {which} · {count} link(s)",
+            cmd, LIKER_DIR)
+
+
 BUILDERS = {
+    "assist": build_assist,
     "search": build_search,
     "upload": build_upload,
     "harvest": build_harvest,
@@ -1962,12 +2031,12 @@ def preview(tool: str, s: dict) -> str:
                 " ".join(build_liker_for(s, n, names)[1][1:]) for n in names
             )
         if tool == "search":
-            runs = search_runs(s)
-            if not runs:
+            plan = search_plan(s)
+            if not plan:
                 raise ValueError("Tick at least one platform.")
-            many = len(runs) > 1
+            many = len(plan) > 1
             return "\n".join(
-                " ".join(build_search_for(s, pl, ct, many)[1][1:]) for pl, ct in runs
+                " ".join(build_search_for(sg, pl, ct, many)[1][1:]) for sg, pl, ct in plan
             )
         _, cmd, _ = BUILDERS[tool](s)
         return " ".join(cmd[1:])  # the interpreter path is noise
@@ -2004,8 +2073,26 @@ def liker_logins() -> list[dict]:
             at = p.stat().st_mtime
         except OSError:
             at = 0.0
-        out.append({"name": name, "ready": used, "at": at})
+        out.append({"name": name, "ready": used, "at": at,
+                    "username": account_usernames().get(name, "")})
     out.sort(key=lambda d: (-d["at"], d["name"]))
+    return out
+
+
+def account_usernames() -> dict[str, str]:
+    """profile -> TikTok @username, as emails.py recorded it (6_comment_liker/emails.csv)."""
+    path = LIKER_DIR / "emails.csv"
+    out: dict[str, str] = {}
+    try:
+        import csv as _csv
+        with path.open(encoding="utf-8", newline="") as f:
+            for row in _csv.DictReader(f):
+                name = str(row.get("profile") or "").strip()
+                user = str(row.get("tiktok_username") or "").strip().lstrip("@")
+                if name and user:
+                    out[name] = user
+    except OSError:
+        pass
     return out
 
 
@@ -2528,29 +2615,32 @@ class Handler(BaseHTTPRequestHandler):
                 # ONE JOB PER PLATFORM. scraper.py takes a single --platform and
                 # writes a single file; four platforms is four runs, started
                 # together so the slowest one is the wait rather than the sum.
+                # AND ONE SET PER GENRE when several are ticked to run together:
+                # each genre's runs use that genre's phrases and upload into
+                # that genre's pool (search_plan).
                 try:
-                    runs = search_runs(s["search"])
-                    if not runs:
+                    plan = search_plan(s["search"])
+                    if not plan:
                         raise ValueError("Tick at least one platform.")
-                    many = len(runs) > 1
-                    built = [build_search_for(s["search"], pl, ct, many)
-                             for pl, ct in runs]
+                    many = len(plan) > 1
+                    built = [build_search_for(sg, pl, ct, many)
+                             for sg, pl, ct in plan]
                 except ValueError as e:
                     self._json({"error": str(e)}, 400)
                     return
                 commit()
                 started = []
-                for (plat, _content), (title, cmd, cwd) in zip(runs, built):
+                for (sg, plat, _content), (title, cmd, cwd) in zip(plan, built):
                     job = RUNNER.start(tool, title, cmd, cwd)
                     started.append(job.id)
                     # Each search chains its OWN upload, of its OWN file. A
                     # second job rather than one job doing two things: two logs,
                     # two exit codes, and an upload you can stop without killing
                     # the scrape that is still running next to it.
-                    if s["search"].get("upload_after"):
+                    if sg.get("upload_after"):
                         threading.Thread(
                             target=_watch_search,
-                            args=(job, dict(s["search"]), plat),
+                            args=(job, dict(sg), plat),
                             daemon=True,
                         ).start()
                 self._json({"ok": True, "job": started[0], "jobs": started})
